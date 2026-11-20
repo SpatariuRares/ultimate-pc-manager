@@ -1,0 +1,28 @@
+name: CI
+
+# Kept minimal to use few Actions minutes: pull requests only, code changes
+# only, one job that compiles once (cargo test) and nothing else.
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'assets/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Tests that read the real PC are #[ignore] and are skipped.
+      - run: cargo test --release --locked

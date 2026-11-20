@@ -1,0 +1,28 @@
+name: Release
+
+# Runs only when a v* tag is pushed: one build, no tests (CI ran them on the PR).
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          $zip = "ultimate-pc-manager-${{ github.ref_name }}-windows-x64.zip"
+          Compress-Archive -Path target/release/ultimate-pc-manager.exe, README.md, assets/Michroma-OFL.txt -DestinationPath $zip
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: ultimate-pc-manager-*-windows-x64.zip
