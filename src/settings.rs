@@ -12,7 +12,7 @@ pub const SPEEDS: [(&str, u64); 5] = [
     ("Paused", 0),
 ];
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub dark: bool,

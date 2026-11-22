@@ -2,6 +2,8 @@
 
 mod app;
 mod core_page;
+mod page_colors;
+mod page_settings;
 mod page_system;
 mod page_users;
 mod cpu_topology;
@@ -13,7 +15,6 @@ mod metrics;
 mod page_perf;
 mod pages;
 mod perfdata;
-mod pages2;
 mod path_cache;
 mod platform;
 mod pro;

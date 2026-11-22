@@ -118,6 +118,12 @@ pub enum Action {
     /// that records sensors for other pages (see
     /// [`crate::addons::AddonHost::record_sensors`]); nothing when it is off.
     RecordSensors(bool),
+    /// Settings or Colors changed settings: the app keeps these, saves
+    /// them and acts on what changed (the sampler's interval, the
+    /// signatures Hide Microsoft Services and Processes needs).
+    ChangeSettings(Box<Settings>),
+    /// Settings › Add-ons: turns the add-on on or off and saves the choice.
+    SetAddon(&'static str, bool),
 }
 
 /// Said when Restart ends Windows Explorer but explorer.exe does not start
