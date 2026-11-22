@@ -80,6 +80,7 @@ pub fn standard() -> Vec<(ProviderGroup, Factory)> {
         of(Hardware, Arc::new(|| Box::new(super::ryzen::RyzenMaster::new()))),
         of(Hardware, Arc::new(|| Box::new(super::power_plan::PowerPlan::new()))),
         of(Counters, Arc::new(|| Box::new(super::disk::DiskCounters::new()))),
+        of(Counters, Arc::new(|| Box::new(super::gpu_counters::GpuCounters::new()))),
         of(Counters, Arc::new(|| Box::new(super::machine::MachineFacts::new()))),
         of(Hardware, Arc::new(|| Box::new(super::power::PowerStatusProvider::new()))),
         // Vendor GPU providers before DXCore: their values and reasons win

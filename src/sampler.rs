@@ -242,7 +242,8 @@ fn services_by_host(running: &[crate::winsys::RunningService], procs: &[ProcRow]
 
 /// Puts what the sensor service's providers counted into `perf`: the CPU
 /// performance level, every disk's activity and rates (with the totals since
-/// boot) and the package power. A counter that gave nothing (no frame yet, a
+/// boot), the GPU adapters with each process's GPU share and the package
+/// power. A counter that gave nothing (no frame yet, a
 /// provider with a problem or not responding) is in `unanswered`: its
 /// figures are gaps, not zeros.
 fn counters_into(perf: &mut crate::perfdata::PerfLive, frame: Option<&crate::sensors::Frame>) {
@@ -273,6 +274,12 @@ fn counters_into(perf: &mut crate::perfdata::PerfLive, frame: Option<&crate::sen
             perf.unanswered.insert(key);
         }
     }
+    // The GPU adapters and each process's share. No GPU counters (no driver)
+    // is no adapter, not a gap: the GPU keys are in no health list.
+    let instances = |key: &str| set(key).map(|c| c.instances.iter().map(|i| (i.name.clone(), i.value)).collect::<Vec<_>>()).unwrap_or_default();
+    let engines = instances(counter::GPU);
+    perf.gpu_by_pid = crate::perfdata::gpu_by_pid(&engines);
+    perf.gpus = crate::perfdata::gpu_adapters(&engines, &instances(counter::GDED), &instances(counter::GSH));
     // Windows' energy meter reports the RAPL package rail in milliwatts.
     perf.cpu_power_w = set(counter::POWER).and_then(|c| {
         c.instances.iter().find(|i| {
@@ -401,7 +408,6 @@ fn system_fill() -> Fill {
             }
             snap.uptime = System::uptime();
             snap.perf = perf.sample();
-            merge_gpu(&mut snap.procs, &snap.perf.gpu_by_pid);
             snap.compressed = match snap.perf.compressed {
                 0 => snap
                     .procs
@@ -453,6 +459,7 @@ fn run(tx: Sender<Snapshot>, interval: Arc<AtomicU64>, refresh_now: Arc<AtomicBo
         snap.forced = forced;
         let frame = counted_frame(&interest, refresh.as_ref());
         counters_into(&mut snap.perf, frame.as_deref());
+        merge_gpu(&mut snap.procs, &snap.perf.gpu_by_pid);
         // The facts do not change: the last ones stand while a frame has none.
         machine = frame.and_then(|f| f.machine.clone()).or(machine);
         snap.machine = machine.clone();
