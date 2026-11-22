@@ -15,7 +15,7 @@ pub struct RunningService {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct StartupRow {
+pub struct StartupEntry {
     pub name: String,
     pub command: String,
     pub location: String,
@@ -897,7 +897,7 @@ mod imp {
             .unwrap_or(true)
     }
 
-    pub fn list_startup() -> Vec<StartupRow> {
+    pub fn list_startup() -> Vec<StartupEntry> {
         let mut out = Vec::new();
         for (hkcu, hive, label) in [
             (true, RegKey::predef(HKEY_CURRENT_USER), "Registry (current user)"),
@@ -906,7 +906,7 @@ mod imp {
             if let Ok(k) = hive.open_subkey(RUN) {
                 for (name, value) in k.enum_values().flatten() {
                     let command = value.to_string().trim_matches('"').to_string();
-                    out.push(StartupRow {
+                    out.push(StartupEntry {
                         enabled: approved(&hive, APPROVED_RUN, &name),
                         name,
                         command,
@@ -926,7 +926,7 @@ mod imp {
                     if file.eq_ignore_ascii_case("desktop.ini") {
                         continue;
                     }
-                    out.push(StartupRow {
+                    out.push(StartupEntry {
                         enabled: approved(&hkcu, APPROVED_FOLDER, &file),
                         name: file.trim_end_matches(".lnk").to_string(),
                         command: e.path().display().to_string(),
@@ -940,7 +940,7 @@ mod imp {
         out
     }
 
-    pub fn set_startup_enabled(row: &StartupRow, enable: bool) -> Result<(), String> {
+    pub fn set_startup_enabled(row: &StartupEntry, enable: bool) -> Result<(), String> {
         let hive = if row.hkcu { RegKey::predef(HKEY_CURRENT_USER) } else { RegKey::predef(HKEY_LOCAL_MACHINE) };
         let (key, _) = hive
             .create_subkey(&row.approved_key)
@@ -995,9 +995,9 @@ mod imp {
     #[cfg(test)]
     pub fn efficiency_on(_: u32) -> Option<bool> { None }
     /// No startup entries.
-    pub fn list_startup() -> Vec<StartupRow> { Vec::new() }
+    pub fn list_startup() -> Vec<StartupEntry> { Vec::new() }
     /// Startup entries cannot be changed: an error.
-    pub fn set_startup_enabled(_: &StartupRow, _: bool) -> Result<(), String> { Err(NOT.into()) }
+    pub fn set_startup_enabled(_: &StartupEntry, _: bool) -> Result<(), String> { Err(NOT.into()) }
 }
 
 pub use imp::*;
