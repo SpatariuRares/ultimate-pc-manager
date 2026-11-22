@@ -35,6 +35,7 @@ impl RecordingActions {
     /// From now on `request` takes `wait` to answer.
     pub fn delay(&self, request: Request, wait: std::time::Duration) {
         self.delays.lock().unwrap_or_else(|e| e.into_inner()).push((request, wait));
+    }
 
     /// From now on the seam says the app does (or does not) run as administrator.
     pub fn set_admin(&self, admin: bool) {
@@ -81,6 +82,7 @@ impl SystemActions for RecordingActions {
     }
     fn restart_explorer(&self, pid: u32) -> Result<(), String> {
         self.record(Request::RestartExplorer(pid))
+    }
 
     // ---- Elevation, administrator check and the remaining actions (ticket 99) ----
     fn restart_elevated(&self, page: &str) -> Result<(), String> {

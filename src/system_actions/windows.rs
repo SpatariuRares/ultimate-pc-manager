@@ -32,6 +32,7 @@ impl SystemActions for WindowsActions {
     }
     fn restart_explorer(&self, pid: u32) -> Result<(), String> {
         winsys::restart_explorer(pid)
+    }
 
     // ---- Elevation, administrator check and the remaining actions (ticket 99) ----
     fn restart_elevated(&self, page: &str) -> Result<(), String> {
