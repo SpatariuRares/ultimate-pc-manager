@@ -12,7 +12,7 @@ use crate::widgets::parts::{
 };
 use crate::widgets::{first_path, fmt_bytes, refresh_button};
 use crate::system_lists::ServiceRow;
-use crate::winsys::{self, StartupRow};
+use crate::system_lists::StartupRow;
 
 /// Space between the header, the band and the list.
 const GAP: f32 = 8.0;
@@ -94,6 +94,12 @@ impl TaskApp {
     /// Refresh, F5, the sidebar, Go to services, a control) comes here.
     pub fn reload_services(&mut self) {
         self.services = Some(self.system.list_services());
+    }
+
+    /// The one place the startup list is read: every reader (first draw,
+    /// Refresh, F5, the sidebar, an Enable or Disable) comes here.
+    pub fn reload_startup(&mut self) {
+        self.startup = Some(self.system.list_startup());
     }
 
     pub fn page_services(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -219,19 +225,19 @@ impl TaskApp {
 
     pub fn page_startup(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         if self.startup.is_none() {
-            self.startup = Some(winsys::list_startup());
+            self.reload_startup();
         }
         let list = self.startup.clone().unwrap_or_default();
         ui.horizontal(|ui| {
             self.page_title(ui, "Startup apps");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if refresh_button(ui).clicked() {
-                    self.startup = Some(winsys::list_startup());
+                    self.reload_startup();
                 }
                 if let Some(i) = self.startup_selected.filter(|i| *i < list.len()) {
                     let en = list[i].enabled;
                     if parts::header_button(ui, if en { "Disable" } else { "Enable" }, true).clicked() {
-                        actions.push(Action::Startup(i, !en));
+                        actions.push(Action::Startup(list[i].id.clone(), !en));
                     }
                 }
             });
@@ -285,7 +291,7 @@ impl TaskApp {
                                 }
                                 resp.context_menu(|ui| {
                                     if ui.button(if r.enabled { "Disable" } else { "Enable" }).clicked() {
-                                        actions.push(Action::Startup(i, !r.enabled));
+                                        actions.push(Action::Startup(r.id.clone(), !r.enabled));
                                         ui.close();
                                     }
                                     if ui.button("Open file location").clicked() {
@@ -304,9 +310,9 @@ impl TaskApp {
             },
             |ui, new_sel| {
                 let i = new_sel.or(selected).filter(|i| *i < list.len());
-                SidePanel::new("startup-detail").show(ui, i.map(|i| (i, &list[i])), |ui, (i, r)| {
+                SidePanel::new("startup-detail").show(ui, i.map(|i| (i, &list[i])), |ui, (_, r)| {
                     if startup_detail(ui, r) {
-                        panel_action = Some(Action::Startup(i, !r.enabled));
+                        panel_action = Some(Action::Startup(r.id.clone(), !r.enabled));
                     }
                 });
             },
@@ -545,6 +551,78 @@ mod tests {
         let shown = draw_services(&mut app);
         assert!(has(&shown, "The services could not be read"), "{shown:?}");
         assert!(has(&shown, "Access is denied. (os error 5)"), "{shown:?}");
+    }
+
+    fn app_with_startup(rows: Vec<StartupRow>) -> (TaskApp, std::sync::Arc<crate::system_lists::fake::FakeSystem>) {
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.script_startup(rows);
+        (app_on(&fake), fake)
+    }
+
+    fn entry(id: &str, name: &str, enabled: bool) -> StartupRow {
+        StartupRow { id: id.into(), name: name.into(), enabled, ..Default::default() }
+    }
+
+    #[test]
+    fn the_first_draw_of_startup_reads_the_list_once_and_keeps_the_headline() {
+        let (mut app, fake) = app_with_startup(vec![entry("a", "Steam", true), entry("b", "Discord", false), entry("c", "Zoom", true)]);
+        let first = words(|ui| app.page_startup(ui, &mut Vec::new()));
+        let second = words(|ui| app.page_startup(ui, &mut Vec::new()));
+        assert_eq!(fake.startup_reads(), 1, "drawn twice, read once");
+        assert!(has(&first, "2 of 3 startup apps are enabled"), "{first:?}");
+        assert!(has(&second, "Discord"), "{second:?}");
+    }
+
+    #[test]
+    fn f5_on_startup_rereads_the_list() {
+        let (mut app, fake) = app_with_startup(vec![entry("a", "Steam", true)]);
+        app.page = crate::app::Page::Core(crate::addons::Core::Startup);
+        words(|ui| app.page_startup(ui, &mut Vec::new()));
+        fake.script_startup(vec![entry("a", "Steam", true), entry("b", "Discord", true)]);
+        app.refresh_now();
+        assert_eq!(fake.startup_reads(), 2);
+        let shown = words(|ui| app.page_startup(ui, &mut Vec::new()));
+        assert!(has(&shown, "2 of 2 startup apps are enabled"), "{shown:?}");
+    }
+
+    #[test]
+    fn refresh_on_startup_rereads_the_list() {
+        let (mut app, fake) = app_with_startup(vec![entry("a", "Steam", true)]);
+        let ctx = crate::test_ui::context(theme::Mode::Dark);
+        let size = (1300.0, 800.0);
+        let out = crate::test_ui::run(&ctx, size, vec![], |ui| app.page_startup(ui, &mut Vec::new()));
+        let refresh = crate::test_ui::flat_shapes(&out)
+            .iter()
+            .find_map(|sh| match sh {
+                egui::Shape::Text(g) if g.galley.text().trim() == "Refresh" => Some(g.visual_bounding_rect().center()),
+                _ => None,
+            })
+            .expect("a Refresh button");
+        let press = |pressed| egui::Event::PointerButton { pos: refresh, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        crate::test_ui::run(&ctx, size, vec![egui::Event::PointerMoved(refresh), press(true)], |ui| app.page_startup(ui, &mut Vec::new()));
+        crate::test_ui::run(&ctx, size, vec![press(false)], |ui| app.page_startup(ui, &mut Vec::new()));
+        assert_eq!(fake.startup_reads(), 2, "the first draw and the click");
+    }
+
+    #[test]
+    fn the_startup_header_action_names_the_chosen_entry_not_its_position() {
+        let (mut app, _fake) = app_with_startup(vec![entry("a", "Steam", true), entry("b", "Discord", true)]);
+        app.startup_selected = Some(1);
+        let ctx = crate::test_ui::context(theme::Mode::Dark);
+        let size = (1300.0, 800.0);
+        let out = crate::test_ui::run(&ctx, size, vec![], |ui| app.page_startup(ui, &mut Vec::new()));
+        let disable = crate::test_ui::flat_shapes(&out)
+            .iter()
+            .find_map(|sh| match sh {
+                egui::Shape::Text(g) if g.galley.text().trim() == "Disable" => Some(g.visual_bounding_rect().center()),
+                _ => None,
+            })
+            .expect("a Disable button");
+        let press = |pressed| egui::Event::PointerButton { pos: disable, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let mut actions = Vec::new();
+        crate::test_ui::run(&ctx, size, vec![egui::Event::PointerMoved(disable), press(true)], |ui| app.page_startup(ui, &mut Vec::new()));
+        crate::test_ui::run(&ctx, size, vec![press(false)], |ui| app.page_startup(ui, &mut actions));
+        assert_eq!(actions, vec![Action::Startup("b".into(), false)]);
     }
 
     #[test]

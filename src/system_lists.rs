@@ -39,5 +39,26 @@ pub trait SystemLists {
     /// "restart"), or says why it could not be done.
     fn control_service(&self, name: &str, action: &str) -> Result<(), String>;
 
-    // Startup entries (list, enable, disable) are added here.
+    /// Every startup entry with its state. Startup has no error state: a
+    /// location that cannot be read simply lists nothing.
+    fn list_startup(&self) -> Vec<StartupRow>;
+
+    /// Enables or disables the startup entry named by `id` (a
+    /// [`StartupRow::id`]), or says why it could not.
+    fn set_startup_enabled(&self, id: &str, enable: bool) -> Result<(), String>;
 }
+
+/// One startup entry as the Startup apps page shows it.
+#[derive(Clone, Debug, Default)]
+pub struct StartupRow {
+    /// Names this entry for as long as it exists, whatever its position in
+    /// the list: an action carries it instead of an index.
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    pub location: String,
+    pub enabled: bool,
+}
+
+/// Said when an action names a startup entry that has left the list.
+pub const STARTUP_GONE: &str = "That startup app is no longer in the list";

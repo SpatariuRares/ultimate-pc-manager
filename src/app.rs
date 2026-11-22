@@ -12,8 +12,8 @@ use crate::platform::PageContext;
 use crate::sampler::{Sampler, Snapshot};
 use crate::settings::{Settings, SPEEDS};
 use crate::widgets::{fmt_bytes, health_colour, local_ip, logo, nav_entry_back, nav_heading, push, refresh_button};
-use crate::system_lists::{ServiceRow, SystemLists};
-use crate::winsys::{self, StartupRow};
+use crate::system_lists::{ServiceRow, StartupRow, SystemLists};
+use crate::winsys;
 
 /// The open page: one of the core pages, or the page of an add-on (by its
 /// registry id; the add-on draws it through the host).
@@ -583,7 +583,7 @@ impl TaskApp {
         self.sampler.refresh();
         match self.page {
             Page::Core(Core::Services) => self.reload_services(),
-            Page::Core(Core::Startup) => self.startup = Some(winsys::list_startup()),
+            Page::Core(Core::Startup) => self.reload_startup(),
             p => {
                 // An add-on refreshes itself and reads its sensors; for a core
                 // page, only the sensors it holds (Summary's) are read.
@@ -920,7 +920,7 @@ impl TaskApp {
             self.page = p;
             match p {
                 Page::Core(Core::Services) if self.services.is_none() => self.reload_services(),
-                Page::Core(Core::Startup) if self.startup.is_none() => self.startup = Some(winsys::list_startup()),
+                Page::Core(Core::Startup) if self.startup.is_none() => self.reload_startup(),
                 _ => {}
             }
         }
@@ -1602,14 +1602,18 @@ impl TaskApp {
                 }
                 self.reload_services();
             }
-            Action::Startup(i, enable) => {
-                if let Some(row) = self.startup.as_ref().and_then(|l| l.get(i)).cloned() {
-                    match winsys::set_startup_enabled(&row, enable) {
-                        Ok(()) => self.say(format!("{} {}", row.name, if enable { "enabled" } else { "disabled" })),
+            Action::Startup(id, enable) => {
+                // The entry is named by its id, so a reread since the click
+                // cannot change the target; a name is only for the message.
+                let name = self.startup.as_ref().and_then(|l| l.iter().find(|r| r.id == id)).map(|r| r.name.clone());
+                match name {
+                    Some(name) => match self.system.set_startup_enabled(&id, enable) {
+                        Ok(()) => self.say(format!("{name} {}", if enable { "enabled" } else { "disabled" })),
                         Err(e) => self.say(e),
-                    }
-                    self.startup = Some(winsys::list_startup());
+                    },
+                    None => self.say(crate::system_lists::STARTUP_GONE),
                 }
+                self.reload_startup();
             }
         }
     }
@@ -2052,6 +2056,82 @@ mod tests {
         let shown = crate::test_ui::texts(&crate::test_ui::run(&ctx, (1300.0, 800.0), vec![], |ui| app.page_services(ui, &mut Vec::new())));
         assert_eq!(fake.service_reads(), 1, "the page does not read it again");
         assert!(shown.iter().any(|w| w == "Winmgmt") && !shown.iter().any(|w| w == "Spooler"), "the host's services only: {shown:?}");
+    }
+
+    fn entry(id: &str, name: &str, enabled: bool) -> crate::system_lists::StartupRow {
+        crate::system_lists::StartupRow { id: id.into(), name: name.into(), enabled, ..Default::default() }
+    }
+
+    /// An app on the Startup apps page, over a fake holding `rows`.
+    fn startup_app(rows: Vec<crate::system_lists::StartupRow>) -> (TaskApp, std::sync::Arc<crate::system_lists::fake::FakeSystem>) {
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.script_startup(rows);
+        let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
+        app.page = Page::Core(Core::Startup);
+        app.refresh_now();
+        (app, fake)
+    }
+
+    #[test]
+    fn a_startup_toggle_reports_and_rereads() {
+        let (mut app, fake) = startup_app(vec![entry("run|Steam", "Steam", true)]);
+        let ctx = egui::Context::default();
+        let reads = fake.startup_reads();
+        fake.script_startup(vec![entry("run|Steam", "Steam", false)]);
+        app.run_action(&ctx, Action::Startup("run|Steam".into(), false));
+        assert_eq!(fake.startup_requests(), vec![("run|Steam".to_string(), false)]);
+        assert_eq!(said(&app).as_deref(), Some("Steam disabled"));
+        assert_eq!(fake.startup_reads(), reads + 1, "the list is read again");
+        assert!(!app.startup.as_ref().unwrap()[0].enabled, "the reread state is kept");
+        app.run_action(&ctx, Action::Startup("run|Steam".into(), true));
+        assert_eq!(said(&app).as_deref(), Some("Steam enabled"));
+    }
+
+    #[test]
+    fn a_refused_startup_toggle_says_the_error_and_rereads() {
+        let (mut app, fake) = startup_app(vec![entry("run|Steam", "Steam", true)]);
+        fake.fail_startup_toggle("Access denied. Run the app as administrator to change this entry.");
+        let reads = fake.startup_reads();
+        app.run_action(&egui::Context::default(), Action::Startup("run|Steam".into(), false));
+        assert_eq!(said(&app).as_deref(), Some("Access denied. Run the app as administrator to change this entry."));
+        assert_eq!(fake.startup_reads(), reads + 1);
+    }
+
+    #[test]
+    fn a_startup_toggle_targets_the_chosen_entry_after_the_list_changed() {
+        let (mut app, fake) = startup_app(vec![entry("run|Alpha", "Alpha", true), entry("run|Beta", "Beta", true)]);
+        // Between the click and the action the list is read again and a new
+        // entry sorts in front: Beta moves from index 1 to index 2.
+        fake.script_startup(vec![entry("run|Aardvark", "Aardvark", true), entry("run|Alpha", "Alpha", true), entry("run|Beta", "Beta", true)]);
+        app.refresh_now();
+        app.run_action(&egui::Context::default(), Action::Startup("run|Beta".into(), false));
+        assert_eq!(fake.startup_requests(), vec![("run|Beta".to_string(), false)]);
+        assert_eq!(said(&app).as_deref(), Some("Beta disabled"));
+    }
+
+    #[test]
+    fn a_startup_toggle_of_an_entry_that_left_the_list_changes_nothing() {
+        let (mut app, fake) = startup_app(vec![entry("run|Steam", "Steam", true)]);
+        fake.script_startup(vec![]);
+        app.refresh_now();
+        let reads = fake.startup_reads();
+        app.run_action(&egui::Context::default(), Action::Startup("run|Steam".into(), false));
+        assert!(fake.startup_requests().is_empty(), "no entry is toggled");
+        assert_eq!(said(&app).as_deref(), Some("That startup app is no longer in the list"));
+        assert_eq!(fake.startup_reads(), reads + 1, "the list is read again");
+    }
+
+    #[test]
+    fn the_sidebar_reads_the_startup_list_through_the_seam() {
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.script_startup(vec![entry("run|Steam", "Steam", true)]);
+        let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
+        app.refresh_now();
+        assert_eq!(fake.startup_reads(), 0, "refresh on another page reads no startup list");
+        app.page = Page::Core(Core::Startup);
+        app.refresh_now();
+        assert_eq!(fake.startup_reads(), 1);
+        assert_eq!(app.startup.as_ref().map(|l| l.len()), Some(1));
     }
 
     #[test]
