@@ -1,11 +1,10 @@
-//! Summary, Processes, System Info and Users pages.
-
-use std::collections::BTreeMap;
+//! Summary and Processes pages (System Info and Users are in `page_system`
+//! and `page_users`).
 
 use egui::{vec2, Align, Color32, Layout, RichText, Sense, Ui};
 use egui_extras::Column;
 
-use crate::app::{status_parts, Action, ProcCol, TaskApp};
+use crate::app::{Action, ProcCol, TaskApp};
 use crate::settings::SPEEDS;
 use crate::page_perf::fmt_bytes_rate;
 use crate::platform::PageContext;
@@ -15,6 +14,10 @@ use crate::summary_view::Metric;
 use crate::theme::{self, Theme};
 use crate::widgets::parts::{self, cell_text, BandArea, CellInk, Mark, SidePanel, StatusBand, TABLE_ROW_HEIGHT};
 use crate::widgets::*;
+#[cfg(test)]
+use crate::page_system::system_sections;
+#[cfg(test)]
+use crate::page_users::{accounts, users_headline};
 
 impl TaskApp {
     pub fn page_summary(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -544,89 +547,6 @@ impl TaskApp {
                 _ => true,
             });
         }
-    }
-
-    pub fn page_system(&mut self, ui: &mut Ui) {
-        self.header(ui, "System Info");
-        let t = theme::of_ui(ui);
-        let s = &self.snap;
-        let computer = sysinfo::System::host_name().unwrap_or_default();
-        let os = sysinfo::System::long_os_version().unwrap_or_default();
-        let fields = vec![
-            ("Computer name", computer.clone()),
-            ("Operating system", os.clone()),
-            ("Version", sysinfo::System::os_version().unwrap_or_default()),
-            ("Kernel", sysinfo::System::kernel_version().unwrap_or_default()),
-            ("Architecture", sysinfo::System::cpu_arch()),
-            ("Processor", cpu_brand()),
-            ("Cores", sysinfo::System::physical_core_count().map(|c| c.to_string()).unwrap_or_default()),
-            ("Logical processors", s.cpu_per_core.len().to_string()),
-            ("Speed", format!("{:.2} GHz", s.cpu_freq_mhz as f64 / 1000.0)),
-            ("Installed memory", fmt_bytes(s.mem_total)),
-            ("Page file", fmt_bytes(s.swap_total)),
-            ("Drives", s.disks.len().to_string()),
-            ("Network adapters", s.net.len().to_string()),
-            ("Up time", fmt_uptime(s.uptime)),
-        ];
-        let paused = self.settings.interval_ms() == 0;
-        let providers = crate::app::ProviderState::of(s);
-        let [state, procs, ip, generation] = status_parts(paused, providers, s.procs.len(), &local_ip(), s.seq);
-        let sub = [procs, ip, generation, computer, os].into_iter().filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" \u{b7} ");
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            StatusBand::new(Mark::Dot(health_colour(&t, paused, providers)), &state).sub(&sub).show(ui, |_, _| {});
-            for section in system_sections(&fields) {
-                ui.add_space(14.0);
-                parts::field_card(ui, section.group, section.title, &section.fields);
-            }
-        });
-    }
-
-    pub fn page_users(&mut self, ui: &mut Ui) {
-        self.header(ui, "Users");
-        let t = self.settings.theme();
-        let accounts = accounts(&self.snap.procs);
-        let n: usize = accounts.iter().map(|a| a.procs.len()).sum();
-        let cpu: f32 = accounts.iter().map(|a| a.cpu).sum();
-        let mem: u64 = accounts.iter().map(|a| a.mem).sum();
-        let sub = format!("{n} processes \u{b7} CPU {cpu:.1}% \u{b7} {} memory", fmt_bytes(mem));
-        StatusBand::new(Mark::None, &users_headline(&accounts)).sub(&sub).show(ui, |_, _| {});
-        ui.add_space(14.0);
-
-        // The chosen account (its details beside the list) and the expanded
-        // ones are kept in egui's memory.
-        let chosen_id = egui::Id::new("users-chosen");
-        let before: Option<String> = ui.data_mut(|d| d.get_persisted(chosen_id)).flatten();
-        let chosen = parts::list_with_panel(
-            ui,
-            |ui, list_w| {
-                let mut chosen = before;
-                user_head(ui, &t, list_w);
-                egui::ScrollArea::vertical().id_salt("users-list").auto_shrink([false, false]).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    for a in &accounts {
-                        let open_id = egui::Id::new(("users-open", &a.name));
-                        let mut open: bool = ui.data_mut(|d| d.get_persisted(open_id)).unwrap_or(false);
-                        let on = chosen.as_deref() == Some(a.name.as_str());
-                        if account_row(ui, &t, list_w - 12.0, a, on, open).clicked() {
-                            open = !open || !on;
-                            chosen = Some(a.name.clone());
-                            ui.data_mut(|d| d.insert_persisted(open_id, open));
-                        }
-                        if open {
-                            for p in a.procs.iter().take(200) {
-                                member_row(ui, &t, list_w - 12.0, p);
-                            }
-                        }
-                    }
-                });
-                chosen
-            },
-            |ui, chosen| {
-                let item = chosen.as_ref().and_then(|c| accounts.iter().find(|a| &a.name == c));
-                SidePanel::new("user-detail").show(ui, item, |ui, a| account_detail(ui, &t, a));
-            },
-        );
-        ui.data_mut(|d| d.insert_persisted(chosen_id, chosen));
     }
 }
 
@@ -1403,143 +1323,6 @@ fn process_details(ui: &mut Ui, t: &Theme, chosen: &[&ProcRow], procs: &[ProcRow
         });
     });
     end
-}
-
-/// A System Info card: its group, its title and its fields.
-struct Section<'a> {
-    group: &'a str,
-    title: &'a str,
-    fields: Vec<(&'a str, String)>,
-}
-
-/// Which card each System Info field sits in, as Design A groups them.
-const SECTIONS: &[(&str, &str, &[&str])] = &[
-    ("Software", "Operating System", &["Computer name", "Operating system", "Version", "Kernel", "Up time"]),
-    ("Hardware", "Processor", &["Processor", "Architecture", "Cores", "Logical processors", "Speed"]),
-    ("Hardware", "Memory", &["Installed memory", "Page file"]),
-    ("Hardware", "Storage", &["Drives"]),
-    ("Network", "Network", &["Network adapters"]),
-];
-
-/// The page's fields in their cards; a card with no field is left out.
-fn system_sections<'a>(fields: &[(&'a str, String)]) -> Vec<Section<'a>> {
-    SECTIONS
-        .iter()
-        .map(|(group, title, keys)| Section {
-            group,
-            title,
-            fields: keys.iter().filter_map(|k| fields.iter().find(|(f, _)| f == k).cloned()).collect(),
-        })
-        .filter(|s| !s.fields.is_empty())
-        .collect()
-}
-
-/// An account running processes, with its processes by memory.
-#[derive(Debug)]
-struct Account {
-    name: String,
-    cpu: f32,
-    mem: u64,
-    procs: Vec<ProcRow>,
-}
-
-/// The accounts that run processes, by name; processes without a user
-/// are "System".
-fn accounts(procs: &[ProcRow]) -> Vec<Account> {
-    let mut by: BTreeMap<String, Account> = BTreeMap::new();
-    for p in procs {
-        let name = if p.user.is_empty() { "System".to_string() } else { p.user.clone() };
-        let a = by.entry(name.clone()).or_insert_with(|| Account { name, cpu: 0.0, mem: 0, procs: Vec::new() });
-        a.cpu += p.cpu;
-        a.mem += p.mem;
-        a.procs.push(p.clone());
-    }
-    let mut all: Vec<Account> = by.into_values().collect();
-    for a in &mut all {
-        a.procs.sort_by(|x, y| y.mem.cmp(&x.mem));
-    }
-    all
-}
-
-/// The Users band's headline.
-fn users_headline(accounts: &[Account]) -> String {
-    match accounts {
-        [] => "No user sessions were reported".to_string(),
-        [one] => format!("Only {} is running processes", one.name),
-        many => format!("{} accounts are running processes", many.len()),
-    }
-}
-
-/// x of each Users column from the right edge: CPU, Memory, Processes.
-const USER_COLUMNS: [f32; 3] = [200.0, 110.0, 12.0];
-
-fn user_head(ui: &mut Ui, t: &Theme, width: f32) {
-    let (rect, _) = ui.allocate_exact_size(vec2(width - 12.0, 24.0), Sense::hover());
-    let p = ui.painter();
-    let y = rect.center().y;
-    p.text(egui::pos2(rect.left() + 12.0, y), egui::Align2::LEFT_CENTER, "User", t.fonts.label.clone(), t.label);
-    for (label, x) in ["CPU", "Memory", "Processes"].iter().zip(USER_COLUMNS) {
-        p.text(egui::pos2(rect.right() - x, y), egui::Align2::RIGHT_CENTER, *label, t.fonts.label.clone(), t.label);
-    }
-    p.hline(rect.x_range(), rect.bottom(), egui::Stroke::new(1.0, t.line));
-    ui.add_space(4.0);
-}
-
-/// An account's row: chevron, name and how many processes, its figures.
-fn account_row(ui: &mut Ui, t: &Theme, width: f32, a: &Account, selected: bool, open: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, 42.0), Sense::click());
-    let p = ui.painter();
-    parts::row_fill(p, rect, selected, resp.hovered());
-    let ink = if selected { t.on_selected } else { t.text };
-    let sub = parts::sub_colour(t, selected);
-    let y = rect.center().y;
-    // The chevron: down while the account's processes show, right otherwise.
-    let c = egui::pos2(rect.left() + 17.0, y);
-    crate::widgets::disclosure(p, c, open);
-    p.text(egui::pos2(rect.left() + 30.0, rect.top() + 13.0), egui::Align2::LEFT_CENTER, &a.name, egui::FontId::new(13.0, theme::semibold()), ink);
-    let count = match a.procs.len() {
-        1 => "1 process".to_string(),
-        n => format!("{n} processes"),
-    };
-    p.text(egui::pos2(rect.left() + 30.0, rect.top() + 30.0), egui::Align2::LEFT_CENTER, &count, egui::FontId::proportional(11.5), sub);
-    let figures = [format!("{:.1}%", a.cpu), fmt_bytes(a.mem), a.procs.len().to_string()];
-    for (f, x) in figures.iter().zip(USER_COLUMNS) {
-        p.text(egui::pos2(rect.right() - x, y), egui::Align2::RIGHT_CENTER, f, t.fonts.row.clone(), ink);
-    }
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &a.name));
-    resp
-}
-
-/// One process under an open account: name and PID, CPU and memory.
-fn member_row(ui: &mut Ui, t: &Theme, width: f32, proc: &ProcRow) {
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, 26.0), Sense::hover());
-    let p = ui.painter();
-    parts::row_fill(p, rect, false, resp.hovered());
-    let y = rect.center().y;
-    let name = p.text(egui::pos2(rect.left() + 40.0, y), egui::Align2::LEFT_CENTER, &proc.name, t.fonts.row.clone(), t.text);
-    p.text(egui::pos2(name.right() + 8.0, y), egui::Align2::LEFT_CENTER, format!("PID {}", proc.pid), egui::FontId::proportional(11.5), t.faint);
-    let figures = [format!("{:.1}%", proc.cpu), fmt_mb(proc.mem)];
-    for (f, x) in figures.iter().zip(USER_COLUMNS) {
-        p.text(egui::pos2(rect.right() - x, y), egui::Align2::RIGHT_CENTER, f, t.fonts.row.clone(), t.soft);
-    }
-}
-
-/// The chosen account beside the Users list: its name and its figures.
-fn account_detail(ui: &mut Ui, t: &Theme, a: &Account) {
-    ui.label(RichText::new(&a.name).font(t.fonts.figure.clone()).color(t.text));
-    ui.add_space(8.0);
-    ui.columns(3, |cols| {
-        let figures = [
-            ("CPU", format!("{:.1}%", a.cpu), t.graphs.cpu),
-            ("Memory", fmt_bytes(a.mem), t.graphs.memory),
-            ("Processes", a.procs.len().to_string(), t.text),
-        ];
-        for (ui, (label, value, ink)) in cols.iter_mut().zip(figures) {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            ui.label(RichText::new(label).font(t.fonts.label.clone()).color(t.label));
-            ui.label(RichText::new(value).font(t.fonts.figure_small.clone()).color(ink));
-        }
-    });
 }
 
 #[cfg(test)]

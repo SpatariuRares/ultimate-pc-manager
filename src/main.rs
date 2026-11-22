@@ -1,6 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod core_page;
+mod page_system;
+mod page_users;
 mod cpu_topology;
 mod addons;
 mod file_activity;

@@ -8,6 +8,7 @@ use egui::{vec2, Align, Color32, Layout, Pos2, RichText, Sense, Stroke, Ui};
 
 use crate::addons::{AddonHost, Core, Landing};
 pub use crate::platform::Action;
+use crate::core_page::{Histories, PageCtx, SampleSlot};
 use crate::platform::PageContext;
 use crate::sampler::{Sampler, Snapshot};
 use crate::settings::{Settings, SPEEDS};
@@ -200,8 +201,9 @@ pub struct TaskApp {
     pub snap: Snapshot,
     pub cpu_hist: VecDeque<f32>,
     pub mem_hist: VecDeque<f32>,
-    pub disk_hist: VecDeque<f32>,
-    pub net_hist: BTreeMap<String, VecDeque<f32>>,
+    /// The core pages that moved to the shared interface (see
+    /// [`crate::core_page`]).
+    pub pages: crate::core_page::CorePages,
     /// Long histories for the Performance page graphs, by series name.
     pub ph: BTreeMap<String, VecDeque<f32>>,
     /// What the Summary page draws, built once per new sample.
@@ -339,8 +341,7 @@ impl TaskApp {
             snap: Snapshot::default(),
             cpu_hist: VecDeque::new(),
             mem_hist: VecDeque::new(),
-            disk_hist: VecDeque::new(),
-            net_hist: BTreeMap::new(),
+            pages: Default::default(),
             ph: BTreeMap::new(),
             summary: Default::default(),
             machine_info: None,
@@ -476,6 +477,38 @@ impl TaskApp {
         crate::theme::apply(ctx, crate::theme::Mode::from_dark(dark));
     }
 
+    /// Draws the page shown: one arm per core page that has not moved to
+    /// the shared interface (a moved page's arm is deleted; the last arm
+    /// reaches it through [`crate::core_page::CorePages`]).
+    pub(crate) fn draw_page(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        match self.page {
+            Page::Core(Core::Summary) => self.page_summary(ui, actions),
+            Page::Core(Core::Performance) => self.page_performance(ui),
+            Page::Core(Core::Processes) => self.page_processes(ui, actions),
+            Page::Core(Core::Startup) => self.page_startup(ui, actions),
+            Page::Core(Core::Services) => self.page_services(ui, actions),
+            Page::Addon(id) => self.addon_page(ui, id, actions),
+            Page::Core(Core::AppHistory) => self.page_history(ui),
+            Page::Core(Core::Settings) => self.page_settings(ui, actions),
+            Page::Core(Core::Colors) => self.page_colors(ui),
+            Page::Core(core) => self.draw_core_page(core, ui, actions),
+        }
+    }
+
+    /// A core page behind the shared interface: the standard header when
+    /// the page asks for one, then the page.
+    fn draw_core_page(&mut self, core: Core, ui: &mut Ui, actions: &mut Vec<Action>) {
+        let Some(title) = self.pages.page_mut(core).map(|p| p.title()) else { return };
+        if let Some(title) = title {
+            self.header(ui, title);
+        }
+        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
+        let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories };
+        if let Some(page) = self.pages.page_mut(core) {
+            page.draw(ui, &ctx, actions);
+        }
+    }
+
     /// The Design A theme of the dark or light setting.
     fn theme(&self) -> crate::theme::Theme {
         crate::theme::Theme::of(crate::theme::Mode::from_dark(self.settings.dark))
@@ -535,15 +568,16 @@ impl TaskApp {
             got = Some(s);
         }
         let Some(s) = got else { return };
+        // The order a sample is handled in (the add-ons came first, above):
+        // the Performance history, the short histories, App history,
+        // process tracking, the Summary rebuild, signatures. A page's
+        // `on_sample` runs at its `SampleSlot`.
         self.push_perf(&s);
+        self.sample_pages(SampleSlot::Performance, &s);
         push(&mut self.cpu_hist, s.cpu_total);
         let mem_pct = if s.mem_total > 0 { s.mem_used as f32 * 100.0 / s.mem_total as f32 } else { 0.0 };
         push(&mut self.mem_hist, mem_pct);
-        push(&mut self.disk_hist, ((s.disk_read_bps + s.disk_write_bps) / 1_048_576.0) as f32);
-        for n in &s.net {
-            let h = self.net_hist.entry(n.name.clone()).or_default();
-            push(h, ((n.rx_bps + n.tx_bps) * 8.0 / 1000.0) as f32);
-        }
+        self.sample_pages(SampleSlot::AppHistory, &s);
         let now = Instant::now();
         if let Some(prev) = self.last_sample_at {
             let dt = now.duration_since(prev).as_secs_f64().min(10.0);
@@ -557,10 +591,20 @@ impl TaskApp {
         self.last_sample_at = Some(now);
         // The Processes view notices the processes that ended (it keeps
         // them a moment; the sampler does not).
+        self.sample_pages(SampleSlot::ProcessTracking, &s);
         self.proc_view.track(&s.procs, now, self.settings.show_exited);
+        self.sample_pages(SampleSlot::Summary, &s);
         self.snap = s;
         self.rebuild_summary();
+        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
+        self.pages.on_sample(SampleSlot::Last, &PageCtx { settings: &self.settings, snapshot: &self.snap, histories });
         self.ask_signatures();
+    }
+
+    /// Delivers the new sample `s` to the core pages of `slot`.
+    fn sample_pages(&mut self, slot: SampleSlot, s: &Snapshot) {
+        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
+        self.pages.on_sample(slot, &PageCtx { settings: &self.settings, snapshot: s, histories });
     }
 
     pub fn set_speed(&mut self, idx: usize) {
@@ -584,6 +628,14 @@ impl TaskApp {
         match self.page {
             Page::Core(Core::Services) => self.reload_services(),
             Page::Core(Core::Startup) => self.reload_startup(),
+            Page::Core(c) if self.pages.page_mut(c).is_some() => {
+                let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
+                let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories };
+                if let Some(page) = self.pages.page_mut(c) {
+                    page.refresh(&ctx);
+                }
+                self.addons.read_held_sensors();
+            }
             p => {
                 // An add-on refreshes itself and reads its sensors; for a core
                 // page, only the sensors it holds (Summary's) are read.
@@ -664,19 +716,7 @@ impl eframe::App for TaskApp {
         self.nav_panel(ctx);
         self.status_bar(ctx, &mut actions);
         let frame = egui::Frame::new().fill(self.theme().page).inner_margin(egui::Margin { left: 22, right: 18, top: 0, bottom: 8 });
-        egui::CentralPanel::default().frame(frame).show(ctx, |ui| match self.page {
-            Page::Core(Core::Summary) => self.page_summary(ui, &mut actions),
-            Page::Core(Core::Performance) => self.page_performance(ui),
-            Page::Core(Core::Processes) => self.page_processes(ui, &mut actions),
-            Page::Core(Core::SystemInfo) => self.page_system(ui),
-            Page::Core(Core::Startup) => self.page_startup(ui, &mut actions),
-            Page::Core(Core::Users) => self.page_users(ui),
-            Page::Core(Core::Services) => self.page_services(ui, &mut actions),
-            Page::Addon(id) => self.addon_page(ui, id, &mut actions),
-            Page::Core(Core::AppHistory) => self.page_history(ui),
-            Page::Core(Core::Settings) => self.page_settings(ui, &mut actions),
-            Page::Core(Core::Colors) => self.page_colors(ui),
-        });
+        egui::CentralPanel::default().frame(frame).show(ctx, |ui| self.draw_page(ui, &mut actions));
         self.end_frame();
         self.dialogs(ctx, &mut actions);
         self.off_question(ctx);
@@ -2417,5 +2457,41 @@ mod tests {
         feed.send(one(4, "running.exe")).expect("sent");
         app.pull_samples();
         assert_eq!(table_names(&mut app), ["running.exe"], "running again, samples reach the table");
+    }
+
+    /// The texts the page shown draws, through the app's dispatch.
+    fn page_texts(app: &mut TaskApp) -> Vec<String> {
+        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        crate::test_ui::texts(&crate::test_ui::run(&ctx, (1400.0, 900.0), vec![], |ui| app.draw_page(ui, &mut Vec::new())))
+    }
+
+    #[test]
+    fn system_info_is_drawn_for_its_page_under_the_standard_header() {
+        let snap = Snapshot { cpu_per_core: vec![0.0; 4], ..Default::default() };
+        let mut app = TaskApp::headless(Settings::default(), snap);
+        app.page = Page::Core(Core::SystemInfo);
+        let texts = page_texts(&mut app);
+        assert!(texts.iter().any(|t| t == "System Info"), "its title: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Logical processors"), "its cards: {texts:?}");
+        assert!(texts.iter().any(|t| t.trim() == "Refresh"), "the header's Refresh: {texts:?}");
+    }
+
+    #[test]
+    fn users_is_drawn_for_its_page_from_the_latest_snapshot() {
+        let mut app = app_with_three_processes();
+        app.page = Page::Core(Core::Users);
+        let texts = page_texts(&mut app);
+        assert!(texts.iter().any(|t| t == "Users"), "its title: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Only System is running processes"), "its band: {texts:?}");
+    }
+
+    #[test]
+    fn refresh_on_a_moved_page_still_asks_the_sampler_for_a_sample() {
+        for core in [Core::SystemInfo, Core::Users] {
+            let mut app = app_with_three_processes();
+            app.page = Page::Core(core);
+            app.refresh_now();
+            assert!(refreshed(&app), "{core:?}");
+        }
     }
 }
