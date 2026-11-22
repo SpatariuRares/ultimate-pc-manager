@@ -29,6 +29,9 @@ pub struct PageCtx<'a> {
     /// While a sample is delivered, the new sample; otherwise the latest.
     pub snapshot: &'a Snapshot,
     pub histories: Histories<'a>,
+    /// What Processes reads that the app owns (signatures, the add-ons'
+    /// columns, the system seam).
+    pub processes: crate::page_processes::ProcessInputs<'a>,
 }
 
 /// Where in the app's handling of a new sample a page's
@@ -68,6 +71,10 @@ pub trait CorePage {
 
     /// Draws the page; what it asks of the app goes in `actions`.
     fn draw(&mut self, ui: &mut Ui, ctx: &PageCtx, actions: &mut Vec<Action>);
+
+    /// Draws what the page keeps open whichever page is shown (a question,
+    /// a window), after the page itself, every frame.
+    fn windows(&mut self, _egui_ctx: &egui::Context, _ctx: &PageCtx, _actions: &mut Vec<Action>) {}
 }
 
 /// Every core page that has moved to the interface, one field each.
@@ -75,17 +82,25 @@ pub trait CorePage {
 pub struct CorePages {
     pub system_info: crate::page_system::SystemInfoPage,
     pub users: crate::page_users::UsersPage,
+    pub processes: crate::page_processes::ProcessesPage,
 }
 
 impl CorePages {
     /// Each moved page with its identity: one line per page.
     fn all_mut(&mut self) -> Vec<(Core, &mut dyn CorePage)> {
-        vec![(Core::SystemInfo, &mut self.system_info), (Core::Users, &mut self.users)]
+        vec![(Core::SystemInfo, &mut self.system_info), (Core::Users, &mut self.users), (Core::Processes, &mut self.processes)]
     }
 
     /// The page for `core`, `None` while it has not moved.
     pub fn page_mut(&mut self, core: Core) -> Option<&mut dyn CorePage> {
         self.all_mut().into_iter().find(|(c, _)| *c == core).map(|(_, p)| p)
+    }
+
+    /// Draws what every moved page keeps open (see [`CorePage::windows`]).
+    pub fn windows(&mut self, egui_ctx: &egui::Context, ctx: &PageCtx, actions: &mut Vec<Action>) {
+        for (_, page) in self.all_mut() {
+            page.windows(egui_ctx, ctx, actions);
+        }
     }
 
     /// Delivers a new sample to the pages whose slot is `slot`.
@@ -122,7 +137,8 @@ pub mod testing {
     /// The same with the app's short histories given.
     pub fn draw_with(page: &mut dyn CorePage, settings: &Settings, snapshot: &Snapshot, cpu: &VecDeque<f32>, mem: &VecDeque<f32>) -> Drawn {
         let ctx = crate::test_ui::context(Mode::Dark);
-        draw_in(&ctx, page, &PageCtx { settings, snapshot, histories: Histories { cpu, mem } })
+        let standalone = crate::page_processes::Standalone::default();
+        draw_in(&ctx, page, &PageCtx { settings, snapshot, histories: Histories { cpu, mem }, processes: standalone.inputs() })
     }
 
     /// Draws in `ctx` (draw again in the same one to keep what egui
@@ -162,7 +178,8 @@ mod tests {
         let settings = Settings::default();
         let snapshot = Snapshot { seq: 7, ..Default::default() };
         let (cpu, mem) = (VecDeque::new(), VecDeque::new());
-        let ctx = PageCtx { settings: &settings, snapshot: &snapshot, histories: Histories { cpu: &cpu, mem: &mem } };
+        let standalone = crate::page_processes::Standalone::default();
+        let ctx = PageCtx { settings: &settings, snapshot: &snapshot, histories: Histories { cpu: &cpu, mem: &mem }, processes: standalone.inputs() };
         deliver([&mut summary as &mut dyn CorePage, &mut perf].into_iter(), SampleSlot::Performance, &ctx);
         assert_eq!(*log.borrow(), ["perf saw seq 7"]);
         deliver([&mut summary as &mut dyn CorePage, &mut perf].into_iter(), SampleSlot::Summary, &ctx);

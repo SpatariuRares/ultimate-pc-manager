@@ -9,6 +9,7 @@ use egui::{vec2, Align, Color32, Layout, Pos2, RichText, Sense, Stroke, Ui};
 use crate::addons::{AddonHost, Core, Landing};
 pub use crate::platform::Action;
 use crate::core_page::{Histories, PageCtx, SampleSlot};
+use crate::page_processes::{ProcView, ProcessInputs, ProcessesChange};
 use crate::platform::PageContext;
 use crate::sampler::{Sampler, Snapshot};
 use crate::settings::{Settings, SPEEDS};
@@ -180,13 +181,6 @@ impl PerfItem {
     }
 }
 
-/// Asked when another page goes to a process Hide Microsoft Services and
-/// Processes keeps out of the table.
-pub const SHOW_MICROSOFT_QUESTION: &str = "Processes does not list this process while Hide Microsoft Services and Processes is on. Turn it off?";
-
-/// Asked once Create memory dump file has written its file.
-pub const DUMP_QUESTION: &str = "Show it in File Explorer?";
-
 pub struct TaskApp {
     pub settings: Settings,
     /// The add-on registry and which add-ons are on.
@@ -222,15 +216,6 @@ pub struct TaskApp {
     /// The Processes table's layout as last saved (see
     /// [`TaskApp::process_table_unsaved`]).
     process_table_saved: crate::settings::ProcessTable,
-    /// The process rows selected on Processes (Ctrl and Shift add rows).
-    pub selected: crate::process_view::Selection,
-    /// Processes scrolls to the selected process once (after "Go to the
-    /// process" or type-ahead).
-    pub reveal_selected: bool,
-    /// Follow process: the process Processes keeps selected and in view.
-    pub following: Option<crate::process_view::Follow>,
-    /// Processes: which tree rows are open and which groups are folded.
-    pub proc_view: crate::process_view::ViewState,
     /// What the Services and Startup apps pages read and control: the
     /// machine in the app, a fake in tests (see [`crate::system_lists`]).
     pub(crate) system: std::sync::Arc<dyn SystemLists>,
@@ -238,36 +223,9 @@ pub struct TaskApp {
     pub svc_selected: Option<String>,
     pub startup: Option<Vec<StartupRow>>,
     pub startup_selected: Option<usize>,
-    pub confirm_end: Option<crate::pages::EndAsk>,
-    /// Efficiency mode's question, open while it waits for an answer.
-    pub confirm_efficiency: Option<crate::pages::EfficiencyAsk>,
-    /// The processes Set priority ▸ Realtime waits to change while its
-    /// question is open.
-    pub confirm_realtime: Option<Vec<u32>>,
-    /// The process another page went to while "Hide Microsoft Services and
-    /// Processes" hides it: Processes asks whether to turn the option off.
-    pub ask_show_microsoft: Option<u32>,
-    /// The memory dump file just written, while [`DUMP_QUESTION`] waits
-    /// for an answer.
-    pub dump_question: Option<std::path::PathBuf>,
-    /// The memory dumps being written off the UI thread, each sending
-    /// the file written or why Windows refused.
-    dumps: Vec<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
-    /// Restarts of Windows Explorer running off the UI thread, each
-    /// sending how it went.
-    explorer_restarts: Vec<std::sync::mpsc::Receiver<Result<(), String>>>,
     /// Who signed each program file, checked off the UI thread.
     pub signatures: crate::signature::Signatures,
-    /// Each program file's description, read off the UI thread.
-    pub descriptions: crate::version_info::Descriptions,
     pub run_dialog: Option<String>,
-    /// The open Process Inspector windows, one per process.
-    pub inspectors: Vec<crate::inspector::Inspector>,
-    /// The open Analyze wait chain windows, one per process.
-    pub wait_chains: Vec<crate::wait_chain::WaitChain>,
-    /// The open File activity windows, one per process; each holds its
-    /// trace, stopped when the window goes.
-    pub file_activity: Vec<crate::file_activity::FileActivity>,
     pub message: Option<(String, Instant)>,
     /// What the app asks of the system (see [`crate::system_actions`]): the
     /// Windows adapter, or in tests a recording one that acts on nothing.
@@ -352,28 +310,13 @@ impl TaskApp {
 
             search: String::new(),
             process_table_saved: Default::default(),
-            selected: Default::default(),
-            reveal_selected: false,
-            following: None,
-            proc_view: Default::default(),
             system,
             services: None,
             svc_selected: None,
             startup: None,
             startup_selected: None,
-            confirm_end: None,
-            confirm_efficiency: None,
-            confirm_realtime: None,
-            ask_show_microsoft: None,
-            dump_question: None,
-            dumps: Vec::new(),
-            explorer_restarts: Vec::new(),
             signatures: Default::default(),
-            descriptions: Default::default(),
             run_dialog: None,
-            inspectors: Vec::new(),
-            wait_chains: Vec::new(),
-            file_activity: Vec::new(),
             message: None,
             actions,
             #[cfg(test)]
@@ -484,7 +427,6 @@ impl TaskApp {
         match self.page {
             Page::Core(Core::Summary) => self.page_summary(ui, actions),
             Page::Core(Core::Performance) => self.page_performance(ui),
-            Page::Core(Core::Processes) => self.page_processes(ui, actions),
             Page::Core(Core::Startup) => self.page_startup(ui, actions),
             Page::Core(Core::Services) => self.page_services(ui, actions),
             Page::Addon(id) => self.addon_page(ui, id, actions),
@@ -503,7 +445,9 @@ impl TaskApp {
             self.header(ui, title);
         }
         let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
-        let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories };
+        let columns = std::cell::RefCell::new(&mut self.addons);
+        let processes = ProcessInputs::new(&self.signatures, &*self.actions).with_columns(&columns);
+        let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories, processes };
         if let Some(page) = self.pages.page_mut(core) {
             page.draw(ui, &ctx, actions);
         }
@@ -592,19 +536,20 @@ impl TaskApp {
         // The Processes view notices the processes that ended (it keeps
         // them a moment; the sampler does not).
         self.sample_pages(SampleSlot::ProcessTracking, &s);
-        self.proc_view.track(&s.procs, now, self.settings.show_exited);
         self.sample_pages(SampleSlot::Summary, &s);
         self.snap = s;
         self.rebuild_summary();
         let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
-        self.pages.on_sample(SampleSlot::Last, &PageCtx { settings: &self.settings, snapshot: &self.snap, histories });
+        let processes = ProcessInputs::new(&self.signatures, &*self.actions);
+        self.pages.on_sample(SampleSlot::Last, &PageCtx { settings: &self.settings, snapshot: &self.snap, histories, processes });
         self.ask_signatures();
     }
 
     /// Delivers the new sample `s` to the core pages of `slot`.
     fn sample_pages(&mut self, slot: SampleSlot, s: &Snapshot) {
         let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
-        self.pages.on_sample(slot, &PageCtx { settings: &self.settings, snapshot: s, histories });
+        let processes = ProcessInputs::new(&self.signatures, &*self.actions);
+        self.pages.on_sample(slot, &PageCtx { settings: &self.settings, snapshot: s, histories, processes });
     }
 
     pub fn set_speed(&mut self, idx: usize) {
@@ -630,7 +575,8 @@ impl TaskApp {
             Page::Core(Core::Startup) => self.reload_startup(),
             Page::Core(c) if self.pages.page_mut(c).is_some() => {
                 let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
-                let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories };
+                let processes = ProcessInputs::new(&self.signatures, &*self.actions);
+                let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories, processes };
                 if let Some(page) = self.pages.page_mut(c) {
                     page.refresh(&ctx);
                 }
@@ -1130,24 +1076,6 @@ impl TaskApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
-        self.finished_dumps();
-        self.finished_restarts();
-        if self.dump_question.is_some() {
-            let (mut yes, mut no) = (false, false);
-            egui::Modal::new(egui::Id::new("dump-question")).show(ctx, |ui| {
-                ui.set_max_width(420.0);
-                ui.label(DUMP_QUESTION);
-                ui.add_space(10.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    use crate::widgets::parts::{outline_button, primary_button};
-                    yes = primary_button(ui, "Yes", true).clicked();
-                    no = outline_button(ui, "No", true).clicked();
-                });
-            });
-            if yes || no {
-                self.answer_dump(yes, actions);
-            }
-        }
         if let Some(mut text) = self.run_dialog.take() {
             let mut open = true;
             let mut done = false;
@@ -1180,163 +1108,20 @@ impl TaskApp {
                 self.run_dialog = Some(text);
             }
         }
-        if self.ask_show_microsoft.is_some() {
-            let (mut turn_off, mut cancel) = (false, false);
-            egui::Modal::new(egui::Id::new("show-microsoft-question")).show(ctx, |ui| {
-                ui.set_max_width(420.0);
-                ui.label(SHOW_MICROSOFT_QUESTION);
-                ui.add_space(10.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    use crate::widgets::parts::{outline_button, primary_button};
-                    turn_off = primary_button(ui, "Turn off", true).clicked();
-                    cancel = outline_button(ui, "Cancel", true).clicked();
-                });
-            });
-            if turn_off {
-                self.show_microsoft_and_go();
-                self.settings.save();
-            } else if cancel {
-                self.ask_show_microsoft = None;
-            }
-        }
-        if let Some(ask) = self.confirm_end.clone() {
-            let mut close = false;
-            let sub = self.sub_text();
-            egui::Window::new(ask.title())
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                .show(ctx, |ui| {
-                    ui.label(ask.question());
-                    if !ask.note().is_empty() {
-                        ui.label(RichText::new(ask.note()).color(sub));
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button(ask.title()).clicked() {
-                            actions.push(ask.action());
-                            close = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            close = true;
-                        }
-                    });
-                });
-            if close {
-                self.confirm_end = None;
-            }
-        }
-        if let Some(mut ask) = self.confirm_efficiency.clone() {
-            let (mut go, mut cancel) = (false, false);
-            egui::Modal::new(egui::Id::new("efficiency-question")).show(ctx, |ui| {
-                ui.set_max_width(420.0);
-                ui.label(crate::pages::EFFICIENCY_QUESTION);
-                ui.add_space(6.0);
-                ui.checkbox(&mut ask.dont_ask, "Don't ask again");
-                ui.add_space(10.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    use crate::widgets::parts::{outline_button, primary_button};
-                    go = primary_button(ui, ask.title(), true).clicked();
-                    cancel = outline_button(ui, "Cancel", true).clicked();
-                });
-            });
-            self.confirm_efficiency = if go || cancel { None } else { Some(ask.clone()) };
-            if go {
-                self.answer_efficiency(&ask, actions);
-                if ask.dont_ask {
-                    self.settings.save();
-                }
-            }
-        }
-        if let Some(pids) = self.confirm_realtime.clone() {
-            let (mut go, mut cancel) = (false, false);
-            egui::Modal::new(egui::Id::new("realtime-question")).show(ctx, |ui| {
-                ui.set_max_width(420.0);
-                ui.label(crate::pages::REALTIME_QUESTION);
-                ui.add_space(10.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    use crate::widgets::parts::{outline_button, primary_button};
-                    go = primary_button(ui, "Continue", true).clicked();
-                    cancel = outline_button(ui, "Cancel", true).clicked();
-                });
-            });
-            if go || cancel {
-                self.confirm_realtime = None;
-            }
-            if go {
-                Self::answer_realtime(&pids, actions);
-            }
-        }
-        // The Process Inspectors; a resize is saved with the Processes
-        // table's layout.
-        let procs = &self.snap.procs;
-        let width = &mut self.settings.process_table.inspector_width;
-        self.inspectors.retain_mut(|inspector| inspector.show(ctx, procs, width, actions));
-        self.wait_chains.retain_mut(|w| w.show(ctx));
-        // The File activity windows; closing one stops its trace.
-        let width = &mut self.settings.process_table.file_activity_width;
-        self.file_activity.retain_mut(|window| window.show(ctx, procs, width, actions));
+        let processes = ProcessInputs::new(&self.signatures, &*self.actions);
+        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
+        let page_ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories, processes };
+        self.pages.windows(ctx, &page_ctx, actions);
     }
 
     /// Closes every File activity window, stopping their traces (on exit).
     pub fn close_file_activity(&mut self) {
-        self.file_activity.clear();
-    }
-
-    /// Efficiency mode agreed to: it runs, and "Don't ask again" turns
-    /// "Ask before applying Efficiency mode" off (the dialog saves it).
-    pub fn answer_efficiency(&mut self, ask: &crate::pages::EfficiencyAsk, actions: &mut Vec<Action>) {
-        if ask.dont_ask {
-            self.settings.ask_efficiency = false;
-        }
-        actions.push(Action::Efficiency(ask.pids.clone()));
-    }
-
-    /// Realtime priority agreed to: it is set on each of `pids`.
-    pub fn answer_realtime(pids: &[u32], actions: &mut Vec<Action>) {
-        actions.extend(pids.iter().map(|&pid| Action::Priority(pid, "Realtime")));
-    }
-
-    /// A memory dump is done: once written, [`DUMP_QUESTION`] is asked;
-    /// a refusal is said in the status bar.
-    pub fn dump_done(&mut self, result: Result<std::path::PathBuf, String>) {
-        match result {
-            Ok(path) => self.dump_question = Some(path),
-            Err(e) => self.say(e),
-        }
-    }
-
-    /// The answer to [`DUMP_QUESTION`]: Yes shows the file in File
-    /// Explorer.
-    pub fn answer_dump(&mut self, show: bool, actions: &mut Vec<Action>) {
-        if let Some(path) = self.dump_question.take() {
-            if show {
-                actions.push(Action::ShowInExplorer(path));
-            }
-        }
-    }
-
-    /// Takes the memory dumps whose writing has ended ([`Self::dump_done`]).
-    fn finished_dumps(&mut self) {
-        let mut done = Vec::new();
-        self.dumps.retain(|rx| match rx.try_recv() {
-            Ok(result) => {
-                done.push(result);
-                false
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => true,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                done.push(Err(winsys::DUMP_FAILED.to_string()));
-                false
-            }
-        });
-        for result in done {
-            self.dump_done(result);
-        }
+        self.pages.processes.close_file_activity();
     }
 
     /// Restart on the shell's Windows Explorer: the system call (which waits
     /// up to several seconds) runs on a worker thread; the status bar says
-    /// how it went on a later frame ([`Self::finished_restarts`]).
+    /// how it went on a later frame ([`crate::page_processes::ProcessesPage::watch_restart`]).
     fn restart_explorer(&mut self, ctx: &egui::Context, pid: u32) {
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
@@ -1346,34 +1131,8 @@ impl TaskApp {
             ctx.request_repaint();
         });
         match spawned {
-            Ok(_) => self.explorer_restarts.push(rx),
+            Ok(_) => self.pages.processes.watch_restart(rx),
             Err(_) => self.say(crate::platform::EXPLORER_NOT_RESTARTED.to_string()),
-        }
-    }
-
-    /// Takes the restarts of Windows Explorer that have ended and says
-    /// how each went.
-    fn finished_restarts(&mut self) {
-        let mut done = Vec::new();
-        self.explorer_restarts.retain(|rx| match rx.try_recv() {
-            Ok(result) => {
-                done.push(result);
-                false
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => true,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                done.push(Err(crate::platform::EXPLORER_NOT_RESTARTED.to_string()));
-                false
-            }
-        });
-        for result in done {
-            match result {
-                Ok(()) => {
-                    self.say("Restarted Windows Explorer".to_string());
-                    self.sampler.refresh_requested.store(true, Ordering::Relaxed);
-                }
-                Err(e) => self.say(e),
-            }
         }
     }
 
@@ -1397,17 +1156,9 @@ impl TaskApp {
     /// "Turn it off": Hide Microsoft Services and Processes goes off and
     /// Processes shows the process asked for.
     pub fn show_microsoft_and_go(&mut self) {
-        if let Some(pid) = self.ask_show_microsoft.take() {
+        if let Some(pid) = self.pages.processes.ask_show_microsoft.take() {
             self.settings.hide_microsoft = false;
             self.go_to_process(pid);
-        }
-    }
-
-    /// Follow process on `pid`, or Stop following (`None`).
-    pub fn follow(&mut self, pid: Option<u32>) {
-        self.following = pid.map(crate::process_view::Follow::new);
-        if let Some(pid) = pid {
-            self.selected = crate::process_view::Selection::only(pid);
         }
     }
 
@@ -1421,12 +1172,51 @@ impl TaskApp {
         self.page = Page::Core(Core::Services);
     }
 
+    /// A Process View item: the saved options toggle here; the page keeps
+    /// the open rows and the exited processes.
+    pub(crate) fn apply_process_view(&mut self, item: ProcView) {
+        match item {
+            ProcView::Tree => {
+                self.settings.process_tree = !self.settings.process_tree;
+                self.settings.save();
+            }
+            ProcView::Smooth => {
+                self.settings.smooth_cpu = !self.settings.smooth_cpu;
+                self.settings.save();
+            }
+            ProcView::ShowExited => {
+                self.settings.show_exited = !self.settings.show_exited;
+                if !self.settings.show_exited {
+                    self.pages.processes.drop_exited();
+                }
+                self.settings.save();
+            }
+            ProcView::ExpandAll => self.pages.processes.expand_all(&self.snap.procs, self.snap.services.keys().copied()),
+            ProcView::CollapseAll => self.pages.processes.collapse_all(),
+        }
+    }
+
+    /// What the Processes page asked to change in the settings.
+    fn apply_processes_change(&mut self, change: ProcessesChange) {
+        match change {
+            ProcessesChange::Table(layout) => self.settings.process_table = layout,
+            ProcessesChange::InspectorWidth(width) => self.settings.process_table.inspector_width = width,
+            ProcessesChange::FileActivityWidth(width) => self.settings.process_table.file_activity_width = width,
+            ProcessesChange::EfficiencyAskOff => {
+                self.settings.ask_efficiency = false;
+                self.settings.save();
+            }
+            ProcessesChange::ShowMicrosoft => {
+                self.show_microsoft_and_go();
+                self.settings.save();
+            }
+        }
+    }
+
     /// Opens Processes on `pid`: clears the search so the process is
     /// listed, selects it and scrolls to it.
     fn go_to_process(&mut self, pid: u32) {
-        self.search.clear();
-        self.selected = crate::process_view::Selection::only(pid);
-        self.reveal_selected = true;
+        self.pages.processes.go_to(pid);
         self.page = Page::Core(Core::Processes);
     }
 
@@ -1523,7 +1313,7 @@ impl TaskApp {
                 // of the table: ask whether to turn the option off first.
                 let hidden = self.snap.procs.iter().find(|p| p.pid == pid).and_then(|p| self.hide().why(p));
                 if hidden == Some(crate::process_view::Hidden::Microsoft) {
-                    self.ask_show_microsoft = Some(pid);
+                    self.pages.processes.ask_show_microsoft = Some(pid);
                 } else {
                     self.go_to_process(pid);
                 }
@@ -1538,33 +1328,13 @@ impl TaskApp {
                     Err(e) => self.say(format!("Could not save: {e}")),
                 }
             }
-            Action::Inspect(pid) => {
-                // One window per process: inspecting it again brings its window up.
-                if self.inspectors.iter().any(|i| i.pid == pid) {
-                    ctx.move_to_top(egui::LayerId::new(egui::Order::Middle, crate::inspector::window_id(pid)));
-                } else {
-                    self.inspectors.push(crate::inspector::Inspector::open(pid, &self.snap.procs));
-                }
-            }
-            Action::AnalyzeWaitChain(pid) => {
-                // One window per process: analysing it again runs it again
-                // and brings its window up.
-                if let Some(w) = self.wait_chains.iter_mut().find(|w| w.pid == pid) {
-                    w.rerun(&self.snap.procs);
-                    ctx.move_to_top(egui::LayerId::new(egui::Order::Middle, crate::wait_chain::window_id(pid)));
-                } else {
-                    self.wait_chains.push(crate::wait_chain::WaitChain::open(pid, &self.snap.procs));
-                }
-            }
+            Action::Inspect(pid) => self.pages.processes.inspect(ctx, pid, &self.snap.procs),
+            Action::AnalyzeWaitChain(pid) => self.pages.processes.analyze_wait_chain(ctx, pid, &self.snap.procs),
             Action::FileActivity(pid) => {
-                // One window per process; the administrator check runs on
-                // the click (the menu item is never greyed).
-                if self.file_activity.iter().any(|w| w.pid == pid) {
-                    ctx.move_to_top(egui::LayerId::new(egui::Order::Middle, crate::file_activity::window_id(pid)));
-                } else {
-                    let admin = self.actions.is_admin();
-                    self.file_activity.push(crate::file_activity::FileActivity::open(pid, &self.snap.procs, admin));
-                }
+                // The administrator check runs on the click (the menu item is
+                // never greyed).
+                let admin = self.actions.is_admin();
+                self.pages.processes.open_file_activity(ctx, pid, &self.snap.procs, admin);
             }
             Action::RestartAsAdministrator => match self.actions.restart_elevated(Core::Processes.id()) {
                 // The elevated copy takes over; this one closes.
@@ -1592,9 +1362,11 @@ impl TaskApp {
                 self.each_process(&pids, "Processor affinity set for", |pid| system.set_affinity(pid, mask))
             }
             Action::ProcessView(item) => self.apply_process_view(item),
+            Action::Refresh => self.refresh_now(),
+            Action::Processes(change) => self.apply_processes_change(change),
             Action::Dump { pid, name } => {
                 // A full dump can take seconds: written off the UI thread,
-                // taken by `finished_dumps`.
+                // taken by the Processes page.
                 let (tx, rx) = std::sync::mpsc::channel();
                 let ctx = ctx.clone();
                 let system = self.actions.clone();
@@ -1603,7 +1375,7 @@ impl TaskApp {
                     ctx.request_repaint();
                 });
                 match spawned {
-                    Ok(_) => self.dumps.push(rx),
+                    Ok(_) => self.pages.processes.watch_dump(rx),
                     Err(_) => self.say(winsys::DUMP_FAILED),
                 }
             }
@@ -1618,7 +1390,7 @@ impl TaskApp {
                     self.say(e);
                 }
             }
-            Action::Follow(pid) => self.follow(pid),
+            Action::Follow(pid) => self.pages.processes.follow(pid),
             Action::RestartExplorer(pid) => self.restart_explorer(ctx, pid),
             Action::GoToServices { pid, service } => self.go_to_services(pid, service),
             Action::OpenPowerOptions => {
@@ -1665,6 +1437,7 @@ impl TaskApp {
 mod tests {
     use super::*;
     use crate::addons::AddonHost;
+    use crate::page_processes::{DUMP_QUESTION, SHOW_MICROSOFT_QUESTION};
 
     use crate::addons::fake::test_registry;
     use serde_json::json;
@@ -1734,13 +1507,23 @@ mod tests {
     }
 
     #[test]
+    fn column_changes_on_the_processes_page_are_saved_once_the_mouse_is_up() {
+        let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
+        assert!(!app.process_table_unsaved(false), "nothing changed");
+        crate::page_processes::set_column_shown(&mut app.settings.process_table, ProcCol::Pid, false);
+        assert!(!app.process_table_unsaved(true), "not while a divider is dragged");
+        assert!(app.process_table_unsaved(false));
+        assert!(!app.process_table_unsaved(false), "saved once");
+    }
+
+    #[test]
     fn inspect_opens_one_inspector_window_per_process() {
         let me = crate::sampler::ProcRow { pid: std::process::id(), name: "tests.exe".into(), ..Default::default() };
         let mut app = TaskApp::headless(Settings::default(), Snapshot { procs: vec![me], ..Default::default() });
         let ctx = egui::Context::default();
         app.run_action(&ctx, Action::Inspect(std::process::id()));
         app.run_action(&ctx, Action::Inspect(std::process::id()));
-        assert_eq!(app.inspectors.iter().map(|i| i.pid).collect::<Vec<_>>(), [std::process::id()], "inspecting it again opens no second window");
+        assert_eq!(app.pages.processes.inspectors.iter().map(|i| i.pid).collect::<Vec<_>>(), [std::process::id()], "inspecting it again opens no second window");
     }
 
     #[test]
@@ -1750,7 +1533,7 @@ mod tests {
         let ctx = egui::Context::default();
         app.run_action(&ctx, Action::AnalyzeWaitChain(std::process::id()));
         app.run_action(&ctx, Action::AnalyzeWaitChain(std::process::id()));
-        assert_eq!(app.wait_chains.iter().map(|w| w.pid).collect::<Vec<_>>(), [std::process::id()], "analysing it again opens no second window");
+        assert_eq!(app.pages.processes.wait_chains.iter().map(|w| w.pid).collect::<Vec<_>>(), [std::process::id()], "analysing it again opens no second window");
     }
 
     #[test]
@@ -1760,13 +1543,13 @@ mod tests {
         let ctx = egui::Context::default();
         app.run_action(&ctx, Action::FileActivity(std::process::id()));
         app.run_action(&ctx, Action::FileActivity(std::process::id()));
-        assert_eq!(app.file_activity.iter().map(|w| w.pid).collect::<Vec<_>>(), [std::process::id()], "asking again opens no second window");
+        assert_eq!(app.pages.processes.file_activity.iter().map(|w| w.pid).collect::<Vec<_>>(), [std::process::id()], "asking again opens no second window");
         if !crate::platform::is_admin() {
-            assert!(!app.file_activity[0].tracing(), "the admin check runs on click; not elevated, no trace");
+            assert!(!app.pages.processes.file_activity[0].tracing(), "the admin check runs on click; not elevated, no trace");
         }
         // Closing the app stops every trace with its window.
         app.close_file_activity();
-        assert!(app.file_activity.is_empty());
+        assert!(app.pages.processes.file_activity.is_empty());
     }
 
     // ---- Process actions through the system-actions seam ----
@@ -1963,7 +1746,7 @@ mod tests {
         let mut app = app_with_three_processes();
         app.recording().set_admin(false);
         app.run_action(&ctx, Action::FileActivity(A));
-        assert!(!app.file_activity[0].tracing(), "the seam says not administrator: no trace, whatever the test run is");
+        assert!(!app.pages.processes.file_activity[0].tracing(), "the seam says not administrator: no trace, whatever the test run is");
         app.close_file_activity();
     }
 
@@ -2084,7 +1867,7 @@ mod tests {
         let mut app = with_windows_process(true);
         app.run_action(&ctx, Action::GoToProcess(900));
         assert_eq!(app.page, Page::Core(Core::Summary), "it does not open a table without the process");
-        assert_eq!(app.ask_show_microsoft, Some(900));
+        assert_eq!(app.pages.processes.ask_show_microsoft, Some(900));
         // A modal sizes itself on its first frame and shows on the next.
         let mut draw = || crate::test_ui::texts(&crate::test_ui::run(&ctx, (1200.0, 800.0), vec![], |ui| app.dialogs(ui.ctx(), &mut Vec::new())));
         draw();
@@ -2094,7 +1877,7 @@ mod tests {
         // "Turn it off": the option goes off and Processes shows the process.
         app.show_microsoft_and_go();
         assert!(!app.settings.hide_microsoft);
-        assert_eq!((app.page, app.selected.single(), app.ask_show_microsoft), (Page::Core(Core::Processes), Some(900), None));
+        assert_eq!((app.page, app.pages.processes.selected.single(), app.pages.processes.ask_show_microsoft), (Page::Core(Core::Processes), Some(900), None));
     }
 
     #[test]
@@ -2102,10 +1885,21 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = with_windows_process(true);
         app.run_action(&ctx, Action::GoToProcess(901));
-        assert_eq!((app.page, app.selected.single(), app.ask_show_microsoft), (Page::Core(Core::Processes), Some(901), None), "not Microsoft's");
+        assert_eq!((app.page, app.pages.processes.selected.single(), app.pages.processes.ask_show_microsoft), (Page::Core(Core::Processes), Some(901), None), "not Microsoft's");
         let mut app = with_windows_process(false);
         app.run_action(&ctx, Action::GoToProcess(900));
-        assert_eq!((app.page, app.selected.single(), app.ask_show_microsoft), (Page::Core(Core::Processes), Some(900), None), "the option is off");
+        assert_eq!((app.page, app.pages.processes.selected.single(), app.pages.processes.ask_show_microsoft), (Page::Core(Core::Processes), Some(900), None), "the option is off");
+    }
+
+    /// One frame of the dialogs and what they queue, run as the app does:
+    /// the Processes page takes the finished background jobs here.
+    fn pump_jobs(app: &mut TaskApp) {
+        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        let mut actions = Vec::new();
+        crate::test_ui::run(&ctx, (800.0, 600.0), vec![], |ui| app.dialogs(ui.ctx(), &mut actions));
+        for a in actions {
+            app.run_action(&ctx, a);
+        }
     }
 
     /// Frames until the status bar says something (or 10 s pass): the
@@ -2113,10 +1907,9 @@ mod tests {
     fn frames_until_said(app: &mut TaskApp) -> Option<String> {
         use std::time::{Duration, Instant};
         let until = Instant::now() + Duration::from_secs(10);
-        while app.message.is_none() && app.dump_question.is_none() && Instant::now() < until {
+        while app.message.is_none() && app.pages.processes.dump_question.is_none() && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(20));
-            app.finished_restarts();
-            app.finished_dumps();
+            pump_jobs(app);
         }
         said(app)
     }
@@ -2163,9 +1956,9 @@ mod tests {
         let started = Instant::now();
         app.run_action(&ctx, Action::Dump { pid: 4242, name: "Code.exe".into() });
         assert!(started.elapsed() < Duration::from_millis(250), "the UI thread does not wait: {:?}", started.elapsed());
-        assert_eq!(app.dump_question, None, "not written yet");
+        assert_eq!(app.pages.processes.dump_question, None, "not written yet");
         frames_until_said(&mut app);
-        assert_eq!(app.dump_question, Some(dir.join("Code.exe-4242.dmp")));
+        assert_eq!(app.pages.processes.dump_question, Some(dir.join("Code.exe-4242.dmp")));
         assert_eq!(app.message, None);
         assert_eq!(app.recording().requests(), [asked]);
     }
@@ -2180,7 +1973,7 @@ mod tests {
         app.recording().fail(asked.clone(), winsys::DUMP_FAILED);
         app.run_action(&ctx, Action::Dump { pid: 4242, name: "Code.exe".into() });
         assert_eq!(frames_until_said(&mut app).as_deref(), Some(winsys::DUMP_FAILED));
-        assert_eq!(app.dump_question, None);
+        assert_eq!(app.pages.processes.dump_question, None);
         assert_eq!(app.recording().requests(), [asked]);
     }
 
@@ -2189,8 +1982,8 @@ mod tests {
         let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
         let mut app = with_windows_process(false);
         let path = std::path::PathBuf::from(r"C:\Temp\TaskManager-tool-901.dmp");
-        app.dump_done(Ok(path.clone()));
-        assert_eq!(app.dump_question, Some(path.clone()));
+        app.pages.processes.dump_done(Ok(path.clone()), &mut Vec::new());
+        assert_eq!(app.pages.processes.dump_question, Some(path.clone()));
         // A modal sizes itself on its first frame and shows on the next.
         let mut draw = || crate::test_ui::texts(&crate::test_ui::run(&ctx, (1200.0, 800.0), vec![], |ui| app.dialogs(ui.ctx(), &mut Vec::new())));
         draw();
@@ -2199,16 +1992,20 @@ mod tests {
         assert_eq!(DUMP_QUESTION, "Show it in File Explorer?");
         // Yes: File Explorer shows the file; No: nothing.
         let mut actions = Vec::new();
-        app.answer_dump(true, &mut actions);
-        assert_eq!((actions, app.dump_question.clone()), (vec![Action::ShowInExplorer(path.clone())], None));
-        app.dump_done(Ok(path));
+        app.pages.processes.answer_dump(true, &mut actions);
+        assert_eq!((actions, app.pages.processes.dump_question.clone()), (vec![Action::ShowInExplorer(path.clone())], None));
+        app.pages.processes.dump_done(Ok(path), &mut Vec::new());
         let mut actions = Vec::new();
-        app.answer_dump(false, &mut actions);
-        assert_eq!((actions, app.dump_question.clone()), (vec![], None));
+        app.pages.processes.answer_dump(false, &mut actions);
+        assert_eq!((actions, app.pages.processes.dump_question.clone()), (vec![], None));
         // A dump Windows refused: the status bar says why, nothing is asked.
-        app.dump_done(Err("Windows could not write the memory dump file.".into()));
+        let mut said = Vec::new();
+        app.pages.processes.dump_done(Err("Windows could not write the memory dump file.".into()), &mut said);
+        for a in said {
+            app.run_action(&ctx, a);
+        }
         assert_eq!(app.message.as_ref().map(|(m, _)| m.as_str()), Some("Windows could not write the memory dump file."));
-        assert_eq!(app.dump_question, None);
+        assert_eq!(app.pages.processes.dump_question, None);
     }
 
     #[test]

@@ -87,7 +87,7 @@ pub enum Action {
     Efficiency(Vec<u32>),
     /// An item of the Processes page's Process View, also the View
     /// submenu of a process's menu.
-    ProcessView(crate::pages::ProcView),
+    ProcessView(crate::page_processes::ProcView),
     /// Restart on the shell's Windows Explorer (the process of this PID):
     /// ends it and starts explorer.exe again.
     RestartExplorer(u32),
@@ -105,6 +105,10 @@ pub enum Action {
     /// "Restart as Administrator": starts this app again elevated (UAC
     /// asks) on Processes and closes this window; a refusal is said.
     RestartAsAdministrator,
+    /// Refresh now (the Refresh button of a page that draws its own header).
+    Refresh,
+    /// A change of the settings the Processes page asks for.
+    Processes(crate::page_processes::ProcessesChange),
     /// Create memory dump file: a full dump of the process `pid` (named
     /// `name`) goes to the temp folder, off the UI thread; once written the
     /// app asks "Show it in File Explorer?".

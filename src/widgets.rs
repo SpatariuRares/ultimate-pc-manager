@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 
 use egui::{vec2, Color32, CornerRadius, Mesh, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, Ui};
 
-use crate::pages::ProcView;
+use crate::page_processes::ProcView;
 use crate::sampler::ProcRow;
 use crate::app::Action;
 use crate::theme::{self, Mode, Theme};
