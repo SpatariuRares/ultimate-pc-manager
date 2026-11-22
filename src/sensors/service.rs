@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use super::model::{CounterSet, Frame, Reading, SourceStatus};
 use super::stats::Stats;
+use crate::perfdata::StaticInfo;
 pub use super::provider::{Factory, Provider};
 
 /// The time the history of each metric covers unless told otherwise.
@@ -221,12 +222,14 @@ struct Slot {
     report_kick: u64,
     /// What it counted in that read.
     counted: Vec<CounterSet>,
+    /// The machine facts it reports, if it does.
+    machine: Option<Arc<StaticInfo>>,
 }
 
 impl Slot {
     /// A slot of a group nobody asks for.
     fn idle(group: ProviderGroup) -> Self {
-        Slot { group, running: false, name: "", report: None, problem: None, busy_since: None, timeout: super::provider::DEFAULT_TIMEOUT, started: Instant::now(), hidden: false, started_kick: 0, report_kick: 0, counted: Vec::new() }
+        Slot { group, running: false, name: "", report: None, problem: None, busy_since: None, timeout: super::provider::DEFAULT_TIMEOUT, started: Instant::now(), hidden: false, started_kick: 0, report_kick: 0, counted: Vec::new(), machine: None }
     }
 
     fn stuck(&self, now: Instant) -> bool {
@@ -473,10 +476,10 @@ fn work(shared: &Shared, born: u64, i: usize) {
             hardware_wanted = st.wanted(ProviderGroup::Hardware);
         }
         let started = Instant::now();
-        let Ok((readings, counted)) = catch_unwind(AssertUnwindSafe(|| {
+        let Ok((readings, counted, machine)) = catch_unwind(AssertUnwindSafe(|| {
             provider.hardware_wanted(hardware_wanted);
             let readings = provider.read(started);
-            (readings, provider.counted())
+            (readings, provider.counted(), provider.machine())
         })) else {
             fail(shared, born, i);
             return;
@@ -493,6 +496,7 @@ fn work(shared: &Shared, born: u64, i: usize) {
         slot.busy_since = None;
         slot.report = Some(readings);
         slot.counted = counted;
+        slot.machine = machine.or(slot.machine.take());
         slot.report_kick = slot.started_kick;
         publish(&mut st, false);
     }
@@ -575,6 +579,7 @@ fn publish(st: &mut State, force: bool) {
     let sources = live().filter(|s| !s.hidden).map(|s| SourceStatus { name: if s.name.is_empty() { "provider" } else { s.name }, problem: s.why(now) }).collect();
     let mut frame = Frame::build(st.seq, &reports, sources);
     frame.counters = merge_counters(st, now);
+    frame.machine = st.slots.iter().filter(|s| s.running).find_map(|s| s.machine.clone());
     let frame = Arc::new(frame);
     st.shown = st.slots.iter().map(|s| s.running && s.why(now).is_some()).collect();
     if st.settled(&ProviderGroup::ALL, now) {

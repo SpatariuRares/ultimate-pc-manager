@@ -140,7 +140,7 @@ pub(crate) struct Dev {
 #[derive(Default)]
 pub(crate) struct Stats {
     pub(crate) top: Vec<(String, String)>,
-    table: Vec<(String, String)>,
+    pub(crate) table: Vec<(String, String)>,
 }
 
 impl Stats {
@@ -440,7 +440,7 @@ impl TaskApp {
     /// Big title and the line under the LED meter.
     fn detail_titles(&self, d: &Dev) -> (String, String) {
         let s = &self.snap;
-        let info = perfdata::info();
+        let info = self.machine();
         match d.item {
             PerfItem::Cpu => {
                 let b = cpu_brand();
@@ -652,7 +652,7 @@ impl TaskApp {
     }
 
     fn gpu_graphs(&self, p: &Painter, area: Rect, luid: u64) {
-        let info = perfdata::info().gpus.iter().find(|g| g.luid == luid);
+        let info = self.machine().gpus.iter().find(|g| g.luid == luid);
         let live = self.snap.perf.gpus.iter().find(|g| g.luid == luid);
         let (top, mem) = split(area, 0.66, 6.0);
         if self.settings.perf_gpu_engines {
@@ -688,7 +688,7 @@ impl TaskApp {
 
     pub(crate) fn stats(&self, item: PerfItem) -> Stats {
         let s = &self.snap;
-        let info = perfdata::info();
+        let info = self.machine();
         let pf = &s.perf;
         let mut st = Stats::default();
         let dash = "\u{2014}";

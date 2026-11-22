@@ -209,6 +209,11 @@ pub struct DiskCounters {
 
 impl DiskCounters {
     pub fn new() -> Self {
+        Self::over(super::machine::disks())
+    }
+
+    /// A provider for these disks (their models and buses are its input).
+    pub fn over(disks: Vec<crate::perfdata::DiskInfo>) -> Self {
         DiskCounters {
             #[cfg(windows)]
             query: super::pdh::Query::open(&[
@@ -219,8 +224,8 @@ impl DiskCounters {
             ]),
             #[cfg(windows)]
             collected: Instant::now(),
-            models: crate::perfdata::info().disks.iter().map(|d| (d.number, d.model.clone())).collect(),
-            smart: crate::perfdata::info().disks.iter().filter_map(|d| smart_bus(d.bus).map(|ata| (d.number, ata, None))).collect(),
+            models: disks.iter().map(|d| (d.number, d.model.clone())).collect(),
+            smart: disks.iter().filter_map(|d| smart_bus(d.bus).map(|ata| (d.number, ata, None))).collect(),
             health: true,
             counted: Vec::new(),
         }

@@ -192,13 +192,23 @@ pub struct CpuCounters {
     #[cfg(windows)]
     collected: Instant,
     name: String,
+    /// The processor's rated clock in MHz (0 if unknown): the first of the
+    /// base clock's sources.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    machine_mhz: u32,
     /// What the last read counted (see [`Provider::counted`]).
     counted: Vec<CounterSet>,
 }
 
 impl CpuCounters {
     pub fn new() -> Self {
+        Self::with_base_mhz(super::machine::base_mhz())
+    }
+
+    /// A provider of a processor rated at `machine_mhz`.
+    pub fn with_base_mhz(machine_mhz: u32) -> Self {
         CpuCounters {
+            machine_mhz,
             #[cfg(windows)]
             query: super::pdh::Query::open(&[
                 ("perf", r"\Processor Information(*)\% Processor Performance"),
@@ -218,11 +228,19 @@ impl CpuCounters {
         }
     }
 
+    /// The base clock in MHz: the machine's rated clock, else the counter's,
+    /// else the power API's maximum (the one order, see `metrics`).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn base_clock(machine_mhz: u32, counter: Option<f64>, power_max: Option<f64>) -> Option<f64> {
+        crate::metrics::base_clock_mhz(Some(machine_mhz as f64), counter, power_max)
+    }
+
     #[cfg(windows)]
     fn sample(&mut self) -> CpuSample {
         let mut s = CpuSample { name: self.name.clone(), ..Default::default() };
         let power = processor_power();
         s.cores = power.iter().map(|&(max, cur)| CoreSample { current_mhz: Some(cur), max_mhz: Some(max), ..Default::default() }).collect();
+        let machine_mhz = self.machine_mhz;
         let Some(q) = self.query.as_mut() else { return s };
         let wait = MIN_SPAN.saturating_sub(self.collected.elapsed());
         if !wait.is_zero() {
@@ -234,8 +252,7 @@ impl CpuCounters {
         // read it from the frame), once.
         let perf = q.counted(crate::perfdata::counter::PERF, false);
         let total = |key: &str| q.values(key).into_iter().find(|(n, _)| n == "_Total").map(|(_, v)| v);
-        let machine = Some(crate::perfdata::info().cpu.base_mhz as f64);
-        s.base_mhz = crate::metrics::base_clock_mhz(machine, total("freq"), power.first().map(|p| p.0));
+        s.base_mhz = Self::base_clock(machine_mhz, total("freq"), power.first().map(|p| p.0));
         s.performance_percent = perf.instance("_Total").map(|i| i.value);
         self.counted = vec![perf];
         s.utilization_percent = total("util");
@@ -347,6 +364,16 @@ fn processor_power() -> Vec<(f64, f64)> {
 mod tests {
     use super::*;
     use crate::sensors::model::{Frame, Group, Kind};
+
+    #[test]
+    fn the_processors_rated_clock_given_to_the_provider_is_the_first_base_clock_source() {
+        let provider = CpuCounters::with_base_mhz(3_400);
+        assert_eq!(CpuCounters::base_clock(provider.machine_mhz, Some(2_900.0), Some(3_000.0)), Some(3_400.0), "the machine's clock first");
+        let unknown = CpuCounters::with_base_mhz(0);
+        assert_eq!(CpuCounters::base_clock(unknown.machine_mhz, Some(2_900.0), Some(3_000.0)), Some(2_900.0), "then the counter");
+        assert_eq!(CpuCounters::base_clock(unknown.machine_mhz, None, Some(3_000.0)), Some(3_000.0), "then the power API");
+        assert_eq!(CpuCounters::base_clock(unknown.machine_mhz, None, None), None, "else unknown");
+    }
 
     fn twelve_cores() -> CpuSample {
         CpuSample {

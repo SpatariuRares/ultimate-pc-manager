@@ -162,7 +162,7 @@ fn engines_now(s: &Snapshot) -> Option<layout::Engines> {
     if s.perf.gpus.is_empty() {
         return None;
     }
-    layout::engines_of(&s.perf.gpus, &crate::perfdata::info().gpus)
+    layout::engines_of(&s.perf.gpus, s.machine.as_deref().map_or(&[], |m| &m.gpus[..]))
 }
 
 impl FlightRecorder {
@@ -870,7 +870,7 @@ mod tests {
         collector.sample();
         std::thread::sleep(std::time::Duration::from_millis(1000));
         let live = collector.sample();
-        let engines = layout::engines_of(&live.gpus, &crate::perfdata::info().gpus).expect("a GPU with engine counters");
+        let engines = layout::engines_of(&live.gpus, &crate::sensors::machine::read().gpus).expect("a GPU with engine counters");
         println!("{}: {} engines", engines.adapter, engines.cells.len());
         for (name, v) in &engines.cells {
             println!("  {name}: {v:.1}%");

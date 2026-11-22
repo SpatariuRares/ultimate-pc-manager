@@ -362,6 +362,8 @@ pub struct Frame {
     pub sources: Vec<SourceStatus>,
     /// What the providers counted (see [`CounterSet`]), one set per key.
     pub counters: Vec<CounterSet>,
+    /// The machine's fixed facts, once a provider reported them.
+    pub machine: Option<std::sync::Arc<crate::perfdata::StaticInfo>>,
 }
 
 impl Frame {
@@ -398,7 +400,7 @@ impl Frame {
         for d in &mut devices {
             d.groups.sort_by_key(|g| g.group);
         }
-        Frame { seq, devices, sources, counters: Vec::new() }
+        Frame { seq, devices, sources, counters: Vec::new(), machine: None }
     }
 
     /// What was counted under `key`, if a provider gave it.

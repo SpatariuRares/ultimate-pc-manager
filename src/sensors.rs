@@ -51,6 +51,8 @@ pub mod fake;
 pub mod smbios;
 /// The firmware provider: Bus Clock, Motherboard and Memory (#60).
 pub mod board;
+/// The machine's fixed facts (processor, memory, disks, video cards).
+pub mod machine;
 /// Intel Dynamic Tuning: its row, grey until reading DTT is supported.
 pub mod intel_dtt;
 
