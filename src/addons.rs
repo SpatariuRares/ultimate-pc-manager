@@ -190,7 +190,8 @@ pub trait Addon {
     fn header_status(&mut self, _ui: &mut egui::Ui, _page: &mut PageContext) {}
     /// Called once when its page, drawn in the last frame, is not drawn any
     /// more (another page opened). Drop here what only a visible page
-    /// needs, e.g. an interest in the sensor service.
+    /// needs. Not for sensors: the host drops a page's sensor interest
+    /// itself (see [`AddonContext::sensors`]).
     fn page_hidden(&mut self) {}
     /// Called once when Summary, drawn with its tile in the last frame, is
     /// not drawn any more. Drop here what only a visible tile needs.
