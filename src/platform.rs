@@ -581,7 +581,7 @@ pub struct AddonContext {
 impl AddonContext {
     /// The real context: launches programs and shows dialogs.
     pub fn system() -> Self {
-        let sensors = SensorService::new(crate::sensors::provider::standard());
+        let sensors = SensorService::grouped(crate::sensors::provider::standard());
         let leases = Leases::new(sensors.clone());
         AddonContext { runner: Arc::new(SystemRunner), admin: is_admin(), dialogs: true, sensors, leases, queue: Default::default() }
     }

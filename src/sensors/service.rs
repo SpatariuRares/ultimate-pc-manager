@@ -165,8 +165,44 @@ fn caption_for(shown: Duration) -> String {
     }
 }
 
+/// Which providers an [`Interest`] wakes. The service starts a group's
+/// providers with the first interest that asks for the group and stops them
+/// with the last, so something that is on for the whole app run (the
+/// Sampler) can read the performance counters without keeping the hardware
+/// sensors on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderGroup {
+    /// Windows performance counters (processor information, disks, energy
+    /// meter): what the core pages are built from.
+    Counters,
+    /// Everything that talks to hardware or vendor libraries: read only
+    /// while a page, tile, recording or alert looks at it.
+    Hardware,
+}
+
+impl ProviderGroup {
+    const ALL: [ProviderGroup; 2] = [ProviderGroup::Counters, ProviderGroup::Hardware];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// The groups an interest in everything wakes, and in the counters only.
+const EVERYTHING: &[ProviderGroup] = &[ProviderGroup::Counters, ProviderGroup::Hardware];
+const COUNTERS_ONLY: &[ProviderGroup] = &[ProviderGroup::Counters];
+const HARDWARE_ONLY: &[ProviderGroup] = &[ProviderGroup::Hardware];
+
+/// A Refresh request: what [`Interest::latest_after`] waits for (the
+/// Refresh count of each group, at the time of the request).
+#[derive(Clone, Debug, Default)]
+pub struct Ticket([u64; 2]);
+
 /// One provider's place in a run.
 struct Slot {
+    group: ProviderGroup,
+    /// Its group has an interest: its worker lives.
+    running: bool,
     name: &'static str,
     /// Its last readings; `None` until it answered once.
     report: Option<Vec<Reading>>,
@@ -179,24 +215,48 @@ struct Slot {
     started: Instant,
     /// For hardware this PC lacks: left out of the frame's sources.
     hidden: bool,
+    /// The group's Refresh count when the read in progress began.
+    started_kick: u64,
+    /// The same, for the read `report` comes from.
+    report_kick: u64,
 }
 
 impl Slot {
+    /// A slot of a group nobody asks for.
+    fn idle(group: ProviderGroup) -> Self {
+        Slot { group, running: false, name: "", report: None, problem: None, busy_since: None, timeout: super::provider::DEFAULT_TIMEOUT, started: Instant::now(), hidden: false, started_kick: 0, report_kick: 0 }
+    }
+
     fn stuck(&self, now: Instant) -> bool {
         let since = self.busy_since.or(self.report.is_none().then_some(self.started));
-        since.is_some_and(|t| now.duration_since(t) > self.timeout)
+        self.running && since.is_some_and(|t| now.duration_since(t) > self.timeout)
+    }
+
+    /// It has answered once (or never will: it is stuck).
+    fn settled(&self, now: Instant) -> bool {
+        self.report.is_some() || self.stuck(now)
     }
 }
 
-struct State {
+/// What the service keeps for one group of providers.
+struct GroupState {
     interest: usize,
-    /// Bumped at every start and stop: workers of another run exit.
+    /// Bumped at every start and stop of the group: its workers of another
+    /// run exit.
     run: u64,
     interval_ms: u64,
-    /// Bumped by "Refresh": every worker reads once more.
+    /// Bumped by "Refresh": the group's workers read once more.
     kick: u64,
+}
+
+struct State {
+    groups: [GroupState; 2],
+    /// One per factory, in order; the ones of a group nobody asks for idle.
     slots: Vec<Slot>,
     frame: Option<Arc<Frame>>,
+    /// Per slot: it showed a problem in `frame` (so a newly stuck one is
+    /// noticed).
+    shown: Vec<bool>,
     /// Never reset, so frames of a later run are newer.
     seq: u64,
     history: History,
@@ -205,11 +265,22 @@ struct State {
     stats: Arc<Stats>,
 }
 
+impl State {
+    fn wanted(&self, group: ProviderGroup) -> bool {
+        self.groups[group.index()].interest > 0
+    }
+
+    /// Every running provider of `groups` has answered (or is stuck).
+    fn settled(&self, groups: &[ProviderGroup], now: Instant) -> bool {
+        self.slots.iter().filter(|s| s.running && groups.contains(&s.group)).all(|s| s.settled(now))
+    }
+}
+
 struct Shared {
-    factories: Vec<Factory>,
+    factories: Vec<(ProviderGroup, Factory)>,
     state: Mutex<State>,
     wake: Condvar,
-    threads: AtomicUsize,
+    threads: [AtomicUsize; 2],
 }
 
 impl Shared {
@@ -224,62 +295,124 @@ impl Shared {
 pub struct SensorService(Arc<Shared>);
 
 impl SensorService {
-    /// A service over these providers; nothing runs until someone asks.
+    /// A service over these providers, all of the [`ProviderGroup::Hardware`]
+    /// group; nothing runs until someone asks.
     pub fn new(factories: Vec<Factory>) -> Self {
-        let state = State { interest: 0, run: 0, interval_ms: 1000, kick: 0, slots: Vec::new(), frame: None, seq: 0, history: History::default(), stats: Arc::default() };
-        SensorService(Arc::new(Shared { factories, state: Mutex::new(state), wake: Condvar::new(), threads: AtomicUsize::new(0) }))
+        Self::grouped(factories.into_iter().map(|f| (ProviderGroup::Hardware, f)).collect())
     }
 
-    /// Asks for sensors: the service runs while at least one [`Interest`]
-    /// is alive.
+    /// A service over providers in groups; nothing runs until someone asks.
+    pub fn grouped(factories: Vec<(ProviderGroup, Factory)>) -> Self {
+        let group = || GroupState { interest: 0, run: 0, interval_ms: 1000, kick: 0 };
+        let slots = factories.iter().map(|(g, _)| Slot::idle(*g)).collect();
+        let state = State { groups: [group(), group()], slots, frame: None, shown: Vec::new(), seq: 0, history: History::default(), stats: Arc::default() };
+        SensorService(Arc::new(Shared { factories, state: Mutex::new(state), wake: Condvar::new(), threads: [AtomicUsize::new(0), AtomicUsize::new(0)] }))
+    }
+
+    /// Asks for every sensor: the groups run while at least one [`Interest`]
+    /// in them is alive.
     pub fn interest(&self) -> Interest {
+        self.ask(EVERYTHING)
+    }
+
+    /// Asks for the sensors of one group only.
+    pub fn interest_in(&self, group: ProviderGroup) -> Interest {
+        self.ask(match group {
+            ProviderGroup::Counters => COUNTERS_ONLY,
+            ProviderGroup::Hardware => HARDWARE_ONLY,
+        })
+    }
+
+    fn ask(&self, scope: &'static [ProviderGroup]) -> Interest {
         let mut st = self.0.lock();
-        st.interest += 1;
-        if st.interest == 1 {
-            st.run += 1;
-            st.stats = Arc::new(Stats::new(crate::platform::local_secs()));
-            let now = Instant::now();
-            st.slots = self
-                .0
-                .factories
-                .iter()
-                .map(|_| Slot { name: "", report: None, problem: None, busy_since: None, timeout: super::provider::DEFAULT_TIMEOUT, started: now, hidden: false })
-                .collect();
-            let born = st.run;
-            for i in 0..self.0.factories.len() {
-                let shared = self.0.clone();
-                shared.threads.fetch_add(1, Ordering::SeqCst);
-                std::thread::spawn(move || {
-                    let _alive = Alive(&shared);
-                    work(&shared, born, i);
-                });
-            }
+        for &group in scope {
+            start_group(&self.0, &mut st, group);
         }
-        Interest(self.0.clone())
+        Interest { shared: self.0.clone(), scope }
+    }
+
+    /// Worker threads of one group alive now.
+    #[cfg_attr(not(test), allow(dead_code))] // contract tests
+    pub fn threads_in(&self, group: ProviderGroup) -> usize {
+        self.0.threads[group.index()].load(Ordering::SeqCst)
     }
 
     /// Worker threads alive now (0 while nobody asks, once old reads end).
     #[cfg_attr(not(test), allow(dead_code))] // contract tests
     pub fn threads(&self) -> usize {
-        self.0.threads.load(Ordering::SeqCst)
+        ProviderGroup::ALL.iter().map(|g| self.threads_in(*g)).sum()
     }
 }
 
+/// The first interest in a group starts its workers.
+fn start_group(shared: &Arc<Shared>, st: &mut State, group: ProviderGroup) {
+    let gs = &mut st.groups[group.index()];
+    gs.interest += 1;
+    if gs.interest > 1 {
+        return;
+    }
+    gs.run += 1;
+    let born = gs.run;
+    let now = Instant::now();
+    if group == ProviderGroup::Hardware {
+        st.stats = Arc::new(Stats::new(crate::platform::local_secs()));
+    }
+    for i in 0..shared.factories.len() {
+        if shared.factories[i].0 != group {
+            continue;
+        }
+        st.slots[i] = Slot { running: true, started: now, ..Slot::idle(group) };
+        let shared = shared.clone();
+        shared.threads[group.index()].fetch_add(1, Ordering::SeqCst);
+        std::thread::spawn(move || {
+            let _alive = Alive(&shared, group);
+            work(&shared, born, i);
+        });
+    }
+    if st.frame.is_some() {
+        // The frame lists the sources of the running providers.
+        publish(st, false);
+    }
+}
+
+/// The last interest in a group ends its run at once, without waiting for
+/// the reads in progress.
+fn stop_group(shared: &Shared, st: &mut State, group: ProviderGroup) {
+    let gs = &mut st.groups[group.index()];
+    gs.interest -= 1;
+    if gs.interest > 0 {
+        return;
+    }
+    gs.run += 1;
+    for slot in st.slots.iter_mut().filter(|s| s.group == group) {
+        *slot = Slot::idle(group);
+    }
+    let window = st.history.window();
+    if group == ProviderGroup::Hardware || !ProviderGroup::ALL.iter().any(|g| st.wanted(*g)) {
+        st.history = History::new(window);
+        st.stats = Arc::default();
+    }
+    st.frame = None;
+    publish(st, false);
+    shared.wake.notify_all();
+}
+
 /// Counts a worker thread while it lives.
-struct Alive<'a>(&'a Shared);
+struct Alive<'a>(&'a Shared, ProviderGroup);
 
 impl Drop for Alive<'_> {
     fn drop(&mut self) {
-        self.0.threads.fetch_sub(1, Ordering::SeqCst);
+        self.0.threads[self.1.index()].fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 /// A worker: builds its provider, then reads it once at once and then at
-/// every interval (or Refresh), until its run ends.
+/// every interval of its group (or Refresh), until its run ends.
 fn work(shared: &Shared, born: u64, i: usize) {
+    let group = shared.factories[i].0.index();
     // A provider that panics (a crashing vendor library) fails alone.
     let built = catch_unwind(AssertUnwindSafe(|| {
-        let mut provider = (shared.factories[i])();
+        let mut provider = (shared.factories[i].1)();
         let available = provider.availability();
         (provider, available)
     }));
@@ -289,7 +422,7 @@ fn work(shared: &Shared, born: u64, i: usize) {
     };
     {
         let mut st = shared.lock();
-        if st.run != born {
+        if st.groups[group].run != born {
             return;
         }
         st.slots[i].name = provider.name();
@@ -300,29 +433,29 @@ fn work(shared: &Shared, born: u64, i: usize) {
             if !provider.for_this_pc() {
                 st.slots[i].hidden = true;
                 st.slots[i].report = Some(Vec::new());
-                publish(&mut st);
+                publish(&mut st, false);
                 return;
             }
             st.slots[i].report = Some(provider.unavailable_readings(&why, Instant::now()));
             st.slots[i].problem = Some(why);
-            publish(&mut st);
+            publish(&mut st, false);
             return;
         }
     }
-    let mut last_kick = shared.lock().kick;
+    let mut last_kick = shared.lock().groups[group].kick;
     let mut last_read: Option<Instant> = None;
     loop {
         {
             let mut st = shared.lock();
             loop {
-                if st.run != born {
+                if st.groups[group].run != born {
                     return;
                 }
-                if st.kick != last_kick {
-                    last_kick = st.kick;
+                if st.groups[group].kick != last_kick {
+                    last_kick = st.groups[group].kick;
                     break;
                 }
-                let wait = match (last_read, st.interval_ms) {
+                let wait = match (last_read, st.groups[group].interval_ms) {
                     (None, _) => break,
                     (Some(_), 0) => Duration::from_secs(1),
                     (Some(t), ms) => match Duration::from_millis(ms).checked_sub(t.elapsed()) {
@@ -333,6 +466,7 @@ fn work(shared: &Shared, born: u64, i: usize) {
                 st = shared.wake.wait_timeout(st, wait).unwrap_or_else(|e| e.into_inner()).0;
             }
             st.slots[i].busy_since = Some(Instant::now());
+            st.slots[i].started_kick = st.groups[group].kick;
         }
         let started = Instant::now();
         let Ok(readings) = catch_unwind(AssertUnwindSafe(|| provider.read(started))) else {
@@ -341,14 +475,17 @@ fn work(shared: &Shared, born: u64, i: usize) {
         };
         last_read = Some(started);
         let mut st = shared.lock();
-        if st.run != born {
+        if st.groups[group].run != born {
             return;
         }
-        st.history.record(&readings);
+        if st.wanted(ProviderGroup::Hardware) {
+            st.history.record(&readings);
+        }
         let slot = &mut st.slots[i];
         slot.busy_since = None;
         slot.report = Some(readings);
-        publish(&mut st);
+        slot.report_kick = slot.started_kick;
+        publish(&mut st, false);
     }
 }
 
@@ -361,7 +498,7 @@ pub const NOT_RESPONDING: &str = "not responding";
 /// stay unavailable until the next run; the others go on.
 fn fail(shared: &Shared, born: u64, i: usize) {
     let mut st = shared.lock();
-    if st.run != born {
+    if st.groups[shared.factories[i].0.index()].run != born {
         return;
     }
     let slot = &mut st.slots[i];
@@ -371,7 +508,7 @@ fn fail(shared: &Shared, born: u64, i: usize) {
     slot.busy_since = None;
     slot.problem = Some(FAILED.into());
     slot.report.get_or_insert_with(Vec::new);
-    publish(&mut st);
+    publish(&mut st, false);
 }
 
 impl Slot {
@@ -392,17 +529,24 @@ impl Slot {
     }
 }
 
-/// Rebuilds the frame once every provider answered (or is stuck).
-fn publish(st: &mut State) {
+/// Rebuilds the frame of the running providers once a group of them has
+/// answered (or is stuck); `force` builds it even for no provider at all.
+fn publish(st: &mut State, force: bool) {
     let now = Instant::now();
-    if st.frame.is_none() && !st.slots.iter().all(|s| s.report.is_some() || s.stuck(now)) {
+    let running = |g: &ProviderGroup| st.wanted(*g) && st.slots.iter().any(|s| s.running && s.group == *g);
+    let answered = ProviderGroup::ALL.iter().any(|g| running(g) && st.settled(&[*g], now));
+    if st.frame.is_none() && !answered && !force {
         return;
     }
     st.seq += 1;
-    let reports: Vec<Vec<Reading>> = st.slots.iter().map(|s| s.readings(now)).collect();
-    let sources = st.slots.iter().filter(|s| !s.hidden).map(|s| SourceStatus { name: if s.name.is_empty() { "provider" } else { s.name }, problem: s.why(now) }).collect();
+    let live = || st.slots.iter().filter(|s| s.running);
+    let reports: Vec<Vec<Reading>> = live().map(|s| s.readings(now)).collect();
+    let sources = live().filter(|s| !s.hidden).map(|s| SourceStatus { name: if s.name.is_empty() { "provider" } else { s.name }, problem: s.why(now) }).collect();
     let frame = Arc::new(Frame::build(st.seq, &reports, sources));
-    Arc::make_mut(&mut st.stats).observe(&frame);
+    st.shown = st.slots.iter().map(|s| s.running && s.why(now).is_some()).collect();
+    if st.settled(&ProviderGroup::ALL, now) {
+        Arc::make_mut(&mut st.stats).observe(&frame);
+    }
     st.frame = Some(frame);
 }
 
@@ -410,20 +554,43 @@ fn publish(st: &mut State) {
 /// meanwhile), so the frame still shows its old values.
 fn newly_stuck(st: &State) -> bool {
     let now = Instant::now();
-    // The frame lists only the slots that are not hidden, in slot order.
-    st.frame.as_ref().is_some_and(|f| st.slots.iter().filter(|s| !s.hidden).zip(&f.sources).any(|(s, shown)| shown.problem.is_none() && s.stuck(now)))
+    st.frame.is_some() && st.slots.iter().enumerate().any(|(i, s)| s.stuck(now) && !st.shown.get(i).copied().unwrap_or(false))
 }
 
-/// Someone looking at the sensors. The service runs while one is alive.
-pub struct Interest(Arc<Shared>);
+/// Someone looking at the sensors of some groups. Their providers run while
+/// one is alive.
+pub struct Interest {
+    shared: Arc<Shared>,
+    scope: &'static [ProviderGroup],
+}
 
 impl Interest {
-    /// The latest frame; `None` until every provider answered once
-    /// ("Waiting for all sensors to report...").
+    /// The latest frame; `None` until every provider of this interest's
+    /// groups answered once ("Waiting for all sensors to report...").
     pub fn latest(&self) -> Option<Arc<Frame>> {
-        let mut st = self.0.lock();
-        if st.frame.is_none() || newly_stuck(&st) {
-            publish(&mut st);
+        let mut st = self.shared.lock();
+        self.frame(&mut st, |st, now| st.settled(self.scope, now))
+    }
+
+    /// The latest frame once every provider of this interest's groups has
+    /// read after the Refresh `ticket` asked for (or cannot: it has a
+    /// problem or is stuck); `None` until then.
+    pub fn latest_after(&self, ticket: &Ticket) -> Option<Arc<Frame>> {
+        let mut st = self.shared.lock();
+        self.frame(&mut st, |st, now| {
+            st.slots.iter().filter(|s| s.running && self.scope.contains(&s.group)).all(|s| s.problem.is_some() || s.stuck(now) || (s.report.is_some() && s.report_kick >= ticket.0[s.group.index()]))
+        })
+    }
+
+    fn frame(&self, st: &mut State, ready: impl Fn(&State, Instant) -> bool) -> Option<Arc<Frame>> {
+        if st.frame.is_none() || newly_stuck(st) {
+            publish(st, false);
+        }
+        if !ready(st, Instant::now()) {
+            return None;
+        }
+        if st.frame.is_none() {
+            publish(st, true);
         }
         st.frame.clone()
     }
@@ -431,66 +598,78 @@ impl Interest {
     /// The values of a metric over the history window, oldest first.
     #[cfg_attr(not(test), allow(dead_code))] // contract tests
     pub fn history(&self, id: &str) -> Vec<f64> {
-        self.0.lock().history.values(id)
+        self.shared.lock().history.values(id)
     }
 
     /// The values of a metric spread by time over `slots` graph points
     /// covering the window (see [`History::graph`]).
     pub fn history_graph(&self, id: &str, slots: usize) -> Vec<f64> {
-        self.0.lock().history.graph(id, slots)
+        self.shared.lock().history.graph(id, slots)
     }
 
     /// The time the graph of a metric shows ("Last minute",
     /// "Last 40 seconds" while it fills).
     pub fn history_caption(&self, id: &str) -> String {
-        self.0.lock().history.caption(id)
+        self.shared.lock().history.caption(id)
     }
 
     /// The time every metric's history covers, shared by every interest
     /// ([`DEFAULT_WINDOW`] until set).
     pub fn set_history_window(&self, window: Duration) {
-        self.0.lock().history.set_window(window);
+        self.shared.lock().history.set_window(window);
     }
 
     /// The statistics of this run (shared by every interest): Min / Avg /
     /// Max of every read published since the epoch. A snapshot, cheap to
     /// take at every draw.
     pub fn stats(&self) -> Arc<Stats> {
-        self.0.lock().stats.clone()
+        self.shared.lock().stats.clone()
     }
 
     /// "Reset statistics": a new epoch, now, for every interest.
     pub fn reset_stats(&self) {
-        Arc::make_mut(&mut self.0.lock().stats).reset(crate::platform::local_secs());
+        Arc::make_mut(&mut self.shared.lock().stats).reset(crate::platform::local_secs());
     }
 
-    /// The app's update interval; 0 = Paused (no reads but on Refresh).
+    /// The app's update interval; 0 = Paused (no reads but on Refresh). It
+    /// is the interval of the groups this interest asks for (the last one to
+    /// set it wins): a group nobody sets keeps its own.
     pub fn set_interval_ms(&self, ms: u64) {
-        let mut st = self.0.lock();
-        if st.interval_ms != ms {
-            st.interval_ms = ms;
-            self.0.wake.notify_all();
+        let mut st = self.shared.lock();
+        let mut changed = false;
+        for g in self.scope {
+            let gs = &mut st.groups[g.index()];
+            changed |= gs.interval_ms != ms;
+            gs.interval_ms = ms;
+        }
+        if changed {
+            self.shared.wake.notify_all();
         }
     }
 
-    /// Reads every provider once more, now (Refresh).
-    pub fn read_now(&self) {
-        self.0.lock().kick += 1;
-        self.0.wake.notify_all();
+    /// Reads every provider of this interest's groups once more, now
+    /// (Refresh). The ticket says when to look for the result with
+    /// [`Interest::latest_after`].
+    pub fn read_now(&self) -> Ticket {
+        let mut ticket = Ticket::default();
+        {
+            let mut st = self.shared.lock();
+            for g in self.scope {
+                let gs = &mut st.groups[g.index()];
+                gs.kick += 1;
+                ticket.0[g.index()] = gs.kick;
+            }
+        }
+        self.shared.wake.notify_all();
+        ticket
     }
 }
 
 impl Drop for Interest {
     fn drop(&mut self) {
-        let mut st = self.0.lock();
-        st.interest -= 1;
-        if st.interest == 0 {
-            st.run += 1;
-            st.slots.clear();
-            st.frame = None;
-            st.history = History::new(st.history.window());
-            st.stats = Arc::default();
-            self.0.wake.notify_all();
+        let mut st = self.shared.lock();
+        for &group in self.scope {
+            stop_group(&self.shared, &mut st, group);
         }
     }
 }
@@ -1014,5 +1193,85 @@ mod tests {
         assert!(lo.is_none_or(|lo| lo >= before), "only frames after the reset count, got {lo:?} (reads before the reset {before})");
         assert!(tile.stats().since() >= page.stats().since() && page.stats().since() > 0, "the epoch is the reset's local time");
         until("counted again", || tile.stats().min_max("a.reads").is_some());
+    }
+
+    // ---- provider groups (spec #77, D1)
+
+    fn two_groups() -> (SensorService, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let (counters, counter_reads) = fake("counters", 0, None);
+        let (hardware, hardware_reads) = fake("hardware", 0, None);
+        (SensorService::grouped(vec![(ProviderGroup::Counters, counters), (ProviderGroup::Hardware, hardware)]), counter_reads, hardware_reads)
+    }
+
+    #[test]
+    fn an_interest_in_the_counters_wakes_only_the_counter_providers() {
+        let (service, counter_reads, hardware_reads) = two_groups();
+        let _interest = service.interest_in(ProviderGroup::Counters);
+        until("the counters read", || counter_reads.load(Ordering::SeqCst) >= 1);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(service.threads_in(ProviderGroup::Hardware), 0, "no hardware thread");
+        assert_eq!(service.threads(), 1);
+        assert_eq!(hardware_reads.load(Ordering::SeqCst), 0, "the hardware is never read");
+    }
+
+    #[test]
+    fn the_hardware_stops_with_the_last_surface_while_the_counters_go_on() {
+        let (service, counter_reads, hardware_reads) = two_groups();
+        let always = service.interest_in(ProviderGroup::Counters);
+        let page = service.interest();
+        until("both groups read", || counter_reads.load(Ordering::SeqCst) >= 1 && hardware_reads.load(Ordering::SeqCst) >= 1);
+        assert_eq!(service.threads(), 2);
+        drop(page);
+        until("the hardware stopped", || service.threads_in(ProviderGroup::Hardware) == 0);
+        assert_eq!(service.threads_in(ProviderGroup::Counters), 1, "the counters are still read");
+        assert!(always.latest().is_some());
+        drop(always);
+        until("nothing runs", || service.threads() == 0);
+    }
+
+    #[test]
+    fn the_counters_do_not_wait_for_slow_hardware() {
+        let (counters, _) = fake("counters", 0, None);
+        let (slow, slow_reads, permit) = gated("slow");
+        let service = SensorService::grouped(vec![(ProviderGroup::Counters, counters), (ProviderGroup::Hardware, slow)]);
+        let always = service.interest_in(ProviderGroup::Counters);
+        let page = service.interest();
+        until("the slow hardware is reading", || slow_reads.load(Ordering::SeqCst) >= 1);
+        until("the counters' first frame", || always.latest().is_some());
+        assert!(page.latest().is_none(), "a page still waits for every provider it asked for");
+        let frame = always.latest().unwrap();
+        assert!(frame.reading("counters.reads").is_some());
+        permit.send(()).unwrap();
+        until("the page's first frame", || page.latest().is_some());
+        assert!(page.latest().unwrap().reading("slow.reads").is_some());
+    }
+
+    #[test]
+    fn the_update_speed_belongs_to_the_group_of_the_interest_that_sets_it() {
+        let (service, counter_reads, hardware_reads) = two_groups();
+        let always = service.interest_in(ProviderGroup::Counters);
+        let page = service.interest_in(ProviderGroup::Hardware);
+        until("one read each", || counter_reads.load(Ordering::SeqCst) >= 1 && hardware_reads.load(Ordering::SeqCst) >= 1);
+        always.set_interval_ms(600_000);
+        page.set_interval_ms(10);
+        until("the hardware reads fast", || hardware_reads.load(Ordering::SeqCst) >= 5);
+        assert_eq!(counter_reads.load(Ordering::SeqCst), 1, "the counters keep their own speed");
+    }
+
+    #[test]
+    fn a_refresh_ticket_is_met_only_by_a_read_that_began_after_it() {
+        let (f, started, permit) = gated("a");
+        let service = SensorService::grouped(vec![(ProviderGroup::Counters, f)]);
+        let interest = service.interest_in(ProviderGroup::Counters);
+        permit.send(()).unwrap();
+        until("the first frame", || interest.latest().is_some());
+        interest.set_interval_ms(0);
+        let ticket = interest.read_now();
+        until("the Refresh read began", || started.load(Ordering::SeqCst) == 2);
+        assert!(interest.latest().is_some(), "the old frame is still the latest");
+        assert!(interest.latest_after(&ticket).is_none(), "but it was read before the Refresh");
+        permit.send(()).unwrap();
+        until("the frame after the Refresh", || interest.latest_after(&ticket).is_some());
+        assert_eq!(interest.latest_after(&ticket).unwrap().reading("a.reads").and_then(|r| r.value), Some(2.0));
     }
 }

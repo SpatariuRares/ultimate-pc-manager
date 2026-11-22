@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::model::Reading;
+use super::service::ProviderGroup;
 
 /// How long a read may take before the provider counts as not responding.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -48,23 +49,29 @@ pub trait Provider {
 /// Builds a provider on its worker thread.
 pub type Factory = Arc<dyn Fn() -> Box<dyn Provider> + Send + Sync>;
 
-/// The providers of the real app, in the order their sources are listed.
-pub fn standard() -> Vec<Factory> {
+/// The providers of the real app, in the order their sources are listed,
+/// each with the group that wakes it (see [`ProviderGroup`]).
+pub fn standard() -> Vec<(ProviderGroup, Factory)> {
+    use ProviderGroup::{Counters, Hardware};
+    fn of(group: ProviderGroup, factory: Factory) -> (ProviderGroup, Factory) {
+        (group, factory)
+    }
     vec![
-        Arc::new(|| Box::new(super::cpu::CpuCounters::new())),
-        Arc::new(|| Box::new(super::energy::EnergyMeter::new())),
-        Arc::new(|| Box::new(super::ryzen::RyzenMaster::new())),
-        Arc::new(|| Box::new(super::power_plan::PowerPlan::new())),
-        Arc::new(|| Box::new(super::disk::DiskCounters::new())),
-        Arc::new(|| Box::new(super::power::PowerStatusProvider::new())),
+        of(Counters, Arc::new(|| Box::new(super::cpu::CpuCounters::new()))),
+        of(Counters, Arc::new(|| Box::new(super::energy::EnergyMeter::new()))),
+        of(Hardware, Arc::new(|| Box::new(super::ryzen::RyzenMaster::new()))),
+        of(Hardware, Arc::new(|| Box::new(super::power_plan::PowerPlan::new()))),
+        of(Counters, Arc::new(|| Box::new(super::disk::DiskCounters::new()))),
+        of(Hardware, Arc::new(|| Box::new(super::power::PowerStatusProvider::new()))),
         // Vendor GPU providers before DXCore: their values and reasons win
         // over DXCore's grey rows for the same card.
-        Arc::new(|| Box::new(super::nvml::Nvml::new())),
-        Arc::new(|| Box::new(super::adlx::provider())),
-        Arc::new(|| Box::new(super::igcl::provider())),
-        Arc::new(|| Box::new(super::dxcore::DxCore::new())),
-        Arc::new(|| Box::new(super::board::FirmwareTables::new())),
-        Arc::new(|| Box::new(super::intel_dtt::IntelDtt::new())),
-        // A new provider: one line here (its module under `sensors/`).
+        of(Hardware, Arc::new(|| Box::new(super::nvml::Nvml::new()))),
+        of(Hardware, Arc::new(|| Box::new(super::adlx::provider()))),
+        of(Hardware, Arc::new(|| Box::new(super::igcl::provider()))),
+        of(Hardware, Arc::new(|| Box::new(super::dxcore::DxCore::new()))),
+        of(Hardware, Arc::new(|| Box::new(super::board::FirmwareTables::new()))),
+        of(Hardware, Arc::new(|| Box::new(super::intel_dtt::IntelDtt::new()))),
+        // A new provider: one line here (its module under `sensors/`), in
+        // the group that should wake it.
     ]
 }
