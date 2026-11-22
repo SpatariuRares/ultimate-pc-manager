@@ -134,6 +134,9 @@ pub struct Snapshot {
     pub services: crate::process_view::Services,
     /// Taken on Refresh (also while updates are paused), not on the clock.
     pub forced: bool,
+    /// The machine's fixed facts, as the providers reported them (none
+    /// until one did).
+    pub machine: Option<Arc<crate::perfdata::StaticInfo>>,
 }
 
 impl Snapshot {
@@ -300,8 +303,6 @@ fn system_fill() -> Fill {
     let mut perf = crate::perfdata::Collector::new();
     let mut facts = crate::proc_info::Reader::default();
     let mut descriptions: HashMap<String, String> = HashMap::new();
-    // Read the fixed facts (disks, GPUs, memory modules) off the UI thread.
-    let _ = crate::perfdata::info();
     // A short first wait so CPU usage has two points to compare.
     thread::sleep(Duration::from_millis(250));
     Box::new(move |snap: &mut Snapshot| {
@@ -435,6 +436,7 @@ fn counted_frame(interest: &Interest, refresh: Option<&Ticket>) -> Option<Arc<cr
 
 fn run(tx: Sender<Snapshot>, interval: Arc<AtomicU64>, refresh_now: Arc<AtomicBool>, interest: Arc<Interest>, asked: Arc<Mutex<Option<Ticket>>>, mut fill: Fill) {
     let mut seq = 0u64;
+    let mut machine = None;
     loop {
         let ms = interval.load(Ordering::Relaxed);
         let forced = refresh_now.swap(false, Ordering::Relaxed);
@@ -449,7 +451,11 @@ fn run(tx: Sender<Snapshot>, interval: Arc<AtomicU64>, refresh_now: Arc<AtomicBo
         let mut snap = Snapshot::default();
         fill(&mut snap);
         snap.forced = forced;
-        counters_into(&mut snap.perf, counted_frame(&interest, refresh.as_ref()).as_deref());
+        let frame = counted_frame(&interest, refresh.as_ref());
+        counters_into(&mut snap.perf, frame.as_deref());
+        // The facts do not change: the last ones stand while a frame has none.
+        machine = frame.and_then(|f| f.machine.clone()).or(machine);
+        snap.machine = machine.clone();
         seq += 1;
         snap.seq = seq;
         if tx.send(snap).is_err() {

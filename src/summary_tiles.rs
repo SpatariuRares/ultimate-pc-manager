@@ -57,7 +57,8 @@ impl TaskApp {
     /// The machine's fixed facts (disk models, GPUs): the ones set for a
     /// test, otherwise the machine's.
     pub fn machine(&self) -> &StaticInfo {
-        self.machine_info.as_ref().unwrap_or_else(|| crate::perfdata::info())
+        static NONE: std::sync::OnceLock<StaticInfo> = std::sync::OnceLock::new();
+        self.machine_info.as_ref().or(self.snap.machine.as_deref()).unwrap_or_else(|| NONE.get_or_init(StaticInfo::default))
     }
 
     /// Summary's tiles for the current sample, in this order:

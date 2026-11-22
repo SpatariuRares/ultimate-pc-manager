@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use super::model::{CounterSet, Reading};
 use super::service::ProviderGroup;
+use crate::perfdata::StaticInfo;
 
 /// How long a read may take before the provider counts as not responding.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -50,6 +51,12 @@ pub trait Provider {
     fn counted(&mut self) -> Vec<CounterSet> {
         Vec::new()
     }
+    /// The machine's fixed facts, when this provider reports them (see
+    /// [`crate::sensors::machine::MachineFacts`]); called with
+    /// [`Provider::counted`]. Default: none.
+    fn machine(&mut self) -> Option<Arc<StaticInfo>> {
+        None
+    }
     /// The longest one read may take before its readings are reported as
     /// "not responding" (the other providers go on meanwhile).
     fn timeout(&self) -> Duration {
@@ -73,6 +80,7 @@ pub fn standard() -> Vec<(ProviderGroup, Factory)> {
         of(Hardware, Arc::new(|| Box::new(super::ryzen::RyzenMaster::new()))),
         of(Hardware, Arc::new(|| Box::new(super::power_plan::PowerPlan::new()))),
         of(Counters, Arc::new(|| Box::new(super::disk::DiskCounters::new()))),
+        of(Counters, Arc::new(|| Box::new(super::machine::MachineFacts::new()))),
         of(Hardware, Arc::new(|| Box::new(super::power::PowerStatusProvider::new()))),
         // Vendor GPU providers before DXCore: their values and reasons win
         // over DXCore's grey rows for the same card.

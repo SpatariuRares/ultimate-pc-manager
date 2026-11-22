@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use super::cpu::CpuSample;
 use super::model::{CounterSet, Reading};
 use super::provider::{Factory, Provider};
+use crate::perfdata::StaticInfo;
 
 /// What a fake provider reads now, and how often it was read.
 #[derive(Default)]
@@ -17,6 +18,8 @@ pub struct Script {
     pub sets: Mutex<Vec<CounterSet>>,
     /// The processor it reads (its readings are the real provider's).
     pub cpu: Mutex<Option<CpuSample>>,
+    /// The machine's facts it reports (see [`Provider::machine`]).
+    pub machine: Mutex<Option<StaticInfo>>,
     /// Reads begun.
     pub reads: AtomicUsize,
     /// How long a read takes.
@@ -76,6 +79,9 @@ impl Provider for Fake {
     }
     fn counted(&mut self) -> Vec<CounterSet> {
         std::mem::take(&mut self.counted)
+    }
+    fn machine(&mut self) -> Option<Arc<StaticInfo>> {
+        self.script.machine.lock().unwrap().clone().map(Arc::new)
     }
     fn timeout(&self) -> Duration {
         Duration::from_millis(1_500)

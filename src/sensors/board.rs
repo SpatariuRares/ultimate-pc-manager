@@ -56,7 +56,7 @@ pub struct FirmwareTables {
 
 impl FirmwareTables {
     pub fn new() -> Self {
-        FirmwareTables { firmware: crate::perfdata::smbios_table().map(|raw| super::smbios::parse(&raw)), cpu_name: super::cpu::cpu_name() }
+        FirmwareTables { firmware: super::machine::smbios_table().map(|raw| super::smbios::parse(&raw)), cpu_name: super::cpu::cpu_name() }
     }
 }
 
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     #[ignore]
     fn reads_this_pc_firmware() {
-        let raw = crate::perfdata::smbios_table().expect("Windows gives the SMBIOS table");
+        let raw = crate::sensors::machine::smbios_table().expect("Windows gives the SMBIOS table");
         let fw = crate::sensors::smbios::parse(&raw);
         println!("{fw:#?}");
         let mut p = FirmwareTables::new();

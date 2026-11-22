@@ -195,6 +195,64 @@ fn the_hardware_stops_with_the_last_page_while_the_sampler_keeps_the_counters() 
     assert_eq!(service.threads_in(ProviderGroup::Counters), 1, "the sampler still reads the counters");
 }
 
+/// Fixed facts a fake PC reports: rated 3.4 GHz, 8 cores, one disk.
+fn machine_facts(base_mhz: u32) -> crate::perfdata::StaticInfo {
+    crate::perfdata::StaticInfo {
+        cpu: crate::perfdata::CpuInfo { base_mhz, cores: 8, ..Default::default() },
+        disks: vec![crate::perfdata::DiskInfo { number: 0, model: "Fake SSD".into(), ..Default::default() }],
+        ..Default::default()
+    }
+}
+
+fn row(app: &TaskApp, item: PerfItem, name: &str) -> Option<String> {
+    app.stats(item).table.into_iter().find(|(k, _)| k == name).map(|(_, v)| v)
+}
+
+#[test]
+fn the_core_pages_show_the_machine_facts_their_providers_report() {
+    let script = Script::new(counted(110.0));
+    *script.machine.lock().unwrap() = Some(machine_facts(3_400));
+    let (mut app, _service) = app_over(&script, NORMAL, &[]);
+    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+    let top = app.stats(PerfItem::Cpu).top;
+    assert!(top.iter().any(|(k, v)| k == "Speed" && v == "3.74 GHz"), "the base clock the provider reported x the performance level: {top:?}");
+    assert_eq!(row(&app, PerfItem::Cpu, "Base speed:").as_deref(), Some("3.40 GHz"));
+    assert_eq!(row(&app, PerfItem::Cpu, "Physical cores:").as_deref(), Some("8"));
+}
+
+#[test]
+fn without_machine_facts_the_speed_and_base_speed_are_blank() {
+    let script = Script::new(counted(110.0));
+    let (mut app, _service) = app_over(&script, NORMAL, &[]);
+    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+    let top = app.stats(PerfItem::Cpu).top;
+    assert!(top.iter().any(|(k, v)| k == "Speed" && v == "\u{2014}"), "no base clock: no speed: {top:?}");
+    assert_eq!(row(&app, PerfItem::Cpu, "Base speed:").as_deref(), Some("\u{2014}"));
+}
+
+#[test]
+fn the_override_of_the_machine_wins_over_what_the_providers_report() {
+    let script = Script::new(counted(110.0));
+    *script.machine.lock().unwrap() = Some(machine_facts(3_400));
+    let (mut app, _service) = app_over(&script, NORMAL, &[]);
+    app.machine_info = Some(crate::summary_view::tests::clocked(2_000));
+    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1 && a.snap.machine.is_some());
+    let top = app.stats(PerfItem::Cpu).top;
+    assert!(top.iter().any(|(k, v)| k == "Speed" && v == "2.20 GHz"), "the override: {top:?}");
+}
+
+#[test]
+fn the_machine_facts_stay_when_a_later_reading_has_none() {
+    let script = Script::new(counted(110.0));
+    *script.machine.lock().unwrap() = Some(machine_facts(3_400));
+    let (mut app, _service) = app_over(&script, NORMAL, &[]);
+    pull_until(&mut app, "the first sample", |a| a.snap.machine.is_some());
+    let seq = app.snap.seq;
+    *script.machine.lock().unwrap() = None;
+    pull_until(&mut app, "a later sample", |a| a.snap.seq >= seq + 2);
+    assert_eq!(row(&app, PerfItem::Cpu, "Base speed:").as_deref(), Some("3.40 GHz"), "the last facts stand");
+}
+
 /// The real providers on this PC (needs Windows counters): what the sampler
 /// builds from them.
 #[test]
