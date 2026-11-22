@@ -1838,39 +1838,6 @@ pub(crate) mod tests {
         assert!(texts.iter().any(|t| t.starts_with("chrome.exe, ")), "{texts:?}");
     }
 
-    #[test]
-    fn services_keep_their_own_filter_on_the_shared_search_text() {
-        let svc = |name: &str| crate::winsys::ServiceRow { name: name.into(), display: String::new(), pid: 0, status: "Running".into(), start_type: "Manual".into() };
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
-        app.services = Some(Ok(vec![svc("WSearch"), svc("Spooler")]));
-        let ctx = crate::test_ui::context(theme::Mode::Dark);
-        let draw = |app: &mut TaskApp| {
-            let out = crate::test_ui::run(&ctx, (1400.0, 900.0), vec![], |ui| app.page_services(ui, &mut Vec::new()));
-            crate::test_ui::texts(&out).into_iter().map(|t| t.trim().to_string()).collect::<Vec<_>>()
-        };
-        let texts = draw(&mut app);
-        assert!(texts.iter().any(|t| t == "Filter services"), "{texts:?}");
-        assert!(!texts.iter().any(|t| t == "Filter by name, user, or PID"));
-        app.search = "wsearch".into();
-        let texts = draw(&mut app);
-        assert!(texts.iter().any(|t| t == "WSearch"), "{texts:?}");
-        assert!(!texts.iter().any(|t| t == "Spooler"));
-        assert!(!texts.iter().any(|t| t.starts_with("Clear the search box")), "the processes message stays on Processes");
-    }
-
-    #[test]
-    fn the_services_filter_also_matches_the_pid_of_their_host() {
-        let svc = |name: &str, pid| crate::winsys::ServiceRow { name: name.into(), display: String::new(), pid, status: "Running".into(), start_type: "Manual".into() };
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
-        app.services = Some(Ok(vec![svc("WSearch", 300), svc("Winmgmt", 200), svc("Schedule", 200)]));
-        app.search = "200".into();
-        let ctx = crate::test_ui::context(theme::Mode::Dark);
-        let out = crate::test_ui::run(&ctx, (1400.0, 900.0), vec![], |ui| app.page_services(ui, &mut Vec::new()));
-        let texts: Vec<String> = crate::test_ui::texts(&out).into_iter().map(|t| t.trim().to_string()).collect();
-        assert!(texts.iter().any(|t| t == "Winmgmt") && texts.iter().any(|t| t == "Schedule"), "{texts:?}");
-        assert!(!texts.iter().any(|t| t == "WSearch"), "another host's service");
-    }
-
     /// A process busy on the GPU, one less so and one without GPU engines.
     fn gpu_sample() -> crate::sampler::Snapshot {
         let row = |pid, name: &str, cpu, gpu| ProcRow { gpu, ..proc(pid, name, "spata", cpu, 1_000_000) };

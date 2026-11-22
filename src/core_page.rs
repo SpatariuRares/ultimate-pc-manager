@@ -11,6 +11,7 @@ use crate::addons::Core;
 use crate::platform::Action;
 use crate::sampler::Snapshot;
 use crate::settings::Settings;
+use crate::system_lists::SystemLists;
 
 /// Histories more than one page reads; the app owns them and lends them.
 #[derive(Clone, Copy)]
@@ -29,6 +30,9 @@ pub struct PageCtx<'a> {
     /// While a sample is delivered, the new sample; otherwise the latest.
     pub snapshot: &'a Snapshot,
     pub histories: Histories<'a>,
+    /// What the Services and Startup apps pages read and control: the
+    /// machine in the app, a fake in tests.
+    pub system: &'a dyn SystemLists,
 }
 
 /// Where in the app's handling of a new sample a page's
@@ -75,12 +79,21 @@ pub trait CorePage {
 pub struct CorePages {
     pub system_info: crate::page_system::SystemInfoPage,
     pub users: crate::page_users::UsersPage,
+    pub services: crate::page_services::ServicesPage,
+    pub startup: crate::page_startup::StartupPage,
+    pub app_history: crate::page_history::AppHistoryPage,
 }
 
 impl CorePages {
     /// Each moved page with its identity: one line per page.
     fn all_mut(&mut self) -> Vec<(Core, &mut dyn CorePage)> {
-        vec![(Core::SystemInfo, &mut self.system_info), (Core::Users, &mut self.users)]
+        vec![
+            (Core::SystemInfo, &mut self.system_info),
+            (Core::Users, &mut self.users),
+            (Core::Services, &mut self.services),
+            (Core::Startup, &mut self.startup),
+            (Core::AppHistory, &mut self.app_history),
+        ]
     }
 
     /// The page for `core`, `None` while it has not moved.
@@ -122,7 +135,8 @@ pub mod testing {
     /// The same with the app's short histories given.
     pub fn draw_with(page: &mut dyn CorePage, settings: &Settings, snapshot: &Snapshot, cpu: &VecDeque<f32>, mem: &VecDeque<f32>) -> Drawn {
         let ctx = crate::test_ui::context(Mode::Dark);
-        draw_in(&ctx, page, &PageCtx { settings, snapshot, histories: Histories { cpu, mem } })
+        let system = crate::system_lists::fake::FakeSystem::default();
+        draw_in(&ctx, page, &PageCtx { settings, snapshot, histories: Histories { cpu, mem }, system: &system })
     }
 
     /// Draws in `ctx` (draw again in the same one to keep what egui
@@ -162,7 +176,8 @@ mod tests {
         let settings = Settings::default();
         let snapshot = Snapshot { seq: 7, ..Default::default() };
         let (cpu, mem) = (VecDeque::new(), VecDeque::new());
-        let ctx = PageCtx { settings: &settings, snapshot: &snapshot, histories: Histories { cpu: &cpu, mem: &mem } };
+        let system = crate::system_lists::fake::FakeSystem::default();
+        let ctx = PageCtx { settings: &settings, snapshot: &snapshot, histories: Histories { cpu: &cpu, mem: &mem }, system: &system };
         deliver([&mut summary as &mut dyn CorePage, &mut perf].into_iter(), SampleSlot::Performance, &ctx);
         assert_eq!(*log.borrow(), ["perf saw seq 7"]);
         deliver([&mut summary as &mut dyn CorePage, &mut perf].into_iter(), SampleSlot::Summary, &ctx);
