@@ -598,11 +598,12 @@ impl AddonContext {
     }
 
     /// The shared sensor service. It runs only while someone holds an
-    /// [`crate::sensors::Interest`]. A page or tile never holds one: it
-    /// reads sensors through [`PageContext::sensors`] while it draws, and the
-    /// host keeps the interest while it is drawn, drops it at the end of the
-    /// first frame it is not, and when the add-on is turned off. Only an
-    /// interest that does not depend on what is on screen (a recording, an
+    /// [`crate::sensors::Interest`]. For anything that is drawn, take nothing
+    /// by hand: a page or tile reads sensors through [`PageContext::sensors`]
+    /// while it draws, and the host keeps the interest while it is drawn and
+    /// drops it at the end of the first frame it is not, and when the add-on
+    /// is turned off. There is nothing to drop in `page_hidden` or `stop`. Only
+    /// an interest that does not depend on what is on screen (a recording, an
     /// alert) is taken here, by the add-on that owns it, and dropped by it.
     pub fn sensors(&self) -> &SensorService {
         &self.sensors

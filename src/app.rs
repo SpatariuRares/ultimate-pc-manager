@@ -211,9 +211,6 @@ pub struct TaskApp {
     /// The latest sensor frame Summary's tiles read (GPU temperature and
     /// power, S.M.A.R.T.); `None` when no sensor has reported.
     pub summary_frame: Option<std::sync::Arc<crate::sensors::Frame>>,
-    /// The sensors Summary's tiles read, held only while Summary is the
-    /// page shown (see [`TaskApp::read_summary_sensors`]).
-    pub summary_sensors: Option<crate::sensors::Interest>,
     pub page: Page,
     #[allow(dead_code)]
     pub nav_open: bool,
@@ -328,7 +325,6 @@ impl TaskApp {
             summary: Default::default(),
             machine_info: None,
             summary_frame: None,
-            summary_sensors: None,
             page,
             nav_open: true,
             perf: PerfItem::Cpu,
@@ -605,7 +601,6 @@ impl eframe::App for TaskApp {
             Page::Core(Core::Colors) => self.page_colors(ui),
         });
         self.addons.end_frame();
-        self.summary_sensors_hidden();
         self.dialogs(ctx, &mut actions);
         self.off_question(ctx);
         self.close_question(ctx);

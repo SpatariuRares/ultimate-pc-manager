@@ -1,7 +1,7 @@
 //! Sensor interests that depend on what is on screen, owned by the add-on
 //! host so that no surface writes lifetime code for them.
 //!
-//! A [`Surface`] (today an add-on's page) asks for sensors while it draws
+//! A [`Surface`] (an add-on's page, or the core Summary page) asks for sensors while it draws
 //! ([`crate::platform::PageContext::sensors`]). The first ask creates the
 //! surface's interest in the shared sensor service; every frame in which the
 //! surface asks again keeps it; the host drops it at the end of the first
@@ -18,13 +18,17 @@ use std::sync::{Arc, Mutex};
 pub enum Surface {
     /// The page of the add-on with this id.
     Page(&'static str),
+    /// The core Summary page: no add-on owns it, so only the end of a frame
+    /// drops it.
+    Summary,
 }
 
 impl Surface {
-    /// The id of the add-on this surface belongs to.
-    fn addon(self) -> &'static str {
+    /// The id of the add-on this surface belongs to, if one does.
+    fn addon(self) -> Option<&'static str> {
         match self {
-            Surface::Page(id) => id,
+            Surface::Page(id) => Some(id),
+            Surface::Summary => None,
         }
     }
 }
@@ -85,7 +89,7 @@ impl Leases {
 
     /// Drops the interests of the add-on `id` (it was turned off).
     pub fn release(&self, id: &str) {
-        drop(self.take(|s, _| s.addon() == id));
+        drop(self.take(|s, _| s.addon() == Some(id)));
     }
 
     /// "Refresh" of the page of `id`: reads every sensor at once, when that
