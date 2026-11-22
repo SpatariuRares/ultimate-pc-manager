@@ -1114,8 +1114,8 @@ mod tests {
     }
     /// The same inputs through the app: one fake processor provider, read
     /// by the sampler for the core pages and by a page for the sensors.
-    /// Returns Performance's "Speed", Summary's view and Power & Freq's
-    /// "Core Average" (Hz).
+    /// Returns Performance's "Speed", Summary's view and the sensor
+    /// pipeline's "Core Average" (Hz).
     fn speeds_through_the_app(base_mhz: u32, perf_pct: f32) -> (String, crate::summary_view::SummaryView, Option<f64>) {
         use crate::sensors::{fake, service::ProviderGroup, SensorService};
         let sample = crate::sensors::cpu::CpuSample { base_mhz: Some(base_mhz as f64), performance_percent: Some(perf_pct as f64), ..Default::default() };

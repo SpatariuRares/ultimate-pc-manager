@@ -194,3 +194,22 @@ fn the_hardware_stops_with_the_last_page_while_the_sampler_keeps_the_counters() 
     crate::addons::until("the hardware stops", || service.threads_in(ProviderGroup::Hardware) == 0);
     assert_eq!(service.threads_in(ProviderGroup::Counters), 1, "the sampler still reads the counters");
 }
+
+/// The real providers on this PC (needs Windows counters): what the sampler
+/// builds from them.
+#[test]
+#[ignore = "reads this PC's performance counters"]
+fn on_this_pc_the_real_counter_providers_fill_the_snapshot() {
+    let service = SensorService::grouped(crate::sensors::provider::standard());
+    let mut app = TaskApp::headless_over(settings(NORMAL), service.clone(), |_: &mut Snapshot| {});
+    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+    let perf = &app.snap.perf;
+    eprintln!("perf {:?} power {:?} gaps {:?}", perf.cpu_perf_pct, perf.cpu_power_w, perf.unanswered);
+    for d in &perf.disks {
+        eprintln!("disk {} active {} read {} write {} total_read {} total_written {}", d.number, d.active, d.read_bps, d.write_bps, d.total_read, d.total_written);
+    }
+    assert!(perf.answered(counter::IDLE) && perf.answered(counter::DREAD) && perf.answered(counter::DWRITE), "disk counters answered");
+    assert!(perf.disks.iter().any(|d| d.total_read > 0), "raw totals since boot come through");
+    assert!(perf.cpu_perf_pct > 0.0, "the processor performance level");
+    assert_eq!(service.threads_in(ProviderGroup::Hardware), 0, "only the counters run");
+}
