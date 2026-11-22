@@ -39,6 +39,11 @@ pub trait Provider {
     /// Reads what it can now. Partial results are fine: a reading it cannot
     /// get is returned unavailable with its reason, or left out.
     fn read(&mut self, at: Instant) -> Vec<Reading>;
+    /// Told before each read whether something looks at the hardware sensors
+    /// (a page, tile, recording or alert: an interest in
+    /// [`ProviderGroup::Hardware`]). A counter provider that also reads
+    /// hardware (the health of a disk) reads it only then. Default: ignored.
+    fn hardware_wanted(&mut self, _wanted: bool) {}
     /// What the last [`Provider::read`] counted, for what is more than one
     /// plain number (see [`CounterSet`]); called once after each read, on the
     /// same thread. Default: nothing.

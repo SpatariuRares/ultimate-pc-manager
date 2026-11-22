@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::model::{Device, Group, Reading, Unit};
+use super::model::{CounterSet, Device, Group, Reading, Unit};
 use super::provider::Provider;
 
 /// The provider's name in "Sources on this PC" / "Read from".
@@ -192,6 +192,8 @@ pub struct CpuCounters {
     #[cfg(windows)]
     collected: Instant,
     name: String,
+    /// What the last read counted (see [`Provider::counted`]).
+    counted: Vec<CounterSet>,
 }
 
 impl CpuCounters {
@@ -212,6 +214,7 @@ impl CpuCounters {
             #[cfg(windows)]
             collected: Instant::now(),
             name: cpu_name(),
+            counted: Vec::new(),
         }
     }
 
@@ -227,10 +230,14 @@ impl CpuCounters {
         }
         q.collect();
         self.collected = Instant::now();
+        // The performance level is also reported as counted (the core pages
+        // read it from the frame), once.
+        let perf = q.counted(crate::perfdata::counter::PERF, false);
         let total = |key: &str| q.values(key).into_iter().find(|(n, _)| n == "_Total").map(|(_, v)| v);
         let machine = Some(crate::perfdata::info().cpu.base_mhz as f64);
         s.base_mhz = crate::metrics::base_clock_mhz(machine, total("freq"), power.first().map(|p| p.0));
-        s.performance_percent = total("perf");
+        s.performance_percent = perf.instance("_Total").map(|i| i.value);
+        self.counted = vec![perf];
         s.utilization_percent = total("util");
         for (key, set) in [
             ("park", (|c: &mut CoreSample, v: f64| c.parked = Some(v != 0.0)) as fn(&mut CoreSample, f64)),
@@ -267,6 +274,10 @@ impl Provider for CpuCounters {
         };
         #[cfg(not(windows))]
         Err("Windows only".into())
+    }
+
+    fn counted(&mut self) -> Vec<CounterSet> {
+        std::mem::take(&mut self.counted)
     }
 
     fn read(&mut self, at: Instant) -> Vec<Reading> {

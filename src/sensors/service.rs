@@ -447,6 +447,7 @@ fn work(shared: &Shared, born: u64, i: usize) {
     let mut last_kick = shared.lock().groups[group].kick;
     let mut last_read: Option<Instant> = None;
     loop {
+        let hardware_wanted;
         {
             let mut st = shared.lock();
             loop {
@@ -469,9 +470,11 @@ fn work(shared: &Shared, born: u64, i: usize) {
             }
             st.slots[i].busy_since = Some(Instant::now());
             st.slots[i].started_kick = st.groups[group].kick;
+            hardware_wanted = st.wanted(ProviderGroup::Hardware);
         }
         let started = Instant::now();
         let Ok((readings, counted)) = catch_unwind(AssertUnwindSafe(|| {
+            provider.hardware_wanted(hardware_wanted);
             let readings = provider.read(started);
             (readings, provider.counted())
         })) else {
@@ -1397,5 +1400,34 @@ mod tests {
         let frame = interest.latest().unwrap();
         assert_eq!(frame.counters.len(), 1, "one set per key");
         assert!(frame.counter("dread").unwrap().instance("1").is_some());
+    }
+
+    #[test]
+    fn a_counter_provider_is_told_whether_the_hardware_is_looked_at() {
+        struct Told(Arc<Mutex<Vec<bool>>>);
+        impl Provider for Told {
+            fn name(&self) -> &'static str {
+                "told"
+            }
+            fn hardware_wanted(&mut self, wanted: bool) {
+                self.0.lock().unwrap().push(wanted);
+            }
+            fn read(&mut self, _at: Instant) -> Vec<Reading> {
+                Vec::new()
+            }
+        }
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let t = told.clone();
+        let f: Factory = Arc::new(move || Box::new(Told(t.clone())));
+        let service = SensorService::grouped(vec![(ProviderGroup::Counters, f)]);
+        let always = service.interest_in(ProviderGroup::Counters);
+        until("the first read", || !told.lock().unwrap().is_empty());
+        assert_eq!(told.lock().unwrap().last(), Some(&false), "only the counters are asked for");
+        let page = service.interest();
+        always.read_now();
+        until("a read told about the page", || told.lock().unwrap().last() == Some(&true));
+        drop(page);
+        always.read_now();
+        until("a read told the page is gone", || told.lock().unwrap().last() == Some(&false));
     }
 }
