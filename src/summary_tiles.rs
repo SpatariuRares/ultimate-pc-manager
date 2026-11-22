@@ -1,16 +1,18 @@
 //! Summary's tiles: the tile row (Network, one tile per disk,
 //! GPUs, CPU Power), mapped from Performance's device list
-//! ([`TaskApp::devices`]) so the two pages never disagree, plus the sensor
+//! ([`crate::page_perf::devices`]) so the two pages never disagree, plus the sensor
 //! readings Performance does not show (S.M.A.R.T. health, GPU temperature
 //! and power). Built with the Summary view, once per sample; the page only
 //! draws them.
 
 use egui::Ui;
 
-use crate::app::{PerfItem, TaskApp};
+use crate::core_page::PageCtx;
+use crate::app::PerfItem;
+use crate::sensors::Frame;
 use crate::page_perf::fmt_bytes_rate;
 use crate::metrics::combine_adapters;
-use crate::perfdata::{counter, DiskLive, StaticInfo};
+use crate::perfdata::{counter, DiskLive};
 use crate::summary_view::GAP;
 use crate::sensors::model::{DeviceKind, Group};
 
@@ -53,104 +55,82 @@ impl Tile {
     }
 }
 
-impl TaskApp {
+impl crate::app::TaskApp {
     /// The machine's fixed facts (disk models, GPUs): the ones set for a
     /// test, otherwise the machine's.
-    pub fn machine(&self) -> &StaticInfo {
-        static NONE: std::sync::OnceLock<StaticInfo> = std::sync::OnceLock::new();
-        self.machine_info.as_ref().or(self.snap.machine.as_deref()).unwrap_or_else(|| NONE.get_or_init(StaticInfo::default))
-    }
-
-    /// Summary's tiles for the current sample, in this order:
-    /// Network, one tile per disk, GPUs, CPU Power.
-    pub fn summary_tiles(&self) -> Vec<Tile> {
-        let s = &self.snap;
-        let frame = self.summary_frame.as_deref();
-        let fahrenheit = self.settings.fahrenheit;
-        let read = |id: &str| frame.and_then(|f| f.reading(id)).filter(|r| r.value.is_some()).map(|r| r.text_in(fahrenheit));
-        let devices = crate::page_perf::devices(&self.settings, s, self.machine(), &self.ph);
-        let mut tiles = Vec::new();
-        // Before the first sample no figure is a reading.
-        let waiting = s.seq == 0;
-        let adapters = combine_adapters(&s.net).count;
-        for d in devices.iter().filter(|d| d.item == PerfItem::Network) {
-            // With no adapter, a gap and "No adapter", as on the card (not
-            // Performance's "1 network interface" and 0 bps).
-            let (value, lines) = match (waiting, adapters) {
-                (true, _) => (GAP.to_string(), Vec::new()),
-                (false, 0) => (GAP.to_string(), vec!["No adapter".to_string()]),
-                (false, _) => (d.line2.clone(), vec![d.line1.clone()]),
-            };
-            tiles.push(Tile { kind: TileKind::Network, label: d.title.clone(), value: Some(value), lines });
-        }
-        for d in &devices {
-            let PerfItem::Disk(n) = d.item else { continue };
-            let live = s.perf.disks.iter().find(|l| l.number == n).filter(|_| !waiting);
-            // Each figure only when its counter answered for this disk.
-            let figure = |counter: &str, text: &dyn Fn(&DiskLive) -> String| {
-                live.filter(|_| s.perf.answered(counter)).map_or_else(|| GAP.to_string(), text)
-            };
-            let read_rate = figure(counter::DREAD, &|l| fmt_bytes_rate(l.read_bps));
-            let write_rate = figure(counter::DWRITE, &|l| fmt_bytes_rate(l.write_bps));
-            let active = figure(counter::IDLE, &|_| d.line2.clone());
-            let mut lines = vec![d.line1.clone(), format!("Read {read_rate}  Write {write_rate}")];
-            // The disk's health only when a sensor read it: never "Healthy"
-            // for a disk nobody could ask.
-            lines.extend(read(&format!("disk{n}.smart.health")).map(|h| format!("{}: {h}", Group::Smart.name())));
-            tiles.push(Tile { kind: TileKind::Disk(n), label: d.title.clone(), value: Some(format!("Active {active}")), lines });
-        }
-        let gpus: Vec<_> = devices.iter().filter(|d| matches!(d.item, PerfItem::Gpu(_))).collect();
-        if !gpus.is_empty() {
-            let cards: Vec<_> = frame.map(|f| f.devices.iter().filter(|c| c.device.kind == DeviceKind::Gpu).collect()).unwrap_or_default();
-            let lines = gpus
-                .iter()
-                .map(|d| {
-                    // The sensors name a card as Windows does, so the name
-                    // pairs it with Performance's adapter.
-                    let card = cards.iter().find(|c| c.device.name == d.title);
-                    let values: Vec<String> = card
-                        .map(|c| {
-                            [crate::sensors::gpu::TEMPERATURE, crate::sensors::gpu::BOARD_POWER].into_iter().filter_map(|what| read(&crate::sensors::gpu::metric(&c.device, what))).collect()
-                        })
-                        .unwrap_or_default();
-                    let values = if values.is_empty() { format!("temperature and power: {}", NO_READING.to_lowercase()) } else { values.join(", ") };
-                    format!("{}: {}, {values}", d.title, d.line2)
-                })
-                .collect();
-            let util: Vec<&str> = gpus.iter().map(|d| d.line2.as_str()).collect();
-            tiles.push(Tile { kind: TileKind::Gpus, label: if gpus.len() == 1 { "GPU".into() } else { "GPUs".into() }, value: Some(util.join(" / ")), lines });
-        }
-        // Performance's CPU Power device when the Windows energy meter reads
-        // the package, else the sensors' package power, else a gap.
-        let power = devices
-            .iter()
-            .find(|d| d.item == PerfItem::Power)
-            .filter(|_| s.perf.cpu_power_w.is_some())
-            .map(|d| d.line2.clone())
-            .or_else(|| read(crate::sensors::energy::PACKAGE));
-        tiles.push(Tile { kind: TileKind::CpuPower, label: "CPU Power".into(), value: power, lines: vec!["CPU package".into()] });
-        tiles
+    pub fn machine(&self) -> &crate::perfdata::StaticInfo {
+        crate::page_perf::machine_of(&self.snap, self.machine_info.as_ref())
     }
 }
 
-impl TaskApp {
-    /// Asks the host for the sensors while Summary is drawn (the host keeps
-    /// them while this is called every frame and drops them after) and,
-    /// unless paused, puts a new sensor frame into the tiles at once.
-    pub(crate) fn read_summary_sensors(&mut self) {
-        let sensors = self.addons.core_sensors(crate::addons::leases::Surface::Summary);
-        let interval_ms = self.settings.interval_ms();
-        sensors.set_interval_ms(interval_ms);
-        if interval_ms == 0 {
-            // Paused: the tiles keep the last view.
-            return;
-        }
-        let Some(frame) = sensors.latest() else { return };
-        if self.summary_frame.as_ref().map(|f| f.seq) != Some(frame.seq) {
-            self.summary_frame = Some(frame);
-            self.summary.tiles = self.summary_tiles();
-        }
+/// Summary's tiles for the sample in `ctx` and the latest sensor `frame`,
+/// in this order: Network, one tile per disk, GPUs, CPU Power.
+pub fn summary_tiles(ctx: &PageCtx, frame: Option<&Frame>) -> Vec<Tile> {
+    let s = ctx.snapshot;
+    let fahrenheit = ctx.settings.fahrenheit;
+    let read = |id: &str| frame.and_then(|f| f.reading(id)).filter(|r| r.value.is_some()).map(|r| r.text_in(fahrenheit));
+    let devices = crate::page_perf::devices(ctx.settings, s, crate::page_perf::machine_of(s, None), ctx.histories.perf);
+    let mut tiles = Vec::new();
+    // Before the first sample no figure is a reading.
+    let waiting = s.seq == 0;
+    let adapters = combine_adapters(&s.net).count;
+    for d in devices.iter().filter(|d| d.item == PerfItem::Network) {
+        // With no adapter, a gap and "No adapter", as on the card (not
+        // Performance's "1 network interface" and 0 bps).
+        let (value, lines) = match (waiting, adapters) {
+            (true, _) => (GAP.to_string(), Vec::new()),
+            (false, 0) => (GAP.to_string(), vec!["No adapter".to_string()]),
+            (false, _) => (d.line2.clone(), vec![d.line1.clone()]),
+        };
+        tiles.push(Tile { kind: TileKind::Network, label: d.title.clone(), value: Some(value), lines });
     }
+    for d in &devices {
+        let PerfItem::Disk(n) = d.item else { continue };
+        let live = s.perf.disks.iter().find(|l| l.number == n).filter(|_| !waiting);
+        // Each figure only when its counter answered for this disk.
+        let figure = |counter: &str, text: &dyn Fn(&DiskLive) -> String| {
+            live.filter(|_| s.perf.answered(counter)).map_or_else(|| GAP.to_string(), text)
+        };
+        let read_rate = figure(counter::DREAD, &|l| fmt_bytes_rate(l.read_bps));
+        let write_rate = figure(counter::DWRITE, &|l| fmt_bytes_rate(l.write_bps));
+        let active = figure(counter::IDLE, &|_| d.line2.clone());
+        let mut lines = vec![d.line1.clone(), format!("Read {read_rate}  Write {write_rate}")];
+        // The disk's health only when a sensor read it: never "Healthy"
+        // for a disk nobody could ask.
+        lines.extend(read(&format!("disk{n}.smart.health")).map(|h| format!("{}: {h}", Group::Smart.name())));
+        tiles.push(Tile { kind: TileKind::Disk(n), label: d.title.clone(), value: Some(format!("Active {active}")), lines });
+    }
+    let gpus: Vec<_> = devices.iter().filter(|d| matches!(d.item, PerfItem::Gpu(_))).collect();
+    if !gpus.is_empty() {
+        let cards: Vec<_> = frame.map(|f| f.devices.iter().filter(|c| c.device.kind == DeviceKind::Gpu).collect()).unwrap_or_default();
+        let lines = gpus
+            .iter()
+            .map(|d| {
+                // The sensors name a card as Windows does, so the name
+                // pairs it with Performance's adapter.
+                let card = cards.iter().find(|c| c.device.name == d.title);
+                let values: Vec<String> = card
+                    .map(|c| {
+                        [crate::sensors::gpu::TEMPERATURE, crate::sensors::gpu::BOARD_POWER].into_iter().filter_map(|what| read(&crate::sensors::gpu::metric(&c.device, what))).collect()
+                    })
+                    .unwrap_or_default();
+                let values = if values.is_empty() { format!("temperature and power: {}", NO_READING.to_lowercase()) } else { values.join(", ") };
+                format!("{}: {}, {values}", d.title, d.line2)
+            })
+            .collect();
+        let util: Vec<&str> = gpus.iter().map(|d| d.line2.as_str()).collect();
+        tiles.push(Tile { kind: TileKind::Gpus, label: if gpus.len() == 1 { "GPU".into() } else { "GPUs".into() }, value: Some(util.join(" / ")), lines });
+    }
+    // Performance's CPU Power device when the Windows energy meter reads
+    // the package, else the sensors' package power, else a gap.
+    let power = devices
+        .iter()
+        .find(|d| d.item == PerfItem::Power)
+        .filter(|_| s.perf.cpu_power_w.is_some())
+        .map(|d| d.line2.clone())
+        .or_else(|| read(crate::sensors::energy::PACKAGE));
+    tiles.push(Tile { kind: TileKind::CpuPower, label: "CPU Power".into(), value: power, lines: vec!["CPU package".into()] });
+    tiles
 }
 
 /// Draws the tiles in rows that wrap with the page's width.
@@ -178,7 +158,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::perfdata::{DiskInfo, DiskLive, GpuInfo, GpuLive, PerfLive};
+    use crate::perfdata::{DiskInfo, DiskLive, GpuInfo, GpuLive, PerfLive, StaticInfo};
     use crate::sampler::{NetRow, Snapshot};
     use crate::sensors::model::{Device, Reading};
     use crate::sensors::Frame;
@@ -230,14 +210,13 @@ mod tests {
         Frame::build(1, &[vec![health(0, Some("Healthy")), health(1, None)], gpu], Vec::new())
     }
 
-    /// The Summary view of a headless app on `snap`, this machine and these
-    /// sensor readings.
-    fn view_of(snap: Snapshot, frame: Option<Frame>) -> SummaryView {
-        let mut app = TaskApp::headless(Settings::default(), snap);
-        app.machine_info = Some(machine());
-        app.summary_frame = frame.map(std::sync::Arc::new);
-        app.rebuild_summary();
-        app.summary_view().clone()
+    /// The Summary view of `snap`, this machine and these sensor readings.
+    fn view_of(mut snap: Snapshot, frame: Option<Frame>) -> SummaryView {
+        snap.machine = Some(std::sync::Arc::new(machine()));
+        let (short, perf) = (std::collections::VecDeque::new(), crate::core_page::PerfHistory::new());
+        let histories = crate::core_page::Histories { cpu: &short, mem: &short, perf: &perf };
+        let standalone = crate::page_processes::Standalone::default();
+        SummaryView::build(&PageCtx { settings: &Settings::default(), snapshot: &snap, histories, system: &crate::system_lists::fake::FakeSystem::default(), processes: standalone.inputs() }, frame.as_ref())
     }
 
     #[test]
@@ -270,45 +249,6 @@ mod tests {
         for disk in view.tiles.iter().filter(|t| matches!(t.kind, TileKind::Disk(_))) {
             assert!(!disk.lines.iter().any(|l| l.contains("S.M.A.R.T.")), "no sensor: no health text: {:?}", disk.lines);
         }
-    }
-
-    #[test]
-    fn summary_holds_the_sensors_only_while_it_is_the_page_shown() {
-        let mut app = TaskApp::headless(Settings::default(), sample(None));
-        // The test add-on host: a made-up CPU, no real sensor.
-        app.addons = crate::addons::AddonHost::for_tests(&serde_json::json!({})).0;
-        app.read_summary_sensors();
-        crate::addons::until("the sensors run", || app.addons.context().sensors().threads() > 0);
-        app.addons.end_frame();
-        app.read_summary_sensors(); // still on Summary: kept
-        app.addons.end_frame();
-        assert!(app.addons.context().sensors().threads() > 0, "still on Summary: kept");
-        app.addons.end_frame(); // another page: Summary did not ask
-        crate::addons::until("the sensors stop", || app.addons.context().sensors().threads() == 0);
-    }
-
-    #[test]
-    fn leaving_summary_drops_its_old_sensor_frame_so_coming_back_never_shows_it() {
-        let mut app = TaskApp::headless(Settings::default(), sample(None));
-        app.addons = crate::addons::AddonHost::for_tests(&serde_json::json!({})).0;
-        crate::addons::until("a sensor frame reaches the tiles", || {
-            app.read_summary_sensors();
-            app.summary_frame.is_some()
-        });
-        app.end_frame(); // Summary was drawn in this frame
-        assert!(app.summary_frame.is_some(), "still on Summary: kept");
-        app.end_frame(); // another page: Summary did not ask
-        assert!(app.summary_frame.is_none(), "the old frame is gone");
-    }
-
-    #[test]
-    fn summary_fills_its_sensor_tiles_from_the_sensors_while_it_is_shown() {
-        let mut app = TaskApp::headless(Settings::default(), sample(None));
-        app.addons = crate::addons::AddonHost::for_tests(&serde_json::json!({})).0;
-        crate::addons::until("a sensor frame reaches the tiles", || {
-            app.read_summary_sensors();
-            app.summary_frame.is_some()
-        });
     }
 
     fn disk_tile(view: &SummaryView, n: u32) -> &Tile {

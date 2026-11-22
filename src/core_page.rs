@@ -115,6 +115,7 @@ pub fn page_title(ui: &mut Ui, id: &str, title: &str) {
 #[derive(Default)]
 pub struct CorePages {
     pub performance: crate::page_perf::PerformancePage,
+    pub summary: crate::page_summary::SummaryPage,
     pub system_info: crate::page_system::SystemInfoPage,
     pub users: crate::page_users::UsersPage,
     pub processes: crate::page_processes::ProcessesPage,
@@ -130,6 +131,7 @@ impl CorePages {
     fn all_mut(&mut self) -> Vec<(Core, &mut dyn CorePage)> {
         vec![
             (Core::Performance, &mut self.performance),
+            (Core::Summary, &mut self.summary),
             (Core::SystemInfo, &mut self.system_info),
             (Core::Users, &mut self.users),
             (Core::Processes, &mut self.processes),
