@@ -213,3 +213,82 @@ fn on_this_pc_the_real_counter_providers_fill_the_snapshot() {
     assert!(perf.cpu_perf_pct > 0.0, "the processor performance level");
     assert_eq!(service.threads_in(ProviderGroup::Hardware), 0, "only the counters run");
 }
+
+/// What one adapter counts (luid 0x1670C): per-process engine instances, an
+/// engine of the same type twice, and the adapter's memory.
+fn gpu_counted() -> Vec<CounterSet> {
+    let engine = |pid: u32, eng: u32, ty: &str, v: f64| Instance::new(&format!("pid_{pid}_luid_0x00000000_0x0001670C_phys_0_eng_{eng}_engtype_{ty}"), v);
+    vec![
+        CounterSet::new(
+            counter::GPU,
+            vec![engine(1234, 0, "3D", 10.0), engine(88, 0, "3D", 20.0), engine(88, 1, "Copy", 1.5), engine(5, 2, "VideoDecode", 5.0), engine(1234, 3, "Copy", 2.5)],
+        ),
+        CounterSet::new(counter::GDED, vec![Instance::new("luid_0x00000000_0x0001670C_phys_0", 2_000_000_000.0)]),
+        CounterSet::new(counter::GSH, vec![Instance::new("luid_0x00000000_0x0001670C_phys_0", 500_000_000.0)]),
+    ]
+}
+
+const LUID: u64 = 0x1670C;
+
+#[test]
+fn the_gpu_figures_of_the_core_pages_come_from_the_provider() {
+    let script = Script::new(counted(110.0).into_iter().chain(gpu_counted()).collect());
+    let (mut app, _service) = app_over(&script, NORMAL, &[]);
+    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+    let gpus = &app.snap.perf.gpus;
+    assert_eq!(gpus.len(), 1);
+    let gpu = &gpus[0];
+    assert_eq!(gpu.luid, LUID);
+    let named = |v: &[(String, f32)]| v.iter().map(|(n, x)| (n.clone(), *x)).collect::<Vec<_>>();
+    assert_eq!(named(&gpu.cells), [("3D".to_string(), 30.0), ("Copy 1".into(), 1.5), ("Video decode".into(), 5.0), ("Copy 2".into(), 2.5)], "every engine in index order, repeated types numbered");
+    assert_eq!(named(&gpu.engines), [("3D".to_string(), 30.0), ("Copy".into(), 2.5), ("Video decode".into(), 5.0)], "the busiest engine of each type");
+    assert_eq!((gpu.util, gpu.dedicated, gpu.shared), (30.0, 2_000_000_000, 500_000_000));
+    // The same figures, built by hand, give the same page.
+    let hand_gpu = crate::perfdata::GpuLive { luid: LUID, util: 30.0, engines: gpu.engines.clone(), cells: gpu.cells.clone(), dedicated: 2_000_000_000, shared: 500_000_000 };
+    let hand = TaskApp::headless(settings(NORMAL), Snapshot { seq: 1, perf: PerfLive { gpus: vec![hand_gpu], ..Default::default() }, ..Default::default() });
+    let top = app.stats(PerfItem::Gpu(LUID)).top.clone();
+    assert!(top.iter().any(|(k, v)| k == "Utilization" && v.starts_with("30")), "{top:?}");
+    assert_eq!(top, hand.stats(PerfItem::Gpu(LUID)).top, "the GPU page");
+    assert_eq!(ProviderState::of(&app.snap), ProviderState::Healthy, "a GPU never degrades the state");
+}
+
+#[test]
+fn each_process_shows_the_gpu_of_its_engines_and_one_without_engines_shows_zero() {
+    let script = Script::new(counted(110.0).into_iter().chain(gpu_counted()).collect());
+    let service = SensorService::grouped(vec![(ProviderGroup::Counters, fake::provider("Windows counters", &script))]);
+    let mut app = TaskApp::headless_over(settings(NORMAL), service, |snap: &mut Snapshot| {
+        let row = |pid, gpu| crate::sampler::ProcRow { pid, gpu, ..Default::default() };
+        snap.procs = vec![row(1234, 99.0), row(88, 99.0), row(77, 99.0)];
+    });
+    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+    let by_pid: Vec<(u32, f32)> = app.snap.procs.iter().map(|p| (p.pid, p.gpu)).collect();
+    assert_eq!(by_pid, [(1234, 12.5), (88, 21.5), (77, 0.0)]);
+}
+
+#[test]
+fn flight_recorder_is_handed_the_gpu_engines_in_every_sample() {
+    let script = Script::new(counted(110.0).into_iter().chain(gpu_counted()).collect());
+    let (app, _service) = app_over(&script, NORMAL, &[]);
+    // The samples as they go to the add-ons (the app hands each one on).
+    let mut seen = Vec::new();
+    let end = Instant::now() + Duration::from_secs(10);
+    while seen.len() < 3 {
+        assert!(Instant::now() < end, "timed out waiting for three samples");
+        if let Ok(sample) = app.sampler.rx.recv_timeout(Duration::from_millis(100)) {
+            seen.push(sample);
+        }
+    }
+    for s in &seen {
+        let engines = crate::addons::flight_recorder::layout::engines_of(&s.perf.gpus, &[]);
+        assert_eq!(engines.map(|e| e.cells.len()), Some(4), "sample {} carries the engines: {:?}", s.seq, s.perf.gpus);
+    }
+}
+
+#[test]
+fn a_pc_whose_gpu_counters_give_nothing_has_no_gpu_figures_and_no_gap_for_them() {
+    let script = Script::new(counted(110.0));
+    let (mut app, _service) = app_over(&script, NORMAL, &[]);
+    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+    assert!(app.snap.perf.gpus.is_empty() && app.snap.perf.gpu_by_pid.is_empty());
+    assert_eq!(ProviderState::of(&app.snap), ProviderState::Healthy, "no GPU driver is not a problem");
+}
