@@ -1184,10 +1184,15 @@ impl AddonHost {
     /// Draws the Summary tiles of the add-ons that are on.
     pub fn summary_tiles(&mut self, ui: &mut egui::Ui, page: &mut PageContext) {
         let mut drawn = Vec::new();
+        let leases = self.context.leases().clone();
+        let own = page.lease.take();
         for addon in self.enabled_addons() {
+            // The tile reads sensors through its own lease, kept while it is drawn.
+            page.lease = Some((leases.clone(), leases::Surface::Tile(addon.id())));
             addon.summary(ui, page);
             drawn.push(addon.id());
         }
+        page.lease = own;
         for id in drawn {
             self.tiles.mark(id);
         }

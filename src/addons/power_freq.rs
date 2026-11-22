@@ -485,8 +485,10 @@ pub struct PowerFreq {
     /// What the page reads sensors through, set only while it draws (the
     /// host owns the interest behind it).
     drawing: Option<Sensors>,
-    /// Held while its Summary tile is shown.
-    tile_sensors: Option<Interest>,
+    /// Whether the page / the Summary tile were drawn and not yet hidden: the
+    /// statistics reset when neither is.
+    page_on: bool,
+    tile_on: bool,
     /// The sensor service's statistics as of the last frame (the service
     /// owns them, so they survive this page while anyone holds interest).
     stats: std::sync::Arc<Stats>,
@@ -620,30 +622,18 @@ impl PowerFreq {
 
     /// "Reset statistics": the sensor service starts a new epoch now.
     pub fn reset_statistics(&mut self) {
-        if let Some(s) = self.drawing.as_deref().or(self.tile_sensors.as_ref()) {
+        let held = self.context.as_ref().and_then(|c| c.leases().held_by(self.id()));
+        if let Some(s) = self.drawing.as_ref().or(held.as_ref()) {
             s.reset_stats();
             self.stats = s.stats();
         }
     }
 
     /// The latest frame (with the service's statistics) through what the
-    /// host gave this draw; asking is what makes the host keep the service
-    /// running while the page is drawn.
+    /// host gave this draw (page or tile); asking is what makes the host keep
+    /// the service running while it is drawn.
     fn frame(&mut self, interval_ms: u64) -> Option<std::sync::Arc<Frame>> {
         let sensors = self.drawing.as_ref()?;
-        let frame = latest(sensors, interval_ms, self.prefs.history_window())?;
-        if self.stats.seq() != Some(frame.seq) {
-            self.stats = sensors.stats();
-        }
-        Some(frame)
-    }
-
-    /// The latest frame for the Summary tile (with the statistics).
-    fn tile_frame(&mut self, interval_ms: u64) -> Option<std::sync::Arc<Frame>> {
-        if self.tile_sensors.is_none() {
-            self.tile_sensors = self.context.as_ref().map(|c| c.sensors().interest());
-        }
-        let sensors = self.tile_sensors.as_ref()?;
         let frame = latest(sensors, interval_ms, self.prefs.history_window())?;
         if self.stats.seq() != Some(frame.seq) {
             self.stats = sensors.stats();
@@ -694,13 +684,14 @@ impl Addon for PowerFreq {
         self.on = false;
         self.watcher = None;
         self.drawing = None;
-        self.tile_sensors = None;
+        (self.page_on, self.tile_on) = (false, false);
         self.stats = Default::default();
     }
 
     fn page_hidden(&mut self) {
         // The host drops the page's sensors itself.
-        if self.tile_sensors.is_none() {
+        self.page_on = false;
+        if !self.tile_on {
             // The service keeps them while anyone else holds interest; the
             // next frame brings them back.
             self.stats = Default::default();
@@ -708,7 +699,10 @@ impl Addon for PowerFreq {
     }
 
     fn summary_hidden(&mut self) {
-        self.tile_sensors = None;
+        self.tile_on = false;
+        if !self.page_on {
+            self.stats = Default::default();
+        }
     }
 
     fn recording_shown(&mut self, recording: Recording) {
@@ -717,11 +711,15 @@ impl Addon for PowerFreq {
 
     /// The values of the whole PC this PC reads ([`tile_lines`]).
     fn summary(&mut self, ui: &mut Ui, page: &mut PageContext) {
-        if !self.prefs.summary_tile {
-            self.tile_sensors = None;
+        self.tile_on = self.prefs.summary_tile;
+        if !self.tile_on {
             return;
         }
-        let Some(frame) = self.tile_frame(page.settings.interval_ms()) else {
+        self.drawing = page.sensors();
+        let frame = self.frame(page.settings.interval_ms());
+        // Between frames the host alone holds the interest.
+        self.drawing = None;
+        let Some(frame) = frame else {
             crate::addons::summary_tile(ui, page, "Power & Freq", vec![WAITING.to_string()]);
             return;
         };
@@ -807,6 +805,7 @@ impl Addon for PowerFreq {
     }
 
     fn ui(&mut self, ui: &mut Ui, page: &mut PageContext) {
+        self.page_on = true;
         self.drawing = page.sensors();
         let frame = self.frame(page.settings.interval_ms());
         let user = page.settings.theme();
@@ -1738,7 +1737,12 @@ mod tests {
         let (settings, snap) = (Settings::default(), Snapshot::default());
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| p.summary(ui, &mut PageContext::new(&settings, &snap)));
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut page = PageContext::new(&settings, &snap);
+                // As the host draws the tile: its sensors come from the host's leases.
+                page.lease = p.context.as_ref().map(|c| (c.leases().clone(), crate::addons::leases::Surface::Tile("power-freq")));
+                p.summary(ui, &mut page)
+            });
         });
     }
 
@@ -1777,8 +1781,11 @@ mod tests {
         ctx.leases().end_frame();
         ctx.leases().end_frame(); // the host drops the page's sensors
         p.page_hidden();
+        draw_summary(&mut p);
         std::thread::sleep(Duration::from_millis(30));
         assert!(ctx.sensors().threads() > 0, "the tile still looks at the sensors");
+        ctx.leases().end_frame();
+        ctx.leases().end_frame(); // Summary is left: the host drops the tile's sensors
         p.summary_hidden();
         until("no sensor thread", || ctx.sensors().threads() == 0);
     }
@@ -1792,6 +1799,7 @@ mod tests {
         draw_summary(&mut p);
         assert!(ctx.sensors().threads() > 0);
         p.stop();
+        ctx.leases().release("power-freq"); // as the host does when it turns an add-on off
         until("no sensor thread", || ctx.sensors().threads() == 0);
     }
 
@@ -1970,6 +1978,98 @@ mod tests {
             });
         });
         host.end_frame();
+    }
+
+    /// One frame through the host with the page and/or the tile drawn.
+    fn draw_surfaces(host: &mut crate::addons::AddonHost, page_shown: bool, tile_shown: bool) {
+        let (settings, snap) = (Settings::default(), Snapshot::default());
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if page_shown {
+                    host.ui("power-freq", ui, &mut PageContext::new(&settings, &snap));
+                }
+                if tile_shown {
+                    host.summary_tiles(ui, &mut PageContext::new(&settings, &snap));
+                }
+            });
+        });
+        host.end_frame();
+    }
+
+    fn tile_host() -> crate::addons::AddonHost {
+        power_freq_host(&serde_json::json!({ "power-freq": { "settings": { "summary_tile": true } } }))
+    }
+
+    #[test]
+    fn the_host_stops_the_service_one_frame_after_the_tile_is_no_longer_drawn() {
+        let mut host = tile_host();
+        for _ in 0..3 {
+            draw_surfaces(&mut host, false, true);
+            assert!(host.context.sensors().threads() > 0, "drawn in every frame");
+        }
+        host.end_frame(); // the first frame without the tile
+        until("no sensor thread", || host.context.sensors().threads() == 0);
+    }
+
+    #[test]
+    fn with_page_and_tile_shown_hiding_one_keeps_the_service_and_hiding_both_stops_it() {
+        let mut host = tile_host();
+        draw_surfaces(&mut host, true, true);
+        draw_surfaces(&mut host, false, true); // page hidden
+        draw_surfaces(&mut host, false, true);
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(host.context.sensors().threads() > 0, "the tile still looks");
+        draw_surfaces(&mut host, true, false); // the tile is hidden, the page is back
+        draw_surfaces(&mut host, true, false);
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(host.context.sensors().threads() > 0, "the page still looks");
+        host.end_frame();
+        until("no sensor thread", || host.context.sensors().threads() == 0);
+    }
+
+    /// The host's end of a frame in which the page was not drawn.
+    fn page_left(p: &mut PowerFreq, ctx: &AddonContext) {
+        ctx.leases().end_frame();
+        ctx.leases().end_frame();
+        p.page_hidden();
+    }
+
+    #[test]
+    fn statistics_survive_the_page_to_the_tile_and_reset_when_neither_is_shown() {
+        let (ctx, _) = AddonContext::recording();
+        let mut p = PowerFreq::default();
+        p.load_settings(&serde_json::json!({ "summary_tile": true }));
+        p.start(&ctx);
+        shown(&mut p);
+        let since = p.stats.since();
+        draw_summary(&mut p);
+        page_left(&mut p, &ctx);
+        draw_summary(&mut p);
+        assert!(p.stats.min_max(CORE_AVERAGE).is_some(), "the tile went on with the page's statistics");
+        assert_eq!(p.stats.since(), since, "same epoch");
+        ctx.leases().end_frame();
+        ctx.leases().end_frame();
+        p.summary_hidden();
+        until("no sensor thread", || ctx.sensors().threads() == 0);
+        assert_eq!(p.stats.min_max(CORE_AVERAGE), None, "neither is shown: the statistics are gone");
+    }
+
+    #[test]
+    fn reset_statistics_works_with_only_the_tile_shown() {
+        let (ctx, _) = AddonContext::recording();
+        let mut p = PowerFreq::default();
+        p.load_settings(&serde_json::json!({ "summary_tile": true }));
+        p.start(&ctx);
+        until("the tile has statistics", || {
+            draw_summary(&mut p);
+            p.stats.min_max(CORE_AVERAGE).is_some()
+        });
+        std::thread::sleep(Duration::from_millis(1100));
+        let before = crate::platform::local_secs();
+        p.reset_statistics();
+        assert!(p.stats.since() >= before, "the epoch is the reset's time");
     }
 
     #[test]
