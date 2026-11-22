@@ -1150,6 +1150,13 @@ impl AddonHost {
         }
     }
 
+    /// The sensors for a core surface (the Summary page), asked in this
+    /// frame: the host keeps them while the surface asks and drops them at
+    /// the end of the first frame it does not.
+    pub fn core_sensors(&self, surface: leases::Surface) -> leases::Sensors {
+        self.context.leases().ask(surface)
+    }
+
     /// Ends a frame: add-ons whose page was drawn in the last frame but not
     /// in this one are told ([`Addon::page_hidden`]). The app calls it once
     /// per frame, after drawing.
@@ -1424,6 +1431,29 @@ mod tests {
         assert!(sensor_threads(&host) > 0, "the other page still looks");
         host.end_frame();
         until("no sensor thread", || sensor_threads(&host) == 0);
+    }
+
+    #[test]
+    fn the_core_summary_runs_the_sensors_while_it_asks_every_frame_and_stops_one_frame_after() {
+        let (mut host, _) = AddonHost::for_tests_with(Vec::new(), &json!({}));
+        for _ in 0..3 {
+            host.core_sensors(leases::Surface::Summary).latest();
+            host.end_frame();
+            assert!(sensor_threads(&host) > 0, "asked in every frame");
+        }
+        host.end_frame(); // the first frame without Summary
+        until("no sensor thread", || sensor_threads(&host) == 0);
+    }
+
+    #[test]
+    fn leaving_the_core_summary_keeps_the_sensors_an_add_on_page_still_reads() {
+        let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Looks))], &json!({}));
+        host.core_sensors(leases::Surface::Summary).latest();
+        draw_page(&mut host, "looks");
+        draw_page(&mut host, "looks"); // Summary is not asked any more
+        draw_page(&mut host, "looks");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(sensor_threads(&host) > 0, "the add-on page still looks");
     }
 
     #[test]
