@@ -45,18 +45,18 @@ item of sections 2-4 below. `record` and `stop` glyphs exist if we want them lat
 | Inline coloured dot | Benchmarks figure cards, Power & Freq sources, Package Manager notes | `src/widgets.rs:484` `dot()` | No |
 | Run-state dot | Benchmarks run band | `src/addons/benchmarks.rs:681` | No |
 | Outcome dots | Package Manager headlines | `src/addons/package_manager/page.rs:140` | No |
-| Consumption intensity dot | Settings › Add-ons detail | `src/pages2.rs:324` | No |
+| Consumption intensity dot | Settings › Add-ons detail | `src/page_settings.rs:357` | No |
 | Category swatches | Disk Space file-type legend and rows | `src/addons/disk_space/page.rs:602` `swatch()` | No |
 | LIVE tag dot / "Flight Recorder" dot | Flight Recorder header and Summary tile | `src/widgets/parts.rs:1337`, `src/addons/flight_recorder/page.rs:381` | No |
 | Tree caret and leaf dot | Power & Freq sensor tree | `src/widgets.rs:862`, `:879` (`RowLead`) | Maybe (caret) |
-| Expand chevron on an account | Users | `src/pages.rs:670` `account_row()` | Maybe |
+| Expand chevron on an account | Users | `src/page_users.rs:124` `account_row()` | Maybe |
 | "More actions" chevron | Installed Apps and Drivers action rows (the same code twice) | `src/addons/installed_apps/page.rs:425`, `src/addons/drivers/page.rs:292` | Maybe (one shared chevron) |
 | "CPUs Expanded" dropdown chevron | Performance | `src/page_perf.rs:556` | Maybe |
 | Graph line-end marker | Performance graphs | `src/page_perf.rs:944` | No |
 | Painted checkbox | Installed Apps list rows | `src/addons/installed_apps/page.rs:1196` `tick_box()` | No |
 | Switch | Settings | `src/widgets/parts.rs:675` | No |
 | "+" / "−" stepper | Settings numbers | `src/widgets/parts.rs` `number_stepper()` | No |
-| "+" of "+ Run new task" | Header of every page | `src/app.rs:785`, `src/pages.rs:113` (text) | Maybe |
+| "+" of "+ Run new task" | Header of every page | `src/app.rs:785`, `src/widgets.rs:654` (text) | Maybe |
 | Alert "!" | Benchmarks warning banner | `src/widgets/parts.rs:1289` `alert_banner()` (text) | Maybe |
 
 ## 3. Unicode characters used as icons (proposal: keep, or unify)
@@ -66,7 +66,7 @@ item of sections 2-4 below. `record` and `stop` glyphs exist if we want them lat
 | ↑ ↓ (U+2191/2193) | Connections "System traffic" tile; Installed Apps sort headings | `src/addons/connections/band.rs:97,101`; `src/addons/installed_apps/page.rs:681` |
 | ▴ ▾ (U+25B4/25BE) | Package Manager catalog sort headings | `src/addons/package_manager/page.rs:484-485` |
 | → (U+2192) | "old → new" versions: Installed Apps, Drivers; update dialog lists | `src/addons/installed_apps/page.rs:785,1130`; `src/addons/drivers/page.rs:448` |
-| › (U+203A) | Breadcrumbs: Settings › Add-ons, Disk Space path bar, "Open Windows Settings › Installed apps" | `src/pages2.rs:124`; `src/addons/disk_space/canvas.rs:295`; `src/addons/installed_apps/page.rs:432` |
+| › (U+203A) | Breadcrumbs: Settings › Add-ons, Disk Space path bar, "Open Windows Settings › Installed apps" | `src/page_settings.rs:150`; `src/addons/disk_space/canvas.rs:295`; `src/addons/installed_apps/page.rs:432` |
 | • (U+2022) | Current choice in menus (update speed, priority, graph mode); separators and bullets in texts | `src/app.rs:576`; `src/widgets.rs:180`; `src/page_perf.rs:319,324`; others in Flight Recorder, Disk Space, Installed Apps, Package Manager |
 
 egui built-ins (checkboxes, combo box and submenu arrows, collapsing
@@ -80,9 +80,9 @@ triangles, spinners) follow the theme and are not listed one by one.
 - **Bolt** is drawn three times: `Glyph::Bolt`, Performance `Icon::Power`, and the old
   Power & Freq page icon (now only a fallback).
 - **Shield** twice: `need_icon` Admin and `parts::shield`.
-- **Search fields without a magnifier**: Processes (`src/pages.rs:116`), Services
-  (`src/list_pages.rs:110`), Drivers, Installed Apps and Settings "Find a setting"
-  (`src/pages2.rs`) are plain text boxes, unlike Connections, Package Manager and
+- **Search fields without a magnifier**: Processes (`src/page_processes.rs:201`), Services
+  (`src/page_services.rs:74`), Drivers, Installed Apps and Settings "Find a setting"
+  (`src/page_settings.rs:174`) are plain text boxes, unlike Connections, Package Manager and
   Power & Freq.
 
 ## 5. Already done, now only a fallback

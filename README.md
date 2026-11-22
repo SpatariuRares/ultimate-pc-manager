@@ -171,9 +171,12 @@ git push origin v0.2.0
 | `src/version_info.rs` | A program file's description from its version details, read once per path on a worker thread; used by the Description column. |
 | `src/theme.rs` | Design A theme: colors by role in the dark and light themes, chart palette, fonts; the only place where colors are defined. |
 | `src/page_perf.rs` | Performance page. |
-| `src/pages.rs` | Summary, Processes, System Info, Users. |
-| `src/list_pages.rs` | Services, Startup apps, App history. |
-| `src/pages2.rs` | Settings, Settings › Add-ons, Colors. |
+| `src/core_page.rs` | The interface every core page shares (its own state, a new sample, refresh, drawing) and the order a sample reaches the pages in. |
+| `src/page_summary.rs`, `src/summary_view.rs`, `src/summary_tiles.rs` | Summary. |
+| `src/page_processes.rs` | Processes. |
+| `src/page_system.rs`, `src/page_users.rs` | System Info, Users. |
+| `src/page_settings.rs`, `src/page_colors.rs` | Settings, Settings › Add-ons, Colors. |
+| `src/page_services.rs`, `src/page_startup.rs`, `src/page_history.rs`, `src/list_pages.rs` | Services, Startup apps, App history, and what the three share (`list_pages.rs`). |
 | `src/addons.rs`, `src/addons/` | Add-on registry and their pages: Power & Freq, Flight Recorder, Connections, Installed Apps, Drivers, Disk Space, Benchmarks. |
 | `src/platform.rs`, `src/sensors.rs`, `src/sensors/` | Services shared by the add-ons (actions, PowerShell, sensors). |
 | `src/pro.rs` | Local clock and ISO-8601 dates of the histories. |
