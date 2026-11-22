@@ -274,6 +274,63 @@ impl Reading {
     }
 }
 
+/// One instance of a counter: what a performance counter reports for one
+/// thing it counts (a disk "0 C:", a processor "_Total", an energy rail).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Instance {
+    /// As the counter names it ("0 C:", "_Total", "rapl_package0_pkg").
+    pub name: String,
+    /// The counter's value as the provider formats it (a rate, a percent).
+    pub value: f64,
+    /// The raw value, for a counter that counts since boot (bytes read
+    /// since boot, pages read since boot); `None` for the others.
+    pub raw: Option<i64>,
+}
+
+impl Instance {
+    pub fn new(name: &str, value: f64) -> Self {
+        Instance { name: name.into(), value, raw: None }
+    }
+
+    /// The same instance with its raw value.
+    pub fn with_raw(mut self, raw: i64) -> Self {
+        self.raw = Some(raw);
+        self
+    }
+}
+
+/// What a provider counted when it read: every instance of one counter, by
+/// the counter's key. It is the shape for what is not one plain number: the
+/// totals and the per-instance lists of a counter (every disk, every
+/// processor, every GPU engine), with their raw values. A counter that gave
+/// no instance has not answered, and what is built from it is a gap, not a
+/// zero. A provider lists its sets in [`Provider::counted`]; a reader asks
+/// the frame ([`Frame::counter`]).
+///
+/// [`Provider::counted`]: super::provider::Provider::counted
+#[derive(Clone, Debug, PartialEq)]
+pub struct CounterSet {
+    /// The counter's key (one of `perfdata::counter`).
+    pub key: &'static str,
+    pub instances: Vec<Instance>,
+}
+
+impl CounterSet {
+    pub fn new(key: &'static str, instances: Vec<Instance>) -> Self {
+        CounterSet { key, instances }
+    }
+
+    /// Whether the counter gave a value.
+    pub fn answered(&self) -> bool {
+        !self.instances.is_empty()
+    }
+
+    /// The instance called `name`.
+    pub fn instance(&self, name: &str) -> Option<&Instance> {
+        self.instances.iter().find(|i| i.name == name)
+    }
+}
+
 /// Whether a provider works on this PC, and why not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceStatus {
@@ -303,6 +360,10 @@ pub struct Frame {
     pub seq: u64,
     pub devices: Vec<DeviceNode>,
     pub sources: Vec<SourceStatus>,
+    /// What the providers counted (see [`CounterSet`]), one set per key.
+    pub counters: Vec<CounterSet>,
+    /// The machine's fixed facts, once a provider reported them.
+    pub machine: Option<std::sync::Arc<crate::perfdata::StaticInfo>>,
 }
 
 impl Frame {
@@ -339,7 +400,12 @@ impl Frame {
         for d in &mut devices {
             d.groups.sort_by_key(|g| g.group);
         }
-        Frame { seq, devices, sources }
+        Frame { seq, devices, sources, counters: Vec::new(), machine: None }
+    }
+
+    /// What was counted under `key`, if a provider gave it.
+    pub fn counter(&self, key: &str) -> Option<&CounterSet> {
+        self.counters.iter().find(|c| c.key == key)
     }
 
     /// The reading of a metric, if any provider gave it.

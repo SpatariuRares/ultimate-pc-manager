@@ -138,9 +138,9 @@ pub(crate) struct Dev {
 /// Figures under the graphs: a grid of label-over-value cells, then a
 /// two-column "key: value" table (pairs in reading order).
 #[derive(Default)]
-struct Stats {
-    top: Vec<(String, String)>,
-    table: Vec<(String, String)>,
+pub(crate) struct Stats {
+    pub(crate) top: Vec<(String, String)>,
+    pub(crate) table: Vec<(String, String)>,
 }
 
 impl Stats {
@@ -440,7 +440,7 @@ impl TaskApp {
     /// Big title and the line under the LED meter.
     fn detail_titles(&self, d: &Dev) -> (String, String) {
         let s = &self.snap;
-        let info = perfdata::info();
+        let info = self.machine();
         match d.item {
             PerfItem::Cpu => {
                 let b = cpu_brand();
@@ -652,7 +652,7 @@ impl TaskApp {
     }
 
     fn gpu_graphs(&self, p: &Painter, area: Rect, luid: u64) {
-        let info = perfdata::info().gpus.iter().find(|g| g.luid == luid);
+        let info = self.machine().gpus.iter().find(|g| g.luid == luid);
         let live = self.snap.perf.gpus.iter().find(|g| g.luid == luid);
         let (top, mem) = split(area, 0.66, 6.0);
         if self.settings.perf_gpu_engines {
@@ -686,19 +686,19 @@ impl TaskApp {
         cell_title(p, sh, "Shared GPU memory", &fmt_size(live.map(|g| g.shared).unwrap_or(0)));
     }
 
-    fn stats(&self, item: PerfItem) -> Stats {
+    pub(crate) fn stats(&self, item: PerfItem) -> Stats {
         let s = &self.snap;
-        let info = perfdata::info();
+        let info = self.machine();
         let pf = &s.perf;
         let mut st = Stats::default();
         let dash = "\u{2014}";
         match item {
             PerfItem::Cpu => {
                 let c = &info.cpu;
-                // The shared rule; without its inputs, the first core's reported clock.
-                let speed = crate::metrics::cpu_speed_mhz(self.base_mhz(), pf.cpu_perf_pct).unwrap_or(s.cpu_freq_mhz as f32);
+                // The shared rule; blank when either input is unknown.
+                let speed = crate::metrics::cpu_speed_mhz(self.base_mhz(), Some(pf.cpu_perf_pct as f64));
                 st.top("Utilization", pct1(s.cpu_total));
-                st.top("Speed", crate::metrics::fmt_ghz(speed));
+                st.top("Speed", speed.map_or_else(|| dash.into(), |mhz| crate::metrics::fmt_ghz(mhz as f32)));
                 st.top("Processes", s.procs.len().to_string());
                 st.top("Threads", pf.threads.to_string());
                 st.top("Up time", fmt_uptime(s.uptime));
@@ -1089,10 +1089,10 @@ mod tests {
     }
 
     #[test]
-    fn performance_cpu_speed_is_unchanged_by_the_shared_rule() {
+    fn the_cpu_speed_is_the_base_clock_times_the_performance_level_and_blank_when_either_is_unknown() {
         assert_eq!(speeds(3_400, 110.0).0, "3.74 GHz", "base clock x performance level");
-        assert_eq!(speeds(3_400, 0.0).0, "2.90 GHz", "no performance level: the reported clock, as before");
-        assert_eq!(speeds(0, 110.0).0, "2.90 GHz", "no base clock: the reported clock, as before");
+        assert_eq!(speeds(3_400, 0.0).0, "\u{2014}", "no performance level: blank, by the one shared rule");
+        assert_eq!(speeds(0, 110.0).0, "\u{2014}", "no base clock: blank, by the one shared rule");
     }
 
     #[test]
@@ -1101,6 +1101,64 @@ mod tests {
         assert_eq!(summary.cpu.sub_text(), performance);
     }
 
+    /// Power & Freq's "Core Average" (Hz) for a CPU read at `perf_pct`% of a
+    /// `base_mhz` base clock, as the page's frame carries it.
+    fn core_average_speed_hz(base_mhz: u32, perf_pct: f32) -> Option<f64> {
+        let sample = crate::sensors::cpu::CpuSample {
+            base_mhz: Some(base_mhz as f64),
+            performance_percent: Some(perf_pct as f64),
+            ..Default::default()
+        };
+        let frame = crate::sensors::model::Frame::build(1, &[sample.readings(std::time::Instant::now())], Vec::new());
+        frame.reading(crate::sensors::cpu::CORE_AVERAGE).and_then(|r| r.value)
+    }
+    /// The same inputs through the app: one fake processor provider, read
+    /// by the sampler for the core pages and by a page for the sensors.
+    /// Returns Performance's "Speed", Summary's view and the sensor
+    /// pipeline's "Core Average" (Hz).
+    fn speeds_through_the_app(base_mhz: u32, perf_pct: f32) -> (String, crate::summary_view::SummaryView, Option<f64>) {
+        use crate::sensors::{fake, service::ProviderGroup, SensorService};
+        let sample = crate::sensors::cpu::CpuSample { base_mhz: Some(base_mhz as f64), performance_percent: Some(perf_pct as f64), ..Default::default() };
+        let service = SensorService::grouped(vec![(ProviderGroup::Counters, fake::provider("Windows counters", &fake::Script::cpu(sample)))]);
+        let mut app = TaskApp::headless_over(crate::settings::Settings::default(), service.clone(), |snap: &mut Snapshot| snap.cpu_freq_mhz = 2_900);
+        app.machine_info = Some(crate::summary_view::tests::clocked(base_mhz));
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.snap.seq == 0 {
+            app.pull_samples();
+            assert!(std::time::Instant::now() < end, "no sample");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        app.rebuild_summary();
+        let speed = app.stats(PerfItem::Cpu).top.iter().find(|(k, _)| k == "Speed").map(|(_, v)| v.clone()).expect("a Speed figure");
+        let page = service.interest();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let frame = loop {
+            if let Some(frame) = page.latest() {
+                break frame;
+            }
+            assert!(std::time::Instant::now() < end, "no sensor frame");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let hz = frame.reading(crate::sensors::cpu::CORE_AVERAGE).and_then(|r| r.value);
+        (speed, app.summary_view().clone(), hz)
+    }
+
+    #[test]
+    fn summary_performance_and_the_core_average_give_the_same_speed_for_the_same_inputs() {
+        let (performance, summary, hz) = speeds_through_the_app(3_400, 110.0);
+        let hz = hz.expect("a Core Average");
+        assert_eq!(crate::metrics::fmt_ghz((hz / 1e6) as f32), performance);
+        assert_eq!(summary.cpu.sub_text(), performance);
+        assert_eq!(performance, "3.74 GHz");
+    }
+    #[test]
+    fn the_speed_is_blank_on_summary_and_the_core_average_when_an_input_is_unknown() {
+        for (base, pct) in [(3_400, 0.0), (0, 110.0)] {
+            assert_eq!(speeds(base, pct).1.cpu.sub_text(), "\u{2014}", "Summary at {base} MHz x {pct}%");
+            assert_eq!(speeds(base, pct).0, "\u{2014}", "Performance at {base} MHz x {pct}%");
+            assert_eq!(core_average_speed_hz(base, pct), None,"Power & Freq at {base} MHz x {pct}%");
+        }
+    }
     /// Performance's combined Network device for `net`.
     fn network_device(net: Vec<crate::sampler::NetRow>) -> Dev {
         let mut app = TaskApp::headless(crate::settings::Settings::default(), Snapshot { seq: 1, net, ..Default::default() });

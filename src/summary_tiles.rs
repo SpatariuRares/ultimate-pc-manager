@@ -57,7 +57,8 @@ impl TaskApp {
     /// The machine's fixed facts (disk models, GPUs): the ones set for a
     /// test, otherwise the machine's.
     pub fn machine(&self) -> &StaticInfo {
-        self.machine_info.as_ref().unwrap_or_else(|| crate::perfdata::info())
+        static NONE: std::sync::OnceLock<StaticInfo> = std::sync::OnceLock::new();
+        self.machine_info.as_ref().or(self.snap.machine.as_deref()).unwrap_or_else(|| NONE.get_or_init(StaticInfo::default))
     }
 
     /// Summary's tiles for the current sample, in this order:
@@ -133,15 +134,12 @@ impl TaskApp {
 }
 
 impl TaskApp {
-    /// Takes the sensors while Summary is shown (the service runs while
-    /// someone holds an interest) and, unless paused, puts a new sensor
-    /// frame into the tiles at once.
+    /// Asks the host for the sensors while Summary is drawn (the host keeps
+    /// them while this is called every frame and drops them after) and,
+    /// unless paused, puts a new sensor frame into the tiles at once.
     pub(crate) fn read_summary_sensors(&mut self) {
-        if self.summary_sensors.is_none() {
-            self.summary_sensors = Some(self.addons.context().sensors().interest());
-        }
+        let sensors = self.addons.core_sensors(crate::addons::leases::Surface::Summary);
         let interval_ms = self.settings.interval_ms();
-        let Some(sensors) = &self.summary_sensors else { return };
         sensors.set_interval_ms(interval_ms);
         if interval_ms == 0 {
             // Paused: the tiles keep the last view.
@@ -151,16 +149,6 @@ impl TaskApp {
         if self.summary_frame.as_ref().map(|f| f.seq) != Some(frame.seq) {
             self.summary_frame = Some(frame);
             self.summary.tiles = self.summary_tiles();
-        }
-    }
-
-    /// Drops the sensors when Summary is not the page shown (called once
-    /// per frame, after drawing), so the service stops unless someone
-    /// else needs it.
-    pub(crate) fn summary_sensors_hidden(&mut self) {
-        if !matches!(self.page, crate::app::Page::Core(crate::addons::Core::Summary)) {
-            self.summary_sensors = None;
-            self.summary_frame = None;
         }
     }
 }
@@ -290,14 +278,37 @@ mod tests {
         // The test add-on host: a made-up CPU, no real sensor.
         app.addons = crate::addons::AddonHost::for_tests(&serde_json::json!({})).0;
         app.read_summary_sensors();
-        assert!(app.summary_sensors.is_some(), "Summary shown: it holds the sensors");
         crate::addons::until("the sensors run", || app.addons.context().sensors().threads() > 0);
-        app.summary_sensors_hidden();
-        assert!(app.summary_sensors.is_some(), "still on Summary: kept");
-        app.page = crate::app::Page::Core(crate::addons::Core::Performance);
-        app.summary_sensors_hidden();
-        assert!(app.summary_sensors.is_none() && app.summary_frame.is_none(), "another page: dropped");
+        app.addons.end_frame();
+        app.read_summary_sensors(); // still on Summary: kept
+        app.addons.end_frame();
+        assert!(app.addons.context().sensors().threads() > 0, "still on Summary: kept");
+        app.addons.end_frame(); // another page: Summary did not ask
         crate::addons::until("the sensors stop", || app.addons.context().sensors().threads() == 0);
+    }
+
+    #[test]
+    fn leaving_summary_drops_its_old_sensor_frame_so_coming_back_never_shows_it() {
+        let mut app = TaskApp::headless(Settings::default(), sample(None));
+        app.addons = crate::addons::AddonHost::for_tests(&serde_json::json!({})).0;
+        crate::addons::until("a sensor frame reaches the tiles", || {
+            app.read_summary_sensors();
+            app.summary_frame.is_some()
+        });
+        app.end_frame(); // Summary was drawn in this frame
+        assert!(app.summary_frame.is_some(), "still on Summary: kept");
+        app.end_frame(); // another page: Summary did not ask
+        assert!(app.summary_frame.is_none(), "the old frame is gone");
+    }
+
+    #[test]
+    fn summary_fills_its_sensor_tiles_from_the_sensors_while_it_is_shown() {
+        let mut app = TaskApp::headless(Settings::default(), sample(None));
+        app.addons = crate::addons::AddonHost::for_tests(&serde_json::json!({})).0;
+        crate::addons::until("a sensor frame reaches the tiles", || {
+            app.read_summary_sensors();
+            app.summary_frame.is_some()
+        });
     }
 
     fn disk_tile(view: &SummaryView, n: u32) -> &Tile {

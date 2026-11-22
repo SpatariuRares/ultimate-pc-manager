@@ -178,8 +178,8 @@ impl SummaryView {
         // Rounded to the 10 MHz the pages show, so that the card and the
         // band print the same digits. The machine's base clock is read only
         // when there is a performance level to apply it to.
-        let speed_mhz = (!waiting && s.perf.answered(counter::PERF) && s.perf.cpu_perf_pct > 0.0)
-            .then(|| cpu_speed_mhz(app.base_mhz(), s.perf.cpu_perf_pct))
+        let speed_mhz = (!waiting && s.perf.answered(counter::PERF))
+            .then(|| cpu_speed_mhz(app.base_mhz(), Some(s.perf.cpu_perf_pct as f64)))
             .flatten()
             .map(|mhz| (mhz / 10.0).round() as u64 * 10);
         let memory = pct(s.mem_used, s.mem_total);
@@ -272,8 +272,8 @@ fn memory_footer(s: &crate::sampler::Snapshot) -> String {
 impl TaskApp {
     /// The CPU's base frequency in MHz, from the machine's fixed facts
     /// (0 when unknown).
-    pub fn base_mhz(&self) -> u32 {
-        self.machine().cpu.base_mhz
+    pub fn base_mhz(&self) -> Option<f64> {
+        crate::metrics::base_clock_mhz(Some(self.machine().cpu.base_mhz as f64), None, None)
     }
 
     /// Builds Summary's view from the current sample.

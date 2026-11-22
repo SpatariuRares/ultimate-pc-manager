@@ -5,7 +5,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::model::Reading;
+use super::model::{CounterSet, Reading};
+use super::service::ProviderGroup;
+use crate::perfdata::StaticInfo;
 
 /// How long a read may take before the provider counts as not responding.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -38,6 +40,30 @@ pub trait Provider {
     /// Reads what it can now. Partial results are fine: a reading it cannot
     /// get is returned unavailable with its reason, or left out.
     fn read(&mut self, at: Instant) -> Vec<Reading>;
+    /// Told before each read whether something looks at the hardware sensors
+    /// (a page, tile, recording or alert: an interest in
+    /// [`ProviderGroup::Hardware`]). A counter provider that also reads
+    /// hardware (the health of a disk) reads it only then. Default: ignored.
+    fn hardware_wanted(&mut self, _wanted: bool) {}
+    /// What the last [`Provider::read`] counted, for what is more than one
+    /// plain number (see [`CounterSet`]); called once after each read, on the
+    /// same thread. Default: nothing.
+    fn counted(&mut self) -> Vec<CounterSet> {
+        Vec::new()
+    }
+    /// The machine's fixed facts, when this provider reports them (see
+    /// [`crate::sensors::machine::MachineFacts`]). Asked after a read is
+    /// published, on the same thread, until it reports them: reading them
+    /// may be slow and never holds up the first figures. Default: none.
+    fn machine(&mut self) -> Option<Arc<StaticInfo>> {
+        None
+    }
+    /// Whether "Sources on this PC" lists it. A provider that reports no
+    /// readings (only the machine's facts) is not a source of any figure.
+    /// Default: yes.
+    fn listed(&self) -> bool {
+        true
+    }
     /// The longest one read may take before its readings are reported as
     /// "not responding" (the other providers go on meanwhile).
     fn timeout(&self) -> Duration {
@@ -48,23 +74,32 @@ pub trait Provider {
 /// Builds a provider on its worker thread.
 pub type Factory = Arc<dyn Fn() -> Box<dyn Provider> + Send + Sync>;
 
-/// The providers of the real app, in the order their sources are listed.
-pub fn standard() -> Vec<Factory> {
+/// The providers of the real app, in the order their sources are listed,
+/// each with the group that wakes it (see [`ProviderGroup`]).
+pub fn standard() -> Vec<(ProviderGroup, Factory)> {
+    use ProviderGroup::{Counters, Hardware};
+    fn of(group: ProviderGroup, factory: Factory) -> (ProviderGroup, Factory) {
+        (group, factory)
+    }
     vec![
-        Arc::new(|| Box::new(super::cpu::CpuCounters::new())),
-        Arc::new(|| Box::new(super::energy::EnergyMeter::new())),
-        Arc::new(|| Box::new(super::ryzen::RyzenMaster::new())),
-        Arc::new(|| Box::new(super::power_plan::PowerPlan::new())),
-        Arc::new(|| Box::new(super::disk::DiskCounters::new())),
-        Arc::new(|| Box::new(super::power::PowerStatusProvider::new())),
+        of(Counters, Arc::new(|| Box::new(super::cpu::CpuCounters::new()))),
+        of(Counters, Arc::new(|| Box::new(super::energy::EnergyMeter::new()))),
+        of(Hardware, Arc::new(|| Box::new(super::ryzen::RyzenMaster::new()))),
+        of(Hardware, Arc::new(|| Box::new(super::power_plan::PowerPlan::new()))),
+        of(Counters, Arc::new(|| Box::new(super::disk::DiskCounters::new()))),
+        of(Counters, Arc::new(|| Box::new(super::gpu_counters::GpuCounters::new()))),
+        of(Counters, Arc::new(|| Box::new(super::system_counters::SystemCounters::new()))),
+        of(Counters, Arc::new(|| Box::new(super::machine::MachineFacts::new()))),
+        of(Hardware, Arc::new(|| Box::new(super::power::PowerStatusProvider::new()))),
         // Vendor GPU providers before DXCore: their values and reasons win
         // over DXCore's grey rows for the same card.
-        Arc::new(|| Box::new(super::nvml::Nvml::new())),
-        Arc::new(|| Box::new(super::adlx::provider())),
-        Arc::new(|| Box::new(super::igcl::provider())),
-        Arc::new(|| Box::new(super::dxcore::DxCore::new())),
-        Arc::new(|| Box::new(super::board::FirmwareTables::new())),
-        Arc::new(|| Box::new(super::intel_dtt::IntelDtt::new())),
-        // A new provider: one line here (its module under `sensors/`).
+        of(Hardware, Arc::new(|| Box::new(super::nvml::Nvml::new()))),
+        of(Hardware, Arc::new(|| Box::new(super::adlx::provider()))),
+        of(Hardware, Arc::new(|| Box::new(super::igcl::provider()))),
+        of(Hardware, Arc::new(|| Box::new(super::dxcore::DxCore::new()))),
+        of(Hardware, Arc::new(|| Box::new(super::board::FirmwareTables::new()))),
+        of(Hardware, Arc::new(|| Box::new(super::intel_dtt::IntelDtt::new()))),
+        // A new provider: one line here (its module under `sensors/`), in
+        // the group that should wake it.
     ]
 }

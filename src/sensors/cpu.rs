@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::model::{Device, Group, Reading, Unit};
+use super::model::{CounterSet, Device, Group, Reading, Unit};
 use super::provider::Provider;
 
 /// The provider's name in "Sources on this PC" / "Read from".
@@ -65,9 +65,10 @@ fn reasons_text(flags: u32) -> String {
     if words.is_empty() { NO_LIMIT.into() } else { words.join(", ") }
 }
 
-/// The effective clock (Hz): base clock × % Processor Performance / 100.
-pub fn effective_hz(base_mhz: f64, performance_percent: f64) -> f64 {
-    base_mhz * 1e6 * performance_percent / 100.0
+/// The effective clock (Hz): base clock × % Processor Performance / 100,
+/// by the rule every page shares; `None` when either input is unknown.
+pub fn effective_hz(base_mhz: Option<f64>, performance_percent: Option<f64>) -> Option<f64> {
+    crate::metrics::cpu_speed_mhz(base_mhz, performance_percent).map(|mhz| mhz * 1e6)
 }
 
 /// The logical processor of a `Processor Information` instance ("g,n"),
@@ -123,7 +124,7 @@ impl CpuSample {
         for (i, c) in self.cores.iter().enumerate() {
             out.push(row(&format!("cpu.core{i}.utilization_percent"), Group::Utilization, &format!("CPU {i}"), Unit::Percent, c.utilization_percent.map(|u| u.clamp(0.0, 100.0))));
         }
-        let effective = self.base_mhz.zip(self.performance_percent).map(|(b, p)| effective_hz(b, p));
+        let effective = effective_hz(self.base_mhz, self.performance_percent);
         out.push(row(CORE_AVERAGE, Group::Clocks, "Core Average", Unit::Hz, effective));
         out.push(row("cpu.package.frequency.average_reported_hz", Group::Clocks, "Reported Clock", Unit::Hz, mhz(reported_avg)));
         out.push(row(BASE_HZ, Group::General, "Base Frequency", Unit::Hz, mhz(self.base_mhz)));
@@ -191,11 +192,23 @@ pub struct CpuCounters {
     #[cfg(windows)]
     collected: Instant,
     name: String,
+    /// The processor's rated clock in MHz (0 if unknown): the first of the
+    /// base clock's sources.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    machine_mhz: u32,
+    /// What the last read counted (see [`Provider::counted`]).
+    counted: Vec<CounterSet>,
 }
 
 impl CpuCounters {
     pub fn new() -> Self {
+        Self::with_base_mhz(super::machine::base_mhz())
+    }
+
+    /// A provider of a processor rated at `machine_mhz`.
+    pub fn with_base_mhz(machine_mhz: u32) -> Self {
         CpuCounters {
+            machine_mhz,
             #[cfg(windows)]
             query: super::pdh::Query::open(&[
                 ("perf", r"\Processor Information(*)\% Processor Performance"),
@@ -211,7 +224,15 @@ impl CpuCounters {
             #[cfg(windows)]
             collected: Instant::now(),
             name: cpu_name(),
+            counted: Vec::new(),
         }
+    }
+
+    /// The base clock in MHz: the machine's rated clock, else the counter's,
+    /// else the power API's maximum (the one order, see `metrics`).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn base_clock(machine_mhz: u32, counter: Option<f64>, power_max: Option<f64>) -> Option<f64> {
+        crate::metrics::base_clock_mhz(Some(machine_mhz as f64), counter, power_max)
     }
 
     #[cfg(windows)]
@@ -219,6 +240,7 @@ impl CpuCounters {
         let mut s = CpuSample { name: self.name.clone(), ..Default::default() };
         let power = processor_power();
         s.cores = power.iter().map(|&(max, cur)| CoreSample { current_mhz: Some(cur), max_mhz: Some(max), ..Default::default() }).collect();
+        let machine_mhz = self.machine_mhz;
         let Some(q) = self.query.as_mut() else { return s };
         let wait = MIN_SPAN.saturating_sub(self.collected.elapsed());
         if !wait.is_zero() {
@@ -226,9 +248,13 @@ impl CpuCounters {
         }
         q.collect();
         self.collected = Instant::now();
+        // The performance level is also reported as counted (the core pages
+        // read it from the frame), once.
+        let perf = q.counted(crate::perfdata::counter::PERF, false);
         let total = |key: &str| q.values(key).into_iter().find(|(n, _)| n == "_Total").map(|(_, v)| v);
-        s.base_mhz = total("freq").filter(|v| *v > 0.0).or_else(|| power.first().map(|p| p.0));
-        s.performance_percent = total("perf");
+        s.base_mhz = Self::base_clock(machine_mhz, total("freq"), power.first().map(|p| p.0));
+        s.performance_percent = perf.instance("_Total").map(|i| i.value);
+        self.counted = vec![perf];
         s.utilization_percent = total("util");
         for (key, set) in [
             ("park", (|c: &mut CoreSample, v: f64| c.parked = Some(v != 0.0)) as fn(&mut CoreSample, f64)),
@@ -265,6 +291,10 @@ impl Provider for CpuCounters {
         };
         #[cfg(not(windows))]
         Err("Windows only".into())
+    }
+
+    fn counted(&mut self) -> Vec<CounterSet> {
+        std::mem::take(&mut self.counted)
     }
 
     fn read(&mut self, at: Instant) -> Vec<Reading> {
@@ -335,6 +365,16 @@ mod tests {
     use super::*;
     use crate::sensors::model::{Frame, Group, Kind};
 
+    #[test]
+    fn the_processors_rated_clock_given_to_the_provider_is_the_first_base_clock_source() {
+        let provider = CpuCounters::with_base_mhz(3_400);
+        assert_eq!(CpuCounters::base_clock(provider.machine_mhz, Some(2_900.0), Some(3_000.0)), Some(3_400.0), "the machine's clock first");
+        let unknown = CpuCounters::with_base_mhz(0);
+        assert_eq!(CpuCounters::base_clock(unknown.machine_mhz, Some(2_900.0), Some(3_000.0)), Some(2_900.0), "then the counter");
+        assert_eq!(CpuCounters::base_clock(unknown.machine_mhz, None, Some(3_000.0)), Some(3_000.0), "then the power API");
+        assert_eq!(CpuCounters::base_clock(unknown.machine_mhz, None, None), None, "else unknown");
+    }
+
     fn twelve_cores() -> CpuSample {
         CpuSample {
             name: "AMD Ryzen 5 7600X 6-Core Processor".into(),
@@ -349,9 +389,10 @@ mod tests {
 
     #[test]
     fn the_effective_clock_is_the_base_times_processor_performance() {
-        assert_eq!(effective_hz(4_700.0, 100.0), 4.7e9);
-        assert!((effective_hz(4_700.0, 108.7) - 5.1089e9).abs() < 1e3, "boost above the base");
-        assert_eq!(effective_hz(4_700.0, 50.0), 2.35e9, "below the base");
+        let hz = |b, p| effective_hz(Some(b), Some(p)).unwrap();
+        assert_eq!(hz(4_700.0, 100.0), 4.7e9);
+        assert!((hz(4_700.0, 108.7) - 5.1089e9).abs() < 1e3, "boost above the base");
+        assert_eq!(hz(4_700.0, 50.0), 2.35e9, "below the base");
     }
 
     #[test]

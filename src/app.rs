@@ -211,9 +211,6 @@ pub struct TaskApp {
     /// The latest sensor frame Summary's tiles read (GPU temperature and
     /// power, S.M.A.R.T.); `None` when no sensor has reported.
     pub summary_frame: Option<std::sync::Arc<crate::sensors::Frame>>,
-    /// The sensors Summary's tiles read, held only while Summary is the
-    /// page shown (see [`TaskApp::read_summary_sensors`]).
-    pub summary_sensors: Option<crate::sensors::Interest>,
     pub page: Page,
     #[allow(dead_code)]
     pub nav_open: bool,
@@ -290,8 +287,10 @@ impl TaskApp {
         if let Some(mode) = crate::theme::mode_from_args(&std::env::args().collect::<Vec<_>>()) {
             settings.theme_for_this_run(mode == crate::theme::Mode::Dark);
         }
-        let sampler = Sampler::start(settings.interval_ms());
         let mut addons = AddonHost::from_section(&settings.addons);
+        // The sampler reads the performance counters through the sensor
+        // service every page shares, so each counter is read once.
+        let sampler = Sampler::start(settings.interval_ms(), addons.context().sensors().clone());
         // `--page <id or name>` opens a given page (handy for pictures of it).
         let args: Vec<String> = std::env::args().collect();
         // Flags owned by add-ons (e.g. `--scan`); one that is off ignores them.
@@ -328,7 +327,6 @@ impl TaskApp {
             summary: Default::default(),
             machine_info: None,
             summary_frame: None,
-            summary_sensors: None,
             page,
             nav_open: true,
             perf: PerfItem::Cpu,
@@ -379,10 +377,23 @@ impl TaskApp {
     #[cfg(test)]
     pub fn headless(settings: Settings, snap: Snapshot) -> Self {
         let (_, rx) = std::sync::mpsc::channel();
-        let sampler = Sampler { rx, interval_ms: Default::default(), refresh_now: Default::default() };
+        let sampler = Sampler::detached(rx);
         let addons = AddonHost::from_section(&serde_json::json!({}));
         let mut app = Self::build(settings, sampler, addons, Page::Core(Core::Summary), None);
         app.snap = snap;
+        app.rebuild_summary();
+        app
+    }
+
+    /// An app for tests over a sensor service made of fake providers: a real
+    /// sampler holds its interest in the counter providers (the rest of a
+    /// snapshot, `fill`, is the test's) and the add-ons read the same
+    /// service. Samples reach the app when the test calls `pull_samples`.
+    #[cfg(test)]
+    pub fn headless_over(settings: Settings, sensors: crate::sensors::SensorService, fill: impl FnMut(&mut Snapshot) + Send + 'static) -> Self {
+        let sampler = Sampler::start_with(settings.interval_ms(), sensors.clone(), move || Box::new(fill));
+        let addons = AddonHost::over_sensors(sensors);
+        let mut app = Self::build(settings, sampler, addons, Page::Core(Core::Summary), None);
         app.rebuild_summary();
         app
     }
@@ -510,13 +521,27 @@ impl TaskApp {
         self.settings.save();
     }
 
+    /// Ends a frame after the page is drawn: the add-on host drops what is no
+    /// longer shown, and Summary's sensor frame goes with it when Summary was
+    /// not drawn (coming back never shows an old one).
+    pub(crate) fn end_frame(&mut self) {
+        let dropped = self.addons.end_frame();
+        if dropped.contains(&crate::addons::leases::Surface::Summary) {
+            self.summary_frame = None;
+        }
+    }
+
     pub fn refresh_now(&mut self) {
-        self.sampler.refresh_now.store(true, Ordering::Relaxed);
+        self.sampler.refresh();
         match self.page {
             Page::Core(Core::Services) => self.services = Some(winsys::list_services()),
             Page::Core(Core::Startup) => self.startup = Some(winsys::list_startup()),
             p => {
-                self.addons.refresh(p.id());
+                // An add-on refreshes itself and reads its sensors; for a core
+                // page, only the sensors it holds (Summary's) are read.
+                if !self.addons.refresh(p.id()) {
+                    self.addons.read_held_sensors();
+                }
             }
         }
     }
@@ -604,8 +629,7 @@ impl eframe::App for TaskApp {
             Page::Core(Core::Settings) => self.page_settings(ui, &mut actions),
             Page::Core(Core::Colors) => self.page_colors(ui),
         });
-        self.addons.end_frame();
-        self.summary_sensors_hidden();
+        self.end_frame();
         self.dialogs(ctx, &mut actions);
         self.off_question(ctx);
         self.close_question(ctx);
@@ -1257,7 +1281,7 @@ impl TaskApp {
             match result {
                 Ok(()) => {
                     self.say("Restarted Windows Explorer".to_string());
-                    self.sampler.refresh_now.store(true, Ordering::Relaxed);
+                    self.sampler.refresh_requested.store(true, Ordering::Relaxed);
                 }
                 Err(e) => self.say(e),
             }
@@ -1278,7 +1302,7 @@ impl TaskApp {
                 _ => self.say(format!("{done} {} processes", pids.len())),
             },
         }
-        self.sampler.refresh_now.store(true, Ordering::Relaxed);
+        self.sampler.refresh_requested.store(true, Ordering::Relaxed);
     }
 
     /// "Turn it off": Hide Microsoft Services and Processes goes off and
@@ -1335,7 +1359,7 @@ impl TaskApp {
             Action::End { pid, force, tree, name } => match winsys::end_process(pid, force, tree) {
                 Ok(()) => {
                     self.say(format!("Ended {name}"));
-                    self.sampler.refresh_now.store(true, Ordering::Relaxed);
+                    self.sampler.refresh_requested.store(true, Ordering::Relaxed);
                 }
                 Err(e) => self.say(e),
             },
@@ -1346,7 +1370,7 @@ impl TaskApp {
                     None => self.say(format!("Ended {} processes", pids.len())),
                     Some(e) => self.say(e),
                 }
-                self.sampler.refresh_now.store(true, Ordering::Relaxed);
+                self.sampler.refresh_requested.store(true, Ordering::Relaxed);
             }
             Action::Priority(pid, p) => match winsys::set_priority(pid, p) {
                 Ok(()) => self.say(format!("Priority set to {p}")),
@@ -1575,7 +1599,7 @@ mod tests {
     fn f5_still_asks_for_a_new_snapshot() {
         let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
         press(&mut app, egui::Key::F5, egui::Modifiers::NONE);
-        assert!(app.sampler.refresh_now.load(Ordering::Relaxed));
+        assert!(app.sampler.refresh_requested.load(Ordering::Relaxed));
         assert_eq!(app.run_dialog, None);
     }
 
@@ -1585,13 +1609,13 @@ mod tests {
         let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
         let f5 = || egui::Event::Key { key: egui::Key::F5, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
         crate::test_ui::run(&ctx, (400.0, 300.0), vec![f5()], |ui| app.shortcuts(ui.ctx()));
-        assert!(app.sampler.refresh_now.swap(false, Ordering::Relaxed), "the press refreshes");
+        assert!(app.sampler.refresh_requested.swap(false, Ordering::Relaxed), "the press refreshes");
         // Held down: the key repeats without a release in between.
         crate::test_ui::run(&ctx, (400.0, 300.0), vec![f5(), f5()], |ui| app.shortcuts(ui.ctx()));
-        assert!(!app.sampler.refresh_now.load(Ordering::Relaxed), "key repeats refresh nothing more");
+        assert!(!app.sampler.refresh_requested.load(Ordering::Relaxed), "key repeats refresh nothing more");
         let up = egui::Event::Key { key: egui::Key::F5, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE };
         crate::test_ui::run(&ctx, (400.0, 300.0), vec![up, f5()], |ui| app.shortcuts(ui.ctx()));
-        assert!(app.sampler.refresh_now.load(Ordering::Relaxed), "the next press refreshes again");
+        assert!(app.sampler.refresh_requested.load(Ordering::Relaxed), "the next press refreshes again");
     }
 
     #[test]

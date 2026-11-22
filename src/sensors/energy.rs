@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use super::model::{Device, Group, Reading, Unit};
+use super::model::{CounterSet, Device, Group, Reading, Unit};
 use super::provider::Provider;
 
 /// The provider's name in "Sources on this PC" / "Read from".
@@ -89,14 +89,17 @@ pub struct EnergyMeter {
     #[cfg(windows)]
     query: Option<super::pdh::Query>,
     name: String,
+    /// The channels of the last read, in milliwatts (see [`Provider::counted`]).
+    counted: Vec<CounterSet>,
 }
 
 impl EnergyMeter {
     pub fn new() -> Self {
         EnergyMeter {
             #[cfg(windows)]
-            query: super::pdh::Query::open(&[("power", r"\Energy Meter(*)\Power")]),
+            query: super::pdh::Query::open(&[(crate::perfdata::counter::POWER, r"\Energy Meter(*)\Power")]),
             name: super::cpu::cpu_name(),
+            counted: Vec::new(),
         }
     }
 }
@@ -116,17 +119,23 @@ impl Provider for EnergyMeter {
         Err("Windows only".into())
     }
 
+    fn counted(&mut self) -> Vec<CounterSet> {
+        std::mem::take(&mut self.counted)
+    }
+
     fn read(&mut self, at: Instant) -> Vec<Reading> {
         #[cfg(windows)]
-        let channels = match self.query.as_mut() {
+        let set = match self.query.as_mut() {
             Some(q) => {
                 q.collect();
-                q.values("power")
+                q.counted(crate::perfdata::counter::POWER, false)
             }
-            None => Vec::new(),
+            None => CounterSet::new(crate::perfdata::counter::POWER, Vec::new()),
         };
         #[cfg(not(windows))]
-        let channels = Vec::new();
+        let set = CounterSet::new(crate::perfdata::counter::POWER, Vec::new());
+        let channels: Vec<(String, f64)> = set.instances.iter().map(|i| (i.name.clone(), i.value)).collect();
+        self.counted = vec![set];
         readings(&channels, &self.name, at)
     }
 }

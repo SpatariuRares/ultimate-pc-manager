@@ -6,10 +6,19 @@ use crate::perfdata::DiskLive;
 use crate::sampler::NetRow;
 
 /// The CPU speed in MHz: the base frequency times the live "% Processor
-/// Performance" / 100 (the rule Performance and Summary share). `None`
-/// when either input is missing.
-pub fn cpu_speed_mhz(base_mhz: u32, performance_pct: f32) -> Option<f32> {
-    (base_mhz > 0 && performance_pct > 0.0).then(|| base_mhz as f32 * performance_pct / 100.0)
+/// Performance" / 100. The one rule Summary, Performance and Power & Freq
+/// share. `None` when either input is unknown (missing, or not above 0).
+pub fn cpu_speed_mhz(base_mhz: Option<f64>, performance_pct: Option<f64>) -> Option<f64> {
+    let (base, pct) = (base_mhz.filter(|b| *b > 0.0)?, performance_pct.filter(|p| *p > 0.0)?);
+    Some(base * pct / 100.0)
+}
+
+/// The CPU's base clock in MHz: the one fallback order every pipeline
+/// uses. The machine's fixed facts (registry `~MHz`, or the test override)
+/// come first, then the `Processor Frequency` counter, then the highest
+/// clock the power API reports. A source that is missing or 0 is skipped.
+pub fn base_clock_mhz(machine: Option<f64>, counter: Option<f64>, power_max: Option<f64>) -> Option<f64> {
+    [machine, counter, power_max].into_iter().flatten().find(|v| *v > 0.0)
 }
 
 /// A speed in MHz as shown on the pages: "3.74 GHz".
@@ -50,3 +59,24 @@ pub fn physical_disk_bps(disks: &[DiskLive]) -> Option<(f64, f64)> {
 /// all physical disks (one point per sample; NaN when a disk counter
 /// failed, a gap rather than 0).
 pub const DISKS_TOTAL: &str = "disks.rw";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cpu_speed_is_blank_when_the_base_clock_or_the_performance_level_is_unknown() {
+        assert_eq!(cpu_speed_mhz(Some(3_400.0), Some(110.0)).map(|v| v.round()), Some(3_740.0));
+        for (base, pct) in [(None, Some(110.0)), (Some(3_400.0), None), (Some(0.0), Some(110.0)), (Some(3_400.0), Some(0.0))] {
+            assert_eq!(cpu_speed_mhz(base, pct), None, "{base:?} x {pct:?}");
+        }
+    }
+
+    #[test]
+    fn the_base_clock_falls_back_machine_then_counter_then_power_api() {
+        assert_eq!(base_clock_mhz(Some(3_400.0), Some(3_500.0), Some(3_600.0)), Some(3_400.0));
+        assert_eq!(base_clock_mhz(Some(0.0), Some(3_500.0), Some(3_600.0)), Some(3_500.0), "a 0 source is skipped");
+        assert_eq!(base_clock_mhz(None, None, Some(3_600.0)), Some(3_600.0));
+        assert_eq!(base_clock_mhz(None, Some(0.0), None), None);
+    }
+}

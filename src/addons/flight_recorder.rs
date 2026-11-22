@@ -140,11 +140,12 @@ pub struct FlightRecorder {
     alive: Arc<()>,
     /// The live last minute the charts show.
     history: LiveHistory,
-    /// The one page interest in the shared sensor service (Neural Engine,
-    /// Thermals, the CPU and GPU temperatures and the GPU clock), held
-    /// while the page shows live data (see [`FlightRecorder::live_shown`]);
-    /// the add-on reads no sensor of its own.
-    sensors: Option<Interest>,
+    /// The latest sensor frame (Neural Engine, Thermals, the CPU and GPU
+    /// temperatures and the GPU clock) the host's lease gave the page at its
+    /// last draw while it shows live data (see
+    /// [`FlightRecorder::live_shown`]). The host owns the interest behind it
+    /// and ends it when the page is not drawn; the add-on keeps only the frame.
+    page_frame: Option<Arc<crate::sensors::Frame>>,
     /// The one recording interest (NPU and temperatures), held until Stop.
     recording_sensors: Option<Interest>,
     /// The temperatures of the sensors read at Record, kept up to date.
@@ -161,7 +162,7 @@ fn engines_now(s: &Snapshot) -> Option<layout::Engines> {
     if s.perf.gpus.is_empty() {
         return None;
     }
-    layout::engines_of(&s.perf.gpus, &crate::perfdata::info().gpus)
+    layout::engines_of(&s.perf.gpus, s.machine.as_deref().map_or(&[], |m| &m.gpus[..]))
 }
 
 impl FlightRecorder {
@@ -258,36 +259,22 @@ impl FlightRecorder {
         self.page_open && !self.is_replaying()
     }
 
-    /// Takes or drops the page interest in the shared sensors by
-    /// [`FlightRecorder::live_shown`]; called as the page opens or closes
-    /// and as a replay opens or closes, never while drawing.
-    fn hold_page_sensors(&mut self) {
-        if !self.live_shown() {
-            self.sensors = None;
-        } else if self.sensors.is_none() {
-            self.sensors = self.context.as_ref().map(|c| c.sensors().interest());
-        }
-    }
-
-    /// Before the page is drawn: opens it (the first time), keeps the
-    /// page interest at the update speed `interval_ms` and, after Refresh,
-    /// takes the GPU engines of `sample` again.
-    pub fn prepare_page(&mut self, sample: &Snapshot, interval_ms: u64) {
+    /// Before the page is drawn: opens it (the first time) and, after
+    /// Refresh, takes the GPU engines of `sample` again.
+    pub fn prepare_page(&mut self, sample: &Snapshot) {
         if !self.page_open {
             self.page_shown(sample);
-        }
-        if let Some(s) = &self.sensors {
-            s.set_interval_ms(interval_ms);
         }
         if std::mem::take(&mut self.reload_engines) && self.live_shown() {
             self.history.push_engines(engines_now(sample));
         }
     }
 
-    /// The sensors' latest frame through whichever interest is held (the
-    /// page's or the recording's); None while none is or before it answered.
+    /// The sensors' latest frame: the live page's, else the recording's;
+    /// None while neither is held or before it answered.
     fn latest_frame(&self) -> Option<Arc<crate::sensors::Frame>> {
-        self.sensors.as_ref().or(self.recording_sensors.as_ref())?.latest()
+        let page = self.live_shown().then(|| self.page_frame.clone()).flatten();
+        page.or_else(|| self.recording_sensors.as_ref()?.latest())
     }
 
     /// Stop (on the page or the Summary tile): ends the recording and
@@ -306,7 +293,6 @@ impl FlightRecorder {
         if self.live_shown() {
             self.history.push_engines(engines_now(sample));
         }
-        self.hold_page_sensors();
     }
 
     /// Whether its Summary tile shows: only while recording, unless
@@ -339,8 +325,7 @@ impl FlightRecorder {
                 self.position_ms = 0;
                 self.replay_error = None;
                 self.replay_note = None;
-                // Nothing on the page is live now.
-                self.hold_page_sensors();
+                // Nothing on the page is live now: the host's lease ends.
                 None
             }
             Err(e) => {
@@ -355,7 +340,6 @@ impl FlightRecorder {
         self.replay = None;
         self.position_ms = 0;
         self.replay_note = None;
-        self.hold_page_sensors();
     }
 
     /// Replay…: the picker, filtered on trace files.
@@ -665,24 +649,34 @@ impl Addon for FlightRecorder {
         }
     }
 
-    /// Refresh: the sensors are read again now and the GPU engines taken
-    /// again before the page is next drawn (#40).
+    /// Refresh: the sensors are read again now (the host reads for the
+    /// page's lease; the recording's own interest here) and the GPU engines
+    /// taken again before the page is next drawn (#40).
     fn refresh(&mut self) {
-        for interest in [&self.sensors, &self.recording_sensors].into_iter().flatten() {
+        if let Some(interest) = &self.recording_sensors {
             interest.read_now();
         }
         self.reload_engines = true;
     }
 
-    /// Stops asking the sensor service for the page (a recording keeps
-    /// its own interest until Stop) and stops taking the GPU engines.
+    /// Stops taking the GPU engines; the host ends the page's sensor
+    /// interest itself (a recording keeps its own until Stop).
     fn page_hidden(&mut self) {
         self.page_open = false;
-        self.hold_page_sensors();
+        self.page_frame = None;
     }
 
     fn ui(&mut self, ui: &mut Ui, page: &mut PageContext) {
-        self.prepare_page(page.sample, page.settings.interval_ms());
+        self.prepare_page(page.sample);
+        // Asking is what keeps the host's lease: only while live.
+        self.page_frame = if self.live_shown() {
+            page.sensors().and_then(|s| {
+                s.set_interval_ms(page.settings.interval_ms());
+                s.latest()
+            })
+        } else {
+            None
+        };
         self.page(ui, page);
     }
 }
@@ -813,32 +807,30 @@ mod tests {
     fn a_replay_takes_neither_the_gpu_engines_nor_the_sensors_for_the_page() {
         let path = trace_file("gating", &recorded_trace().to_json());
         let mut fr = started();
-        fr.prepare_page(&gpu_sample(40.0, 5.0), NORMAL);
-        assert!(fr.live_shown() && fr.sensors.is_some(), "shown live: the page reads the sensors");
+        fr.prepare_page(&gpu_sample(40.0, 5.0));
+        assert!(fr.live_shown(), "shown live");
         fr.replay_picked(Ok(Some(path.to_string_lossy().into())));
         let _ = std::fs::remove_file(&path);
         assert!(!fr.live_shown());
-        assert!(fr.sensors.is_none(), "the replay drops the page's interest as it opens");
         fr.on_sample(&gpu_sample(90.0, 5.0));
-        fr.prepare_page(&gpu_sample(90.0, 5.0), NORMAL);
+        fr.prepare_page(&gpu_sample(90.0, 5.0));
         assert_eq!(fr.history.engines().unwrap().cells[0].1, 40.0, "no engines taken during the replay");
-        assert!(fr.sensors.is_none(), "preparing the page takes no interest during a replay");
         fr.close_replay();
-        assert!(fr.sensors.is_some(), "back to live, the page reads the sensors again");
+        assert!(fr.live_shown(), "back to live");
         fr.on_sample(&gpu_sample(70.0, 5.0));
         assert_eq!(fr.history.engines().unwrap().cells[0].1, 70.0);
         fr.page_hidden();
-        assert!(fr.sensors.is_none());
+        assert!(!fr.live_shown());
     }
 
     #[test]
     fn refresh_takes_the_gpu_engines_again() {
         let mut fr = started();
-        fr.prepare_page(&gpu_sample(40.0, 5.0), NORMAL);
-        fr.prepare_page(&gpu_sample(55.0, 5.0), NORMAL);
+        fr.prepare_page(&gpu_sample(40.0, 5.0));
+        fr.prepare_page(&gpu_sample(55.0, 5.0));
         assert_eq!(fr.history.engines().unwrap().cells[0].1, 40.0, "drawn again, nothing new without a sample");
         fr.refresh();
-        fr.prepare_page(&gpu_sample(55.0, 5.0), NORMAL);
+        fr.prepare_page(&gpu_sample(55.0, 5.0));
         assert_eq!(fr.history.engines().unwrap().cells[0].1, 55.0, "Refresh reloads them");
     }
 
@@ -874,11 +866,21 @@ mod tests {
     #[test]
     #[ignore]
     fn lists_this_pcs_gpu_engines() {
-        let mut collector = crate::perfdata::Collector::new();
-        collector.sample();
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-        let live = collector.sample();
-        let engines = layout::engines_of(&live.gpus, &crate::perfdata::info().gpus).expect("a GPU with engine counters");
+        use crate::perfdata::counter;
+        let service = crate::sensors::SensorService::grouped(crate::sensors::provider::standard());
+        let interest = service.interest_in(crate::sensors::service::ProviderGroup::Counters);
+        interest.set_interval_ms(1000);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let frame = loop {
+            if let Some(f) = interest.latest() {
+                break f;
+            }
+            assert!(std::time::Instant::now() < end, "the counter providers gave no frame");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let of = |key: &str| frame.counter(key).map(|c| c.instances.iter().map(|i| (i.name.clone(), i.value)).collect::<Vec<_>>()).unwrap_or_default();
+        let gpus = crate::perfdata::gpu_adapters(&of(counter::GPU), &of(counter::GDED), &of(counter::GSH));
+        let engines = layout::engines_of(&gpus, &crate::sensors::machine::read().gpus).expect("a GPU with engine counters");
         println!("{}: {} engines", engines.adapter, engines.cells.len());
         for (name, v) in &engines.cells {
             println!("  {name}: {v:.1}%");
@@ -941,12 +943,27 @@ mod tests {
     /// Feeds samples (page shown) until the sensors have answered once.
     fn until_npus_known(fr: &mut FlightRecorder) {
         let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        fr.prepare_page(&sample(1.0), NORMAL);
         while fr.history.npus().is_none() {
+            draw_leased(fr);
             assert!(std::time::Instant::now() < end, "the sensors never answered");
             std::thread::sleep(std::time::Duration::from_millis(5));
             fr.on_sample(&sample(1.0));
         }
+    }
+
+    /// Draws the page as the host does: its sensors come from the leases of
+    /// the add-on's context.
+    fn draw_leased(fr: &mut FlightRecorder) {
+        let (settings, snap) = (crate::settings::Settings::default(), sample(1.0));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut page = PageContext::new(&settings, &snap);
+                page.lease = fr.context.as_ref().map(|c| c.leases().lease(crate::addons::leases::Surface::Page("flight-recorder")));
+                fr.ui(ui, &mut page);
+            });
+        });
     }
 
     #[test]
@@ -965,6 +982,68 @@ mod tests {
         assert_eq!(replay::check(&trace), Ok(()));
     }
 
+    /// A host with Flight Recorder alone.
+    fn recorder_host() -> crate::addons::AddonHost {
+        let entries = vec![crate::addons::Entry::Addon(Box::<FlightRecorder>::default())];
+        crate::addons::AddonHost::for_tests_with(entries, &serde_json::json!({})).0
+    }
+
+    /// One frame with the page drawn through the host, then the frame ends.
+    fn draw_through(host: &mut crate::addons::AddonHost) {
+        crate::addons::draw_page_with(host, "flight-recorder", &sample(1.0));
+    }
+
+    #[test]
+    fn the_live_page_holds_no_sensor_interest_of_its_own() {
+        let mut host = recorder_host();
+        draw_through(&mut host);
+        assert!(crate::addons::sensor_threads(&host) > 0, "the page reads the sensors while drawn");
+        // Only the host's lease keeps the service running for the page.
+        host.context.leases().release("flight-recorder");
+        crate::addons::until("no sensor thread", || crate::addons::sensor_threads(&host) == 0);
+    }
+
+    #[test]
+    fn leaving_the_page_while_nothing_records_stops_the_service() {
+        let mut host = recorder_host();
+        for _ in 0..3 {
+            draw_through(&mut host);
+        }
+        assert!(crate::addons::sensor_threads(&host) > 0);
+        host.end_frame(); // the first frame without the page
+        crate::addons::until("no sensor thread", || crate::addons::sensor_threads(&host) == 0);
+    }
+
+    #[test]
+    fn a_recording_keeps_the_service_running_after_the_page_is_hidden_and_stop_ends_it() {
+        let mut host = recorder_host();
+        draw_through(&mut host);
+        let (settings, snap) = (crate::settings::Settings::default(), sample(1.0));
+        let mut page = PageContext::new(&settings, &snap);
+        assert_eq!(host.record_sensors(true, &mut page), Ok(()));
+        draw_through(&mut host);
+        host.end_frame(); // the page is hidden
+        host.end_frame();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(crate::addons::sensor_threads(&host) > 0, "the recording keeps the service running");
+        assert_eq!(host.record_sensors(false, &mut page), Ok(()));
+        crate::addons::until("no sensor thread after Stop", || crate::addons::sensor_threads(&host) == 0);
+    }
+
+    #[test]
+    fn refresh_on_the_page_reads_the_sensors_at_once() {
+        let mut host = recorder_host();
+        draw_through(&mut host);
+        // Only the host's lease for the page exists; its update interval is far
+        // away, so nothing reads by itself while this test waits.
+        let page = host.context.leases().held_by("flight-recorder").expect("the host keeps the sensors for the page");
+        page.set_interval_ms(600_000);
+        crate::addons::until("a frame", || page.latest().is_some());
+        let before = page.latest().unwrap().seq;
+        assert!(host.refresh("flight-recorder"));
+        crate::addons::until("a newer frame", || page.latest().is_some_and(|f| f.seq > before));
+    }
+
     #[test]
     fn the_sensors_run_only_while_the_page_is_shown_or_a_recording_runs() {
         let mut fr = started();
@@ -981,6 +1060,8 @@ mod tests {
         until_npus_known(&mut fr);
         fr.record(NORMAL, &sample(1.0)).unwrap();
         fr.page_hidden();
+        service.leases().end_frame(); // the host ends the page's lease
+        service.leases().end_frame();
         std::thread::sleep(std::time::Duration::from_millis(20));
         assert!(service.sensors().threads() > 0, "the recording keeps reading the NPU");
         fr.finish();
@@ -995,8 +1076,8 @@ mod tests {
         let mut fr = FlightRecorder::default();
         fr.start(&AddonContext::system());
         let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        fr.prepare_page(&sample(1.0), NORMAL);
         while fr.history.npus().is_none() {
+            draw_leased(&mut fr);
             assert!(std::time::Instant::now() < end, "the sensors never answered");
             std::thread::sleep(std::time::Duration::from_millis(50));
             fr.on_sample(&sample(1.0));

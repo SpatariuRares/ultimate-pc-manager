@@ -21,6 +21,10 @@ pub mod ryzen;
 pub mod power_plan;
 /// The disk provider (physical disk counters).
 pub mod disk;
+/// The GPU engine and adapter memory counters (the per-adapter figures of the core pages).
+pub mod gpu_counters;
+/// Kernel time, pages read, compression, page file and the performance info.
+pub mod system_counters;
 /// Power source, battery, thermal state and ACPI thermal zones.
 pub mod power;
 /// Video cards (pure): readings, heading line, card matching.
@@ -40,10 +44,15 @@ pub mod npu;
 #[cfg(windows)]
 /// A PDH counter query (Windows performance counters).
 mod pdh;
+#[cfg(test)]
+/// A fake provider whose figures a test sets.
+pub mod fake;
 /// Firmware tables (SMBIOS): bus clock, motherboard, memory (#60).
 pub mod smbios;
 /// The firmware provider: Bus Clock, Motherboard and Memory (#60).
 pub mod board;
+/// The machine's fixed facts (processor, memory, disks, video cards).
+pub mod machine;
 /// Intel Dynamic Tuning: its row, grey until reading DTT is supported.
 pub mod intel_dtt;
 
