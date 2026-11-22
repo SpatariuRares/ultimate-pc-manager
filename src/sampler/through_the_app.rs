@@ -34,6 +34,9 @@ fn counted(perf: f64) -> Vec<CounterSet> {
         CounterSet::new(counter::DWRITE, vec![Instance::new("0 C:", 1_000_000.0).with_raw(4_000_000), Instance::new("_Total", 1_000_000.0)]),
         CounterSet::new(counter::POWER, vec![Instance::new("rapl_package0_pkg", 47_500.0)]),
     ]
+    .into_iter()
+    .chain(more_counted())
+    .collect()
 }
 
 /// An app whose counters are what `script` says, with the collector's gaps
@@ -41,6 +44,7 @@ fn counted(perf: f64) -> Vec<CounterSet> {
 fn app_over(script: &Arc<Script>, speed: usize, collector_gaps: &'static [&'static str]) -> (TaskApp, SensorService) {
     let service = SensorService::grouped(vec![(ProviderGroup::Counters, fake::provider("Windows counters", script))]);
     let app = TaskApp::headless_over(settings(speed), service.clone(), move |snap: &mut Snapshot| {
+        sysinfo_part(snap);
         snap.perf.unanswered = collector_gaps.iter().copied().collect();
     });
     (app, service)
@@ -61,9 +65,7 @@ fn pull_until(app: &mut TaskApp, what: &str, cond: impl Fn(&TaskApp) -> bool) {
 
 /// The same figures as a hand-built snapshot.
 fn by_hand(perf: f32) -> TaskApp {
-    let disk = DiskLive { number: 0, active: 50.0, read_bps: 3_000_000.0, write_bps: 1_000_000.0, total_read: 9_000_000, total_written: 4_000_000, ..Default::default() };
-    let snap = Snapshot { seq: 1, perf: PerfLive { cpu_perf_pct: perf, disks: vec![disk], cpu_power_w: Some(47.5), ..Default::default() }, ..Default::default() };
-    TaskApp::headless(settings(NORMAL), snap)
+    by_hand_all(perf)
 }
 
 #[test]
@@ -193,6 +195,162 @@ fn the_hardware_stops_with_the_last_page_while_the_sampler_keeps_the_counters() 
     app.addons.end_frame(); // another page: Summary did not ask
     crate::addons::until("the hardware stops", || service.threads_in(ProviderGroup::Hardware) == 0);
     assert_eq!(service.threads_in(ProviderGroup::Counters), 1, "the sampler still reads the counters");
+}
+
+/// What the providers of the rest of the counters count: kernel time per
+/// core, pages read, a disk's response time, the compressed memory, the page
+/// file and what GetPerformanceInfo returns.
+fn more_counted() -> Vec<CounterSet> {
+    let named = |name: &str, value: f64| Instance::new(name, value);
+    vec![
+        CounterSet::new(counter::KERNEL, vec![named("0", 8.0), named("1", 4.0), named("_Total", 6.0)]),
+        CounterSet::new(counter::PAGEIN, vec![Instance::new("", 120.0).with_raw(9_000)]),
+        CounterSet::new(counter::DRESP, vec![named("0 C:", 0.0035), named("_Total", 0.0035)]),
+        CounterSet::new(counter::COMPR, vec![named("memory compression", 512.0 * 1024.0 * 1024.0)]),
+        CounterSet::new(counter::PAGEFILE, vec![named("_total", 40.0)]),
+        CounterSet::new(crate::perfdata::PERF_INFO, vec![named("threads", 2_000.0), named("handles", 90_000.0), named("commit", 8e9), named("commit_limit", 3e10), named("cached", 4e9)]),
+    ]
+}
+
+fn all_counted() -> Vec<CounterSet> {
+    counted(110.0)
+}
+
+/// A hand-built snapshot with the same figures `all_counted` counts.
+fn by_hand_all(perf_level: f32) -> TaskApp {
+    let disk = DiskLive { number: 0, active: 50.0, read_bps: 3_000_000.0, write_bps: 1_000_000.0, total_read: 9_000_000, total_written: 4_000_000, resp_ms: 3.5, ..Default::default() };
+    let perf = PerfLive {
+        cpu_perf_pct: perf_level,
+        disks: vec![disk],
+        cpu_power_w: Some(47.5),
+        kernel_total: 6.0,
+        kernel_per_core: vec![8.0, 4.0],
+        hard_faults: 120.0,
+        page_ins: 9_000,
+        compressed: 512 * 1024 * 1024,
+        pagefile_pct: 40.0,
+        threads: 2_000,
+        handles: 90_000,
+        commit: 8_000_000_000,
+        commit_limit: 30_000_000_000,
+        cached: 4_000_000_000,
+        ..Default::default()
+    };
+    TaskApp::headless(settings(NORMAL), Snapshot { seq: 1, perf, compressed: 512 * 1024 * 1024, swap_total: 10_000_000_000, swap_used: 2_000_000_000, mem_total: 16_000_000_000, cpu_total: 20.0, cpu_per_core: vec![30.0, 10.0], ..Default::default() })
+}
+
+/// What the PC's sysinfo part reads: 20 % busy, a 10 GB page file.
+fn sysinfo_part(snap: &mut Snapshot) {
+    snap.cpu_total = 20.0;
+    snap.cpu_per_core = vec![30.0, 10.0];
+    snap.mem_total = 16_000_000_000;
+    snap.swap_total = 10_000_000_000;
+}
+
+fn app_filled(script: &Arc<Script>, fill: impl FnMut(&mut Snapshot) + Send + 'static) -> TaskApp {
+    let service = SensorService::grouped(vec![(ProviderGroup::Counters, fake::provider("Windows counters", script))]);
+    TaskApp::headless_over(settings(NORMAL), service, fill)
+}
+
+fn top(app: &TaskApp, item: PerfItem, key: &str) -> String {
+    app.stats(item).top.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()).unwrap_or_else(|| panic!("no {key}"))
+}
+
+#[test]
+fn the_memory_and_disk_figures_the_provider_counted_show_as_the_collector_showed_them() {
+    let script = Script::new(all_counted());
+    let mut app = app_filled(&script, |snap: &mut Snapshot| {
+        sysinfo_part(snap);
+        snap.swap_used = 2_000_000_000;
+    });
+    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+    let mut hand = by_hand_all(110.0);
+    for key in ["Committed", "Cached", "Compressed", "Page ins", "Hard faults", "Swap used"] {
+        assert_eq!(top(&app, PerfItem::Memory, key), top(&hand, PerfItem::Memory, key), "Memory > {key}");
+    }
+    assert_eq!(top(&app, PerfItem::Memory, "Page ins"), "9000");
+    assert_eq!(top(&app, PerfItem::Disk(0), "Avg. response time"), "3.50 ms", "the disk response time still shows");
+    assert_eq!(top(&app, PerfItem::Cpu, "Threads"), "2000");
+    assert_eq!(app.summary_view().memory_footer, hand.summary_view().memory_footer);
+    assert_eq!(ProviderState::of(&app.snap), ProviderState::Healthy);
+}
+
+#[test]
+fn kernel_time_from_the_provider_fills_the_kernel_series_and_a_failed_counter_is_a_gap() {
+    let script = Script::new(all_counted());
+    let mut app = app_filled(&script, sysinfo_part);
+    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+    assert_eq!(app.summary_view().cpu_kernel.last().copied(), Some(6.0), "kernel time of the whole CPU");
+    assert_eq!(ProviderState::of(&app.snap), ProviderState::Healthy);
+
+    script.set(all_counted().into_iter().filter(|c| c.key != counter::KERNEL).collect());
+    let seq = app.snap.seq;
+    pull_until(&mut app, "a sample without the kernel counter", |a| a.snap.seq > seq && !a.snap.perf.answered(counter::KERNEL));
+    assert!(app.summary_view().cpu_kernel.last().is_some_and(|v| v.is_nan()), "a gap in the kernel series, not 0");
+    assert_eq!(ProviderState::of(&app.snap), ProviderState::Degraded, "kernel time is a required counter");
+}
+
+#[test]
+fn a_failed_page_input_or_response_time_counter_degrades_the_state() {
+    for gone in [counter::PAGEIN, counter::DRESP] {
+        let script = Script::new(all_counted().into_iter().filter(|c| c.key != gone).collect());
+        let mut app = app_filled(&script, sysinfo_part);
+        pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+        assert!(!app.snap.perf.answered(gone), "{gone} did not answer");
+        assert_eq!(ProviderState::of(&app.snap), ProviderState::Degraded, "{gone} is a required counter");
+    }
+}
+
+#[test]
+fn the_compressed_memory_and_the_page_file_counters_are_optional() {
+    for gone in [counter::COMPR, counter::PAGEFILE] {
+        let script = Script::new(all_counted().into_iter().filter(|c| c.key != gone).collect());
+        let mut app = app_filled(&script, sysinfo_part);
+        pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+        assert!(!app.snap.perf.answered(gone));
+        assert_eq!(ProviderState::of(&app.snap), ProviderState::Healthy, "{gone}: an optional counter never degrades");
+    }
+}
+
+#[test]
+fn a_failed_performance_info_call_is_degraded_and_cached_is_a_gap() {
+    let script = Script::new(all_counted().into_iter().filter(|c| c.key != crate::perfdata::PERF_INFO).collect());
+    let mut app = app_filled(&script, sysinfo_part);
+    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+    assert_eq!(ProviderState::of(&app.snap), ProviderState::Degraded);
+    assert!(app.summary_view().memory_footer.contains("Cached \u{2014}"), "cached is a gap: {}", app.summary_view().memory_footer);
+}
+
+#[test]
+fn without_a_compression_counter_the_compressed_memory_is_the_compression_process() {
+    let compression = |snap: &mut Snapshot| {
+        sysinfo_part(snap);
+        snap.procs.push(crate::sampler::ProcRow { pid: 4, name: "Memory Compression".into(), mem: 300 * 1024 * 1024, ..Default::default() });
+    };
+    let script = Script::new(all_counted().into_iter().filter(|c| c.key != counter::COMPR).collect());
+    let mut app = app_filled(&script, compression);
+    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+    assert_eq!(top(&app, PerfItem::Memory, "Compressed"), "300.0 MB");
+    // The counter, when it answers, wins over the process.
+    let script = Script::new(all_counted());
+    let mut app = app_filled(&script, compression);
+    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+    assert_eq!(top(&app, PerfItem::Memory, "Compressed"), "512.0 MB");
+}
+
+#[test]
+fn when_sysinfo_sees_no_page_file_use_the_page_file_counters_percent() {
+    let script = Script::new(all_counted());
+    let mut app = app_filled(&script, sysinfo_part);
+    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+    assert_eq!(app.snap.swap_used, 4_000_000_000, "40 % of the 10 GB page file");
+    // What sysinfo read wins.
+    let mut app = app_filled(&script, |snap: &mut Snapshot| {
+        sysinfo_part(snap);
+        snap.swap_used = 1_000_000_000;
+    });
+    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+    assert_eq!(app.snap.swap_used, 1_000_000_000);
 }
 
 /// The real providers on this PC (needs Windows counters): what the sampler
