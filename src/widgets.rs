@@ -594,15 +594,21 @@ fn view_items(view: &[parts::DropItem<ProcView>]) -> Vec<MenuEntry> {
         .collect()
 }
 
+/// `state` with what the menu reads about the row right-clicked, asked of
+/// `system`: the priority (one row only), the affinity and whether the row
+/// has a window. A value the page already gave is kept.
+pub fn read_menu_state<'a>(system: &dyn crate::system_actions::SystemActions, p: &ProcRow, rows: &[&ProcRow], state: &MenuState<'a>) -> MenuState<'a> {
+    let priority = if state.priority.is_none() && rows.len() <= 1 { system.priority_of(p.pid) } else { state.priority };
+    let affinity = state.affinity.or_else(|| system.affinity_of(p.pid));
+    let windowed = state.windowed.or_else(|| (rows.len() <= 1).then(|| p.app || system.has_window(p.pid)));
+    MenuState { priority, affinity, windowed, ..*state }
+}
+
 /// The right-click menu of a process ([`menu_entries`]), drawn. The
-/// priority ticked in Set priority and whether the row has a window are
-/// read here for one row.
+/// priority, affinity and window of the row come in `state`
+/// ([`read_menu_state`] reads them from the seam).
 pub fn process_menu(ui: &mut Ui, p: &ProcRow, rows: &[&ProcRow], state: &MenuState, actions: &mut Vec<Action>) {
-    let priority = if state.priority.is_none() && rows.len() <= 1 { winsys::get_priority(p.pid) } else { state.priority };
-    let affinity = state.affinity.or_else(|| winsys::get_affinity(p.pid));
-    let windowed = state.windowed.or_else(|| (rows.len() <= 1).then(|| p.app || crate::proc_info::has_window(p.pid)));
-    let state = MenuState { priority, affinity, windowed, ..*state };
-    draw_entries(ui, &menu_entries(p, rows, &state), false, actions);
+    draw_entries(ui, &menu_entries(p, rows, state), false, actions);
 }
 
 /// Draws menu lines; in a submenu every item keeps room for a tick.

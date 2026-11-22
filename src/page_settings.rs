@@ -599,7 +599,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use crate::core_page::testing::{self, place};
-    use crate::core_page::Histories;
+    use crate::core_page::{Histories, PerfHistory};
     use crate::sampler::Snapshot;
     use crate::test_ui::{context, run, texts};
     use crate::theme::Mode;
@@ -639,7 +639,8 @@ mod tests {
         fn frame(&mut self, events: Vec<Event>) -> (egui::FullOutput, Vec<Action>) {
             let snapshot = Snapshot::default();
             let (cpu, mem) = (VecDeque::new(), VecDeque::new());
-            let page_ctx = PageCtx { settings: &self.settings, snapshot: &snapshot, histories: Histories { cpu: &cpu, mem: &mem } };
+            let perf = PerfHistory::new();
+            let page_ctx = PageCtx { settings: &self.settings, snapshot: &snapshot, histories: Histories { cpu: &cpu, mem: &mem, perf: &perf } };
             let mut actions = Vec::new();
             let (page, host) = (&mut self.page, &mut self.host);
             let out = run(&self.ctx, (1335.0, 1400.0), events, |ui| page.draw_with_addons(ui, &page_ctx, host, &mut actions));
@@ -736,7 +737,8 @@ mod tests {
         let mut b = Bench::new();
         b.settings.fahrenheit = true;
         b.settings.addons = serde_json::json!({"disk-space": {"on": false}});
-        let expected = Settings { addons: b.settings.addons.clone(), ..Settings::default() };
+        let mut expected = Settings::default();
+        expected.addons = b.settings.addons.clone();
         assert_eq!(b.click("Reset to defaults"), [Action::ChangeSettings(Box::new(expected))]);
     }
 

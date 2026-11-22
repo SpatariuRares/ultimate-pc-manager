@@ -68,7 +68,7 @@ impl TaskApp {
         let frame = self.summary_frame.as_deref();
         let fahrenheit = self.settings.fahrenheit;
         let read = |id: &str| frame.and_then(|f| f.reading(id)).filter(|r| r.value.is_some()).map(|r| r.text_in(fahrenheit));
-        let devices = self.devices();
+        let devices = crate::page_perf::devices(&self.settings, s, self.machine(), &self.ph);
         let mut tiles = Vec::new();
         // Before the first sample no figure is a reading.
         let waiting = s.seq == 0;

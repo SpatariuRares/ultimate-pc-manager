@@ -124,6 +124,10 @@ pub enum Action {
     ChangeSettings(Box<Settings>),
     /// Settings › Add-ons: turns the add-on on or off and saves the choice.
     SetAddon(&'static str, bool),
+    /// Refresh now (the Refresh button of a page that draws its own header).
+    Refresh,
+    /// A choice Performance saves (see [`crate::page_perf::PerfSetting`]).
+    PerfSetting(crate::page_perf::PerfSetting),
 }
 
 /// Said when Restart ends Windows Explorer but explorer.exe does not start

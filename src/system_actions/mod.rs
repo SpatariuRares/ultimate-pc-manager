@@ -58,6 +58,17 @@ pub trait SystemActions: Send + Sync {
     fn open_power_options(&self) -> Result<(), String>;
 
     // ---- (add the next group of actions below, in its own section) ----
+
+    // ---- Process priority and the process menu's reads (ticket 97) ----
+
+    /// Sets the priority class of `pid` (one of the names Set priority offers).
+    fn set_priority(&self, pid: u32, class: &str) -> Result<(), String>;
+    /// The priority class of `pid`; None when it cannot be read.
+    fn priority_of(&self, pid: u32) -> Option<&'static str>;
+    /// The processor affinity of `pid`; None when it cannot be read.
+    fn affinity_of(&self, pid: u32) -> Option<crate::winsys::Affinity>;
+    /// Whether `pid` has any visible top-level window.
+    fn has_window(&self, pid: u32) -> bool;
 }
 
 /// One request the seam received (what the recording adapter notes).
@@ -83,4 +94,7 @@ pub enum Request {
     RunNewTask(String),
     OpenPowerOptions,
     // ---- (add the next group's requests below) ----
+
+    // ---- Process priority and the process menu's reads (ticket 97) ----
+    Priority(u32, String),
 }

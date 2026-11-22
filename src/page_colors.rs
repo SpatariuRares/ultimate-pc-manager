@@ -162,7 +162,7 @@ mod tests {
 
     use super::*;
     use crate::core_page::testing::{click, draw, draw_with};
-    use crate::core_page::Histories;
+    use crate::core_page::{Histories, PerfHistory};
     use crate::sampler::Snapshot;
     use crate::test_ui::{context, flat_shapes, run};
     use crate::theme::Mode;
@@ -184,7 +184,8 @@ mod tests {
     /// One frame of Colors with `settings` and the CPU history `cpu`.
     fn frame(settings: &Settings, cpu: &VecDeque<f32>) -> egui::FullOutput {
         let (snapshot, mem) = (Snapshot::default(), VecDeque::new());
-        let page_ctx = PageCtx { settings, snapshot: &snapshot, histories: Histories { cpu, mem: &mem } };
+        let perf = PerfHistory::new();
+        let page_ctx = PageCtx { settings, snapshot: &snapshot, histories: Histories { cpu, mem: &mem, perf: &perf } };
         run(&context(Mode::Dark), (1400.0, 900.0), vec![], |ui| ColorsPage.draw(ui, &page_ctx, &mut Vec::new()))
     }
 
