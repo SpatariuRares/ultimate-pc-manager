@@ -13,6 +13,8 @@ pub struct RecordingActions {
     /// Scripted failures: a request equal to the first of a pair fails with
     /// the second.
     failures: Mutex<Vec<(Request, String)>>,
+    /// What `is_admin` answers (not elevated unless a test says so).
+    admin: std::sync::atomic::AtomicBool,
 }
 
 impl RecordingActions {
@@ -24,6 +26,11 @@ impl RecordingActions {
     /// From now on `request` (every time it is made) fails with `error`.
     pub fn fail(&self, request: Request, error: &str) {
         self.failures.lock().unwrap_or_else(|e| e.into_inner()).push((request, error.into()));
+    }
+
+    /// From now on the seam says the app does (or does not) run as administrator.
+    pub fn set_admin(&self, admin: bool) {
+        self.admin.store(admin, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Notes `request` and answers it: its scripted failure, else success.
@@ -53,6 +60,32 @@ impl SystemActions for RecordingActions {
     }
     fn set_affinity(&self, pid: u32, mask: u64) -> Result<(), String> {
         self.record(Request::Affinity(pid, mask))
+    }
+
+    // ---- Elevation, administrator check and the remaining actions (ticket 99) ----
+    fn restart_elevated(&self, _page: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn is_admin(&self) -> bool {
+        false
+    }
+    fn toggle_uac_virtualization(&self, _pid: u32) -> Result<(), String> {
+        Ok(())
+    }
+    fn bring_to_front(&self, _pid: u32) -> Result<(), String> {
+        Ok(())
+    }
+    fn open_file_location(&self, _path: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn reveal_in_explorer(&self, _path: &std::path::Path) -> Result<(), String> {
+        Ok(())
+    }
+    fn run_new_task(&self, _cmdline: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn open_power_options(&self) -> Result<(), String> {
+        Ok(())
     }
 
     // ---- (add the next group of actions below, in its own section) ----

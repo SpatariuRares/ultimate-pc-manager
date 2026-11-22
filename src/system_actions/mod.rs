@@ -29,6 +29,25 @@ pub trait SystemActions: Send + Sync {
     /// Lets `pid` run only on the processors whose bit is set in `mask`.
     fn set_affinity(&self, pid: u32, mask: u64) -> Result<(), String>;
 
+    // ---- Elevation, administrator check and the remaining actions (ticket 99) ----
+
+    /// Starts the app again with administrator rights, opening on `page`.
+    /// Ok means the elevated copy took over and this one should close.
+    fn restart_elevated(&self, page: &str) -> Result<(), String>;
+    /// Whether the app runs with administrator rights.
+    fn is_admin(&self) -> bool;
+    /// Turns UAC virtualization of `pid` on or off.
+    fn toggle_uac_virtualization(&self, pid: u32) -> Result<(), String>;
+    /// Brings the main window of `pid` to the front.
+    fn bring_to_front(&self, pid: u32) -> Result<(), String>;
+    /// Opens the folder of the program file `path` in Explorer.
+    fn open_file_location(&self, path: &str) -> Result<(), String>;
+    /// Shows `path` selected in Explorer.
+    fn reveal_in_explorer(&self, path: &std::path::Path) -> Result<(), String>;
+    /// Runs the command line `cmdline` (Run new task).
+    fn run_new_task(&self, cmdline: &str) -> Result<(), String>;
+    fn open_power_options(&self) -> Result<(), String>;
+
     // ---- (add the next group of actions below, in its own section) ----
 }
 
@@ -42,5 +61,13 @@ pub enum Request {
     Resume(u32),
     Efficiency(u32),
     Affinity(u32, u64),
+    // ---- Elevation, administrator check and the remaining actions (ticket 99) ----
+    RestartElevated(String),
+    UacVirtualization(u32),
+    BringToFront(u32),
+    OpenFileLocation(String),
+    RevealInExplorer(std::path::PathBuf),
+    RunNewTask(String),
+    OpenPowerOptions,
     // ---- (add the next group's requests below) ----
 }
