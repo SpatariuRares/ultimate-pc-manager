@@ -205,7 +205,7 @@ pub struct TaskApp {
     /// [`crate::core_page`]).
     pub pages: crate::core_page::CorePages,
     /// Long histories for the Performance page graphs, by series name.
-    pub ph: BTreeMap<String, VecDeque<f32>>,
+    pub ph: crate::core_page::PerfHistory,
     /// What the Summary page draws, built once per new sample.
     pub summary: crate::summary_view::SummaryView,
     /// The machine's fixed facts (base clock, disk models, GPUs) when set (tests);
@@ -217,7 +217,6 @@ pub struct TaskApp {
     pub page: Page,
     #[allow(dead_code)]
     pub nav_open: bool,
-    pub perf: PerfItem,
     pub search: String,
     /// The Processes table's layout as last saved (see
     /// [`TaskApp::process_table_unsaved`]).
@@ -348,7 +347,6 @@ impl TaskApp {
             summary_frame: None,
             page,
             nav_open: true,
-            perf: PerfItem::Cpu,
 
             search: String::new(),
             process_table_saved: Default::default(),
@@ -389,7 +387,6 @@ impl TaskApp {
             close_questions: None,
             closing: false,
         };
-        app.perf = PerfItem::from_key(&app.settings.perf_device);
         app.process_table_saved = app.settings.process_table.clone();
         app.rebuild_summary();
         app
@@ -483,7 +480,6 @@ impl TaskApp {
     pub(crate) fn draw_page(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         match self.page {
             Page::Core(Core::Summary) => self.page_summary(ui, actions),
-            Page::Core(Core::Performance) => self.page_performance(ui),
             Page::Core(Core::Processes) => self.page_processes(ui, actions),
             Page::Core(Core::Startup) => self.page_startup(ui, actions),
             Page::Core(Core::Services) => self.page_services(ui, actions),
@@ -502,7 +498,7 @@ impl TaskApp {
         if let Some(title) = title {
             self.header(ui, title);
         }
-        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
+        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
         let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories };
         if let Some(page) = self.pages.page_mut(core) {
             page.draw(ui, &ctx, actions);
@@ -596,14 +592,14 @@ impl TaskApp {
         self.sample_pages(SampleSlot::Summary, &s);
         self.snap = s;
         self.rebuild_summary();
-        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
+        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
         self.pages.on_sample(SampleSlot::Last, &PageCtx { settings: &self.settings, snapshot: &self.snap, histories });
         self.ask_signatures();
     }
 
     /// Delivers the new sample `s` to the core pages of `slot`.
     fn sample_pages(&mut self, slot: SampleSlot, s: &Snapshot) {
-        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
+        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
         self.pages.on_sample(slot, &PageCtx { settings: &self.settings, snapshot: s, histories });
     }
 
@@ -629,7 +625,7 @@ impl TaskApp {
             Page::Core(Core::Services) => self.reload_services(),
             Page::Core(Core::Startup) => self.reload_startup(),
             Page::Core(c) if self.pages.page_mut(c).is_some() => {
-                let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
+                let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
                 let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories };
                 if let Some(page) = self.pages.page_mut(c) {
                     page.refresh(&ctx);
@@ -878,7 +874,9 @@ impl TaskApp {
                         }
                     });
                     if self.page == Page::Core(Core::Performance) {
-                        self.performance_menu(ui);
+                        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
+                        let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories };
+                        self.pages.performance.menu(ui, &ctx, actions);
                     }
                     // An add-on's own menu, when it belongs in the menu bar.
                     if let Page::Addon(id) = self.page {
@@ -1529,6 +1527,11 @@ impl TaskApp {
                 }
             }
             Action::UpdateSpeed(i) => self.set_speed(i),
+            Action::Refresh => self.refresh_now(),
+            Action::PerfSetting(change) => {
+                change.apply(&mut self.settings);
+                self.settings.save();
+            }
             Action::ExportCsv { file_name, text } => {
                 let Some(path) = crate::platform::pick_csv(file_name) else { return };
                 // With a byte order mark, as the other exports: Excel then
@@ -2467,11 +2470,52 @@ mod tests {
 
     #[test]
     fn refresh_on_a_moved_page_still_asks_the_sampler_for_a_sample() {
-        for core in [Core::SystemInfo, Core::Users] {
+        for core in [Core::SystemInfo, Core::Users, Core::Performance] {
             let mut app = app_with_three_processes();
             app.page = Page::Core(core);
             app.refresh_now();
             assert!(refreshed(&app), "{core:?}");
         }
+    }
+
+    #[test]
+    fn performance_is_drawn_for_its_page_with_its_own_header() {
+        let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
+        app.page = Page::Core(Core::Performance);
+        let texts = page_texts(&mut app);
+        assert!(texts.iter().any(|t| t == "Performance"), "its title: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Memory"), "its device list: {texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("Run new task")), "no standard header: {texts:?}");
+    }
+
+    #[test]
+    fn the_device_chosen_on_performance_is_saved_in_the_settings() {
+        let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
+        app.run_action(&egui::Context::default(), Action::PerfSetting(crate::page_perf::PerfSetting::Device("memory".into())));
+        assert_eq!(app.settings.perf_device, "memory");
+    }
+
+    #[test]
+    fn the_refresh_button_of_performance_asks_the_sampler_for_a_sample() {
+        let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
+        app.run_action(&egui::Context::default(), Action::Refresh);
+        assert!(refreshed(&app));
+    }
+
+    #[test]
+    fn pausing_freezes_the_performance_history_and_refresh_still_adds_a_point() {
+        let (mut app, feed) = TaskApp::fed(Settings::default(), Snapshot::default());
+        let points = |app: &TaskApp| app.ph.get("cpu").map_or(0, |h| h.len());
+        feed.send(Snapshot::default()).expect("sent");
+        app.pull_samples();
+        let running = points(&app);
+        assert!(running > 0, "a running sample adds a point");
+        app.settings.speed = SPEEDS.iter().position(|s| s.1 == 0).expect("a Paused speed");
+        feed.send(Snapshot::default()).expect("sent");
+        app.pull_samples();
+        assert_eq!(points(&app), running, "paused, the history stays");
+        feed.send(Snapshot { forced: true, ..Default::default() }).expect("sent");
+        app.pull_samples();
+        assert_eq!(points(&app), running + 1, "Refresh still adds a point");
     }
 }
