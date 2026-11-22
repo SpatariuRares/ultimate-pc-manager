@@ -175,8 +175,8 @@ pub struct PerfLive {
     pub unanswered: std::collections::BTreeSet<&'static str>,
 }
 
-/// The performance counters' keys: in `PerfLive::unanswered`, [`COUNTERS`]
-/// and the collector's query.
+/// The performance counters' keys: in `PerfLive::unanswered` and
+/// [`COUNTERS`]. Each key is read by exactly one sensor provider.
 pub mod counter {
     /// Kernel (privileged) time per processor and in total.
     pub const KERNEL: &str = "kernel";
@@ -214,17 +214,6 @@ pub const COUNTERS: &[&str] = &[counter::KERNEL, counter::PAGEIN, counter::IDLE,
 
 /// Counters a healthy PC may never answer (VMs, no page file): gaps, but not counted in the provider state.
 pub const OPTIONAL: &[&str] = &[counter::PERF, counter::COMPR, counter::PAGEFILE];
-
-/// The counters the sensor service's providers read for the Sampler: they
-/// are in no query of the [`Collector`], and the Sampler adds the ones that
-/// did not answer to [`PerfLive::unanswered`] when it merges what the
-/// providers counted (see `sampler::counters_into`).
-pub const PROVIDED: &[&str] = &[counter::PERF, counter::IDLE, counter::DREAD, counter::DWRITE, counter::POWER, counter::GPU, counter::GDED, counter::GSH, counter::KERNEL, counter::PAGEIN, counter::DRESP, counter::COMPR, counter::PAGEFILE, PERF_INFO];
-
-/// [`COUNTERS`] and [`OPTIONAL`] the [`Collector`] itself reads.
-fn collected() -> impl Iterator<Item = &'static str> {
-    COUNTERS.iter().chain(OPTIONAL).copied().filter(|k| !PROVIDED.contains(k))
-}
 
 /// Not a counter but the GetPerformanceInfo call (threads, handles, commit,
 /// cached): in `unanswered` when the call failed, so its figures are gaps.
@@ -296,21 +285,6 @@ pub struct StaticInfo {
     pub disks: Vec<DiskInfo>,
     pub gpus: Vec<GpuInfo>,
 }
-
-/// What the performance-data collector still reads: nothing. Every counter
-/// comes from the sensor service's providers (see `sampler::counters_into`);
-/// the collector is removed with the rest of the old path.
-pub struct Collector;
-
-impl Collector {
-    pub fn new() -> Self {
-        Collector
-    }
-    pub fn sample(&mut self) -> PerfLive {
-        PerfLive { unanswered: collected().collect(), ..Default::default() }
-    }
-}
-
 
 #[cfg(test)]
 mod tests {

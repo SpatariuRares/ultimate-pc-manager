@@ -866,11 +866,21 @@ mod tests {
     #[test]
     #[ignore]
     fn lists_this_pcs_gpu_engines() {
-        let mut collector = crate::perfdata::Collector::new();
-        collector.sample();
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-        let live = collector.sample();
-        let engines = layout::engines_of(&live.gpus, &crate::sensors::machine::read().gpus).expect("a GPU with engine counters");
+        use crate::perfdata::counter;
+        let service = crate::sensors::SensorService::grouped(crate::sensors::provider::standard());
+        let interest = service.interest_in(crate::sensors::service::ProviderGroup::Counters);
+        interest.set_interval_ms(1000);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let frame = loop {
+            if let Some(f) = interest.latest() {
+                break f;
+            }
+            assert!(std::time::Instant::now() < end, "the counter providers gave no frame");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let of = |key: &str| frame.counter(key).map(|c| c.instances.iter().map(|i| (i.name.clone(), i.value)).collect::<Vec<_>>()).unwrap_or_default();
+        let gpus = crate::perfdata::gpu_adapters(&of(counter::GPU), &of(counter::GDED), &of(counter::GSH));
+        let engines = layout::engines_of(&gpus, &crate::sensors::machine::read().gpus).expect("a GPU with engine counters");
         println!("{}: {} engines", engines.adapter, engines.cells.len());
         for (name, v) in &engines.cells {
             println!("  {name}: {v:.1}%");

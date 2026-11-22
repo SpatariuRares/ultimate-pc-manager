@@ -338,7 +338,6 @@ fn system_fill() -> Fill {
     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
     let mut last = Instant::now();
     let mut disk_tick = 0u32;
-    let mut perf = crate::perfdata::Collector::new();
     let mut facts = crate::proc_info::Reader::default();
     let mut descriptions: HashMap<String, String> = HashMap::new();
     // A short first wait so CPU usage has two points to compare.
@@ -438,7 +437,6 @@ fn system_fill() -> Fill {
                 });
             }
             snap.uptime = System::uptime();
-            snap.perf = perf.sample();
     })
 }
 
