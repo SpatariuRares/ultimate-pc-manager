@@ -13,12 +13,20 @@ pub struct RecordingActions {
     /// Scripted failures: a request equal to the first of a pair fails with
     /// the second.
     failures: Mutex<Vec<(Request, String)>>,
+    /// What the reads answer (ticket 97); an unscripted read finds nothing.
+    reads: Mutex<Reads>,
     /// Scripted waits: a request equal to the first of a pair takes that long
     /// to answer (like a real dump or Explorer restart).
     delays: Mutex<Vec<(Request, std::time::Duration)>>,
-
     /// What `is_admin` answers (not elevated unless a test says so).
     admin: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct Reads {
+    priority: Vec<(u32, &'static str)>,
+    affinity: Vec<(u32, crate::winsys::Affinity)>,
+    windowed: Vec<u32>,
 }
 
 impl RecordingActions {
@@ -30,6 +38,21 @@ impl RecordingActions {
     /// From now on `request` (every time it is made) fails with `error`.
     pub fn fail(&self, request: Request, error: &str) {
         self.failures.lock().unwrap_or_else(|e| e.into_inner()).push((request, error.into()));
+    }
+
+    /// From now on `pid` reads as running at `class`.
+    pub fn script_priority(&self, pid: u32, class: &'static str) {
+        self.reads.lock().unwrap_or_else(|e| e.into_inner()).priority.push((pid, class));
+    }
+
+    /// From now on `pid` reads as having `affinity`.
+    pub fn script_affinity(&self, pid: u32, affinity: crate::winsys::Affinity) {
+        self.reads.lock().unwrap_or_else(|e| e.into_inner()).affinity.push((pid, affinity));
+    }
+
+    /// From now on `pid` reads as having a visible window.
+    pub fn script_window(&self, pid: u32) {
+        self.reads.lock().unwrap_or_else(|e| e.into_inner()).windowed.push(pid);
     }
 
     /// From now on `request` takes `wait` to answer.
@@ -111,4 +134,18 @@ impl SystemActions for RecordingActions {
     }
 
     // ---- (add the next group of actions below, in its own section) ----
+
+    // ---- Process priority and the process menu's reads (ticket 97) ----
+    fn set_priority(&self, pid: u32, class: &str) -> Result<(), String> {
+        self.record(Request::Priority(pid, class.into()))
+    }
+    fn priority_of(&self, pid: u32) -> Option<&'static str> {
+        self.reads.lock().unwrap_or_else(|e| e.into_inner()).priority.iter().find(|(p, _)| *p == pid).map(|(_, c)| *c)
+    }
+    fn affinity_of(&self, pid: u32) -> Option<crate::winsys::Affinity> {
+        self.reads.lock().unwrap_or_else(|e| e.into_inner()).affinity.iter().find(|(p, _)| *p == pid).map(|(_, a)| *a)
+    }
+    fn has_window(&self, pid: u32) -> bool {
+        self.reads.lock().unwrap_or_else(|e| e.into_inner()).windowed.contains(&pid)
+    }
 }
