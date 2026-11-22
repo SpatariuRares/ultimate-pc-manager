@@ -267,6 +267,12 @@ pub struct TaskApp {
     /// trace, stopped when the window goes.
     pub file_activity: Vec<crate::file_activity::FileActivity>,
     pub message: Option<(String, Instant)>,
+    /// What the app asks of the system (see [`crate::system_actions`]): the
+    /// Windows adapter, or in tests a recording one that acts on nothing.
+    pub actions: std::sync::Arc<dyn crate::system_actions::SystemActions>,
+    /// The recording adapter behind `actions` when the app is headless.
+    #[cfg(test)]
+    recording: Option<std::sync::Arc<crate::system_actions::RecordingActions>>,
     /// App history: per program name, (CPU seconds, disk bytes).
     pub history: BTreeMap<String, (f64, f64)>,
     pub history_since: Instant,
@@ -305,7 +311,7 @@ impl TaskApp {
             Landing::Page(id) => (Page::of(id), None, false),
             Landing::AddonSettings(sel) => (Page::Core(Core::Settings), sel, true),
         };
-        let mut app = Self::build(settings, sampler, addons, page, screenshot, std::sync::Arc::new(crate::system_lists::native::NativeSystem));
+        let mut app = Self::build(settings, sampler, addons, page, screenshot, std::sync::Arc::new(crate::system_lists::native::NativeSystem), std::sync::Arc::new(crate::system_actions::WindowsActions));
         app.addon_selected = addon_selected;
         app.show_addons = show_addons;
         crate::theme::install_fonts(&cc.egui_ctx);
@@ -314,7 +320,15 @@ impl TaskApp {
     }
 
     /// An app on `page` with `settings`, before any frame is drawn.
-    fn build(settings: Settings, sampler: Sampler, addons: AddonHost, page: Page, screenshot: Option<String>, system: std::sync::Arc<dyn SystemLists>) -> Self {
+    fn build(
+        settings: Settings,
+        sampler: Sampler,
+        addons: AddonHost,
+        page: Page,
+        screenshot: Option<String>,
+        system: std::sync::Arc<dyn SystemLists>,
+        actions: std::sync::Arc<dyn crate::system_actions::SystemActions>,
+    ) -> Self {
         let mut app = TaskApp {
             addons,
             addon_selected: None,
@@ -360,6 +374,9 @@ impl TaskApp {
             wait_chains: Vec::new(),
             file_activity: Vec::new(),
             message: None,
+            actions,
+            #[cfg(test)]
+            recording: None,
             history: BTreeMap::new(),
             history_since: Instant::now(),
             last_sample_at: None,
@@ -384,7 +401,7 @@ impl TaskApp {
         let (_, rx) = std::sync::mpsc::channel();
         let sampler = Sampler::detached(rx);
         let addons = AddonHost::from_section(&serde_json::json!({}));
-        let mut app = Self::build(settings, sampler, addons, Page::Core(Core::Summary), None, std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default()));
+        let mut app = Self::recording_build(settings, sampler, addons);
         app.snap = snap;
         app.rebuild_summary();
         app
@@ -398,9 +415,27 @@ impl TaskApp {
     pub fn headless_over(settings: Settings, sensors: crate::sensors::SensorService, fill: impl FnMut(&mut Snapshot) + Send + 'static) -> Self {
         let sampler = Sampler::start_with(settings.interval_ms(), sensors.clone(), move || Box::new(fill));
         let addons = AddonHost::over_sensors(sensors);
-        let mut app = Self::build(settings, sampler, addons, Page::Core(Core::Summary), None, std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default()));
+        let mut app = Self::recording_build(settings, sampler, addons);
         app.rebuild_summary();
         app
+    }
+
+    /// A headless app on Summary whose system actions are recorded and
+    /// acted on nothing (see [`TaskApp::recording`]).
+    #[cfg(test)]
+    fn recording_build(settings: Settings, sampler: Sampler, addons: AddonHost) -> Self {
+        let recording = std::sync::Arc::new(crate::system_actions::RecordingActions::default());
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        let mut app = Self::build(settings, sampler, addons, Page::Core(Core::Summary), None, fake, recording.clone());
+        app.recording = Some(recording);
+        app
+    }
+
+    /// The recording adapter of a headless app: what it was asked, and
+    /// what it is scripted to refuse.
+    #[cfg(test)]
+    pub fn recording(&self) -> std::sync::Arc<crate::system_actions::RecordingActions> {
+        self.recording.clone().expect("only a headless app records")
     }
 
     /// This app over `system` instead of the default fake: tests keep their
@@ -1369,7 +1404,7 @@ impl TaskApp {
 
     fn run_action(&mut self, ctx: &egui::Context, a: Action) {
         match a {
-            Action::End { pid, force, tree, name } => match winsys::end_process(pid, force, tree) {
+            Action::End { pid, force, tree, name } => match self.actions.end_process(pid, force, tree) {
                 Ok(()) => {
                     self.say(format!("Ended {name}"));
                     self.sampler.refresh_requested.store(true, Ordering::Relaxed);
@@ -1378,7 +1413,8 @@ impl TaskApp {
             },
             Action::EndMany { pids, force, tree } => {
                 // Every one is tried; the first failure is said.
-                let failed: Vec<String> = pids.iter().filter_map(|&pid| winsys::end_process(pid, force, tree).err()).collect();
+                let system = self.actions.clone();
+                let failed: Vec<String> = pids.iter().filter_map(|&pid| system.end_process(pid, force, tree).err()).collect();
                 match failed.into_iter().next() {
                     None => self.say(format!("Ended {} processes", pids.len())),
                     Some(e) => self.say(e),
@@ -1498,10 +1534,22 @@ impl TaskApp {
                 self.settings.process_percents = percents;
                 self.settings.save();
             }
-            Action::Suspend(pids) => self.each_process(&pids, "Suspended", winsys::suspend_process),
-            Action::Resume(pids) => self.each_process(&pids, "Resumed", winsys::resume_process),
-            Action::Efficiency(pids) => self.each_process(&pids, "Efficiency mode on for", winsys::set_efficiency),
-            Action::Affinity(pids, mask) => self.each_process(&pids, "Processor affinity set for", |pid| winsys::set_affinity(pid, mask)),
+            Action::Suspend(pids) => {
+                let system = self.actions.clone();
+                self.each_process(&pids, "Suspended", |pid| system.suspend_process(pid))
+            }
+            Action::Resume(pids) => {
+                let system = self.actions.clone();
+                self.each_process(&pids, "Resumed", |pid| system.resume_process(pid))
+            }
+            Action::Efficiency(pids) => {
+                let system = self.actions.clone();
+                self.each_process(&pids, "Efficiency mode on for", |pid| system.set_efficiency(pid))
+            }
+            Action::Affinity(pids, mask) => {
+                let system = self.actions.clone();
+                self.each_process(&pids, "Processor affinity set for", |pid| system.set_affinity(pid, mask))
+            }
             Action::ProcessView(item) => self.apply_process_view(item),
             Action::Dump { pid, name } => {
                 // A full dump can take seconds: written off the UI thread,
@@ -1673,6 +1721,161 @@ mod tests {
         // Closing the app stops every trace with its window.
         app.close_file_activity();
         assert!(app.file_activity.is_empty());
+    }
+
+    // ---- Process actions through the system-actions seam ----
+
+    const A: u32 = 4_000_000_001;
+    const B: u32 = 4_000_000_002;
+    const C: u32 = 4_000_000_003;
+
+    /// A headless app listing alpha.exe, beta.exe and gamma.exe (made-up
+    /// PIDs no real process has), nothing said and no refresh asked yet.
+    fn app_with_three_processes() -> TaskApp {
+        use crate::sampler::ProcRow;
+        let row = |pid, name: &str| ProcRow { pid, name: name.into(), ..Default::default() };
+        let procs = vec![row(A, "alpha.exe"), row(B, "beta.exe"), row(C, "gamma.exe")];
+        let app = TaskApp::headless(Settings::default(), Snapshot { procs, ..Default::default() });
+        app.sampler.refresh_requested.store(false, Ordering::Relaxed);
+        app
+    }
+
+    fn said(app: &TaskApp) -> Option<String> {
+        app.message.as_ref().map(|(m, _)| m.clone())
+    }
+
+    fn refreshed(app: &TaskApp) -> bool {
+        app.sampler.refresh_requested.load(Ordering::Relaxed)
+    }
+
+    fn end(pid: u32, force: bool, tree: bool, name: &str) -> Action {
+        Action::End { pid, force, tree, name: name.into() }
+    }
+
+    #[test]
+    fn ending_a_process_says_ended_with_its_name_and_refreshes() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, end(A, false, false, "alpha.exe"));
+        assert_eq!(said(&app).as_deref(), Some("Ended alpha.exe"));
+        assert!(refreshed(&app));
+        assert_eq!(app.recording().requests(), [Request::End { pid: A, force: false, tree: false }]);
+    }
+
+    #[test]
+    fn force_quit_and_end_tree_ask_the_system_for_exactly_that() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, end(A, true, false, "alpha.exe"));
+        app.run_action(&ctx, end(B, false, true, "beta.exe"));
+        assert_eq!(
+            app.recording().requests(),
+            [Request::End { pid: A, force: true, tree: false }, Request::End { pid: B, force: false, tree: true }]
+        );
+    }
+
+    #[test]
+    fn a_process_that_cannot_be_ended_says_why_and_does_not_refresh() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.recording().fail(Request::End { pid: A, force: false, tree: false }, "Access is denied.");
+        app.run_action(&ctx, end(A, false, false, "alpha.exe"));
+        assert_eq!(said(&app).as_deref(), Some("Access is denied."));
+        assert!(!refreshed(&app));
+    }
+
+    #[test]
+    fn ending_many_processes_says_how_many_were_ended_and_refreshes() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, Action::EndMany { pids: vec![A, B, C], force: true, tree: true });
+        assert_eq!(said(&app).as_deref(), Some("Ended 3 processes"));
+        assert!(refreshed(&app));
+        let ended = |pid| Request::End { pid, force: true, tree: true };
+        assert_eq!(app.recording().requests(), [ended(A), ended(B), ended(C)]);
+    }
+
+    #[test]
+    fn ending_many_tries_every_process_and_reports_the_first_failure() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        let ended = |pid| Request::End { pid, force: false, tree: false };
+        app.recording().fail(ended(A), "Access is denied.");
+        app.recording().fail(ended(B), "The process was not found.");
+        app.run_action(&ctx, Action::EndMany { pids: vec![A, B, C], force: false, tree: false });
+        assert_eq!(said(&app).as_deref(), Some("Access is denied."), "the first failure, in the order of the pids");
+        assert!(refreshed(&app));
+        assert_eq!(app.recording().requests(), [ended(A), ended(B), ended(C)], "a failure does not stop the rest");
+    }
+
+    /// What every "each process" action says: "<done> <name>" for one
+    /// process, "<done> N processes" for several, the first failure when any
+    /// failed (every process is tried); the table is refreshed each time.
+    fn each_process_action_reports(action: fn(Vec<u32>) -> Action, request: fn(u32) -> crate::system_actions::Request, done: &str) {
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, action(vec![B]));
+        assert_eq!(said(&app), Some(format!("{done} beta.exe")), "one process");
+        assert!(refreshed(&app));
+        app.sampler.refresh_requested.store(false, Ordering::Relaxed);
+        app.run_action(&ctx, action(vec![A, B, C]));
+        assert_eq!(said(&app), Some(format!("{done} 3 processes")), "several processes");
+        assert!(refreshed(&app));
+        app.recording().fail(request(A), "Access denied: first.");
+        app.recording().fail(request(B), "Access denied: second.");
+        let before = app.recording().requests().len();
+        app.run_action(&ctx, action(vec![A, B, C]));
+        assert_eq!(said(&app).as_deref(), Some("Access denied: first."), "the first failure");
+        assert_eq!(app.recording().requests()[before..], [request(A), request(B), request(C)], "every process is tried");
+    }
+
+    #[test]
+    fn suspend_reports_for_one_process_for_several_or_the_first_failure() {
+        each_process_action_reports(Action::Suspend, crate::system_actions::Request::Suspend, "Suspended");
+    }
+
+    #[test]
+    fn resume_reports_for_one_process_for_several_or_the_first_failure() {
+        each_process_action_reports(Action::Resume, crate::system_actions::Request::Resume, "Resumed");
+    }
+
+    #[test]
+    fn efficiency_mode_reports_for_one_process_for_several_or_the_first_failure() {
+        each_process_action_reports(Action::Efficiency, crate::system_actions::Request::Efficiency, "Efficiency mode on for");
+    }
+
+    #[test]
+    fn set_affinity_reports_for_one_process_for_several_or_the_first_failure() {
+        fn affinity(pids: Vec<u32>) -> Action {
+            Action::Affinity(pids, 0b101)
+        }
+        fn request(pid: u32) -> crate::system_actions::Request {
+            crate::system_actions::Request::Affinity(pid, 0b101)
+        }
+        each_process_action_reports(affinity, request, "Processor affinity set for");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_headless_app_never_acts_on_a_real_process() {
+        // A real process that would live for half a minute.
+        let mut child = std::process::Command::new("ping").args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        let pid = child.id();
+        for action in [end(pid, true, true, "ping.exe"), Action::EndMany { pids: vec![pid], force: true, tree: true }, Action::Suspend(vec![pid])] {
+            app.run_action(&ctx, action);
+        }
+        let alive = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(alive, "the headless app ended or acted on a real process");
+        assert_eq!(app.recording().requests().len(), 3, "the requests were recorded instead");
     }
 
     /// An app with svchost.exe (Windows's, PID 900) and tool.exe (PID 901),

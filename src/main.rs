@@ -22,6 +22,7 @@ mod settings;
 mod summary_view;
 mod system_lists;
 mod summary_tiles;
+mod system_actions;
 mod signature;
 #[cfg(test)]
 mod test_ui;
