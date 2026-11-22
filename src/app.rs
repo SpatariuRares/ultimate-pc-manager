@@ -1589,7 +1589,7 @@ impl TaskApp {
                 self.say(format!("Copied \"{text}\""));
             }
             Action::Service(name, what) => {
-                match winsys::control_service(&name, what) {
+                match self.system.control_service(&name, what) {
                     Ok(()) => {
                         let verb = match what {
                             "start" => "Started",
@@ -2052,6 +2052,31 @@ mod tests {
         let shown = crate::test_ui::texts(&crate::test_ui::run(&ctx, (1300.0, 800.0), vec![], |ui| app.page_services(ui, &mut Vec::new())));
         assert_eq!(fake.service_reads(), 1, "the page does not read it again");
         assert!(shown.iter().any(|w| w == "Winmgmt") && !shown.iter().any(|w| w == "Spooler"), "the host's services only: {shown:?}");
+    }
+
+    #[test]
+    fn a_service_control_reports_and_rereads_through_the_seam() {
+        let ctx = egui::Context::default();
+        for (what, said_text) in [("start", "Started Spooler"), ("stop", "Stopped Spooler"), ("restart", "Restarted Spooler")] {
+            let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+            let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
+            app.run_action(&ctx, Action::Service("Spooler".into(), what));
+            assert_eq!(fake.service_requests(), vec![("Spooler".to_string(), what.to_string())]);
+            assert_eq!(said(&app).as_deref(), Some(said_text));
+            assert_eq!(fake.service_reads(), 1, "{what} rereads the list");
+        }
+    }
+
+    #[test]
+    fn a_failed_service_control_says_the_error_and_still_rereads() {
+        let reason = "Access denied for \"Spooler\". Run the app as administrator to change services.";
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.fail_service_control(reason);
+        let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
+        app.run_action(&egui::Context::default(), Action::Service("Spooler".into(), "stop"));
+        assert_eq!(fake.service_requests().len(), 1);
+        assert_eq!(said(&app).as_deref(), Some(reason));
+        assert_eq!(fake.service_reads(), 1);
     }
 
     #[test]
