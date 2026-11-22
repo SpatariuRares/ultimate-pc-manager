@@ -1089,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn performance_cpu_speed_is_unchanged_by_the_shared_rule() {
+    fn the_cpu_speed_is_the_base_clock_times_the_performance_level_and_blank_when_either_is_unknown() {
         assert_eq!(speeds(3_400, 110.0).0, "3.74 GHz", "base clock x performance level");
         assert_eq!(speeds(3_400, 0.0).0, "\u{2014}", "no performance level: blank, by the one shared rule");
         assert_eq!(speeds(0, 110.0).0, "\u{2014}", "no base clock: blank, by the one shared rule");

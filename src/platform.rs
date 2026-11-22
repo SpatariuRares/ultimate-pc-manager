@@ -591,10 +591,7 @@ impl AddonContext {
     /// a sensor service over a fixed, made-up CPU.
     #[cfg(test)]
     pub fn recording() -> (Self, Arc<RecordingRunner>) {
-        let runner = Arc::new(RecordingRunner::default());
-        let sensors = SensorService::new(vec![crate::sensors::cpu::made_up(), crate::sensors::power_plan::made_up()]);
-        let leases = Leases::new(sensors.clone());
-        (AddonContext { runner: runner.clone(), admin: false, dialogs: false, sensors, leases, queue: Default::default() }, runner)
+        Self::recording_over(SensorService::new(vec![crate::sensors::cpu::made_up(), crate::sensors::power_plan::made_up()]))
     }
 
     /// [`AddonContext::recording`] over a sensor service of the test's own

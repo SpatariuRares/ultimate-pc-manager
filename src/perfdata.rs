@@ -1,7 +1,9 @@
-//! Extra Windows data for the Performance page:
-//! PDH counters (kernel time, CPU frequency, physical disks, GPU engines,
-//! CPU package power), GetPerformanceInfo, processor topology, SMBIOS memory
-//! details, physical disks and GPU adapters.
+//! The types the performance data is carried in: the live figures of a
+//! sample ([`PerfLive`], its disks and GPUs), the keys of the counters the
+//! sensor providers count ([`counter`]), the machine's fixed facts
+//! ([`StaticInfo`]) and the helpers that turn GPU engine instances into
+//! adapters and per-process shares. The providers under `sensors/` read
+//! them; the Sampler puts them together.
 
 
 /// One physical disk, read every sample.
@@ -217,7 +219,7 @@ pub const OPTIONAL: &[&str] = &[counter::PERF, counter::COMPR, counter::PAGEFILE
 
 /// Not a counter but the GetPerformanceInfo call (threads, handles, commit,
 /// cached): in `unanswered` when the call failed, so its figures are gaps.
-/// The provider state counts it with [`COUNTERS`] (see [`SOURCES`]).
+/// The provider state counts it with [`COUNTERS`] (see [`sources`]).
 pub const PERF_INFO: &str = "perfinfo";
 
 /// Every source the provider state counts: the [`COUNTERS`] and the
