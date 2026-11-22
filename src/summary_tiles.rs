@@ -287,6 +287,20 @@ mod tests {
     }
 
     #[test]
+    fn leaving_summary_drops_its_old_sensor_frame_so_coming_back_never_shows_it() {
+        let mut app = TaskApp::headless(Settings::default(), sample(None));
+        app.addons = crate::addons::AddonHost::for_tests(&serde_json::json!({})).0;
+        crate::addons::until("a sensor frame reaches the tiles", || {
+            app.read_summary_sensors();
+            app.summary_frame.is_some()
+        });
+        app.end_frame(); // Summary was drawn in this frame
+        assert!(app.summary_frame.is_some(), "still on Summary: kept");
+        app.end_frame(); // another page: Summary did not ask
+        assert!(app.summary_frame.is_none(), "the old frame is gone");
+    }
+
+    #[test]
     fn summary_fills_its_sensor_tiles_from_the_sensors_while_it_is_shown() {
         let mut app = TaskApp::headless(Settings::default(), sample(None));
         app.addons = crate::addons::AddonHost::for_tests(&serde_json::json!({})).0;

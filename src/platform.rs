@@ -25,7 +25,7 @@ pub mod toast;
 pub mod uninstaller;
 pub mod winget;
 
-use crate::addons::leases::{Leases, Sensors, Surface};
+use crate::addons::leases::{Lease, Leases, Sensors};
 use crate::sampler::Snapshot;
 use crate::sensors::SensorService;
 use crate::settings::Settings;
@@ -157,7 +157,7 @@ pub struct PageContext<'a> {
     pub owners: Option<Owners<'a>>,
     /// Where the host keeps the sensor interest of the surface being drawn
     /// (set by the host; see [`PageContext::sensors`]).
-    pub lease: Option<(Leases, Surface)>,
+    pub lease: Option<Lease>,
 }
 
 impl<'a> PageContext<'a> {
@@ -178,7 +178,7 @@ impl<'a> PageContext<'a> {
     /// frame and drops it at the end of the first frame it is not. Store
     /// nothing: ask again at every draw. None outside a host.
     pub fn sensors(&self) -> Option<Sensors> {
-        self.lease.as_ref().map(|(leases, surface)| leases.ask(*surface))
+        self.lease.as_ref().map(Lease::ask)
     }
 
     /// The colour of secondary text in the current theme.

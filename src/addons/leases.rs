@@ -6,12 +6,12 @@
 //! surface's interest in the shared sensor service; every frame in which the
 //! surface asks again keeps it; the host drops it at the end of the first
 //! frame in which the surface did not ask ([`Leases::end_frame`]), and when
-//! the add-on is turned off ([`Leases::release`]).
+//! the add-on is turned off or stopped ([`Leases::release`]).
 
 use crate::sensors::{Interest, SensorService};
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Something on screen whose sensor use lasts while it is drawn.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -55,6 +55,21 @@ struct Held {
     asked: bool,
 }
 
+/// How a surface being drawn reaches its sensors: the host's [`Leases`] and
+/// the [`Surface`] they are kept for. Set on the page context by the host.
+#[derive(Clone)]
+pub struct Lease {
+    leases: Leases,
+    surface: Surface,
+}
+
+impl Lease {
+    /// The sensors of this surface, asked in this frame.
+    pub fn ask(&self) -> Sensors {
+        self.leases.ask(self.surface)
+    }
+}
+
 /// The interests of the surfaces drawn now. Cheap to clone.
 #[derive(Clone)]
 pub struct Leases(Arc<Inner>);
@@ -70,51 +85,63 @@ impl Leases {
         Leases(Arc::new(Inner { service, held: Mutex::default() }))
     }
 
+    /// What `surface` reads its sensors through while it draws.
+    pub fn lease(&self, surface: Surface) -> Lease {
+        Lease { leases: self.clone(), surface }
+    }
+
     /// `surface` asks for sensors in this frame: its interest is created on
     /// the first ask and kept by every frame that asks again.
     pub fn ask(&self, surface: Surface) -> Sensors {
-        let mut held = self.0.held.lock().unwrap_or_else(|e| e.into_inner());
+        let mut held = self.held();
         let entry = held.entry(surface).or_insert_with(|| Held { interest: Arc::new(self.0.service.interest()), asked: false });
         entry.asked = true;
         Sensors(entry.interest.clone())
     }
 
     /// Ends a frame: drops the interest of every surface that did not ask in
-    /// it. The others keep theirs for the next frame.
-    pub fn end_frame(&self) {
+    /// it and returns those surfaces. The others keep theirs for the next
+    /// frame.
+    pub fn end_frame(&self) -> Vec<Surface> {
         let gone = self.take(|_, h| !h.asked);
-        for h in self.0.held.lock().unwrap_or_else(|e| e.into_inner()).values_mut() {
+        for h in self.held().values_mut() {
             h.asked = false;
         }
-        drop(gone);
+        gone.into_iter().map(|(surface, _)| surface).collect()
     }
 
-    /// Drops the interests of the add-on `id` (it was turned off).
+    /// Drops the interests of the add-on `id` (it was turned off or stopped).
     pub fn release(&self, id: &str) {
         drop(self.take(|s, _| s.addon() == Some(id)));
     }
 
     /// The sensors an add-on's surface holds now, if any, without asking for
-    /// them: for an action that works between frames.
-    pub fn held_by(&self, id: &str) -> Option<Sensors> {
-        let held = self.0.held.lock().unwrap_or_else(|e| e.into_inner());
-        held.iter().find(|(s, _)| s.addon() == Some(id)).map(|(_, h)| Sensors(h.interest.clone()))
+    /// them: for an action that works between frames. Its page's when it
+    /// holds one, else its tile's.
+    pub fn held_by(&self, id: &'static str) -> Option<Sensors> {
+        let held = self.held();
+        [Surface::Page(id), Surface::Tile(id)].iter().find_map(|s| held.get(s)).map(|h| Sensors(h.interest.clone()))
     }
 
-    /// "Refresh" of the page of `id`: reads every sensor at once, when that
-    /// page holds an interest.
-    pub fn read_now(&self, surface: Surface) {
-        let interest = self.0.held.lock().unwrap_or_else(|e| e.into_inner()).get(&surface).map(|h| h.interest.clone());
-        if let Some(interest) = interest {
+    /// "Refresh": reads every sensor at once through every interest held,
+    /// whichever surface holds it (a page, a tile, the core Summary).
+    pub fn read_now(&self) {
+        let interests: Vec<Arc<Interest>> = self.held().values().map(|h| h.interest.clone()).collect();
+        for interest in interests {
             interest.read_now();
         }
     }
 
-    /// Removes the surfaces `pick` selects and returns their interests, to
-    /// be dropped without the lock.
-    fn take(&self, pick: impl Fn(Surface, &Held) -> bool) -> Vec<Held> {
-        let mut held = self.0.held.lock().unwrap_or_else(|e| e.into_inner());
+    /// The map of held interests; a panic elsewhere does not lock it out.
+    fn held(&self) -> MutexGuard<'_, HashMap<Surface, Held>> {
+        self.0.held.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Removes the surfaces `pick` selects and returns them with their
+    /// interests, to be dropped without the lock.
+    fn take(&self, pick: impl Fn(Surface, &Held) -> bool) -> Vec<(Surface, Held)> {
+        let mut held = self.held();
         let gone: Vec<Surface> = held.iter().filter(|(s, h)| pick(**s, h)).map(|(s, _)| *s).collect();
-        gone.into_iter().filter_map(|s| held.remove(&s)).collect()
+        gone.into_iter().filter_map(|s| held.remove(&s).map(|h| (s, h))).collect()
     }
 }

@@ -950,7 +950,7 @@ mod tests {
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let mut page = PageContext::new(&settings, &snap);
-                page.lease = fr.context.as_ref().map(|c| (c.leases().clone(), crate::addons::leases::Surface::Page("flight-recorder")));
+                page.lease = fr.context.as_ref().map(|c| c.leases().lease(crate::addons::leases::Surface::Page("flight-recorder")));
                 fr.ui(ui, &mut page);
             });
         });
@@ -980,29 +980,17 @@ mod tests {
 
     /// One frame with the page drawn through the host, then the frame ends.
     fn draw_through(host: &mut crate::addons::AddonHost) {
-        let (settings, snap) = (crate::settings::Settings::default(), sample(1.0));
-        let ctx = egui::Context::default();
-        crate::theme::install_fonts(&ctx);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                host.ui("flight-recorder", ui, &mut PageContext::new(&settings, &snap));
-            });
-        });
-        host.end_frame();
-    }
-
-    fn host_threads(host: &crate::addons::AddonHost) -> usize {
-        host.context.sensors().threads()
+        crate::addons::draw_page_with(host, "flight-recorder", &sample(1.0));
     }
 
     #[test]
     fn the_live_page_holds_no_sensor_interest_of_its_own() {
         let mut host = recorder_host();
         draw_through(&mut host);
-        assert!(host_threads(&host) > 0, "the page reads the sensors while drawn");
+        assert!(crate::addons::sensor_threads(&host) > 0, "the page reads the sensors while drawn");
         // Only the host's lease keeps the service running for the page.
         host.context.leases().release("flight-recorder");
-        crate::addons::until("no sensor thread", || host_threads(&host) == 0);
+        crate::addons::until("no sensor thread", || crate::addons::sensor_threads(&host) == 0);
     }
 
     #[test]
@@ -1011,9 +999,9 @@ mod tests {
         for _ in 0..3 {
             draw_through(&mut host);
         }
-        assert!(host_threads(&host) > 0);
+        assert!(crate::addons::sensor_threads(&host) > 0);
         host.end_frame(); // the first frame without the page
-        crate::addons::until("no sensor thread", || host_threads(&host) == 0);
+        crate::addons::until("no sensor thread", || crate::addons::sensor_threads(&host) == 0);
     }
 
     #[test]
@@ -1027,22 +1015,23 @@ mod tests {
         host.end_frame(); // the page is hidden
         host.end_frame();
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(host_threads(&host) > 0, "the recording keeps the service running");
+        assert!(crate::addons::sensor_threads(&host) > 0, "the recording keeps the service running");
         assert_eq!(host.record_sensors(false, &mut page), Ok(()));
-        crate::addons::until("no sensor thread after Stop", || host_threads(&host) == 0);
+        crate::addons::until("no sensor thread after Stop", || crate::addons::sensor_threads(&host) == 0);
     }
 
     #[test]
     fn refresh_on_the_page_reads_the_sensors_at_once() {
         let mut host = recorder_host();
         draw_through(&mut host);
-        let first = host.context.sensors().interest();
-        first.set_interval_ms(0); // paused: only Refresh reads
-        crate::addons::until("a frame", || first.latest().is_some());
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let before = first.latest().unwrap().seq;
+        // Only the host's lease for the page exists; its update interval is far
+        // away, so nothing reads by itself while this test waits.
+        let page = host.context.leases().held_by("flight-recorder").expect("the host keeps the sensors for the page");
+        page.set_interval_ms(600_000);
+        crate::addons::until("a frame", || page.latest().is_some());
+        let before = page.latest().unwrap().seq;
         assert!(host.refresh("flight-recorder"));
-        crate::addons::until("a newer frame", || first.latest().is_some_and(|f| f.seq > before));
+        crate::addons::until("a newer frame", || page.latest().is_some_and(|f| f.seq > before));
     }
 
     #[test]

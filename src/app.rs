@@ -506,13 +506,27 @@ impl TaskApp {
         self.settings.save();
     }
 
+    /// Ends a frame after the page is drawn: the add-on host drops what is no
+    /// longer shown, and Summary's sensor frame goes with it when Summary was
+    /// not drawn (coming back never shows an old one).
+    pub(crate) fn end_frame(&mut self) {
+        let dropped = self.addons.end_frame();
+        if dropped.contains(&crate::addons::leases::Surface::Summary) {
+            self.summary_frame = None;
+        }
+    }
+
     pub fn refresh_now(&mut self) {
         self.sampler.refresh_now.store(true, Ordering::Relaxed);
         match self.page {
             Page::Core(Core::Services) => self.services = Some(winsys::list_services()),
             Page::Core(Core::Startup) => self.startup = Some(winsys::list_startup()),
             p => {
-                self.addons.refresh(p.id());
+                // An add-on refreshes itself and reads its sensors; for a core
+                // page, only the sensors it holds (Summary's) are read.
+                if !self.addons.refresh(p.id()) {
+                    self.addons.read_held_sensors();
+                }
             }
         }
     }
@@ -600,7 +614,7 @@ impl eframe::App for TaskApp {
             Page::Core(Core::Settings) => self.page_settings(ui, &mut actions),
             Page::Core(Core::Colors) => self.page_colors(ui),
         });
-        self.addons.end_frame();
+        self.end_frame();
         self.dialogs(ctx, &mut actions);
         self.off_question(ctx);
         self.close_question(ctx);

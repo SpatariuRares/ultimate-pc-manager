@@ -354,6 +354,28 @@ pub fn until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
+/// Draws the page `id` of `host` for one windowless frame over `sample`,
+/// then ends the frame (what the app does every frame).
+#[cfg(test)]
+pub fn draw_page_with(host: &mut AddonHost, id: &str, sample: &crate::sampler::Snapshot) {
+    let settings = crate::settings::Settings::default();
+    let ctx = egui::Context::default();
+    // The app's faces, as at start-up: pages draw in them.
+    crate::theme::install_fonts(&ctx);
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            host.ui(id, ui, &mut PageContext::new(&settings, sample));
+        });
+    });
+    host.end_frame();
+}
+
+/// Sensor threads alive in the shared service of `host`.
+#[cfg(test)]
+pub fn sensor_threads(host: &AddonHost) -> usize {
+    host.context.sensors().threads()
+}
+
 /// The longest an add-on's [`Addon::on_sample`] may take (contract-tested).
 #[cfg_attr(not(test), allow(dead_code))] // enforced by the contract tests
 pub const SAMPLE_HOOK_BUDGET: std::time::Duration = std::time::Duration::from_millis(1);
@@ -867,6 +889,7 @@ impl AddonHost {
             OffAnswer::Save => addon.save_work(),
             OffAnswer::Discard => {
                 addon.stop();
+                self.context.leases().release(addon.id());
                 self.context.install_queue().withdraw(addon.id());
                 true
             }
@@ -927,6 +950,7 @@ impl AddonHost {
         for slot in self.slots.iter_mut().filter(|s| s.enabled && !s.stopping) {
             if let Entry::Addon(addon) = &mut slot.entry {
                 addon.stop();
+                self.context.leases().release(addon.id());
                 self.context.install_queue().withdraw(addon.id());
             }
         }
@@ -1005,12 +1029,17 @@ impl AddonHost {
         match self.enabled_addon(id) {
             Some(addon) => {
                 addon.refresh();
-                let id = addon.id();
-                self.context.leases().read_now(leases::Surface::Page(id));
+                self.read_held_sensors();
                 true
             }
             None => false,
         }
+    }
+
+    /// "Refresh": every sensor is read at once through every interest the
+    /// surfaces drawn now hold (pages, Summary tiles, the core Summary).
+    pub fn read_held_sensors(&self) {
+        self.context.leases().read_now();
     }
 
     /// Draws the page of an add-on that is on. Returns false (and draws
@@ -1040,7 +1069,7 @@ impl AddonHost {
         let id = addon.id();
         let mut inner = PageContext { settings: page.settings, sample: page.sample, actions: std::mem::take(&mut page.actions), owners: Some(&others), lease: None };
         // A stopping add-on is off: its page reads no sensors.
-        inner.lease = (!slot.stopping).then(|| (self.context.leases().clone(), leases::Surface::Page(id)));
+        inner.lease = (!slot.stopping).then(|| self.context.leases().lease(leases::Surface::Page(id)));
         addon.ui(ui, &mut inner);
         page.actions = inner.actions;
         self.shown.mark(id);
@@ -1159,13 +1188,14 @@ impl AddonHost {
 
     /// Ends a frame: add-ons whose page was drawn in the last frame but not
     /// in this one are told ([`Addon::page_hidden`]). The app calls it once
-    /// per frame, after drawing.
-    pub fn end_frame(&mut self) {
+    /// per frame, after drawing. Returns the core surfaces (the Summary page)
+    /// that asked for sensors in the last frame but not in this one.
+    pub fn end_frame(&mut self) -> Vec<leases::Surface> {
         let hidden = self.shown.end_frame();
         let tiles_hidden = self.tiles.end_frame();
         let columns_hidden = self.columns.end_frame();
         // The sensors only a hidden page read stop with this frame.
-        self.context.leases().end_frame();
+        let dropped = self.context.leases().end_frame();
         for slot in &mut self.slots {
             if let Entry::Addon(a) = &mut slot.entry {
                 if hidden.contains(&a.id()) {
@@ -1179,6 +1209,7 @@ impl AddonHost {
                 }
             }
         }
+        dropped.into_iter().filter(|s| matches!(s, leases::Surface::Summary)).collect()
     }
 
     /// Draws the Summary tiles of the add-ons that are on.
@@ -1188,7 +1219,7 @@ impl AddonHost {
         let own = page.lease.take();
         for addon in self.enabled_addons() {
             // The tile reads sensors through its own lease, kept while it is drawn.
-            page.lease = Some((leases.clone(), leases::Surface::Tile(addon.id())));
+            page.lease = Some(leases.lease(leases::Surface::Tile(addon.id())));
             addon.summary(ui, page);
             drawn.push(addon.id());
         }
@@ -1376,46 +1407,84 @@ mod tests {
         assert_eq!(revealed.lock().unwrap().len(), 1);
     }
 
-    /// An add-on whose page reads the sensors every time it draws, and
-    /// stores nothing: the host decides how long they run.
-    struct Looks;
+    /// The sensors' update interval of the tests that look at what a read
+    /// brings: far longer than a test, so nothing reads by itself.
+    const LONG_INTERVAL_MS: u64 = 600_000;
 
-    impl Addon for Looks {
-        test_addon!("looks", "Looks", "Reads sensors while drawn.");
-        fn ui(&mut self, _: &mut egui::Ui, page: &mut PageContext) {
-            if let Some(sensors) = page.sensors() {
-                sensors.latest();
+    /// The sequence number of the newest sensor frame a test add-on's
+    /// surface saw (0: none yet).
+    #[derive(Clone, Default)]
+    struct Seq(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+    impl Seq {
+        /// Notes the latest frame of `sensors`, at the long interval.
+        fn note(&self, sensors: &leases::Sensors) {
+            sensors.set_interval_ms(LONG_INTERVAL_MS);
+            if let Some(frame) = sensors.latest() {
+                self.0.store(frame.seq, std::sync::atomic::Ordering::SeqCst);
             }
+        }
+
+        fn get(&self) -> u64 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
-    /// A second page that reads the sensors the same way.
-    struct LooksToo;
-
-    impl Addon for LooksToo {
-        test_addon!("looks-too", "Looks too", "Reads sensors while drawn.");
-        fn ui(&mut self, _: &mut egui::Ui, page: &mut PageContext) {
-            if let Some(sensors) = page.sensors() {
-                sensors.latest();
-            }
-        }
+    /// Where the page and the tile of a sensor-reading add-on note the frames
+    /// they saw.
+    #[derive(Clone, Default)]
+    struct Seen {
+        page: Seq,
+        tile: Seq,
     }
+
+    /// Defines a test add-on whose page and Summary tile read the sensors
+    /// every time they draw and store nothing: the host decides how long the
+    /// sensors run.
+    macro_rules! sensor_reader {
+        ($name:ident, $id:literal, $title:literal) => {
+            #[derive(Default)]
+            struct $name(Seen);
+
+            impl Addon for $name {
+                test_addon!($id, $title, "Reads sensors while drawn.");
+                fn ui(&mut self, _: &mut egui::Ui, page: &mut PageContext) {
+                    if let Some(sensors) = page.sensors() {
+                        self.0.page.note(&sensors);
+                    }
+                }
+                fn summary(&mut self, _: &mut egui::Ui, page: &mut PageContext) {
+                    if let Some(sensors) = page.sensors() {
+                        self.0.tile.note(&sensors);
+                    }
+                }
+            }
+        };
+    }
+
+    sensor_reader!(Looks, "looks", "Looks");
+    sensor_reader!(LooksToo, "looks-too", "Looks too");
 
     /// Draws the page `id` for one frame and ends the frame.
     fn draw_page(host: &mut AddonHost, id: &str) {
-        frame(|ui, page| {
-            host.ui(id, ui, page);
-        });
+        draw_page_with(host, id, &Snapshot::default());
+    }
+
+    /// Draws the Summary tiles for one frame and ends the frame.
+    fn draw_tiles(host: &mut AddonHost) {
+        frame(|ui, page| host.summary_tiles(ui, page));
         host.end_frame();
     }
 
-    fn sensor_threads(host: &AddonHost) -> usize {
-        host.context.sensors().threads()
+    /// The add-on `id` has a surface the host keeps sensors for, and the
+    /// service runs for it.
+    fn holds_sensors(host: &AddonHost, id: &'static str) -> bool {
+        host.context.leases().held_by(id).is_some() && sensor_threads(host) > 0
     }
 
     #[test]
     fn the_sensors_run_while_a_page_that_reads_them_is_drawn_every_frame_and_stop_one_frame_after() {
-        let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Looks))], &json!({}));
+        let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Looks::default()))], &json!({}));
         for _ in 0..3 {
             draw_page(&mut host, "looks");
             assert!(sensor_threads(&host) > 0, "drawn in every frame");
@@ -1426,14 +1495,13 @@ mod tests {
 
     #[test]
     fn hiding_one_of_two_pages_that_read_the_sensors_keeps_them_running_and_hiding_both_stops_them() {
-        let entries = vec![Entry::Addon(Box::new(Looks)), Entry::Addon(Box::new(LooksToo))];
+        let entries = vec![Entry::Addon(Box::new(Looks::default())), Entry::Addon(Box::new(LooksToo::default()))];
         let (mut host, _) = AddonHost::for_tests_with(entries, &json!({}));
         draw_page(&mut host, "looks");
         draw_page(&mut host, "looks-too");
         draw_page(&mut host, "looks-too"); // "looks" is not drawn any more
         draw_page(&mut host, "looks-too");
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        assert!(sensor_threads(&host) > 0, "the other page still looks");
+        assert!(holds_sensors(&host, "looks-too"), "the other page still looks");
         host.end_frame();
         until("no sensor thread", || sensor_threads(&host) == 0);
     }
@@ -1451,27 +1519,34 @@ mod tests {
     }
 
     #[test]
+    fn the_host_says_when_the_core_summary_stops_asking() {
+        let (mut host, _) = AddonHost::for_tests_with(Vec::new(), &json!({}));
+        host.core_sensors(leases::Surface::Summary).latest();
+        assert!(host.end_frame().is_empty(), "Summary asked in this frame");
+        assert_eq!(host.end_frame(), vec![leases::Surface::Summary], "the first frame without Summary");
+        assert!(host.end_frame().is_empty(), "told once");
+    }
+
+    #[test]
     fn leaving_the_core_summary_keeps_the_sensors_an_add_on_page_still_reads() {
-        let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Looks))], &json!({}));
+        let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Looks::default()))], &json!({}));
         host.core_sensors(leases::Surface::Summary).latest();
         draw_page(&mut host, "looks");
         draw_page(&mut host, "looks"); // Summary is not asked any more
         draw_page(&mut host, "looks");
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        assert!(sensor_threads(&host) > 0, "the add-on page still looks");
+        assert!(holds_sensors(&host, "looks"), "the add-on page still looks");
     }
 
     #[test]
     fn a_page_that_does_not_read_the_sensors_starts_nothing() {
         let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Spy(Default::default())))], &json!({}));
         draw_page(&mut host, "spy");
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        assert_eq!(sensor_threads(&host), 0);
+        assert_eq!(sensor_threads(&host), 0, "no read was asked, so none runs");
     }
 
     #[test]
     fn turning_an_addon_off_stops_the_sensors_it_alone_kept_running() {
-        let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Looks))], &json!({}));
+        let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Looks::default()))], &json!({}));
         draw_page(&mut host, "looks");
         assert!(sensor_threads(&host) > 0);
         host.set_enabled("looks", false);
@@ -1480,28 +1555,91 @@ mod tests {
 
     #[test]
     fn turning_an_addon_off_leaves_the_sensors_another_page_still_reads() {
-        let entries = vec![Entry::Addon(Box::new(Looks)), Entry::Addon(Box::new(LooksToo))];
+        let entries = vec![Entry::Addon(Box::new(Looks::default())), Entry::Addon(Box::new(LooksToo::default()))];
         let (mut host, _) = AddonHost::for_tests_with(entries, &json!({}));
         draw_page(&mut host, "looks");
         frame(|ui, page| {
             host.ui("looks-too", ui, page);
         });
         host.set_enabled("looks", false);
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        assert!(sensor_threads(&host) > 0, "the other add-on's page is still drawn");
+        assert!(holds_sensors(&host, "looks-too"), "the other add-on's page is still drawn");
+    }
+
+    /// Draws until the surface saw a frame, calls `refresh`, and waits for a
+    /// newer one. The update interval is far away: only the refresh reads.
+    fn refresh_brings_a_new_frame(host: &mut AddonHost, seq: &Seq, draw: impl Fn(&mut AddonHost), refresh: impl Fn(&mut AddonHost)) {
+        until("the first frame", || {
+            draw(host);
+            seq.get() > 0
+        });
+        let before = seq.get();
+        refresh(host);
+        until("a frame newer than the one before Refresh", || {
+            draw(host);
+            seq.get() > before
+        });
     }
 
     #[test]
-    fn refresh_reads_the_sensors_again_through_the_page_that_holds_them() {
-        let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Looks))], &json!({}));
+    fn refresh_reads_the_sensors_again_for_the_page_that_holds_them() {
+        let seen = Seen::default();
+        let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Looks(seen.clone())))], &json!({}));
+        refresh_brings_a_new_frame(&mut host, &seen.page, |h| draw_page(h, "looks"), |h| assert!(h.refresh("looks")));
+    }
+
+    #[test]
+    fn refresh_reads_the_sensors_again_for_a_summary_tile_that_holds_them() {
+        let seen = Seen::default();
+        let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Looks(seen.clone())))], &json!({}));
+        refresh_brings_a_new_frame(&mut host, &seen.tile, draw_tiles, |h| assert!(h.refresh("looks")));
+    }
+
+    #[test]
+    fn refresh_reads_the_sensors_again_for_the_core_summary_that_holds_them() {
+        let seq = Seq::default();
+        let (mut host, _) = AddonHost::for_tests_with(Vec::new(), &json!({}));
+        let draw = |h: &mut AddonHost| {
+            seq.note(&h.core_sensors(leases::Surface::Summary));
+            h.end_frame();
+        };
+        refresh_brings_a_new_frame(&mut host, &seq, draw, |h| h.read_held_sensors());
+    }
+
+    #[test]
+    fn closing_the_app_stops_the_sensors_the_add_ons_pages_kept_running() {
+        let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Looks::default()))], &json!({}));
         draw_page(&mut host, "looks");
-        let first = host.context.sensors().interest();
-        first.set_interval_ms(0); // paused: only Refresh reads
-        until("a frame", || first.latest().is_some());
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let before = first.latest().unwrap().seq;
-        assert!(host.refresh("looks"));
-        until("a newer frame", || first.latest().is_some_and(|f| f.seq > before));
+        assert!(sensor_threads(&host) > 0);
+        host.close();
+        until("no sensor thread", || sensor_threads(&host) == 0);
+    }
+
+    /// An add-on that reads the sensors and holds work closing would lose.
+    struct LooksAndKeeps(bool);
+
+    impl Addon for LooksAndKeeps {
+        test_addon!("keeps", "Keeps", "Reads sensors and holds work.");
+        fn ui(&mut self, _: &mut egui::Ui, page: &mut PageContext) {
+            if let Some(sensors) = page.sensors() {
+                sensors.latest();
+            }
+        }
+        fn unsaved_work(&self) -> Option<&'static str> {
+            self.0.then_some("Not saved.")
+        }
+        fn stop(&mut self) {
+            self.0 = false; // the work is gone
+        }
+    }
+
+    #[test]
+    fn discarding_the_work_on_the_close_question_stops_the_sensors_the_add_on_kept_running() {
+        let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(LooksAndKeeps(true)))], &json!({}));
+        draw_page(&mut host, "keeps");
+        assert!(sensor_threads(&host) > 0);
+        assert!(!host.request_close(), "it holds work");
+        assert!(host.answer_close(OffAnswer::Discard));
+        until("no sensor thread", || sensor_threads(&host) == 0);
     }
 
     /// An add-on that records sensors for other pages: Ready, or Running
