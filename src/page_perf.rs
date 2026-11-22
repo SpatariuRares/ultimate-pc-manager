@@ -1103,7 +1103,7 @@ mod tests {
 
     /// Power & Freq's "Core Average" (Hz) for a CPU read at `perf_pct`% of a
     /// `base_mhz` base clock, as the page's frame carries it.
-    fn power_freq_speed_hz(base_mhz: u32, perf_pct: f32) -> Option<f64> {
+    fn core_average_speed_hz(base_mhz: u32, perf_pct: f32) -> Option<f64> {
         let sample = crate::sensors::cpu::CpuSample {
             base_mhz: Some(base_mhz as f64),
             performance_percent: Some(perf_pct as f64),
@@ -1113,18 +1113,18 @@ mod tests {
         frame.reading(crate::sensors::cpu::CORE_AVERAGE).and_then(|r| r.value)
     }
     #[test]
-    fn summary_performance_and_power_freq_give_the_same_speed_for_the_same_inputs() {
+    fn summary_performance_and_the_core_average_give_the_same_speed_for_the_same_inputs() {
         let (performance, summary) = speeds(3_400, 110.0);
-        let hz = power_freq_speed_hz(3_400, 110.0).expect("a Core Average");
+        let hz = core_average_speed_hz(3_400, 110.0).expect("a Core Average");
         assert_eq!(crate::metrics::fmt_ghz((hz / 1e6) as f32), performance);
         assert_eq!(summary.cpu.sub_text(), performance);
     }
     #[test]
-    fn the_speed_is_blank_on_summary_and_power_freq_when_an_input_is_unknown() {
+    fn the_speed_is_blank_on_summary_and_the_core_average_when_an_input_is_unknown() {
         for (base, pct) in [(3_400, 0.0), (0, 110.0)] {
             assert_eq!(speeds(base, pct).1.cpu.sub_text(), "\u{2014}", "Summary at {base} MHz x {pct}%");
             assert_eq!(speeds(base, pct).0, "\u{2014}", "Performance at {base} MHz x {pct}%");
-            assert_eq!(power_freq_speed_hz(base, pct), None,"Power & Freq at {base} MHz x {pct}%");
+            assert_eq!(core_average_speed_hz(base, pct), None,"Power & Freq at {base} MHz x {pct}%");
         }
     }
     /// Performance's combined Network device for `net`.
