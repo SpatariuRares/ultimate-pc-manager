@@ -640,7 +640,7 @@ mod tests {
             let snapshot = Snapshot::default();
             let (cpu, mem) = (VecDeque::new(), VecDeque::new());
             let perf = PerfHistory::new();
-            let page_ctx = PageCtx { settings: &self.settings, snapshot: &snapshot, histories: Histories { cpu: &cpu, mem: &mem, perf: &perf } };
+            let page_ctx = PageCtx { settings: &self.settings, snapshot: &snapshot, histories: Histories { cpu: &cpu, mem: &mem, perf: &perf }, system: &crate::system_lists::fake::FakeSystem::default() };
             let mut actions = Vec::new();
             let (page, host) = (&mut self.page, &mut self.host);
             let out = run(&self.ctx, (1335.0, 1400.0), events, |ui| page.draw_with_addons(ui, &page_ctx, host, &mut actions));

@@ -13,7 +13,7 @@ use crate::platform::PageContext;
 use crate::sampler::{Sampler, Snapshot};
 use crate::settings::{Settings, SPEEDS};
 use crate::widgets::{fmt_bytes, health_colour, local_ip, logo, nav_entry_back, nav_heading, push, refresh_button};
-use crate::system_lists::{ServiceRow, StartupRow, SystemLists};
+use crate::system_lists::SystemLists;
 use crate::winsys;
 
 /// The open page: one of the core pages, or the page of an add-on (by its
@@ -227,10 +227,6 @@ pub struct TaskApp {
     /// What the Services and Startup apps pages read and control: the
     /// machine in the app, a fake in tests (see [`crate::system_lists`]).
     pub(crate) system: std::sync::Arc<dyn SystemLists>,
-    pub services: Option<Result<Vec<ServiceRow>, String>>,
-    pub svc_selected: Option<String>,
-    pub startup: Option<Vec<StartupRow>>,
-    pub startup_selected: Option<usize>,
     pub confirm_end: Option<crate::pages::EndAsk>,
     /// Efficiency mode's question, open while it waits for an answer.
     pub confirm_efficiency: Option<crate::pages::EfficiencyAsk>,
@@ -268,10 +264,6 @@ pub struct TaskApp {
     /// The recording adapter behind `actions` when the app is headless.
     #[cfg(test)]
     recording: Option<std::sync::Arc<crate::system_actions::RecordingActions>>,
-    /// App history: per program name, (CPU seconds, disk bytes).
-    pub history: BTreeMap<String, (f64, f64)>,
-    pub history_since: Instant,
-    last_sample_at: Option<Instant>,
     applied: Option<bool>,
     applied_top: Option<bool>,
     screenshot: Option<String>,
@@ -347,10 +339,6 @@ impl TaskApp {
             following: None,
             proc_view: Default::default(),
             system,
-            services: None,
-            svc_selected: None,
-            startup: None,
-            startup_selected: None,
             confirm_end: None,
             confirm_efficiency: None,
             confirm_realtime: None,
@@ -368,9 +356,6 @@ impl TaskApp {
             actions,
             #[cfg(test)]
             recording: None,
-            history: BTreeMap::new(),
-            history_since: Instant::now(),
-            last_sample_at: None,
             applied: None,
             applied_top: None,
             screenshot,
@@ -473,10 +458,13 @@ impl TaskApp {
         match self.page {
             Page::Core(Core::Summary) => self.page_summary(ui, actions),
             Page::Core(Core::Processes) => self.page_processes(ui, actions),
-            Page::Core(Core::Startup) => self.page_startup(ui, actions),
-            Page::Core(Core::Services) => self.page_services(ui, actions),
             Page::Addon(id) => self.addon_page(ui, id, actions),
+<<<<<<< HEAD
             Page::Core(Core::AppHistory) => self.page_history(ui),
+=======
+            Page::Core(Core::Settings) => self.page_settings(ui, actions),
+            Page::Core(Core::Colors) => self.page_colors(ui),
+>>>>>>> core-pages-78-79-81
             Page::Core(core) => self.draw_core_page(core, ui, actions),
         }
     }
@@ -489,7 +477,7 @@ impl TaskApp {
             self.header(ui, title);
         }
         let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
-        let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories };
+        let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories, system: &*self.system };
         if let Some(page) = self.pages.page_mut(core) {
             page.draw_with_addons(ui, &ctx, &mut self.addons, actions);
         }
@@ -565,16 +553,6 @@ impl TaskApp {
         push(&mut self.mem_hist, mem_pct);
         self.sample_pages(SampleSlot::AppHistory, &s);
         let now = Instant::now();
-        if let Some(prev) = self.last_sample_at {
-            let dt = now.duration_since(prev).as_secs_f64().min(10.0);
-            let ncpu = s.cpu_per_core.len().max(1) as f64;
-            for p in &s.procs {
-                let e = self.history.entry(p.name.clone()).or_default();
-                e.0 += p.cpu as f64 / 100.0 * ncpu * dt;
-                e.1 += (p.disk_read + p.disk_write) * dt;
-            }
-        }
-        self.last_sample_at = Some(now);
         // The Processes view notices the processes that ended (it keeps
         // them a moment; the sampler does not).
         self.sample_pages(SampleSlot::ProcessTracking, &s);
@@ -583,14 +561,14 @@ impl TaskApp {
         self.snap = s;
         self.rebuild_summary();
         let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
-        self.pages.on_sample(SampleSlot::Last, &PageCtx { settings: &self.settings, snapshot: &self.snap, histories });
+        self.pages.on_sample(SampleSlot::Last, &PageCtx { settings: &self.settings, snapshot: &self.snap, histories, system: &*self.system });
         self.ask_signatures();
     }
 
     /// Delivers the new sample `s` to the core pages of `slot`.
     fn sample_pages(&mut self, slot: SampleSlot, s: &Snapshot) {
         let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
-        self.pages.on_sample(slot, &PageCtx { settings: &self.settings, snapshot: s, histories });
+        self.pages.on_sample(slot, &PageCtx { settings: &self.settings, snapshot: s, histories, system: &*self.system });
     }
 
     /// Keeps the settings a page changed: the sampler runs at the speed
@@ -631,11 +609,9 @@ impl TaskApp {
     pub fn refresh_now(&mut self) {
         self.sampler.refresh();
         match self.page {
-            Page::Core(Core::Services) => self.reload_services(),
-            Page::Core(Core::Startup) => self.reload_startup(),
             Page::Core(c) if self.pages.page_mut(c).is_some() => {
                 let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
-                let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories };
+                let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories, system: &*self.system };
                 if let Some(page) = self.pages.page_mut(c) {
                     page.refresh(&ctx);
                 }
@@ -884,7 +860,7 @@ impl TaskApp {
                     });
                     if self.page == Page::Core(Core::Performance) {
                         let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
-                        let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories };
+                        let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories, system: &*self.system };
                         self.pages.performance.menu(ui, &ctx, actions);
                     }
                     // An add-on's own menu, when it belongs in the menu bar.
@@ -966,8 +942,8 @@ impl TaskApp {
         if resp.clicked() {
             self.page = p;
             match p {
-                Page::Core(Core::Services) if self.services.is_none() => self.reload_services(),
-                Page::Core(Core::Startup) if self.startup.is_none() => self.reload_startup(),
+                Page::Core(Core::Services) if !self.pages.services.is_loaded() => self.reload_services(),
+                Page::Core(Core::Startup) if !self.pages.startup.is_loaded() => self.reload_startup(),
                 _ => {}
             }
         }
@@ -1422,8 +1398,7 @@ impl TaskApp {
     /// `pid`, with `service` or the host's first service selected.
     fn go_to_services(&mut self, pid: u32, service: Option<String>) {
         let first = || self.snap.services.get(&pid).and_then(|v| v.first()).map(|s| s.name.clone());
-        self.svc_selected = service.or_else(first);
-        self.search = pid.to_string();
+        self.pages.services.show(service.or_else(first), pid.to_string());
         self.reload_services();
         self.page = Page::Core(Core::Services);
     }
@@ -1661,7 +1636,7 @@ impl TaskApp {
             Action::Startup(id, enable) => {
                 // The entry is named by its id, so a reread since the click
                 // cannot change the target; a name is only for the message.
-                let name = self.startup.as_ref().and_then(|l| l.iter().find(|r| r.id == id)).map(|r| r.name.clone());
+                let name = self.pages.startup.name_of(&id);
                 match name {
                     Some(name) => match self.system.set_startup_enabled(&id, enable) {
                         Ok(()) => self.say(format!("{name} {}", if enable { "enabled" } else { "disabled" })),
@@ -2270,15 +2245,36 @@ mod tests {
         let ctx = egui::Context::default();
         let info = |name: &str| crate::sampler::ServiceInfo { name: name.into(), ..Default::default() };
         let snap = crate::sampler::Snapshot { services: std::sync::Arc::new([(200, vec![info("Winmgmt"), info("Schedule")])].into_iter().collect()), ..Default::default() };
-        let mut app = TaskApp::headless(Settings::default(), snap);
+        let row = |name: &str, pid| crate::system_lists::ServiceRow { name: name.into(), pid, status: "Running".into(), ..Default::default() };
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.script_services(vec![row("Winmgmt", 200), row("Schedule", 200), row("Spooler", 300)]);
+        let mut app = TaskApp::headless(Settings::default(), snap).on_system(fake);
         app.page = Page::Core(Core::Processes);
-        app.search = "chrome".into();
         app.run_action(&ctx, Action::GoToServices { pid: 200, service: None });
         assert_eq!(app.page, Page::Core(Core::Services));
-        assert_eq!(app.svc_selected.as_deref(), Some("Winmgmt"), "its first service selected");
-        assert_eq!(app.search, "200", "filtered to the services of its host");
+        let shown = page_texts(&mut app);
+        assert_eq!(shown.iter().filter(|w| *w == "Winmgmt").count(), 2, "its first service selected: in the list and its panel: {shown:?}");
+        assert!(!shown.iter().any(|w| w == "Spooler"), "filtered to the services of its host: {shown:?}");
         app.run_action(&ctx, Action::GoToServices { pid: 200, service: Some("Schedule".into()) });
-        assert_eq!(app.svc_selected.as_deref(), Some("Schedule"), "a service row's own service");
+        let shown = page_texts(&mut app);
+        assert_eq!(shown.iter().filter(|w| *w == "Schedule").count(), 2, "a service row's own service: {shown:?}");
+        assert_eq!(shown.iter().filter(|w| *w == "Winmgmt").count(), 1, "no longer selected: {shown:?}");
+    }
+
+    #[test]
+    fn services_and_startup_keep_their_selection_while_another_page_is_shown() {
+        let ctx = egui::Context::default();
+        let row = |name: &str, pid| crate::system_lists::ServiceRow { name: name.into(), pid, status: "Running".into(), ..Default::default() };
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.script_services(vec![row("Winmgmt", 200), row("Spooler", 300)]);
+        let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake);
+        app.run_action(&ctx, Action::GoToServices { pid: 200, service: Some("Winmgmt".into()) });
+        app.page = Page::Core(Core::Processes);
+        page_texts(&mut app);
+        app.page = Page::Core(Core::Services);
+        let shown = page_texts(&mut app);
+        assert_eq!(shown.iter().filter(|w| *w == "Winmgmt").count(), 2, "still selected: {shown:?}");
+        assert!(!shown.iter().any(|w| w == "Spooler"), "still filtered: {shown:?}");
     }
 
     #[test]
@@ -2290,8 +2286,7 @@ mod tests {
         app.run_action(&egui::Context::default(), Action::GoToServices { pid: 200, service: None });
         assert_eq!(app.page, Page::Core(Core::Services));
         assert_eq!(fake.service_reads(), 1);
-        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
-        let shown = crate::test_ui::texts(&crate::test_ui::run(&ctx, (1300.0, 800.0), vec![], |ui| app.page_services(ui, &mut Vec::new())));
+        let shown = page_texts(&mut app);
         assert_eq!(fake.service_reads(), 1, "the page does not read it again");
         assert!(shown.iter().any(|w| w == "Winmgmt") && !shown.iter().any(|w| w == "Spooler"), "the host's services only: {shown:?}");
     }
@@ -2320,7 +2315,7 @@ mod tests {
         assert_eq!(fake.startup_requests(), vec![("run|Steam".to_string(), false)]);
         assert_eq!(said(&app).as_deref(), Some("Steam disabled"));
         assert_eq!(fake.startup_reads(), reads + 1, "the list is read again");
-        assert!(!app.startup.as_ref().unwrap()[0].enabled, "the reread state is kept");
+        assert!(page_texts(&mut app).iter().any(|w| w == "0 of 1 startup apps are enabled"), "the reread state is kept");
         app.run_action(&ctx, Action::Startup("run|Steam".into(), true));
         assert_eq!(said(&app).as_deref(), Some("Steam enabled"));
     }
@@ -2369,7 +2364,7 @@ mod tests {
         app.page = Page::Core(Core::Startup);
         app.refresh_now();
         assert_eq!(fake.startup_reads(), 1);
-        assert_eq!(app.startup.as_ref().map(|l| l.len()), Some(1));
+        assert!(page_texts(&mut app).iter().any(|w| w == "1 of 1 startup apps is enabled"), "the list is the one read");
     }
 
     #[test]
@@ -2530,12 +2525,55 @@ mod tests {
 
     #[test]
     fn refresh_on_a_moved_page_still_asks_the_sampler_for_a_sample() {
-        for core in [Core::SystemInfo, Core::Users, Core::Performance] {
+        for core in [Core::SystemInfo, Core::Users, Core::Performance, Core::Services, Core::Startup, Core::AppHistory] {
             let mut app = app_with_three_processes();
             app.page = Page::Core(core);
             app.refresh_now();
             assert!(refreshed(&app), "{core:?}");
         }
+    }
+
+    #[test]
+    fn f5_on_services_rereads_the_list() {
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
+        app.page = Page::Core(Core::Services);
+        page_texts(&mut app);
+        app.refresh_now();
+        assert_eq!(fake.service_reads(), 2);
+    }
+
+    #[test]
+    fn f5_on_startup_rereads_the_list() {
+        let (mut app, fake) = startup_app(vec![entry("a", "Steam", true)]);
+        page_texts(&mut app);
+        fake.script_startup(vec![entry("a", "Steam", true), entry("b", "Discord", true)]);
+        app.refresh_now();
+        assert_eq!(fake.startup_reads(), 2);
+        let shown = page_texts(&mut app);
+        assert!(shown.iter().any(|w| w == "2 of 2 startup apps are enabled"), "{shown:?}");
+    }
+
+    #[test]
+    fn app_history_counts_from_the_second_sample_and_not_while_paused() {
+        let busy = |name: &str, forced| {
+            let p = crate::sampler::ProcRow { name: name.into(), cpu: 100.0, disk_read: 50e6, ..Default::default() };
+            Snapshot { procs: vec![p], cpu_per_core: vec![0.0; 2], forced, ..Default::default() }
+        };
+        let (mut app, feed) = TaskApp::fed(Settings::default(), Snapshot::default());
+        app.page = Page::Core(Core::AppHistory);
+        feed.send(busy("first.exe", false)).expect("sent");
+        app.pull_samples();
+        assert!(!page_texts(&mut app).iter().any(|w| w == "first.exe"), "the first sample counts nothing");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        feed.send(busy("first.exe", false)).expect("sent");
+        app.pull_samples();
+        assert!(page_texts(&mut app).iter().any(|w| w == "first.exe"), "the next one counts the time since it");
+        app.settings.speed = SPEEDS.iter().position(|s| s.1 == 0).expect("a Paused speed");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        feed.send(busy("late.exe", false)).expect("sent");
+        app.pull_samples();
+        assert!(!page_texts(&mut app).iter().any(|w| w == "late.exe"), "paused, nothing is counted");
     }
 
     #[test]

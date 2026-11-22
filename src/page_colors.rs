@@ -185,7 +185,7 @@ mod tests {
     fn frame(settings: &Settings, cpu: &VecDeque<f32>) -> egui::FullOutput {
         let (snapshot, mem) = (Snapshot::default(), VecDeque::new());
         let perf = PerfHistory::new();
-        let page_ctx = PageCtx { settings, snapshot: &snapshot, histories: Histories { cpu, mem: &mem, perf: &perf } };
+        let page_ctx = PageCtx { settings, snapshot: &snapshot, histories: Histories { cpu, mem: &mem, perf: &perf }, system: &crate::system_lists::fake::FakeSystem::default() };
         run(&context(Mode::Dark), (1400.0, 900.0), vec![], |ui| ColorsPage.draw(ui, &page_ctx, &mut Vec::new()))
     }
 

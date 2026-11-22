@@ -1164,7 +1164,7 @@ mod tests {
     /// One frame of `page` in `ctx` with the given Performance history.
     fn frame_with(ctx: &egui::Context, page: &mut PerformancePage, settings: &Settings, snap: &Snapshot, ph: &PerfHistory, events: Vec<egui::Event>) -> (Vec<String>, Vec<Action>, egui::FullOutput) {
         let (cpu, mem) = (VecDeque::new(), VecDeque::new());
-        let pc = PageCtx { settings, snapshot: snap, histories: Histories { cpu: &cpu, mem: &mem, perf: ph } };
+        let pc = PageCtx { settings, snapshot: snap, histories: Histories { cpu: &cpu, mem: &mem, perf: ph }, system: &crate::system_lists::fake::FakeSystem::default() };
         let mut actions = Vec::new();
         let out = crate::test_ui::run(ctx, (1400.0, 900.0), events, |ui| page.draw(ui, &pc, &mut actions));
         (crate::test_ui::texts(&out), actions, out)

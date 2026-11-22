@@ -11,6 +11,7 @@ use crate::addons::{AddonHost, Core};
 use crate::platform::Action;
 use crate::sampler::Snapshot;
 use crate::settings::Settings;
+use crate::system_lists::SystemLists;
 
 /// The Performance history: one series per name (`cpu`, `cpu.k`, `net.r`,
 /// ...), newest last. Performance draws it and Summary reads from it.
@@ -35,6 +36,9 @@ pub struct PageCtx<'a> {
     /// While a sample is delivered, the new sample; otherwise the latest.
     pub snapshot: &'a Snapshot,
     pub histories: Histories<'a>,
+    /// What the Services and Startup apps pages read and control: the
+    /// machine in the app, a fake in tests.
+    pub system: &'a dyn SystemLists,
 }
 
 /// Where in the app's handling of a new sample a page's
@@ -108,6 +112,9 @@ pub struct CorePages {
     pub users: crate::page_users::UsersPage,
     pub settings: crate::page_settings::SettingsPage,
     pub colors: crate::page_colors::ColorsPage,
+    pub services: crate::page_services::ServicesPage,
+    pub startup: crate::page_startup::StartupPage,
+    pub app_history: crate::page_history::AppHistoryPage,
 }
 
 impl CorePages {
@@ -119,6 +126,9 @@ impl CorePages {
             (Core::Users, &mut self.users),
             (Core::Settings, &mut self.settings),
             (Core::Colors, &mut self.colors),
+            (Core::Services, &mut self.services),
+            (Core::Startup, &mut self.startup),
+            (Core::AppHistory, &mut self.app_history),
         ]
     }
 
@@ -162,14 +172,15 @@ pub mod testing {
     pub fn draw_with(page: &mut dyn CorePage, settings: &Settings, snapshot: &Snapshot, cpu: &VecDeque<f32>, mem: &VecDeque<f32>) -> Drawn {
         let ctx = crate::test_ui::context(Mode::Dark);
         let perf = PerfHistory::new();
-        draw_in(&ctx, page, &PageCtx { settings, snapshot, histories: Histories { cpu, mem, perf: &perf } })
+        let system = crate::system_lists::fake::FakeSystem::default();
+        draw_in(&ctx, page, &PageCtx { settings, snapshot, histories: Histories { cpu, mem, perf: &perf }, system: &system })
     }
 
     /// The same for a page that needs the add-on host (Settings).
     pub fn draw_with_addons(page: &mut dyn CorePage, settings: &Settings, snapshot: &Snapshot, host: &mut AddonHost) -> Drawn {
         let ctx = crate::test_ui::context(Mode::Dark);
         let perf = PerfHistory::new();
-        draw_hosted_in(&ctx, page, &PageCtx { settings, snapshot, histories: Histories { cpu: &VecDeque::new(), mem: &VecDeque::new(), perf: &perf } }, host)
+        draw_hosted_in(&ctx, page, &PageCtx { settings, snapshot, histories: Histories { cpu: &VecDeque::new(), mem: &VecDeque::new(), perf: &perf }, system: &crate::system_lists::fake::FakeSystem::default() }, host)
     }
 
     /// Draws with the host in `ctx`, keeping what egui remembers.
@@ -196,7 +207,7 @@ pub mod testing {
         use egui::{Event, PointerButton};
         let (cpu, mem) = (VecDeque::new(), VecDeque::new());
         let perf = PerfHistory::new();
-        let page_ctx = PageCtx { settings, snapshot, histories: Histories { cpu: &cpu, mem: &mem, perf: &perf } };
+        let page_ctx = PageCtx { settings, snapshot, histories: Histories { cpu: &cpu, mem: &mem, perf: &perf }, system: &crate::system_lists::fake::FakeSystem::default() };
         let ctx = crate::test_ui::context(Mode::Dark);
         let size = (1400.0, 900.0);
         let mut frame = |events: Vec<Event>| {
@@ -247,7 +258,8 @@ mod tests {
         let settings = Settings::default();
         let snapshot = Snapshot { seq: 7, ..Default::default() };
         let (cpu, mem, history) = (VecDeque::new(), VecDeque::new(), PerfHistory::new());
-        let ctx = PageCtx { settings: &settings, snapshot: &snapshot, histories: Histories { cpu: &cpu, mem: &mem, perf: &history } };
+        let system = crate::system_lists::fake::FakeSystem::default();
+        let ctx = PageCtx { settings: &settings, snapshot: &snapshot, histories: Histories { cpu: &cpu, mem: &mem, perf: &history }, system: &system };
         deliver([&mut summary as &mut dyn CorePage, &mut perf].into_iter(), SampleSlot::Performance, &ctx);
         assert_eq!(*log.borrow(), ["perf saw seq 7"]);
         deliver([&mut summary as &mut dyn CorePage, &mut perf].into_iter(), SampleSlot::Summary, &ctx);
