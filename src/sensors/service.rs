@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use super::model::{Frame, Reading, SourceStatus};
+use super::model::{CounterSet, Frame, Reading, SourceStatus};
 use super::stats::Stats;
 pub use super::provider::{Factory, Provider};
 
@@ -219,12 +219,14 @@ struct Slot {
     started_kick: u64,
     /// The same, for the read `report` comes from.
     report_kick: u64,
+    /// What it counted in that read.
+    counted: Vec<CounterSet>,
 }
 
 impl Slot {
     /// A slot of a group nobody asks for.
     fn idle(group: ProviderGroup) -> Self {
-        Slot { group, running: false, name: "", report: None, problem: None, busy_since: None, timeout: super::provider::DEFAULT_TIMEOUT, started: Instant::now(), hidden: false, started_kick: 0, report_kick: 0 }
+        Slot { group, running: false, name: "", report: None, problem: None, busy_since: None, timeout: super::provider::DEFAULT_TIMEOUT, started: Instant::now(), hidden: false, started_kick: 0, report_kick: 0, counted: Vec::new() }
     }
 
     fn stuck(&self, now: Instant) -> bool {
@@ -469,7 +471,10 @@ fn work(shared: &Shared, born: u64, i: usize) {
             st.slots[i].started_kick = st.groups[group].kick;
         }
         let started = Instant::now();
-        let Ok(readings) = catch_unwind(AssertUnwindSafe(|| provider.read(started))) else {
+        let Ok((readings, counted)) = catch_unwind(AssertUnwindSafe(|| {
+            let readings = provider.read(started);
+            (readings, provider.counted())
+        })) else {
             fail(shared, born, i);
             return;
         };
@@ -484,6 +489,7 @@ fn work(shared: &Shared, born: u64, i: usize) {
         let slot = &mut st.slots[i];
         slot.busy_since = None;
         slot.report = Some(readings);
+        slot.counted = counted;
         slot.report_kick = slot.started_kick;
         publish(&mut st, false);
     }
@@ -529,6 +535,28 @@ impl Slot {
     }
 }
 
+impl Slot {
+    /// What it counted, nothing while it shows a problem (a gap, not an old
+    /// figure).
+    fn counters(&self, now: Instant) -> &[CounterSet] {
+        if self.why(now).is_some() { &[] } else { &self.counted }
+    }
+}
+
+/// The counted sets of the running providers, one per key: the first
+/// provider that answered a counter gives it.
+fn merge_counters(st: &State, now: Instant) -> Vec<CounterSet> {
+    let mut merged: Vec<CounterSet> = Vec::new();
+    for set in st.slots.iter().filter(|s| s.running).flat_map(|s| s.counters(now)) {
+        match merged.iter_mut().find(|m| m.key == set.key) {
+            Some(m) if !m.answered() && set.answered() => *m = set.clone(),
+            Some(_) => {}
+            None => merged.push(set.clone()),
+        }
+    }
+    merged
+}
+
 /// Rebuilds the frame of the running providers once a group of them has
 /// answered (or is stuck); `force` builds it even for no provider at all.
 fn publish(st: &mut State, force: bool) {
@@ -542,7 +570,9 @@ fn publish(st: &mut State, force: bool) {
     let live = || st.slots.iter().filter(|s| s.running);
     let reports: Vec<Vec<Reading>> = live().map(|s| s.readings(now)).collect();
     let sources = live().filter(|s| !s.hidden).map(|s| SourceStatus { name: if s.name.is_empty() { "provider" } else { s.name }, problem: s.why(now) }).collect();
-    let frame = Arc::new(Frame::build(st.seq, &reports, sources));
+    let mut frame = Frame::build(st.seq, &reports, sources);
+    frame.counters = merge_counters(st, now);
+    let frame = Arc::new(frame);
     st.shown = st.slots.iter().map(|s| s.running && s.why(now).is_some()).collect();
     if st.settled(&ProviderGroup::ALL, now) {
         Arc::make_mut(&mut st.stats).observe(&frame);
@@ -1273,5 +1303,99 @@ mod tests {
         permit.send(()).unwrap();
         until("the frame after the Refresh", || interest.latest_after(&ticket).is_some());
         assert_eq!(interest.latest_after(&ticket).unwrap().reading("a.reads").and_then(|r| r.value), Some(2.0));
+    }
+
+    // ---- counters: what is more than one plain number
+
+    /// A provider that counts disks: "0 C:" with a raw total, and "_Total".
+    struct Counting {
+        name: &'static str,
+        sets: Vec<crate::sensors::model::CounterSet>,
+        delay: Duration,
+    }
+
+    impl Provider for Counting {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn read(&mut self, _at: Instant) -> Vec<Reading> {
+            std::thread::sleep(self.delay);
+            Vec::new()
+        }
+        fn counted(&mut self) -> Vec<crate::sensors::model::CounterSet> {
+            self.sets.clone()
+        }
+        fn timeout(&self) -> Duration {
+            Duration::from_millis(300)
+        }
+    }
+
+    fn counting(name: &'static str, delay_ms: u64, sets: Vec<crate::sensors::model::CounterSet>) -> Factory {
+        Arc::new(move || Box::new(Counting { name, sets: sets.clone(), delay: Duration::from_millis(delay_ms) }))
+    }
+
+    fn disk_sets() -> Vec<crate::sensors::model::CounterSet> {
+        use crate::sensors::model::{CounterSet, Instance};
+        vec![CounterSet::new("dread", vec![Instance::new("0 C:", 2_000.0).with_raw(9_000_000), Instance::new("_Total", 2_000.0)])]
+    }
+
+    #[test]
+    fn a_frame_carries_what_a_provider_counted_with_its_instances_and_raw_values() {
+        let service = SensorService::new(vec![counting("disks", 0, disk_sets())]);
+        let interest = service.interest();
+        until("a frame", || interest.latest().is_some());
+        let frame = interest.latest().unwrap();
+        let set = frame.counter("dread").expect("the counter is in the frame");
+        assert!(set.answered());
+        assert_eq!(set.instance("0 C:").map(|i| (i.value, i.raw)), Some((2_000.0, Some(9_000_000))));
+        assert_eq!(set.instance("_Total").map(|i| i.raw), Some(None), "a total has no raw value here");
+        assert!(frame.counter("nothing").is_none());
+    }
+
+    #[test]
+    fn what_a_stuck_provider_counted_is_not_shown() {
+        let service = SensorService::new(vec![counting("stuck", 3_000, disk_sets())]);
+        let interest = service.interest();
+        until("the frame of a provider that is not responding", || interest.latest().is_some());
+        assert!(interest.latest().unwrap().counter("dread").is_none_or(|c| !c.answered()), "a gap, not an old figure");
+    }
+
+    #[test]
+    fn what_a_provider_with_a_problem_counted_is_not_shown() {
+        let f: Factory = Arc::new(|| {
+            struct Down;
+            impl Provider for Down {
+                fn name(&self) -> &'static str {
+                    "down"
+                }
+                fn availability(&mut self) -> Result<(), String> {
+                    Err("counters are off".into())
+                }
+                fn read(&mut self, _at: Instant) -> Vec<Reading> {
+                    Vec::new()
+                }
+                fn counted(&mut self) -> Vec<crate::sensors::model::CounterSet> {
+                    disk_sets()
+                }
+            }
+            Box::new(Down)
+        });
+        let service = SensorService::new(vec![f]);
+        let interest = service.interest();
+        until("a frame", || interest.latest().is_some());
+        assert!(interest.latest().unwrap().counter("dread").is_none());
+    }
+
+    #[test]
+    fn the_first_provider_that_answered_a_counter_gives_it() {
+        use crate::sensors::model::{CounterSet, Instance};
+        let empty = vec![CounterSet::new("dread", Vec::new())];
+        let other = vec![CounterSet::new("dread", vec![Instance::new("1", 7.0)])];
+        let service = SensorService::new(vec![counting("first", 0, empty), counting("second", 0, other), counting("third", 0, disk_sets())]);
+        let interest = service.interest();
+        until("a frame", || interest.latest().is_some());
+        let frame = interest.latest().unwrap();
+        assert_eq!(frame.counters.len(), 1, "one set per key");
+        assert!(frame.counter("dread").unwrap().instance("1").is_some());
     }
 }

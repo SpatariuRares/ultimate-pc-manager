@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::model::Reading;
+use super::model::{CounterSet, Reading};
 use super::service::ProviderGroup;
 
 /// How long a read may take before the provider counts as not responding.
@@ -39,6 +39,12 @@ pub trait Provider {
     /// Reads what it can now. Partial results are fine: a reading it cannot
     /// get is returned unavailable with its reason, or left out.
     fn read(&mut self, at: Instant) -> Vec<Reading>;
+    /// What the last [`Provider::read`] counted, for what is more than one
+    /// plain number (see [`CounterSet`]); called once after each read, on the
+    /// same thread. Default: nothing.
+    fn counted(&mut self) -> Vec<CounterSet> {
+        Vec::new()
+    }
     /// The longest one read may take before its readings are reported as
     /// "not responding" (the other providers go on meanwhile).
     fn timeout(&self) -> Duration {
