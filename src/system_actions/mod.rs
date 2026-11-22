@@ -29,6 +29,15 @@ pub trait SystemActions: Send + Sync {
     /// Lets `pid` run only on the processors whose bit is set in `mask`.
     fn set_affinity(&self, pid: u32, mask: u64) -> Result<(), String>;
 
+    // ---- Dump and Explorer restart (ticket 98) ----
+
+    /// Writes a memory dump of `pid` (named after `name`) in `dir`; the file's
+    /// path, or the text to say when it could not be written. Can take seconds.
+    fn write_dump(&self, pid: u32, name: &str, dir: &std::path::Path) -> Result<std::path::PathBuf, String>;
+    /// Restarts the shell's Windows Explorer, whose process is `pid`. Can wait
+    /// several seconds.
+    fn restart_explorer(&self, pid: u32) -> Result<(), String>;
+
     // ---- Elevation, administrator check and the remaining actions (ticket 99) ----
 
     /// Starts the app again with administrator rights, opening on `page`.
@@ -72,6 +81,10 @@ pub enum Request {
     Resume(u32),
     Efficiency(u32),
     Affinity(u32, u64),
+    // ---- Dump and Explorer restart (ticket 98) ----
+    Dump { pid: u32, name: String, dir: std::path::PathBuf },
+    RestartExplorer(u32),
+
     // ---- Elevation, administrator check and the remaining actions (ticket 99) ----
     RestartElevated(String),
     UacVirtualization(u32),

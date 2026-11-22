@@ -15,6 +15,9 @@ pub struct RecordingActions {
     failures: Mutex<Vec<(Request, String)>>,
     /// What the reads answer (ticket 97); an unscripted read finds nothing.
     reads: Mutex<Reads>,
+    /// Scripted waits: a request equal to the first of a pair takes that long
+    /// to answer (like a real dump or Explorer restart).
+    delays: Mutex<Vec<(Request, std::time::Duration)>>,
     /// What `is_admin` answers (not elevated unless a test says so).
     admin: std::sync::atomic::AtomicBool,
 }
@@ -52,6 +55,11 @@ impl RecordingActions {
         self.reads.lock().unwrap_or_else(|e| e.into_inner()).windowed.push(pid);
     }
 
+    /// From now on `request` takes `wait` to answer.
+    pub fn delay(&self, request: Request, wait: std::time::Duration) {
+        self.delays.lock().unwrap_or_else(|e| e.into_inner()).push((request, wait));
+    }
+
     /// From now on the seam says the app does (or does not) run as administrator.
     pub fn set_admin(&self, admin: bool) {
         self.admin.store(admin, std::sync::atomic::Ordering::Relaxed);
@@ -60,6 +68,10 @@ impl RecordingActions {
     /// Notes `request` and answers it: its scripted failure, else success.
     fn record(&self, request: Request) -> Result<(), String> {
         self.requests.lock().unwrap_or_else(|e| e.into_inner()).push(request.clone());
+        let wait = self.delays.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(r, _)| *r == request).map(|(_, d)| *d);
+        if let Some(wait) = wait {
+            std::thread::sleep(wait);
+        }
         let failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
         match failures.iter().find(|(r, _)| *r == request) {
             Some((_, error)) => Err(error.clone()),
@@ -84,6 +96,15 @@ impl SystemActions for RecordingActions {
     }
     fn set_affinity(&self, pid: u32, mask: u64) -> Result<(), String> {
         self.record(Request::Affinity(pid, mask))
+    }
+
+    // ---- Dump and Explorer restart (ticket 98) ----
+    fn write_dump(&self, pid: u32, name: &str, dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        self.record(Request::Dump { pid, name: name.into(), dir: dir.into() })?;
+        Ok(dir.join(format!("{name}-{pid}.dmp")))
+    }
+    fn restart_explorer(&self, pid: u32) -> Result<(), String> {
+        self.record(Request::RestartExplorer(pid))
     }
 
     // ---- Elevation, administrator check and the remaining actions (ticket 99) ----

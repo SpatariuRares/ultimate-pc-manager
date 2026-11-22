@@ -26,6 +26,14 @@ impl SystemActions for WindowsActions {
         winsys::set_affinity(pid, mask)
     }
 
+    // ---- Dump and Explorer restart (ticket 98) ----
+    fn write_dump(&self, pid: u32, name: &str, dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        winsys::write_dump(pid, name, dir)
+    }
+    fn restart_explorer(&self, pid: u32) -> Result<(), String> {
+        winsys::restart_explorer(pid)
+    }
+
     // ---- Elevation, administrator check and the remaining actions (ticket 99) ----
     fn restart_elevated(&self, page: &str) -> Result<(), String> {
         crate::platform::restart_elevated(page)
