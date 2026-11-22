@@ -263,7 +263,8 @@ pub(crate) mod tests {
         const LABELS: [&str; 2] = ["Show Task Manager in Reports", "Hide Microsoft Services and Processes"];
         let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
         let mut app = TaskApp::headless(crate::settings::Settings::default(), crate::sampler::Snapshot::default());
-        let texts = crate::test_ui::texts(&crate::test_ui::run(&ctx, (1400.0, 2400.0), vec![], |ui| app.page_settings(ui, &mut Vec::new())));
+        app.page = crate::app::Page::Core(crate::addons::Core::Settings);
+        let texts = crate::test_ui::texts(&crate::test_ui::run(&ctx, (1400.0, 2400.0), vec![], |ui| app.draw_page(ui, &mut Vec::new())));
         for label in LABELS {
             assert!(texts.iter().any(|t| t == label), "Settings shows {label}: {texts:?}");
         }

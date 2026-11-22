@@ -1,22 +1,23 @@
-//! Settings, Settings › Add-ons and Colors, in Design A (boards P16, P18
-//! and P17). Colours come only from the theme.
+//! Settings and Settings › Add-ons, in Design A (boards P16 and P18).
+//! Colours come only from the theme.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 
 use egui::{vec2, Align, Color32, Layout, RichText, Sense, Ui};
 
 use crate::addons::overview::{intensity, Act, Detail, Intensity, Overview, Row, Switch};
-use crate::app::{nav_items, page_name, Action, Page, TaskApp};
-use crate::platform::PageContext;
-use crate::settings::{GraphColor, Settings, SPEEDS};
+use crate::addons::{AddonHost, Core};
+use crate::app::{nav_items, page_name, Page};
+use crate::core_page::{page_title, CorePage, PageCtx};
+use crate::platform::{Action, PageContext};
+use crate::settings::{Settings, SPEEDS};
 use crate::theme::{self, Theme};
 use crate::widgets::parts::{
     category_heading, facts, group_heading, link_button, neutral_note, outline_button, panel, primary_button, row_fill, segmented,
     set_settings_query, setting_combo, setting_row, setting_switch, settings_card, settings_category, settings_searching, sub_colour, switch,
     tag, warm_note, BandArea, Mark, SidePanel, StatusBand,
 };
-use crate::widgets::{graph, need_icon, rgb, tick};
+use crate::widgets::{need_icon, tick};
 
 /// The project's repository, opened by "GitHub" on Settings.
 pub const REPOSITORY_URL: &str = "https://github.com/SpatariuRares/ultimate-pc-manager";
@@ -94,13 +95,41 @@ impl SettingsCat {
     }
 }
 
-/// What Settings › General shows: the category, the search, and how many
-/// rows each card matched last frame (for the category list).
+/// Settings: the category, the search, how many rows each card matched
+/// last frame (for the category list), and whether Settings › Add-ons is
+/// open with which add-on selected.
 #[derive(Default)]
-pub struct SettingsView {
-    pub cat: SettingsCat,
-    pub query: String,
-    pub(crate) counts: HashMap<&'static str, usize>,
+pub struct SettingsPage {
+    cat: SettingsCat,
+    query: String,
+    counts: HashMap<&'static str, usize>,
+    show_addons: bool,
+    addon_selected: Option<&'static str>,
+}
+
+impl SettingsPage {
+    /// Whether Settings › Add-ons is open (the app keeps its status line
+    /// in the status bar while it is).
+    pub fn showing_addons(&self) -> bool {
+        self.show_addons
+    }
+
+    /// Opens Settings › Add-ons with `selected` chosen in its list.
+    pub fn open_addons(&mut self, selected: Option<&'static str>) {
+        self.show_addons = true;
+        self.addon_selected = selected;
+    }
+}
+
+impl CorePage for SettingsPage {
+    /// Without the add-on host: the app's own categories only.
+    fn draw(&mut self, ui: &mut Ui, ctx: &PageCtx, actions: &mut Vec<Action>) {
+        self.show(ui, ctx, None, actions);
+    }
+
+    fn draw_with_addons(&mut self, ui: &mut Ui, ctx: &PageCtx, host: &mut AddonHost, actions: &mut Vec<Action>) {
+        self.show(ui, ctx, Some(host), actions);
+    }
 }
 
 /// Width of the side panel beside a list.
@@ -111,17 +140,19 @@ const GAP: f32 = 16.0;
 /// Under "Hide Microsoft Services and Processes": what the switch hides.
 const HIDE_MICROSOFT_NOTE: &str = "Hides services and processes whose program file carries a verified Microsoft Windows signature.";
 
-/// The face of small headings ("Core, always on", "Add-ons").
-impl TaskApp {
-    pub fn page_settings(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+impl SettingsPage {
+    /// Settings, or Settings › Add-ons while it is open (which needs the
+    /// add-on host).
+    fn show(&mut self, ui: &mut Ui, ctx: &PageCtx, host: Option<&mut AddonHost>, actions: &mut Vec<Action>) {
         let t = theme::of_ui(ui);
-        if self.show_addons {
+        let host = match host {
+            Some(host) if self.show_addons => {
             // Settings › Add-ons: "Settings" leads back.
             let mut back = false;
             ui.horizontal(|ui| {
                 ui.set_min_height(52.0);
                 let (r, _) = ui.allocate_exact_size(vec2(26.0, 40.0), Sense::hover());
-                self.page_icon(ui.painter(), r.center(), self.page, t.label);
+                crate::core_page::page_icon(ui.painter(), r.center(), Core::Settings.id(), t.label);
                 let link = egui::Label::new(RichText::new("Settings").font(t.fonts.row.clone()).color(t.label)).sense(Sense::click());
                 back = ui.add(link).on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
                 crate::widgets::crumb_separator(ui);
@@ -131,25 +162,27 @@ impl TaskApp {
                 self.show_addons = false;
             }
             ui.add_space(6.0);
-            self.settings_addons(ui);
-        } else {
-            ui.horizontal(|ui| {
-                ui.set_min_height(52.0);
-                self.page_title(ui, "Settings");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    crate::widgets::search_field(ui, &mut self.settings_view.query, "Find a setting", 260.0);
-                });
+                self.settings_addons(ui, host, actions);
+                return;
+            }
+            host => host,
+        };
+        ui.horizontal(|ui| {
+            ui.set_min_height(52.0);
+            page_title(ui, Core::Settings.id(), "Settings");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                crate::widgets::search_field(ui, &mut self.query, "Find a setting", 260.0);
             });
-            ui.add_space(6.0);
-            self.settings_general(ui, actions);
-        }
+        });
+        ui.add_space(6.0);
+        self.settings_general(ui, ctx, host, actions);
     }
 
     /// Settings › Add-ons: the band, the always-on core, the list with one
     /// switch per add-on, and the selected add-on in a side panel. Its
     /// status line goes to the app's status bar.
-    fn settings_addons(&mut self, ui: &mut Ui) {
-        let view = Overview::of(&self.addons, self.addon_selected);
+    fn settings_addons(&mut self, ui: &mut Ui, host: &mut AddonHost, actions: &mut Vec<Action>) {
+        let view = Overview::of(host, self.addon_selected);
         let t = theme::of_ui(ui);
         let mut input = AddonInput::default();
         let stopping = view.rows.iter().any(|r| r.switch == Switch::Stopping);
@@ -192,11 +225,9 @@ impl TaskApp {
         if input.picked.is_some() {
             self.addon_selected = input.picked;
         }
-        for (id, v) in input.toggles {
-            self.set_addon(id, v);
-        }
-        if let Some(p) = input.open {
-            self.page = p;
+        actions.extend(input.toggles.into_iter().map(|(id, on)| Action::SetAddon(id, on)));
+        if let Some(id) = input.open {
+            actions.push(Action::OpenPage(id));
         }
     }
 }
@@ -206,7 +237,7 @@ impl TaskApp {
 struct AddonInput {
     toggles: Vec<(&'static str, bool)>,
     picked: Option<&'static str>,
-    open: Option<Page>,
+    open: Option<&'static str>,
 }
 
 /// The tag of a tier: "Free" in green, "Paid" on the warm note.
@@ -343,7 +374,7 @@ fn addon_panel(ui: &mut Ui, d: &Detail, input: &mut AddonInput) {
                         match act {
                             Act::TurnOn => input.toggles.push((d.id, true)),
                             Act::TurnOff => input.toggles.push((d.id, false)),
-                            Act::OpenPage => input.open = Some(Page::of(d.id)),
+                            Act::OpenPage => input.open = Some(d.id),
                         }
                     }
                 }
@@ -352,13 +383,13 @@ fn addon_panel(ui: &mut Ui, d: &Detail, input: &mut AddonInput) {
     }
 }
 
-impl TaskApp {
+impl SettingsPage {
     /// Settings › General: the band, the list of categories (the app's,
     /// then one per add-on that is on, then About & support) and the chosen
     /// category's card; while searching, every card with a matching row.
-    fn settings_general(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        let before = self.settings.clone();
-        let mut speed = self.settings.speed;
+    /// What the user changed goes to the app as one `ChangeSettings`.
+    fn settings_general(&mut self, ui: &mut Ui, ctx: &PageCtx, mut host: Option<&mut AddonHost>, actions: &mut Vec<Action>) {
+        let mut s = ctx.settings.clone();
         let mut reset = false;
         StatusBand::new(Mark::None, "Every setting applies as soon as you change it")
             .sub("There is nothing to save: settings are saved automatically.")
@@ -369,13 +400,13 @@ impl TaskApp {
                 }
             });
         ui.add_space(14.0);
-        let addons = self.addons.settings_addons();
-        if let SettingsCat::Addon(id) = self.settings_view.cat {
+        let addons = host.as_deref_mut().map(|h| h.settings_addons()).unwrap_or_default();
+        if let SettingsCat::Addon(id) = self.cat {
             if !addons.iter().any(|a| a.0 == id) {
-                self.settings_view.cat = SettingsCat::General;
+                self.cat = SettingsCat::General;
             }
         }
-        set_settings_query(ui, &self.settings_view.query);
+        set_settings_query(ui, &self.query);
         let searching = settings_searching(ui);
         let mut manage = false;
         ui.horizontal_top(|ui| {
@@ -386,40 +417,25 @@ impl TaskApp {
             ui.add_space(GAP);
             ui.vertical(|ui| {
                 egui::ScrollArea::vertical().id_salt("settings-general").auto_shrink([false, false]).show(ui, |ui| {
-                    self.settings_cards(ui, &addons, searching, &mut speed, actions);
+                    self.settings_cards(ui, ctx, &mut s, &addons, searching, host.as_deref_mut(), actions);
                 });
             });
         });
-        if self.settings.hide_microsoft && !before.hide_microsoft {
-            self.ask_signatures();
-        }
         if manage {
             self.show_addons = true;
-        }
-        if speed != self.settings.speed {
-            self.set_speed(speed);
         }
         if reset {
             // Add-on choices have their own page and are kept, as are
             // fields written by a newer version.
-            let addons = std::mem::take(&mut self.settings.addons);
-            let unknown = std::mem::take(&mut self.settings.unknown);
-            self.settings = Settings::default();
-            self.settings.addons = addons;
-            self.settings.unknown = unknown;
-            self.sampler.interval_ms.store(self.settings.interval_ms(), Ordering::Relaxed);
+            let addons = std::mem::take(&mut s.addons);
+            let unknown = std::mem::take(&mut s.unknown);
+            s = Settings::default();
+            s.addons = addons;
+            s.unknown = unknown;
         }
-        if before.dark != self.settings.dark
-            || before.start_page != self.settings.start_page
-            || before.bits_per_second != self.settings.bits_per_second
-            || before.fahrenheit != self.settings.fahrenheit
-            || before.always_on_top != self.settings.always_on_top
-            || before.speed != self.settings.speed
-            || before.highlight_updates != self.settings.highlight_updates
-            || before.show_self_in_reports != self.settings.show_self_in_reports
-            || before.hide_microsoft != self.settings.hide_microsoft
-        {
-            self.settings.save();
+        if s != *ctx.settings {
+            actions.push(Action::ChangeSettings(Box::new(s)));
+            ui.ctx().request_repaint();
         }
     }
 
@@ -428,12 +444,12 @@ impl TaskApp {
     /// click shows that category and ends the search.
     fn settings_categories(&mut self, ui: &mut Ui, addons: &[(&'static str, &'static str, &'static str)], searching: bool) -> bool {
         let t = theme::of_ui(ui);
-        let view = &mut self.settings_view;
+        let (chosen, counts) = (self.cat, &self.counts);
         let mut picked = None;
         let mut entry = |ui: &mut Ui, cat: SettingsCat, name: &str| {
-            let count = searching.then(|| view.counts.get(cat.key()).copied().unwrap_or(0));
+            let count = searching.then(|| counts.get(cat.key()).copied().unwrap_or(0));
             let dim = count == Some(0);
-            if settings_category(ui, name, count.filter(|n| *n > 0), !searching && view.cat == cat, dim).clicked() {
+            if settings_category(ui, name, count.filter(|n| *n > 0), !searching && chosen == cat, dim).clicked() {
                 picked = Some(cat);
             }
         };
@@ -460,32 +476,43 @@ impl TaskApp {
         ui.add_space(8.0);
         entry(ui, SettingsCat::About, "About & support");
         if let Some(cat) = picked {
-            view.cat = cat;
-            view.query.clear();
+            self.cat = cat;
+            self.query.clear();
         }
         manage
     }
 
     /// The chosen category's card, or while searching every card with a
     /// matching row (and a note when none matches).
-    fn settings_cards(&mut self, ui: &mut Ui, addons: &[(&'static str, &'static str, &'static str)], searching: bool, speed: &mut usize, actions: &mut Vec<Action>) {
+    #[allow(clippy::too_many_arguments)]
+    fn settings_cards(
+        &mut self,
+        ui: &mut Ui,
+        ctx: &PageCtx,
+        s: &mut Settings,
+        addons: &[(&'static str, &'static str, &'static str)],
+        searching: bool,
+        mut host: Option<&mut AddonHost>,
+        actions: &mut Vec<Action>,
+    ) {
         let cats: Vec<SettingsCat> = if searching {
             [SettingsCat::General, SettingsCat::Appearance].into_iter().chain(addons.iter().map(|a| SettingsCat::Addon(a.0))).collect()
         } else {
-            vec![self.settings_view.cat]
+            vec![self.cat]
         };
         let mut counts = HashMap::new();
         for cat in cats {
             let shown = match cat {
-                SettingsCat::General => settings_card(ui, "General", "How the app starts and refreshes.", None, |ui| self.general_rows(ui, speed)),
-                SettingsCat::Appearance => settings_card(ui, "Appearance", "The theme and the units figures are shown in.", None, |ui| self.appearance_rows(ui)),
+                SettingsCat::General => settings_card(ui, "General", "How the app starts and refreshes.", None, |ui| general_rows(ui, s, host.as_deref())),
+                SettingsCat::Appearance => settings_card(ui, "Appearance", "The theme and the units figures are shown in.", None, |ui| appearance_rows(ui, s)),
                 SettingsCat::Addon(id) => {
                     let (_, name, blurb) = addons.iter().copied().find(|a| a.0 == id).unwrap_or((id, id, ""));
                     let open = format!("Open {name}");
-                    let mut page = PageContext::new(&self.settings, &self.snap);
-                    let host = &mut self.addons;
+                    let mut page = PageContext::new(ctx.settings, ctx.snapshot);
                     let shown = settings_card(ui, name, blurb, Some(&open), |ui| {
-                        host.settings_section(id, ui, &mut page);
+                        if let Some(host) = host.as_deref_mut() {
+                            host.settings_section(id, ui, &mut page);
+                        }
                     });
                     actions.append(&mut page.actions);
                     if shown.open {
@@ -499,55 +526,56 @@ impl TaskApp {
         }
         if searching {
             if counts.values().all(|n| *n == 0) {
-                neutral_note(ui, &format!("No setting matches \u{201c}{}\u{201d}.", self.settings_view.query.trim()));
+                neutral_note(ui, &format!("No setting matches \u{201c}{}\u{201d}.", self.query.trim()));
             }
-            if counts != self.settings_view.counts {
+            if counts != self.counts {
                 // The category list was drawn with last frame's counts.
                 ui.ctx().request_repaint();
             }
-            self.settings_view.counts = counts;
+            self.counts = counts;
         }
     }
+}
 
-    /// Appearance: the theme, then the temperature and network units.
-    fn appearance_rows(&mut self, ui: &mut Ui) {
-        group_heading(ui, "Look");
-        let s = &mut self.settings;
-        setting_row(ui, "App theme", None, |ui| {
-            if let Some(dark) = segmented(ui, s.dark, &[(false, "Light"), (true, "Dark")]).clicked {
-                s.set_dark(dark);
-            }
-        });
-        group_heading(ui, "Units");
-        setting_row(ui, "Temperature", None, |ui| {
-            if let Some(f) = segmented(ui, s.fahrenheit, &[(false, "Celsius (\u{b0}C)"), (true, "Fahrenheit (\u{b0}F)")]).clicked {
-                s.fahrenheit = f;
-            }
-        });
-        setting_row(ui, "Network speed", Some("Bits per second (Mbps) or bytes per second (MB/sec)"), |ui| {
-            if let Some(bits) = segmented(ui, s.bits_per_second, &[(false, "MB/sec"), (true, "Mbps")]).clicked {
-                s.bits_per_second = bits;
-            }
-        });
-    }
+/// Appearance: the theme, then the temperature and network units.
+fn appearance_rows(ui: &mut Ui, s: &mut Settings) {
+    group_heading(ui, "Look");
+    setting_row(ui, "App theme", None, |ui| {
+        if let Some(dark) = segmented(ui, s.dark, &[(false, "Light"), (true, "Dark")]).clicked {
+            s.set_dark(dark);
+        }
+    });
+    group_heading(ui, "Units");
+    setting_row(ui, "Temperature", None, |ui| {
+        if let Some(f) = segmented(ui, s.fahrenheit, &[(false, "Celsius (\u{b0}C)"), (true, "Fahrenheit (\u{b0}F)")]).clicked {
+            s.fahrenheit = f;
+        }
+    });
+    setting_row(ui, "Network speed", Some("Bits per second (Mbps) or bytes per second (MB/sec)"), |ui| {
+        if let Some(bits) = segmented(ui, s.bits_per_second, &[(false, "MB/sec"), (true, "Mbps")]).clicked {
+            s.bits_per_second = bits;
+        }
+    });
+}
 
-    /// General: update speed and start page, the Processes switches, then
-    /// the window.
-    fn general_rows(&mut self, ui: &mut Ui, speed: &mut usize) {
-        group_heading(ui, "Start and refresh");
-        let current = SPEEDS.get(*speed).map(|s| s.0).unwrap_or("");
-        setting_combo(ui, "speed", "Real-time update speed", Some("How often graphs and lists read the PC"), current, |ui| {
-            for (i, (label, _)) in SPEEDS.iter().enumerate() {
-                ui.selectable_value(speed, i, *label);
-            }
-        });
+/// General: update speed and start page, the Processes switches, then
+/// the window. The start page needs the add-on host for the page names.
+fn general_rows(ui: &mut Ui, s: &mut Settings, host: Option<&AddonHost>) {
+    group_heading(ui, "Start and refresh");
+    let current = SPEEDS.get(s.speed).map(|s| s.0).unwrap_or("");
+    setting_combo(ui, "speed", "Real-time update speed", Some("How often graphs and lists read the PC"), current, |ui| {
+        for (i, (label, _)) in SPEEDS.iter().enumerate() {
+            ui.selectable_value(&mut s.speed, i, *label);
+        }
+    });
+    if let Some(host) = host {
         // Saved by id; older versions saved the shown name.
-        let start_text = match self.settings.start_page.as_str() {
+        let start_text = match s.start_page.as_str() {
             crate::addons::LAST_USED => crate::addons::LAST_USED,
-            s => page_name(&self.addons, Page::of(self.addons.resolve_page(s))),
+            id => page_name(host, Page::of(host.resolve_page(id))),
         };
-        let items = nav_items(&self.addons);
-        let start = &mut self.settings.start_page;
+        let items = nav_items(host);
+        let start = &mut s.start_page;
         setting_combo(ui, "start", "Default start page", Some("The page shown when the app opens"), start_text, |ui| {
             let last = crate::addons::LAST_USED;
             ui.selectable_value(start, last.to_string(), last);
@@ -555,167 +583,27 @@ impl TaskApp {
                 ui.selectable_value(start, item.page.id().to_string(), item.name);
             }
         });
-        group_heading(ui, "Processes");
-        let s = &mut self.settings;
-        setting_switch(ui, "Highlight Process Updates", None, &mut s.highlight_updates);
-        setting_switch(ui, "Show Task Manager in Reports", None, &mut s.show_self_in_reports);
-        setting_switch(ui, "Hide Microsoft Services and Processes", Some(HIDE_MICROSOFT_NOTE), &mut s.hide_microsoft);
-        setting_switch(ui, "Ask before applying Efficiency mode", None, &mut s.ask_efficiency);
-        group_heading(ui, "Window");
-        setting_switch(ui, "Always on top", Some("Keep the app above other windows"), &mut self.settings.always_on_top);
     }
-
-    /// Colors: whether the graph colours are the built-in ones, each graph's
-    /// built-in and saved colour with "Use default", and the CPU graph in
-    /// the saved colour.
-    pub fn page_colors(&mut self, ui: &mut Ui) {
-        let t = theme::of_ui(ui);
-        ui.horizontal(|ui| {
-            ui.set_min_height(52.0);
-            self.page_title(ui, "Colors");
-        });
-        ui.add_space(6.0);
-        let before: Vec<[u8; 3]> = GraphColor::ALL.iter().map(|c| c.get(&self.settings)).collect();
-        let all_original = GraphColor::ALL.iter().all(|c| c.is_original(&self.settings));
-        let (mark, headline) = if all_original {
-            (Mark::Tick, "Your graph colours are the default palette")
-        } else {
-            (Mark::Dot(t.amber), "Your graph colours differ from the default palette")
-        };
-        let mut everywhere = false;
-        StatusBand::new(mark, headline)
-            .sub("Every device has one fixed default colour. \u{201c}Use default\u{201d} puts a graph's back.")
-            .actions_width(300.0)
-            .show(ui, |ui, area| {
-                if area == BandArea::Actions {
-                    everywhere = primary_button(ui, "Use the default palette everywhere", !all_original).clicked();
-                }
-            });
-        ui.add_space(14.0);
-        let height = ui.available_height();
-        ui.horizontal_top(|ui| {
-            let list_w = (ui.available_width() - PANEL - GAP).max(420.0);
-            ui.vertical(|ui| {
-                ui.set_width(list_w);
-                self.palette_list(ui);
-            });
-            ui.add_space(GAP);
-            ui.vertical(|ui| {
-                ui.set_width(PANEL);
-                ui.set_height(height);
-                self.cpu_graph_panel(ui);
-            });
-        });
-        if everywhere {
-            for c in GraphColor::ALL {
-                c.use_original(&mut self.settings);
-            }
-        }
-        if GraphColor::ALL.iter().zip(&before).any(|(c, b)| c.get(&self.settings) != *b) {
-            self.settings.save();
-        }
-    }
-
-    /// The palette: per graph, the built-in colour, the colour saved
-    /// here (with its picker) and "Use default".
-    fn palette_list(&mut self, ui: &mut Ui) {
-        let t = theme::of_ui(ui);
-        ui.horizontal(|ui| {
-            ui.add_space(12.0);
-            ui.label(RichText::new("The default palette").font(egui::FontId::new(14.0, theme::semibold())).color(t.text));
-        });
-        ui.add_space(4.0);
-        let swatch = |ui: &mut Ui, c: [u8; 3]| {
-            let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
-            ui.painter().rect_filled(r, 4.0, rgb(c));
-            ui.painter().rect_stroke(r, 4.0, egui::Stroke::new(1.0, t.line), egui::StrokeKind::Inside);
-        };
-        let hex = |c: [u8; 3]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
-        let grid = egui::Grid::new("colors").num_columns(4).striped(false).spacing(vec2(24.0, 12.0)).min_col_width(130.0);
-        let top = ui.cursor().top();
-        grid.show(ui, |ui| {
-            for head in ["Graph", "Default", "Saved here now", ""] {
-                ui.label(RichText::new(head).font(t.fonts.label.clone()).color(t.label));
-            }
-            ui.end_row();
-            for c in GraphColor::ALL {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.label(RichText::new(c.name()).font(t.fonts.row.clone()).color(t.text));
-                    if !c.sub().is_empty() {
-                        ui.label(RichText::new(c.sub()).size(11.5).color(t.faint));
-                    }
-                });
-                ui.horizontal(|ui| {
-                    swatch(ui, c.original());
-                    ui.label(RichText::new(hex(c.original())).color(t.soft));
-                });
-                let original = c.is_original(&self.settings);
-                ui.horizontal(|ui| {
-                    ui.color_edit_button_srgb(c.get_mut(&mut self.settings)).on_hover_text("Pick your own colour");
-                    let saved = c.get(&self.settings);
-                    if original {
-                        ui.label(RichText::new("same").color(t.faint));
-                    } else {
-                        ui.label(RichText::new(hex(saved)).color(t.amber));
-                    }
-                });
-                if outline_button(ui, "Use default", !original).clicked() {
-                    c.use_original(&mut self.settings);
-                }
-                ui.end_row();
-            }
-        });
-        // The line under the headings.
-        let rule = top + 24.0;
-        let r = ui.min_rect();
-        ui.painter().hline(r.left()..=r.right(), rule, egui::Stroke::new(1.0, t.line));
-        ui.add_space(10.0);
-        neutral_note(ui, "You can pick your own colour for a graph from its row.");
-    }
-
-    /// The side panel: the CPU graph drawn in the colour saved here.
-    fn cpu_graph_panel(&mut self, ui: &mut Ui) {
-        let t = theme::of_ui(ui);
-        let hex = |c: [u8; 3]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
-        let saved = GraphColor::Cpu.get(&self.settings);
-        let original = GraphColor::Cpu.original();
-        let data: Vec<f32> = self.cpu_hist.iter().copied().collect();
-        let mut reset = false;
-        SidePanel::new("colors-cpu").show(ui, Some(()), |ui, ()| {
-            ui.label(RichText::new("CPU graph").font(t.fonts.figure.clone()).color(t.text));
-            ui.label(RichText::new("In the colour saved here").font(t.fonts.label.clone()).color(t.label));
-            let w = ui.available_width();
-            // Graphs stay dark in both modes, as on Performance.
-            graph(ui, vec2(w, 120.0), &data, 100.0, rgb(saved));
-            let caption = if saved == original { format!("Saved here: {} (the default)", hex(saved)) } else { format!("Saved here: {} \u{b7} default {}", hex(saved), hex(original)) };
-            ui.label(RichText::new(caption).font(t.fonts.label.clone()).color(t.label));
-            ui.add_space(6.0);
-            reset = outline_button(ui, &format!("Use default {}", hex(original)), saved != original).clicked();
-        });
-        if reset {
-            GraphColor::Cpu.use_original(&mut self.settings);
-        }
-    }
+    group_heading(ui, "Processes");
+    setting_switch(ui, "Highlight Process Updates", None, &mut s.highlight_updates);
+    setting_switch(ui, "Show Task Manager in Reports", None, &mut s.show_self_in_reports);
+    setting_switch(ui, "Hide Microsoft Services and Processes", Some(HIDE_MICROSOFT_NOTE), &mut s.hide_microsoft);
+    setting_switch(ui, "Ask before applying Efficiency mode", None, &mut s.ask_efficiency);
+    group_heading(ui, "Window");
+    setting_switch(ui, "Always on top", Some("Keep the app above other windows"), &mut s.always_on_top);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    use crate::core_page::testing::{self, place};
+    use crate::core_page::{Histories, PerfHistory};
+    use crate::sampler::Snapshot;
     use crate::test_ui::{context, run, texts};
     use crate::theme::Mode;
-    use egui::{Event, PointerButton, Pos2};
-
-    /// Where the text `word` was drawn in `out`.
-    fn place(out: &egui::FullOutput, word: &str) -> Pos2 {
-        crate::test_ui::flat_shapes(out)
-            .iter()
-            .find_map(|s| match s {
-                egui::Shape::Text(t) if t.galley.text() == word => Some(t.pos + t.galley.rect.center().to_vec2()),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("{word:?} is drawn"))
-    }
+    use egui::{Event, PointerButton};
 
     /// Clicks the button showing `word` and returns the link it asked for.
     fn click(word: &str) -> Option<&'static str> {
@@ -734,47 +622,77 @@ mod tests {
         got
     }
 
-    /// The words Settings › General draws for `app`.
-    fn settings_words(app: &mut TaskApp) -> Vec<String> {
-        let ctx = context(Mode::Dark);
-        let mut actions = Vec::new();
-        let mut words = Vec::new();
-        // Twice: the category list shows last frame's search counts.
-        for _ in 0..2 {
-            let out = run(&ctx, (1335.0, 1400.0), vec![], |ui| app.page_settings(ui, &mut actions));
-            words = texts(&out);
+    /// A Settings page over a host with every add-on on, drawn as the app
+    /// draws it.
+    struct Bench {
+        page: SettingsPage,
+        host: AddonHost,
+        settings: Settings,
+        ctx: egui::Context,
+    }
+
+    impl Bench {
+        fn new() -> Self {
+            Bench { page: SettingsPage::default(), host: AddonHost::from_section(&serde_json::json!({})), settings: Settings::default(), ctx: context(Mode::Dark) }
         }
-        words
+
+        fn frame(&mut self, events: Vec<Event>) -> (egui::FullOutput, Vec<Action>) {
+            let snapshot = Snapshot::default();
+            let (cpu, mem) = (VecDeque::new(), VecDeque::new());
+            let perf = PerfHistory::new();
+            let standalone = crate::page_processes::Standalone::default();
+            let page_ctx = PageCtx { settings: &self.settings, snapshot: &snapshot, histories: Histories { cpu: &cpu, mem: &mem, perf: &perf }, system: &crate::system_lists::fake::FakeSystem::default(), processes: standalone.inputs() };
+            let mut actions = Vec::new();
+            let (page, host) = (&mut self.page, &mut self.host);
+            let out = run(&self.ctx, (1335.0, 1400.0), events, |ui| page.draw_with_addons(ui, &page_ctx, host, &mut actions));
+            (out, actions)
+        }
+
+        /// The words Settings draws. Twice: the category list shows last
+        /// frame's search counts.
+        fn words(&mut self) -> Vec<String> {
+            self.frame(vec![]);
+            texts(&self.frame(vec![]).0)
+        }
+
+        /// Clicks the text `word`; what the frame of the release queued.
+        fn click(&mut self, word: &str) -> Vec<Action> {
+            self.words();
+            let at = place(&self.frame(vec![]).0, word);
+            let press = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+            self.frame(vec![Event::PointerMoved(at), press(true)]);
+            self.frame(vec![press(false)]).1
+        }
     }
 
     #[test]
     fn settings_shows_the_chosen_category_and_every_add_on_that_is_on_in_the_list() {
-        let mut app = TaskApp::headless(Settings::default(), Default::default());
-        let words = settings_words(&mut app);
+        let mut b = Bench::new();
+        let words = b.words();
         for w in ["App", "General", "Appearance", "Add-ons", "Manage", "About & support", "Real-time update speed", "Always on top"] {
             assert!(words.iter().any(|x| x == w), "{w:?} in {words:?}");
         }
-        for (_, name, _) in app.addons.settings_addons() {
+        for (_, name, _) in b.host.settings_addons() {
             assert!(words.iter().any(|x| x == name), "{name} is listed");
         }
         assert!(!words.iter().any(|w| w == "App theme"), "Appearance is not shown with General");
-        app.settings_view.cat = SettingsCat::Addon("disk-space");
-        let words = settings_words(&mut app);
+        b.page.cat = SettingsCat::Addon("disk-space");
+        let words = b.words();
         assert!(words.iter().any(|w| w == "Open Disk Space") && words.iter().any(|w| w == "History folder"), "{words:?}");
         assert!(!words.iter().any(|w| w == "Real-time update speed"));
     }
 
     #[test]
     fn a_search_shows_every_matching_setting_across_categories_or_says_none_matches() {
-        let mut app = TaskApp::headless(Settings::default(), Default::default());
-        app.settings_view.query = "summary".into();
-        let words = settings_words(&mut app);
+        let mut b = Bench::new();
+        b.page.query = "summary".into();
+        let words = b.words();
         let tiles = words.iter().filter(|w| *w == "Show a tile on Summary").count();
         assert!(tiles >= 2, "tiles of several add-ons: {words:?}");
         assert!(!words.iter().any(|w| w == "Always on top"));
-        assert_eq!(app.settings_view.counts.get("general"), Some(&0));
-        app.settings_view.query = "no such setting".into();
-        let words = settings_words(&mut app);
+        assert_eq!(b.page.counts.get("general"), Some(&0));
+        b.page.query = "no such setting".into();
+        let words = b.words();
         assert!(words.iter().any(|w| w == "No setting matches \u{201c}no such setting\u{201d}."), "{words:?}");
     }
 
@@ -793,10 +711,65 @@ mod tests {
 
     #[test]
     fn settings_general_has_the_switches_of_processes() {
-        let mut app = TaskApp::headless(Settings::default(), crate::sampler::Snapshot::default());
-        let words = settings_words(&mut app);
+        let words = Bench::new().words();
         for w in ["Highlight Process Updates", "Show Task Manager in Reports", "Hide Microsoft Services and Processes", "Ask before applying Efficiency mode"] {
             assert!(words.iter().any(|x| x == w), "{w:?} in {words:?}");
         }
+    }
+    #[test]
+    fn a_setting_changed_is_asked_of_the_app_as_the_whole_new_settings() {
+        let mut b = Bench::new();
+        b.settings.dark = true;
+        b.click("Appearance");
+        let mut expected = b.settings.clone();
+        expected.set_dark(false);
+        assert_eq!(b.click("Light"), [Action::ChangeSettings(Box::new(expected))]);
+    }
+
+    #[test]
+    fn a_frame_with_nothing_changed_asks_nothing() {
+        let mut b = Bench::new();
+        b.words();
+        assert!(b.frame(vec![]).1.is_empty());
+    }
+
+    #[test]
+    fn reset_to_defaults_asks_for_the_defaults_and_keeps_the_add_on_choices() {
+        let mut b = Bench::new();
+        b.settings.fahrenheit = true;
+        b.settings.addons = serde_json::json!({"disk-space": {"on": false}});
+        let mut expected = Settings::default();
+        expected.addons = b.settings.addons.clone();
+        assert_eq!(b.click("Reset to defaults"), [Action::ChangeSettings(Box::new(expected))]);
+    }
+
+    #[test]
+    fn manage_opens_add_ons_and_the_settings_crumb_leads_back() {
+        let mut b = Bench::new();
+        assert!(!b.page.showing_addons());
+        b.click("Manage");
+        assert!(b.page.showing_addons());
+        let words = b.words();
+        assert!(words.iter().any(|w| w == "Core, always on"), "{words:?}");
+        assert!(!words.iter().any(|w| w == "Real-time update speed"));
+        b.click("Settings");
+        assert!(!b.page.showing_addons());
+    }
+
+    #[test]
+    fn a_page_opened_on_add_ons_draws_them_without_a_click() {
+        let mut b = Bench::new();
+        b.page.open_addons(Some("disk-space"));
+        let words = b.words();
+        assert!(words.iter().any(|w| w == "Core, always on"), "{words:?}");
+    }
+
+    #[test]
+    fn without_the_add_on_host_settings_draws_the_apps_own_categories() {
+        let drawn = testing::draw(&mut SettingsPage::default(), &Settings::default(), &Snapshot::default());
+        for w in ["General", "Appearance", "About & support", "Real-time update speed"] {
+            assert!(drawn.texts.iter().any(|t| t == w), "{w:?} in {:?}", drawn.texts);
+        }
+        assert!(drawn.actions.is_empty());
     }
 }

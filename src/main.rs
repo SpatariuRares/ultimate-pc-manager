@@ -2,6 +2,8 @@
 
 mod app;
 mod core_page;
+mod page_colors;
+mod page_settings;
 mod page_history;
 mod page_services;
 mod page_startup;
@@ -17,7 +19,6 @@ mod page_perf;
 mod page_processes;
 mod pages;
 mod perfdata;
-mod pages2;
 mod path_cache;
 mod platform;
 mod pro;

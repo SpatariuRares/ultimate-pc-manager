@@ -207,6 +207,13 @@ impl CorePage for ProcessesPage {
         self.view.track(&ctx.snapshot.procs, std::time::Instant::now(), ctx.settings.show_exited);
     }
 
+    /// Draws with the add-ons' Processes columns, read through the host.
+    fn draw_with_addons(&mut self, ui: &mut Ui, ctx: &PageCtx, host: &mut AddonHost, actions: &mut Vec<Action>) {
+        let columns = std::cell::RefCell::new(host);
+        let ctx = PageCtx { processes: ctx.processes.with_columns(&columns), ..*ctx };
+        self.draw(ui, &ctx, actions);
+    }
+
     fn draw(&mut self, ui: &mut Ui, ctx: &PageCtx, actions: &mut Vec<Action>) {
         let t = theme::of_ui(ui);
         // The header: Process View ⌄, the filter, Refresh. Run new task

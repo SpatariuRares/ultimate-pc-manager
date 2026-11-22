@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 
 use egui::Ui;
 
-use crate::addons::Core;
+use crate::addons::{AddonHost, Core};
 use crate::platform::Action;
 use crate::sampler::Snapshot;
 use crate::settings::Settings;
@@ -85,6 +85,30 @@ pub trait CorePage {
     /// Draws what the page keeps open whichever page is shown (a question,
     /// a window), after the page itself, every frame.
     fn windows(&mut self, _egui_ctx: &egui::Context, _ctx: &PageCtx, _actions: &mut Vec<Action>) {}
+
+    /// Draws a page that also needs the add-on host (Settings lists the
+    /// add-ons and draws their settings). The app always calls this one;
+    /// the default ignores the host.
+    fn draw_with_addons(&mut self, ui: &mut Ui, ctx: &PageCtx, _host: &mut AddonHost, actions: &mut Vec<Action>) {
+        self.draw(ui, ctx, actions);
+    }
+}
+
+/// A page's icon from `assets/icons`; a page without one gets a plain
+/// square outline in `ink`.
+pub fn page_icon(painter: &egui::Painter, center: egui::Pos2, id: &str, ink: egui::Color32) {
+    if !crate::widgets::icons::draw(painter, center, id) {
+        crate::widgets::plain_icon(painter, center, ink);
+    }
+}
+
+/// The title a page draws itself when it has no standard header: the icon
+/// of the page `id` and a large, widely spaced heading.
+pub fn page_title(ui: &mut Ui, id: &str, title: &str) {
+    let theme = crate::theme::of_ui(ui);
+    let (r, _) = ui.allocate_exact_size(egui::vec2(26.0, 40.0), egui::Sense::hover());
+    page_icon(ui.painter(), r.center(), id, theme.label);
+    ui.label(egui::RichText::new(title).font(theme.fonts.page_title.clone()).color(theme.text));
 }
 
 /// Every core page that has moved to the interface, one field each.
@@ -94,6 +118,8 @@ pub struct CorePages {
     pub system_info: crate::page_system::SystemInfoPage,
     pub users: crate::page_users::UsersPage,
     pub processes: crate::page_processes::ProcessesPage,
+    pub settings: crate::page_settings::SettingsPage,
+    pub colors: crate::page_colors::ColorsPage,
     pub services: crate::page_services::ServicesPage,
     pub startup: crate::page_startup::StartupPage,
     pub app_history: crate::page_history::AppHistoryPage,
@@ -107,6 +133,8 @@ impl CorePages {
             (Core::SystemInfo, &mut self.system_info),
             (Core::Users, &mut self.users),
             (Core::Processes, &mut self.processes),
+            (Core::Settings, &mut self.settings),
+            (Core::Colors, &mut self.colors),
             (Core::Services, &mut self.services),
             (Core::Startup, &mut self.startup),
             (Core::AppHistory, &mut self.app_history),
@@ -163,6 +191,53 @@ pub mod testing {
         let standalone = crate::page_processes::Standalone::default();
         let system = crate::system_lists::fake::FakeSystem::default();
         draw_in(&ctx, page, &PageCtx { settings, snapshot, histories: Histories { cpu, mem, perf: &perf }, system: &system, processes: standalone.inputs() })
+    }
+
+    /// The same for a page that needs the add-on host (Settings).
+    pub fn draw_with_addons(page: &mut dyn CorePage, settings: &Settings, snapshot: &Snapshot, host: &mut AddonHost) -> Drawn {
+        let ctx = crate::test_ui::context(Mode::Dark);
+        let perf = PerfHistory::new();
+        let standalone = crate::page_processes::Standalone::default();
+        draw_hosted_in(&ctx, page, &PageCtx { settings, snapshot, histories: Histories { cpu: &VecDeque::new(), mem: &VecDeque::new(), perf: &perf }, system: &crate::system_lists::fake::FakeSystem::default(), processes: standalone.inputs() }, host)
+    }
+
+    /// Draws with the host in `ctx`, keeping what egui remembers.
+    pub fn draw_hosted_in(ctx: &egui::Context, page: &mut dyn CorePage, page_ctx: &PageCtx, host: &mut AddonHost) -> Drawn {
+        let mut actions = Vec::new();
+        let out = crate::test_ui::run(ctx, (1400.0, 900.0), vec![], |ui| page.draw_with_addons(ui, page_ctx, host, &mut actions));
+        Drawn { texts: crate::test_ui::texts(&out), actions }
+    }
+
+    /// Where the text `word` was drawn in `out`.
+    pub fn place(out: &egui::FullOutput, word: &str) -> egui::Pos2 {
+        crate::test_ui::flat_shapes(out)
+            .iter()
+            .find_map(|s| match s {
+                egui::Shape::Text(t) if t.galley.text() == word => Some(t.pos + t.galley.rect.center().to_vec2()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{word:?} is drawn"))
+    }
+
+    /// Clicks the text `word` of `page` (drawn first with `settings` and
+    /// `snapshot`) and returns what the frame of the release queued.
+    pub fn click(page: &mut dyn CorePage, settings: &Settings, snapshot: &Snapshot, word: &str) -> Vec<Action> {
+        use egui::{Event, PointerButton};
+        let (cpu, mem) = (VecDeque::new(), VecDeque::new());
+        let perf = PerfHistory::new();
+        let standalone = crate::page_processes::Standalone::default();
+        let page_ctx = PageCtx { settings, snapshot, histories: Histories { cpu: &cpu, mem: &mem, perf: &perf }, system: &crate::system_lists::fake::FakeSystem::default(), processes: standalone.inputs() };
+        let ctx = crate::test_ui::context(Mode::Dark);
+        let size = (1400.0, 900.0);
+        let mut frame = |events: Vec<Event>| {
+            let mut actions = Vec::new();
+            let out = crate::test_ui::run(&ctx, size, events, |ui| page.draw(ui, &page_ctx, &mut actions));
+            (out, actions)
+        };
+        let at = place(&frame(vec![]).0, word);
+        let press = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(vec![Event::PointerMoved(at), press(true)]);
+        frame(vec![press(false)]).1
     }
 
     /// Draws in `ctx` (draw again in the same one to keep what egui

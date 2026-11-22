@@ -185,12 +185,6 @@ pub struct TaskApp {
     pub settings: Settings,
     /// The add-on registry and which add-ons are on.
     pub addons: AddonHost,
-    /// Settings › Add-ons: the add-on picked out (e.g. by `--page` on one that is off).
-    pub addon_selected: Option<&'static str>,
-    /// Settings shows its Add-ons tab (set by `--page`, then by the tabs).
-    pub show_addons: bool,
-    /// Settings: the category shown, and what "Find a setting" holds.
-    pub settings_view: crate::pages2::SettingsView,
     pub sampler: Sampler,
     pub snap: Snapshot,
     pub cpu_hist: VecDeque<f32>,
@@ -263,8 +257,9 @@ impl TaskApp {
             Landing::AddonSettings(sel) => (Page::Core(Core::Settings), sel, true),
         };
         let mut app = Self::build(settings, sampler, addons, page, screenshot, std::sync::Arc::new(crate::system_lists::native::NativeSystem), std::sync::Arc::new(crate::system_actions::WindowsActions));
-        app.addon_selected = addon_selected;
-        app.show_addons = show_addons;
+        if show_addons {
+            app.pages.settings.open_addons(addon_selected);
+        }
         crate::theme::install_fonts(&cc.egui_ctx);
         app.apply_theme(&cc.egui_ctx);
         app
@@ -282,9 +277,6 @@ impl TaskApp {
     ) -> Self {
         let mut app = TaskApp {
             addons,
-            addon_selected: None,
-            show_addons: false,
-            settings_view: Default::default(),
             settings,
             sampler,
             snap: Snapshot::default(),
@@ -409,8 +401,6 @@ impl TaskApp {
         match self.page {
             Page::Core(Core::Summary) => self.page_summary(ui, actions),
             Page::Addon(id) => self.addon_page(ui, id, actions),
-            Page::Core(Core::Settings) => self.page_settings(ui, actions),
-            Page::Core(Core::Colors) => self.page_colors(ui),
             Page::Core(core) => self.draw_core_page(core, ui, actions),
         }
     }
@@ -423,11 +413,10 @@ impl TaskApp {
             self.header(ui, title);
         }
         let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
-        let columns = std::cell::RefCell::new(&mut self.addons);
-        let processes = ProcessInputs::new(&self.signatures, &*self.actions).with_columns(&columns);
+        let processes = ProcessInputs::new(&self.signatures, &*self.actions);
         let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories, system: &*self.system, processes };
         if let Some(page) = self.pages.page_mut(core) {
-            page.draw(ui, &ctx, actions);
+            page.draw_with_addons(ui, &ctx, &mut self.addons, actions);
         }
     }
 
@@ -518,6 +507,25 @@ impl TaskApp {
         let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
         let processes = ProcessInputs::new(&self.signatures, &*self.actions);
         self.pages.on_sample(slot, &PageCtx { settings: &self.settings, snapshot: s, histories, system: &*self.system, processes });
+    }
+
+    /// Keeps the settings a page changed: the sampler runs at the speed
+    /// they name, Hide Microsoft Services and Processes asks for the
+    /// signatures when it was just turned on, and they are saved. Summary
+    /// notices what it shows changed when it is next drawn.
+    fn change_settings(&mut self, new: Settings) {
+        self.adopt_settings(new);
+        self.settings.save();
+    }
+
+    /// [`Self::change_settings`] without the saving.
+    fn adopt_settings(&mut self, new: Settings) {
+        let hide_was_on = self.settings.hide_microsoft;
+        self.settings = new;
+        self.sampler.interval_ms.store(self.settings.interval_ms(), Ordering::Relaxed);
+        if self.settings.hide_microsoft && !hide_was_on {
+            self.ask_signatures();
+        }
     }
 
     pub fn set_speed(&mut self, idx: usize) {
@@ -894,7 +902,7 @@ impl TaskApp {
             .filter(|(_, t)| t.elapsed() < Duration::from_secs(6))
             .map(|(m, _)| m.clone());
         // Settings › Add-ons keeps its status line here while it is open.
-        let note = (self.page == Page::Core(Core::Settings) && self.show_addons)
+        let note = (self.page == Page::Core(Core::Settings) && self.pages.settings.showing_addons())
             .then(|| crate::addons::overview::Overview::of(&self.addons, None).status());
         let theme = self.theme();
         let [state, procs, ip, generation] = status_parts(paused, providers, s.procs.len(), &local_ip(), s.seq);
@@ -1287,6 +1295,8 @@ impl TaskApp {
                 }
             }
             Action::UpdateSpeed(i) => self.set_speed(i),
+            Action::ChangeSettings(new) => self.change_settings(*new),
+            Action::SetAddon(id, on) => self.set_addon(id, on),
             Action::Refresh => self.refresh_now(),
             Action::PerfSetting(change) => {
                 change.apply(&mut self.settings);
@@ -2222,7 +2232,8 @@ mod tests {
         let sources = [
             ("app.rs", include_str!("app.rs")),
             ("pages.rs", include_str!("pages.rs")),
-            ("pages2.rs", include_str!("pages2.rs")),
+            ("page_colors.rs", include_str!("page_colors.rs")),
+            ("page_settings.rs", include_str!("page_settings.rs")),
             ("platform.rs", include_str!("platform.rs")),
             ("widgets.rs", include_str!("widgets.rs")),
             ("settings.rs", include_str!("settings.rs")),
@@ -2298,6 +2309,34 @@ mod tests {
     fn page_texts(app: &mut TaskApp) -> Vec<String> {
         let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
         crate::test_ui::texts(&crate::test_ui::run(&ctx, (1400.0, 900.0), vec![], |ui| app.draw_page(ui, &mut Vec::new())))
+    }
+
+    #[test]
+    fn settings_and_colors_are_drawn_for_their_pages() {
+        let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
+        app.page = Page::Core(Core::Settings);
+        let words = page_texts(&mut app);
+        for w in ["Settings", "Real-time update speed", "Add-ons"] {
+            assert!(words.iter().any(|x| x == w), "{w:?} in {words:?}");
+        }
+        app.page = Page::Core(Core::Colors);
+        let words = page_texts(&mut app);
+        assert!(words.iter().any(|x| x == "The default palette"), "{words:?}");
+    }
+
+    #[test]
+    fn settings_changed_by_a_page_reach_the_sampler() {
+        let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
+        let paused = SPEEDS.len() - 1;
+        let mut new = Settings::default();
+        new.speed = paused;
+        app.adopt_settings(new);
+        assert_eq!(app.settings.speed, paused);
+        assert_eq!(app.sampler.interval_ms.load(Ordering::Relaxed), 0, "Paused stops the sampler");
+        let mut normal = Settings::default();
+        normal.speed = 1;
+        app.adopt_settings(normal);
+        assert_eq!(app.sampler.interval_ms.load(Ordering::Relaxed), SPEEDS[1].1 as u64);
     }
 
     #[test]
