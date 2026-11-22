@@ -123,7 +123,7 @@ pub enum Action {
     /// Settings or Colors changed settings: the app keeps these, saves
     /// them and acts on what changed (the sampler's interval, the
     /// signatures Hide Microsoft Services and Processes needs).
-    ChangeSettings(Box<Settings>),
+    ChangeSettings(crate::settings::SettingsChange),
     /// Settings › Add-ons: turns the add-on on or off and saves the choice.
     SetAddon(&'static str, bool),
     /// Refresh now (the Refresh button of a page that draws its own header).

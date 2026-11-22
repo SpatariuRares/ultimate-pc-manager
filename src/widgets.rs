@@ -595,13 +595,14 @@ fn view_items(view: &[parts::DropItem<ProcView>]) -> Vec<MenuEntry> {
 }
 
 /// `state` with what the menu reads about the row right-clicked, asked of
-/// `system`: the priority (one row only), the affinity and whether the row
-/// has a window. A value the page already gave is kept.
+/// `system`: the priority (one row only), the affinity, whether the row
+/// has a window and which process is the shell's Windows Explorer. A value the page already gave is kept.
 pub fn read_menu_state<'a>(system: &dyn crate::system_actions::SystemActions, p: &ProcRow, rows: &[&ProcRow], state: &MenuState<'a>) -> MenuState<'a> {
     let priority = if state.priority.is_none() && rows.len() <= 1 { system.priority_of(p.pid) } else { state.priority };
     let affinity = state.affinity.or_else(|| system.affinity_of(p.pid));
     let windowed = state.windowed.or_else(|| (rows.len() <= 1).then(|| p.app || system.has_window(p.pid)));
-    MenuState { priority, affinity, windowed, ..*state }
+    let shell = state.shell.or_else(|| system.shell_pid());
+    MenuState { priority, affinity, windowed, shell, ..*state }
 }
 
 /// The right-click menu of a process ([`menu_entries`]), drawn. The

@@ -396,7 +396,6 @@ mod tests {
         let sources = [
             ("app.rs", include_str!("../app.rs")),
             ("main.rs", include_str!("../main.rs")),
-            ("pages.rs", include_str!("../pages.rs")),
             ("page_colors.rs", include_str!("../page_colors.rs")),
             ("page_settings.rs", include_str!("../page_settings.rs")),
             ("platform.rs", include_str!("../platform.rs")),

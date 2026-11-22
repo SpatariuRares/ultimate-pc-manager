@@ -13,7 +13,7 @@ pub struct RecordingActions {
     /// Scripted failures: a request equal to the first of a pair fails with
     /// the second.
     failures: Mutex<Vec<(Request, String)>>,
-    /// What the reads answer (ticket 97); an unscripted read finds nothing.
+    /// What the reads answer; an unscripted read finds nothing.
     reads: Mutex<Reads>,
     /// Scripted waits: a request equal to the first of a pair takes that long
     /// to answer (like a real dump or Explorer restart).
@@ -27,6 +27,7 @@ struct Reads {
     priority: Vec<(u32, &'static str)>,
     affinity: Vec<(u32, crate::winsys::Affinity)>,
     windowed: Vec<u32>,
+    shell: Option<u32>,
 }
 
 impl RecordingActions {
@@ -55,6 +56,11 @@ impl RecordingActions {
         self.reads.lock().unwrap_or_else(|e| e.into_inner()).windowed.push(pid);
     }
 
+    /// From now on the shell's Windows Explorer reads as the process `pid`.
+    pub fn script_shell(&self, pid: u32) {
+        self.reads.lock().unwrap_or_else(|e| e.into_inner()).shell = Some(pid);
+    }
+
     /// From now on `request` takes `wait` to answer.
     pub fn delay(&self, request: Request, wait: std::time::Duration) {
         self.delays.lock().unwrap_or_else(|e| e.into_inner()).push((request, wait));
@@ -81,7 +87,7 @@ impl RecordingActions {
 }
 
 impl SystemActions for RecordingActions {
-    // ---- Process actions (ticket 96) ----
+    // ---- Process control ----
     fn end_process(&self, pid: u32, force: bool, tree: bool) -> Result<(), String> {
         self.record(Request::End { pid, force, tree })
     }
@@ -98,7 +104,7 @@ impl SystemActions for RecordingActions {
         self.record(Request::Affinity(pid, mask))
     }
 
-    // ---- Dump and Explorer restart (ticket 98) ----
+    // ---- Dumps and Explorer ----
     fn write_dump(&self, pid: u32, name: &str, dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
         self.record(Request::Dump { pid, name: name.into(), dir: dir.into() })?;
         Ok(dir.join(format!("{name}-{pid}.dmp")))
@@ -107,7 +113,7 @@ impl SystemActions for RecordingActions {
         self.record(Request::RestartExplorer(pid))
     }
 
-    // ---- Elevation, administrator check and the remaining actions (ticket 99) ----
+    // ---- Elevation and shell ----
     fn restart_elevated(&self, page: &str) -> Result<(), String> {
         self.record(Request::RestartElevated(page.into()))
     }
@@ -133,9 +139,8 @@ impl SystemActions for RecordingActions {
         self.record(Request::OpenPowerOptions)
     }
 
-    // ---- (add the next group of actions below, in its own section) ----
 
-    // ---- Process priority and the process menu's reads (ticket 97) ----
+    // ---- Priority and reads ----
     fn set_priority(&self, pid: u32, class: &str) -> Result<(), String> {
         self.record(Request::Priority(pid, class.into()))
     }
@@ -147,5 +152,8 @@ impl SystemActions for RecordingActions {
     }
     fn has_window(&self, pid: u32) -> bool {
         self.reads.lock().unwrap_or_else(|e| e.into_inner()).windowed.contains(&pid)
+    }
+    fn shell_pid(&self) -> Option<u32> {
+        self.reads.lock().unwrap_or_else(|e| e.into_inner()).shell
     }
 }

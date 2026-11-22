@@ -53,22 +53,6 @@ impl<'a> ProcessInputs<'a> {
     }
 }
 
-/// What a page test owns so it can be given [`ProcessInputs`]: a signature
-/// cache, a recording system and no add-on columns.
-#[cfg(test)]
-#[derive(Default)]
-pub struct Standalone {
-    signatures: Signatures,
-    system: crate::system_actions::RecordingActions,
-}
-
-#[cfg(test)]
-impl Standalone {
-    pub fn inputs(&self) -> ProcessInputs<'_> {
-        ProcessInputs::new(&self.signatures, &self.system)
-    }
-}
-
 /// The Processes columns the add-ons that are on add, and their figures.
 pub trait ProcessColumns {
     /// The columns, by add-on id, in registry order.
@@ -172,16 +156,6 @@ fn hide_of(ctx: &PageCtx) -> process_view::Hide {
     process_view::Hide::new(ctx.settings, std::process::id(), ctx.processes.signatures.microsoft())
 }
 
-/// The page title: an outline icon and a large, widely spaced heading.
-fn page_title(ui: &mut Ui, title: &str) {
-    let theme = theme::of_ui(ui);
-    let (r, _) = ui.allocate_exact_size(vec2(26.0, 40.0), Sense::hover());
-    if !crate::widgets::icons::draw(ui.painter(), r.center(), Core::Processes.id()) {
-        crate::widgets::plain_icon(ui.painter(), r.center(), theme.label);
-    }
-    ui.label(RichText::new(title).font(theme.fonts.page_title.clone()).color(theme.text));
-}
-
 /// What the "Process View" menu lists now, top to bottom.
 pub fn process_view_items(settings: &Settings) -> Vec<parts::DropItem<ProcView>> {
     let tree = settings.process_tree;
@@ -221,7 +195,7 @@ impl CorePage for ProcessesPage {
         let (mut refresh, mut view) = (false, None);
         let view_items = process_view_items(ctx.settings);
         ui.horizontal(|ui| {
-            page_title(ui, "Processes");
+            crate::core_page::page_title(ui, Core::Processes.id(), "Processes");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 refresh = refresh_button(ui).clicked();
                 crate::widgets::search_field(ui, &mut self.search, "Filter by name, user, or PID", 300.0);
@@ -574,7 +548,7 @@ impl CorePage for ProcessesPage {
                                     view: &view_items,
                                     priority: None,
                                     affinity: None,
-                                    shell: crate::winsys::shell_pid(),
+                                    shell: None,
                                     following,
                                     services: Some(&*services),
                                     windowed: None,
@@ -2700,6 +2674,15 @@ pub(crate) mod tests {
         // Several rows: no priority; the affinity is still the row's own.
         let many = crate::widgets::read_menu_state(&*seam, &p, &[&p, &q], &blank);
         assert_eq!((many.priority, many.affinity, many.windowed), (None, Some(mask), None));
+        // The shell's Explorer is read through the seam too.
+        seam.script_shell(p.pid);
+        assert_eq!(crate::widgets::read_menu_state(&*seam, &p, &[&p], &blank).shell, Some(p.pid));
+        let explorer = proc(4_000_000_003, "explorer.exe", "spata", 0.0, 0);
+        seam.script_shell(explorer.pid);
+        let state = crate::widgets::read_menu_state(&*seam, &explorer, &[&explorer], &blank);
+        assert_eq!(menu_item(&menu_entries(&explorer, &[&explorer], &state), "Restart"), (true, vec![Action::RestartExplorer(explorer.pid)]), "Restart follows the shell the seam reports");
+        let other = menu_entries(&p, &[&p], &crate::widgets::read_menu_state(&*seam, &p, &[&p], &blank));
+        assert!(!labels(&other).contains(&"Restart"), "not for a process that is not the shell");
         // A process the adapter knows nothing about: nothing ticked, no window.
         let none = crate::widgets::read_menu_state(&*seam, &q, &[&q], &blank);
         assert_eq!((none.priority, none.affinity, none.windowed), (None, None, Some(false)));

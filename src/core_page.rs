@@ -124,6 +124,9 @@ pub struct CorePages {
     pub services: crate::page_services::ServicesPage,
     pub startup: crate::page_startup::StartupPage,
     pub app_history: crate::page_history::AppHistoryPage,
+    /// Tests: every delivery of a sample, by slot, is noted here.
+    #[cfg(test)]
+    pub trace: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
 impl CorePages {
@@ -157,6 +160,10 @@ impl CorePages {
 
     /// Delivers a new sample to the pages whose slot is `slot`.
     pub fn on_sample(&mut self, slot: SampleSlot, ctx: &PageCtx) {
+        #[cfg(test)]
+        if let Some(trace) = &self.trace {
+            trace.lock().unwrap().push(format!("pages {slot:?}"));
+        }
         deliver(self.all_mut().into_iter().map(|(_, p)| p), slot, ctx);
     }
 }
@@ -171,8 +178,64 @@ fn deliver<'a>(pages: impl Iterator<Item = &'a mut dyn CorePage>, slot: SampleSl
 /// Helpers for testing a page through the interface, without the app.
 #[cfg(test)]
 pub mod testing {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::system_lists::fake::FakeSystem;
     use crate::theme::Mode;
+
+    /// What a page test owns so it can be given
+    /// [`crate::page_processes::ProcessInputs`]: a signature cache, a
+    /// recording system and no add-on columns.
+    #[derive(Default)]
+    pub struct Standalone {
+        signatures: crate::signature::Signatures,
+        system: crate::system_actions::RecordingActions,
+    }
+
+    impl Standalone {
+        pub fn inputs(&self) -> crate::page_processes::ProcessInputs<'_> {
+            crate::page_processes::ProcessInputs::new(&self.signatures, &self.system)
+        }
+    }
+
+    /// What a page is lent besides the settings and the snapshot: the app's
+    /// shared histories (empty unless a test fills them), a fake system the
+    /// test keeps a handle to, and the Processes inputs.
+    #[derive(Default)]
+    pub struct Lent {
+        pub cpu: VecDeque<f32>,
+        pub mem: VecDeque<f32>,
+        pub perf: PerfHistory,
+        pub system: Arc<FakeSystem>,
+        pub standalone: Standalone,
+    }
+
+    impl Lent {
+        pub fn ctx<'a>(&'a self, settings: &'a Settings, snapshot: &'a Snapshot) -> PageCtx<'a> {
+            PageCtx { settings, snapshot, histories: Histories { cpu: &self.cpu, mem: &self.mem, perf: &self.perf }, system: &*self.system, processes: self.standalone.inputs() }
+        }
+    }
+
+    /// Everything a page is given, owned by a test: settings and snapshot to
+    /// change, and what is lent.
+    pub struct Env {
+        pub settings: Settings,
+        pub snapshot: Snapshot,
+        pub system: Arc<FakeSystem>,
+        lent: Lent,
+    }
+
+    impl Env {
+        pub fn new() -> Env {
+            let lent = Lent::default();
+            Env { settings: Settings::default(), snapshot: Snapshot::default(), system: lent.system.clone(), lent }
+        }
+
+        pub fn ctx(&self) -> PageCtx<'_> {
+            self.lent.ctx(&self.settings, &self.snapshot)
+        }
+    }
 
     /// What one frame of a page drew and queued.
     pub struct Drawn {
@@ -189,18 +252,8 @@ pub mod testing {
     /// The same with the app's short histories given.
     pub fn draw_with(page: &mut dyn CorePage, settings: &Settings, snapshot: &Snapshot, cpu: &VecDeque<f32>, mem: &VecDeque<f32>) -> Drawn {
         let ctx = crate::test_ui::context(Mode::Dark);
-        let perf = PerfHistory::new();
-        let standalone = crate::page_processes::Standalone::default();
-        let system = crate::system_lists::fake::FakeSystem::default();
-        draw_in(&ctx, page, &PageCtx { settings, snapshot, histories: Histories { cpu, mem, perf: &perf }, system: &system, processes: standalone.inputs() })
-    }
-
-    /// The same for a page that needs the add-on host (Settings).
-    pub fn draw_with_addons(page: &mut dyn CorePage, settings: &Settings, snapshot: &Snapshot, host: &mut AddonHost) -> Drawn {
-        let ctx = crate::test_ui::context(Mode::Dark);
-        let perf = PerfHistory::new();
-        let standalone = crate::page_processes::Standalone::default();
-        draw_hosted_in(&ctx, page, &PageCtx { settings, snapshot, histories: Histories { cpu: &VecDeque::new(), mem: &VecDeque::new(), perf: &perf }, system: &crate::system_lists::fake::FakeSystem::default(), processes: standalone.inputs() }, host)
+        let lent = Lent { cpu: cpu.clone(), mem: mem.clone(), ..Default::default() };
+        draw_in(&ctx, page, &lent.ctx(settings, snapshot))
     }
 
     /// Draws with the host in `ctx`, keeping what egui remembers.
@@ -225,10 +278,8 @@ pub mod testing {
     /// `snapshot`) and returns what the frame of the release queued.
     pub fn click(page: &mut dyn CorePage, settings: &Settings, snapshot: &Snapshot, word: &str) -> Vec<Action> {
         use egui::{Event, PointerButton};
-        let (cpu, mem) = (VecDeque::new(), VecDeque::new());
-        let perf = PerfHistory::new();
-        let standalone = crate::page_processes::Standalone::default();
-        let page_ctx = PageCtx { settings, snapshot, histories: Histories { cpu: &cpu, mem: &mem, perf: &perf }, system: &crate::system_lists::fake::FakeSystem::default(), processes: standalone.inputs() };
+        let lent = Lent::default();
+        let page_ctx = lent.ctx(settings, snapshot);
         let ctx = crate::test_ui::context(Mode::Dark);
         let size = (1400.0, 900.0);
         let mut frame = |events: Vec<Event>| {
@@ -278,10 +329,8 @@ mod tests {
         let mut summary = Recorder { name: "summary", slot: SampleSlot::Summary, log: log.clone() };
         let settings = Settings::default();
         let snapshot = Snapshot { seq: 7, ..Default::default() };
-        let (cpu, mem, history) = (VecDeque::new(), VecDeque::new(), PerfHistory::new());
-        let standalone = crate::page_processes::Standalone::default();
-        let system = crate::system_lists::fake::FakeSystem::default();
-        let ctx = PageCtx { settings: &settings, snapshot: &snapshot, histories: Histories { cpu: &cpu, mem: &mem, perf: &history }, system: &system, processes: standalone.inputs() };
+        let lent = testing::Lent::default();
+        let ctx = lent.ctx(&settings, &snapshot);
         deliver([&mut summary as &mut dyn CorePage, &mut perf].into_iter(), SampleSlot::Performance, &ctx);
         assert_eq!(*log.borrow(), ["perf saw seq 7"]);
         deliver([&mut summary as &mut dyn CorePage, &mut perf].into_iter(), SampleSlot::Summary, &ctx);

@@ -8,8 +8,8 @@ use egui::{Align, Layout, Ui};
 use egui_extras::{Column, TableBuilder};
 
 use crate::addons::Core;
-use crate::core_page::{CorePage, PageCtx, SampleSlot};
-use crate::list_pages::{page_title, summary_band, GAP};
+use crate::core_page::{page_title, CorePage, PageCtx, SampleSlot};
+use crate::list_pages::{summary_band, GAP};
 use crate::platform::Action;
 use crate::widgets::fmt_bytes;
 use crate::widgets::parts::{self, cell_text, column_heading, design_table, CellInk, Mark, TABLE_HEADER_HEIGHT, TABLE_ROW_HEIGHT};
@@ -52,9 +52,9 @@ impl CorePage for AppHistoryPage {
         self.last_sample_at = Some(now);
     }
 
-    fn draw(&mut self, ui: &mut Ui, ctx: &PageCtx, _actions: &mut Vec<Action>) {
+    fn draw(&mut self, ui: &mut Ui, _ctx: &PageCtx, _actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
-            page_title(ui, ctx, Core::AppHistory, "App history");
+            page_title(ui, Core::AppHistory.id(), "App history");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if parts::header_button(ui, "Delete usage history", true).clicked() {
                     self.totals.clear();
@@ -176,6 +176,21 @@ mod tests {
         let at = |name: &str| shown.iter().position(|t| t == name);
         assert!(at("heavy.exe").is_some(), "{shown:?}");
         assert!(at("light.exe").is_none(), "1% for 80 ms is under 0.01 s of CPU: {shown:?}");
+    }
+
+    #[test]
+    fn a_long_gap_between_samples_counts_at_most_ten_seconds() {
+        let mut env = Env::new();
+        let mut page = AppHistoryPage::default();
+        let ui = ui_ctx();
+        sample(&mut page, &mut env, busy("busy.exe"));
+        // The app was suspended for a minute (a laptop asleep, say): the
+        // next sample arrives 60 seconds after the previous one.
+        page.last_sample_at = Instant::now().checked_sub(std::time::Duration::from_secs(60));
+        sample(&mut page, &mut env, busy("busy.exe"));
+        let shown = texts(&ui, &mut page, &env.ctx());
+        // Two cores at 100% for 10 seconds is 20 seconds of CPU time.
+        assert!(has(&shown, "0:00:20"), "{shown:?}");
     }
 
     #[test]

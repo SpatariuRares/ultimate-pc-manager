@@ -1,28 +1,15 @@
 //! What Services, Startup apps and App history share, in Design A's look:
-//! the page title, the band that sums a list up and the side panel's
-//! pieces. The pages themselves are in `page_services`, `page_startup` and
+//! the band that sums a list up and the side panel's pieces. The pages themselves are in `page_services`, `page_startup` and
 //! `page_history`.
 
-use egui::{vec2, RichText, Sense, Ui};
+use egui::{RichText, Ui};
 
-use crate::addons::Core;
 use crate::app::TaskApp;
-use crate::core_page::PageCtx;
 use crate::theme;
 use crate::widgets::parts::{Mark, StatusBand};
 
 /// Space between the header, the band and the list.
 pub const GAP: f32 = 8.0;
-
-/// The page title: an outline icon and a large, widely spaced heading.
-pub fn page_title(ui: &mut Ui, ctx: &PageCtx, core: Core, title: &str) {
-    let t = theme::Theme::of(theme::Mode::from_dark(ctx.settings.dark));
-    let (r, _) = ui.allocate_exact_size(vec2(26.0, 40.0), Sense::hover());
-    if !crate::widgets::icons::draw(ui.painter(), r.center(), core.id()) {
-        crate::widgets::plain_icon(ui.painter(), r.center(), t.label);
-    }
-    ui.label(RichText::new(title).font(t.fonts.page_title.clone()).color(t.text));
-}
 
 /// A band that only sums the page up: a headline and the line under it.
 pub fn summary_band(ui: &mut Ui, mark: Mark, headline: &str, sub: &str) {
@@ -59,38 +46,13 @@ impl TaskApp {
 /// Helpers for testing the three pages through the interface.
 #[cfg(test)]
 pub mod testing {
-    use std::collections::VecDeque;
-    use std::sync::Arc;
-
     use egui::{Event, PointerButton, Shape};
 
-    use crate::core_page::{CorePage, Histories, PageCtx};
+    pub use crate::core_page::testing::Env;
+    use crate::core_page::{CorePage, PageCtx};
     use crate::platform::Action;
-    use crate::sampler::Snapshot;
-    use crate::settings::Settings;
-    use crate::system_lists::fake::FakeSystem;
 
     pub const SIZE: (f32, f32) = (1300.0, 800.0);
-
-    /// What a page is given, with a fake the test keeps.
-    pub struct Env {
-        pub settings: Settings,
-        pub snapshot: Snapshot,
-        pub system: Arc<FakeSystem>,
-        history: VecDeque<f32>,
-        perf: crate::core_page::PerfHistory,
-        standalone: crate::page_processes::Standalone,
-    }
-
-    impl Env {
-        pub fn new() -> Env {
-            Env { settings: Settings::default(), snapshot: Snapshot::default(), system: Arc::new(FakeSystem::default()), history: VecDeque::new(), perf: Default::default(), standalone: Default::default() }
-        }
-
-        pub fn ctx(&self) -> PageCtx<'_> {
-            PageCtx { settings: &self.settings, snapshot: &self.snapshot, histories: Histories { cpu: &self.history, mem: &self.history, perf: &self.perf }, system: &*self.system, processes: self.standalone.inputs() }
-        }
-    }
 
     /// The texts of one frame of `page`.
     pub fn texts(ctx: &egui::Context, page: &mut dyn CorePage, page_ctx: &PageCtx) -> Vec<String> {

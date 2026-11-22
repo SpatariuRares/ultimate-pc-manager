@@ -1,4 +1,4 @@
-//! The window: a sidebar of pages and one panel per page (see pages.rs).
+//! The window: a sidebar of pages and one panel per page (see core_page.rs).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::Ordering;
@@ -198,9 +198,6 @@ pub struct TaskApp {
     /// otherwise the machine's are read (see [`TaskApp::machine`]).
     pub machine_info: Option<crate::perfdata::StaticInfo>,
     pub page: Page,
-    #[allow(dead_code)]
-    pub nav_open: bool,
-    pub search: String,
     /// The Processes table's layout as last saved (see
     /// [`TaskApp::process_table_unsaved`]).
     process_table_saved: crate::settings::ProcessTable,
@@ -281,9 +278,6 @@ impl TaskApp {
             ph: BTreeMap::new(),
             machine_info: None,
             page,
-            nav_open: true,
-
-            search: String::new(),
             process_table_saved: Default::default(),
             system,
             signatures: Default::default(),
@@ -477,7 +471,6 @@ impl TaskApp {
         let mem_pct = if s.mem_total > 0 { s.mem_used as f32 * 100.0 / s.mem_total as f32 } else { 0.0 };
         push(&mut self.mem_hist, mem_pct);
         self.sample_pages(SampleSlot::AppHistory, &s);
-        let now = Instant::now();
         // The Processes view notices the processes that ended (it keeps
         // them a moment; the sampler does not).
         self.sample_pages(SampleSlot::ProcessTracking, &s);
@@ -500,7 +493,9 @@ impl TaskApp {
     /// they name, Hide Microsoft Services and Processes asks for the
     /// signatures when it was just turned on, and they are saved. Summary
     /// notices what it shows changed when it is next drawn.
-    fn change_settings(&mut self, new: Settings) {
+    fn change_settings(&mut self, change: crate::settings::SettingsChange) {
+        let mut new = self.settings.clone();
+        change.apply(&mut new);
         self.adopt_settings(new);
         self.settings.save();
     }
@@ -919,14 +914,6 @@ impl TaskApp {
         }
     }
 
-    /// The page title: an outline icon and a large, widely spaced heading.
-    pub fn page_title(&self, ui: &mut Ui, title: &str) {
-        let theme = self.theme();
-        let (r, _) = ui.allocate_exact_size(vec2(26.0, 40.0), Sense::hover());
-        self.page_icon(ui.painter(), r.center(), self.page, theme.label);
-        ui.label(RichText::new(title).font(theme.fonts.page_title.clone()).color(theme.text));
-    }
-
     /// The page of a migrated add-on: the app's header, then the add-on
     /// draws the rest through the host.
     fn addon_page(&mut self, ui: &mut Ui, id: &str, actions: &mut Vec<Action>) {
@@ -953,7 +940,7 @@ impl TaskApp {
     fn header_with(&mut self, ui: &mut Ui, title: &str, subtitle: Option<&str>, mut extra: impl FnMut(&mut Self, &mut Ui)) {
         let (mut refresh, mut run) = (false, false);
         ui.horizontal(|ui| {
-            self.page_title(ui, title);
+            crate::core_page::page_title(ui, self.page.id(), title);
             if let Some(sub) = subtitle {
                 ui.label(RichText::new(sub).color(ui.visuals().weak_text_color()));
             }
@@ -1267,7 +1254,7 @@ impl TaskApp {
                 }
             }
             Action::UpdateSpeed(i) => self.set_speed(i),
-            Action::ChangeSettings(new) => self.change_settings(*new),
+            Action::ChangeSettings(change) => self.change_settings(change),
             Action::SetAddon(id, on) => self.set_addon(id, on),
             Action::Refresh => self.refresh_now(),
             Action::PerfSetting(change) => {
@@ -1516,6 +1503,87 @@ mod tests {
     }
 
     #[test]
+    fn a_sample_is_handled_in_the_order_the_spec_names() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut app, tx) = TaskApp::fed(Settings::default(), Snapshot::default());
+        app.addons = AddonHost::for_tests_with(vec![crate::addons::Entry::Addon(Box::new(Tap(log.clone())))], &json!({ "tap": { "enabled": true } })).0;
+        app.pages.trace = Some(log.clone());
+        tx.send(Snapshot { seq: 1, ..Default::default() }).unwrap();
+        app.pull_samples();
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["1", "pages Performance", "pages AppHistory", "pages ProcessTracking", "pages Summary", "pages Last"],
+            "the add-ons first, then the pages in the order of their slots"
+        );
+        assert_eq!(app.cpu_hist.len(), 1, "the short histories are filled between the Performance and App history slots");
+    }
+
+    #[test]
+    fn a_settings_change_applies_only_what_its_page_changed() {
+        use crate::page_perf::PerfSetting;
+        use crate::page_processes::ProcessesChange;
+        let ctx = egui::Context::default();
+        let start = Settings::default();
+        let mut colours = start.clone();
+        colours.cpu_color = [1, 2, 3];
+        let queue = || {
+            vec![
+                Action::ChangeSettings(crate::settings::SettingsChange::new(&start, colours.clone())),
+                Action::PerfSetting(PerfSetting::Logical(false)),
+                Action::Processes(ProcessesChange::InspectorWidth(321.0)),
+                Action::ResourceValues { percents: true },
+            ]
+        };
+        for reversed in [false, true] {
+            let mut actions = queue();
+            if reversed {
+                actions.reverse();
+            }
+            let mut app = TaskApp::headless(start.clone(), Snapshot::default());
+            for a in actions {
+                app.run_action(&ctx, a);
+            }
+            let s = &app.settings;
+            assert_eq!(s.cpu_color, [1, 2, 3], "the page's own change (reversed: {reversed})");
+            assert!(!s.perf_logical, "Performance's change (reversed: {reversed})");
+            assert_eq!(s.process_table.inspector_width, 321.0, "Processes' change (reversed: {reversed})");
+            assert!(s.process_percents, "Resource values (reversed: {reversed})");
+        }
+    }
+
+    #[test]
+    fn a_settings_change_keeps_the_add_on_choices_made_in_the_same_frame() {
+        let ctx = egui::Context::default();
+        let start = Settings::default();
+        let mut colours = start.clone();
+        colours.cpu_color = [1, 2, 3];
+        let mut app = TaskApp::headless(start.clone(), Snapshot::default());
+        app.settings.addons = json!({ "tap": { "enabled": false } });
+        app.run_action(&ctx, Action::ChangeSettings(crate::settings::SettingsChange::new(&start, colours)));
+        assert_eq!(app.settings.cpu_color, [1, 2, 3]);
+        assert_eq!(app.settings.addons, json!({ "tap": { "enabled": false } }));
+    }
+
+    #[test]
+    fn processes_keeps_its_selection_and_search_while_another_page_is_shown() {
+        let (mut app, _tx) = TaskApp::fed(Settings::default(), Snapshot { procs: vec![crate::sampler::ProcRow { pid: A, name: "alpha.exe".into(), ..Default::default() }, crate::sampler::ProcRow { pid: B, name: "beta.exe".into(), ..Default::default() }], ..Default::default() });
+        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        let frame = |app: &mut TaskApp| crate::test_ui::texts(&crate::test_ui::run(&ctx, (1400.0, 900.0), vec![], |ui| app.draw_page(ui, &mut Vec::new())));
+        app.page = Page::Core(Core::Processes);
+        app.pages.processes.go_to(B);
+        app.pages.processes.search = "bet".into();
+        frame(&mut app);
+        app.page = Page::Core(Core::Settings);
+        frame(&mut app);
+        frame(&mut app);
+        app.page = Page::Core(Core::Processes);
+        let shown = frame(&mut app);
+        assert_eq!(app.pages.processes.selected.single(), Some(B), "the selection survives the other page");
+        assert_eq!(app.pages.processes.search, "bet", "so does the search");
+        assert!(shown.iter().any(|t| t == "beta.exe") && !shown.iter().any(|t| t == "alpha.exe"), "and the page shows them again: {shown:?}");
+    }
+
+    #[test]
     fn inspect_opens_one_inspector_window_per_process() {
         let me = crate::sampler::ProcRow { pid: std::process::id(), name: "tests.exe".into(), ..Default::default() };
         let mut app = TaskApp::headless(Settings::default(), Snapshot { procs: vec![me], ..Default::default() });
@@ -1540,12 +1608,11 @@ mod tests {
         let me = crate::sampler::ProcRow { pid: std::process::id(), name: "tests.exe".into(), ..Default::default() };
         let mut app = TaskApp::headless(Settings::default(), Snapshot { procs: vec![me], ..Default::default() });
         let ctx = egui::Context::default();
+        app.recording().set_admin(false);
         app.run_action(&ctx, Action::FileActivity(std::process::id()));
         app.run_action(&ctx, Action::FileActivity(std::process::id()));
         assert_eq!(app.pages.processes.file_activity.iter().map(|w| w.pid).collect::<Vec<_>>(), [std::process::id()], "asking again opens no second window");
-        if !crate::platform::is_admin() {
-            assert!(!app.pages.processes.file_activity[0].tracing(), "the admin check runs on click; not elevated, no trace");
-        }
+        assert!(!app.pages.processes.file_activity[0].tracing(), "the admin check runs on click; the seam says not elevated, no trace");
         // Closing the app stops every trace with its window.
         app.close_file_activity();
         assert!(app.pages.processes.file_activity.is_empty());
@@ -2203,7 +2270,6 @@ mod tests {
     fn the_app_names_no_addon() {
         let sources = [
             ("app.rs", include_str!("app.rs")),
-            ("pages.rs", include_str!("pages.rs")),
             ("page_colors.rs", include_str!("page_colors.rs")),
             ("page_settings.rs", include_str!("page_settings.rs")),
             ("platform.rs", include_str!("platform.rs")),

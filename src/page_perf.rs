@@ -1153,7 +1153,6 @@ mod tests {
     use super::*;
 
     use crate::core_page::testing::draw;
-    use crate::core_page::Histories;
 
     const HARD_FAULTS: &str = "Hard faults, pages read from disk (file-backed paging included)";
 
@@ -1163,9 +1162,9 @@ mod tests {
 
     /// One frame of `page` in `ctx` with the given Performance history.
     fn frame_with(ctx: &egui::Context, page: &mut PerformancePage, settings: &Settings, snap: &Snapshot, ph: &PerfHistory, events: Vec<egui::Event>) -> (Vec<String>, Vec<Action>, egui::FullOutput) {
-        let (cpu, mem) = (VecDeque::new(), VecDeque::new());
-        let standalone = crate::page_processes::Standalone::default();
-        let pc = PageCtx { settings, snapshot: snap, histories: Histories { cpu: &cpu, mem: &mem, perf: ph }, system: &crate::system_lists::fake::FakeSystem::default(), processes: standalone.inputs() };
+        let lent = crate::core_page::testing::Lent::default();
+        let mut pc = lent.ctx(settings, snap);
+        pc.histories.perf = ph;
         let mut actions = Vec::new();
         let out = crate::test_ui::run(ctx, (1400.0, 900.0), events, |ui| page.draw(ui, &pc, &mut actions));
         (crate::test_ui::texts(&out), actions, out)
@@ -1268,7 +1267,7 @@ mod tests {
 
     #[test]
     fn a_custom_cpu_colour_reaches_performance() {
-        let (settings, cpu) = crate::pages::tests::custom_cpu();
+        let (settings, cpu) = crate::test_ui::custom_cpu();
         let snap = Snapshot::default();
         assert_eq!(devices(&settings, &snap, machine_of(&snap, None), &PerfHistory::new())[0].color, cpu, "the CPU tile");
         let ctx = crate::test_ui::context(Mode::Dark);

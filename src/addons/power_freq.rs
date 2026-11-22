@@ -1668,7 +1668,7 @@ mod tests {
     #[test]
     fn a_custom_cpu_colour_reaches_power_and_freq() {
         use crate::sensors::model::{Device, DeviceKind, Group, Reading, Unit};
-        let (settings, cpu) = crate::pages::tests::custom_cpu();
+        let (settings, cpu) = crate::test_ui::custom_cpu();
         let disk = Device::new(DeviceKind::Disk, "disk0", "SSD");
         let speed = Reading::measure("disk.read", disk, Group::Speed, "Read Speed", Unit::BytesPerSec, "test", Instant::now()).with(Some(1e6), "");
         let frame = Frame::build(1, &[vec![speed]], Vec::new());

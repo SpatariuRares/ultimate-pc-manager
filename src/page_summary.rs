@@ -291,8 +291,7 @@ fn top_processes(ui: &mut Ui, t: &Theme, width: f32, top: &[ProcRow]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core_page::testing::{draw, draw_hosted_in, draw_in};
-    use crate::core_page::{Histories, PerfHistory};
+    use crate::core_page::testing::{draw, draw_hosted_in, draw_in, Lent};
     use crate::perfdata::PerfLive;
     use crate::sampler::{NetRow, Snapshot};
     use crate::settings::{Settings, SPEEDS};
@@ -330,19 +329,6 @@ mod tests {
         texts.iter().any(|t| t == wanted)
     }
 
-    /// The app's shared histories, empty.
-    #[derive(Default)]
-    struct Empty {
-        short: std::collections::VecDeque<f32>,
-        perf: PerfHistory,
-        system: crate::system_lists::fake::FakeSystem,
-        standalone: crate::page_processes::Standalone,
-    }
-
-    fn ctx_of<'a>(settings: &'a Settings, snapshot: &'a Snapshot, empty: &'a Empty) -> PageCtx<'a> {
-        PageCtx { settings, snapshot, histories: Histories { cpu: &empty.short, mem: &empty.short, perf: &empty.perf }, system: &empty.system, processes: empty.standalone.inputs() }
-    }
-
     #[test]
     fn summary_draws_the_cards_and_the_busiest_processes_from_a_snapshot() {
         let drawn = draw(&mut SummaryPage::default(), &Settings::default(), &sample());
@@ -362,14 +348,14 @@ mod tests {
     #[test]
     fn a_new_sample_changes_what_summary_draws() {
         let settings = Settings::default();
-        let empty = Empty::default();
+        let empty = Lent::default();
         let first = sample();
         let mut page = SummaryPage::default();
         let ctx = crate::test_ui::context(theme::Mode::Dark);
-        let drawn = draw_in(&ctx, &mut page, &ctx_of(&settings, &first, &empty));
+        let drawn = draw_in(&ctx, &mut page, &empty.ctx(&settings, &first));
         assert!(has(&drawn.texts, "15%"));
         let second = Snapshot { seq: 2, cpu_total: 99.0, ..sample() };
-        let page_ctx = ctx_of(&settings, &second, &empty);
+        let page_ctx = empty.ctx(&settings, &second);
         page.on_sample(&page_ctx);
         let drawn = draw_in(&ctx, &mut page, &page_ctx);
         assert!(has(&drawn.texts, "99%"), "the new sample is drawn: {:?}", drawn.texts);
@@ -380,14 +366,14 @@ mod tests {
     fn summary_rebuilds_when_the_network_units_change_without_a_new_sample() {
         let mut settings = Settings::default();
         settings.bits_per_second = true;
-        let empty = Empty::default();
+        let empty = Lent::default();
         let snap = sample();
         let mut page = SummaryPage::default();
         let ctx = crate::test_ui::context(theme::Mode::Dark);
-        let before = draw_in(&ctx, &mut page, &ctx_of(&settings, &snap, &empty));
+        let before = draw_in(&ctx, &mut page, &empty.ctx(&settings, &snap));
         assert!(has(&before.texts, "16.0 Mbps"), "{:?}", before.texts);
         settings.bits_per_second = false;
-        let after = draw_in(&ctx, &mut page, &ctx_of(&settings, &snap, &empty));
+        let after = draw_in(&ctx, &mut page, &empty.ctx(&settings, &snap));
         assert!(has(&after.texts, "1.9 MB/s"), "{:?}", after.texts);
         assert!(!has(&after.texts, "16.0 Mbps"));
     }
@@ -402,12 +388,12 @@ mod tests {
 
     #[test]
     fn a_custom_cpu_colour_reaches_summary() {
-        let (settings, cpu) = crate::pages::tests::custom_cpu();
+        let (settings, cpu) = crate::test_ui::custom_cpu();
         let snap = Snapshot::default();
         let mut page = SummaryPage::default();
         let ctx = crate::test_ui::context(theme::Mode::Dark);
-        let empty = Empty::default();
-        let page_ctx = ctx_of(&settings, &snap, &empty);
+        let empty = Lent::default();
+        let page_ctx = empty.ctx(&settings, &snap);
         let out = crate::test_ui::run(&ctx, (1200.0, 800.0), vec![], |ui| page.draw(ui, &page_ctx, &mut Vec::new()));
         assert!(crate::test_ui::colours(&out).contains(&cpu));
     }
@@ -419,14 +405,14 @@ mod tests {
 
     #[test]
     fn summary_holds_the_sensors_only_while_it_is_drawn() {
-        let (settings, snap, empty) = (Settings::default(), sample(), Empty::default());
+        let (settings, snap, empty) = (Settings::default(), sample(), Lent::default());
         let mut addons = host();
         let mut page = SummaryPage::default();
         let ctx = crate::test_ui::context(theme::Mode::Dark);
-        draw_hosted_in(&ctx, &mut page, &ctx_of(&settings, &snap, &empty), &mut addons);
+        draw_hosted_in(&ctx, &mut page, &empty.ctx(&settings, &snap), &mut addons);
         crate::addons::until("the sensors run", || addons.context().sensors().threads() > 0);
         addons.end_frame();
-        draw_hosted_in(&ctx, &mut page, &ctx_of(&settings, &snap, &empty), &mut addons); // still drawn: kept
+        draw_hosted_in(&ctx, &mut page, &empty.ctx(&settings, &snap), &mut addons); // still drawn: kept
         addons.end_frame();
         assert!(addons.context().sensors().threads() > 0, "still drawn: kept");
         addons.end_frame(); // another page: Summary did not ask
@@ -435,24 +421,24 @@ mod tests {
 
     #[test]
     fn summary_fills_its_sensor_tiles_from_the_sensors_while_it_is_drawn() {
-        let (settings, snap, empty) = (Settings::default(), sample(), Empty::default());
+        let (settings, snap, empty) = (Settings::default(), sample(), Lent::default());
         let mut addons = host();
         let mut page = SummaryPage::default();
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         crate::addons::until("a sensor frame reaches the tiles", || {
-            draw_hosted_in(&ctx, &mut page, &ctx_of(&settings, &snap, &empty), &mut addons);
+            draw_hosted_in(&ctx, &mut page, &empty.ctx(&settings, &snap), &mut addons);
             page.has_frame()
         });
     }
 
     #[test]
     fn dropping_the_frame_when_summary_leaves_means_coming_back_never_shows_it() {
-        let (settings, snap, empty) = (Settings::default(), sample(), Empty::default());
+        let (settings, snap, empty) = (Settings::default(), sample(), Lent::default());
         let mut addons = host();
         let mut page = SummaryPage::default();
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         crate::addons::until("a sensor frame reaches the tiles", || {
-            draw_hosted_in(&ctx, &mut page, &ctx_of(&settings, &snap, &empty), &mut addons);
+            draw_hosted_in(&ctx, &mut page, &empty.ctx(&settings, &snap), &mut addons);
             page.has_frame()
         });
         page.drop_frame();

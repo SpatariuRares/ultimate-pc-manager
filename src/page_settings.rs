@@ -434,7 +434,7 @@ impl SettingsPage {
             s.unknown = unknown;
         }
         if s != *ctx.settings {
-            actions.push(Action::ChangeSettings(Box::new(s)));
+            actions.push(Action::ChangeSettings(crate::settings::SettingsChange::new(ctx.settings, s)));
             ui.ctx().request_repaint();
         }
     }
@@ -596,14 +596,33 @@ fn general_rows(ui: &mut Ui, s: &mut Settings, host: Option<&AddonHost>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
 
     use crate::core_page::testing::{self, place};
-    use crate::core_page::{Histories, PerfHistory};
     use crate::sampler::Snapshot;
     use crate::test_ui::{context, run, texts};
     use crate::theme::Mode;
     use egui::{Event, PointerButton};
+
+    #[test]
+    fn both_hiding_settings_are_on_the_settings_page_not_in_process_view() {
+        const LABELS: [&str; 2] = ["Show Task Manager in Reports", "Hide Microsoft Services and Processes"];
+        let ctx = context(Mode::Dark);
+        let mut app = crate::app::TaskApp::headless(Settings::default(), Snapshot::default());
+        app.page = crate::app::Page::Core(crate::addons::Core::Settings);
+        let texts = texts(&run(&ctx, (1400.0, 2400.0), vec![], |ui| app.draw_page(ui, &mut Vec::new())));
+        for label in LABELS {
+            assert!(texts.iter().any(|t| t == label), "Settings shows {label}: {texts:?}");
+        }
+        assert!(texts.iter().any(|t| t.starts_with("Hides services and processes whose program file carries a verified Microsoft Windows signature")));
+        let menu: Vec<&str> = crate::page_processes::process_view_items(&app.settings)
+            .iter()
+            .filter_map(|i| match i {
+                crate::widgets::parts::DropItem::Item { label, .. } => Some(*label),
+                crate::widgets::parts::DropItem::Separator => None,
+            })
+            .collect();
+        assert!(LABELS.iter().all(|l| !menu.contains(l)), "Process View lists {menu:?}");
+    }
 
     /// Clicks the button showing `word` and returns the link it asked for.
     fn click(word: &str) -> Option<&'static str> {
@@ -638,10 +657,8 @@ mod tests {
 
         fn frame(&mut self, events: Vec<Event>) -> (egui::FullOutput, Vec<Action>) {
             let snapshot = Snapshot::default();
-            let (cpu, mem) = (VecDeque::new(), VecDeque::new());
-            let perf = PerfHistory::new();
-            let standalone = crate::page_processes::Standalone::default();
-            let page_ctx = PageCtx { settings: &self.settings, snapshot: &snapshot, histories: Histories { cpu: &cpu, mem: &mem, perf: &perf }, system: &crate::system_lists::fake::FakeSystem::default(), processes: standalone.inputs() };
+            let lent = testing::Lent::default();
+            let page_ctx = lent.ctx(&self.settings, &snapshot);
             let mut actions = Vec::new();
             let (page, host) = (&mut self.page, &mut self.host);
             let out = run(&self.ctx, (1335.0, 1400.0), events, |ui| page.draw_with_addons(ui, &page_ctx, host, &mut actions));
@@ -717,13 +734,14 @@ mod tests {
         }
     }
     #[test]
-    fn a_setting_changed_is_asked_of_the_app_as_the_whole_new_settings() {
+    fn a_setting_changed_is_asked_of_the_app_as_a_change_from_the_settings_drawn() {
         let mut b = Bench::new();
         b.settings.dark = true;
         b.click("Appearance");
-        let mut expected = b.settings.clone();
+        let before = b.settings.clone();
+        let mut expected = before.clone();
         expected.set_dark(false);
-        assert_eq!(b.click("Light"), [Action::ChangeSettings(Box::new(expected))]);
+        assert_eq!(b.click("Light"), [Action::ChangeSettings(crate::settings::SettingsChange::new(&before, expected))]);
     }
 
     #[test]
@@ -740,7 +758,8 @@ mod tests {
         b.settings.addons = serde_json::json!({"disk-space": {"on": false}});
         let mut expected = Settings::default();
         expected.addons = b.settings.addons.clone();
-        assert_eq!(b.click("Reset to defaults"), [Action::ChangeSettings(Box::new(expected))]);
+        let before = b.settings.clone();
+        assert_eq!(b.click("Reset to defaults"), [Action::ChangeSettings(crate::settings::SettingsChange::new(&before, expected))]);
     }
 
     #[test]

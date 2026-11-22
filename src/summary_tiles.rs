@@ -213,10 +213,8 @@ mod tests {
     /// The Summary view of `snap`, this machine and these sensor readings.
     fn view_of(mut snap: Snapshot, frame: Option<Frame>) -> SummaryView {
         snap.machine = Some(std::sync::Arc::new(machine()));
-        let (short, perf) = (std::collections::VecDeque::new(), crate::core_page::PerfHistory::new());
-        let histories = crate::core_page::Histories { cpu: &short, mem: &short, perf: &perf };
-        let standalone = crate::page_processes::Standalone::default();
-        SummaryView::build(&PageCtx { settings: &Settings::default(), snapshot: &snap, histories, system: &crate::system_lists::fake::FakeSystem::default(), processes: standalone.inputs() }, frame.as_ref())
+        let lent = crate::core_page::testing::Lent::default();
+        SummaryView::build(&lent.ctx(&Settings::default(), &snap), frame.as_ref())
     }
 
     #[test]

@@ -5,8 +5,8 @@ use egui::{Align, Layout, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 
 use crate::addons::Core;
-use crate::core_page::{CorePage, PageCtx};
-use crate::list_pages::{fact_values, page_title, panel_title, summary_band, GAP};
+use crate::core_page::{page_title, CorePage, PageCtx};
+use crate::list_pages::{fact_values, panel_title, summary_band, GAP};
 use crate::platform::Action;
 use crate::system_lists::{StartupRow, SystemLists};
 use crate::widgets::parts::{
@@ -51,7 +51,7 @@ impl CorePage for StartupPage {
         }
         let list = self.list.clone().unwrap_or_default();
         ui.horizontal(|ui| {
-            page_title(ui, ctx, Core::Startup, "Startup apps");
+            page_title(ui, Core::Startup.id(), "Startup apps");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if refresh_button(ui).clicked() {
                     self.reload(ctx.system);

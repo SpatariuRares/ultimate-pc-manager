@@ -340,10 +340,8 @@ pub(crate) mod tests {
     /// The same with the settings given.
     fn view_with(settings: &Settings, mut snap: Snapshot, base_mhz: u32) -> SummaryView {
         snap.machine = Some(std::sync::Arc::new(clocked(base_mhz)));
-        let (short, perf) = (VecDeque::new(), crate::core_page::PerfHistory::new());
-        let histories = crate::core_page::Histories { cpu: &short, mem: &short, perf: &perf };
-        let standalone = crate::page_processes::Standalone::default();
-        SummaryView::build(&PageCtx { settings, snapshot: &snap, histories, system: &crate::system_lists::fake::FakeSystem::default(), processes: standalone.inputs() }, None)
+        let lent = crate::core_page::testing::Lent::default();
+        SummaryView::build(&lent.ctx(settings, &snap), None)
     }
 
     #[test]

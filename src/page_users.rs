@@ -220,4 +220,32 @@ mod tests {
     fn it_asks_nothing_of_the_app() {
         assert!(draw(&mut UsersPage, &Settings::default(), &snapshot(&[("a.exe", "spata", 1.0, 1)])).actions.is_empty());
     }
+
+    fn proc(pid: u32, name: &str, user: &str, cpu: f32, mem: u64) -> ProcRow {
+        ProcRow { pid, name: name.into(), user: user.into(), cpu, mem, ..Default::default() }
+    }
+
+    fn sample() -> Vec<ProcRow> {
+        vec![
+            proc(0, "System Idle Process", "", 90.0, 0),
+            proc(4, "System", "", 0.4, 0),
+            proc(35308, "chrome.exe", "spata", 0.2, 6_000_000_000),
+            proc(16244, "Code.exe", "spata", 8.0, 4_300_000_000),
+            proc(8944, "explorer.exe", "spata", 0.0, 470_000_000),
+        ]
+    }
+
+    #[test]
+    fn users_are_the_accounts_running_processes() {
+        let accounts = accounts(&sample());
+        let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["System", "spata"]);
+        let spata = &accounts[1];
+        assert_eq!(spata.procs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["chrome.exe", "Code.exe", "explorer.exe"], "by memory");
+        assert!((spata.cpu - 8.2).abs() < 1e-4);
+        assert_eq!(spata.mem, 10_770_000_000);
+        assert_eq!(users_headline(&accounts), "2 accounts are running processes");
+        assert_eq!(users_headline(&accounts[1..]), "Only spata is running processes");
+        assert_eq!(users_headline(&[]), "No user sessions were reported");
+    }
 }

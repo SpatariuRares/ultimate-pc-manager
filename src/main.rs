@@ -18,7 +18,6 @@ mod list_pages;
 mod metrics;
 mod page_perf;
 mod page_processes;
-mod pages;
 mod perfdata;
 mod path_cache;
 mod platform;

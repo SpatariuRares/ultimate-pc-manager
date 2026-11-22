@@ -74,6 +74,45 @@ pub struct Settings {
     saved_dark: Option<bool>,
 }
 
+/// What a page changed in the settings: the settings it was drawn with and
+/// the ones it asks for. Applying it changes only the fields that differ
+/// between the two, so a change made in the same frame by another page (or
+/// by an add-on) is never undone.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettingsChange {
+    before: Settings,
+    after: Settings,
+}
+
+impl SettingsChange {
+    /// The change from `before` (what the page was drawn with) to `after`.
+    pub fn new(before: &Settings, after: Settings) -> Self {
+        SettingsChange { before: before.clone(), after }
+    }
+
+    /// Sets, in `current`, every field this change changed.
+    pub fn apply(&self, current: &mut Settings) {
+        let (Ok(serde_json::Value::Object(before)), Ok(serde_json::Value::Object(after)), Ok(serde_json::Value::Object(mut now))) =
+            (serde_json::to_value(&self.before), serde_json::to_value(&self.after), serde_json::to_value(&*current))
+        else {
+            return;
+        };
+        for key in before.keys().chain(after.keys()) {
+            if before.get(key) != after.get(key) {
+                match after.get(key) {
+                    Some(value) => now.insert(key.clone(), value.clone()),
+                    None => now.remove(key),
+                };
+            }
+        }
+        let saved_dark = if self.before.saved_dark != self.after.saved_dark { self.after.saved_dark } else { current.saved_dark };
+        if let Ok(mut merged) = serde_json::from_value::<Settings>(serde_json::Value::Object(now)) {
+            merged.saved_dark = saved_dark;
+            *current = merged;
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -275,7 +314,12 @@ impl GraphColor {
     }
 }
 
+/// The settings file. Tests have none: nothing they do reads or writes the
+/// user's real settings.
 fn path() -> Option<std::path::PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
     Some(app_dir()?.join("settings.json"))
 }
 

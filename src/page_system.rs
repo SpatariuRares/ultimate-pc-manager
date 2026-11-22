@@ -129,4 +129,21 @@ mod tests {
     fn it_asks_nothing_of_the_app() {
         assert!(draw(&mut SystemInfoPage, &Settings::default(), &snapshot()).actions.is_empty());
     }
+
+    #[test]
+    fn system_info_keeps_every_field_in_one_card() {
+        let keys = [
+            "Computer name", "Operating system", "Version", "Kernel", "Architecture", "Processor", "Cores",
+            "Logical processors", "Speed", "Installed memory", "Page file", "Drives", "Network adapters", "Up time",
+        ];
+        let fields: Vec<(&str, String)> = keys.iter().map(|k| (*k, format!("value of {k}"))).collect();
+        let sections = system_sections(&fields);
+        let shown: Vec<(&str, String)> = sections.iter().flat_map(|s| s.fields.clone()).collect();
+        assert_eq!(shown.len(), keys.len());
+        for k in keys {
+            assert_eq!(shown.iter().filter(|(f, v)| *f == k && *v == format!("value of {k}")).count(), 1, "{k}");
+        }
+        let titles: Vec<&str> = sections.iter().map(|s| s.title).collect();
+        assert_eq!(titles, ["Operating System", "Processor", "Memory", "Storage", "Network"]);
+    }
 }

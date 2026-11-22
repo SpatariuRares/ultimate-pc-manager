@@ -9,7 +9,7 @@ use crate::winsys;
 pub struct WindowsActions;
 
 impl SystemActions for WindowsActions {
-    // ---- Process actions (ticket 96) ----
+    // ---- Process control ----
     fn end_process(&self, pid: u32, force: bool, tree: bool) -> Result<(), String> {
         winsys::end_process(pid, force, tree)
     }
@@ -26,7 +26,7 @@ impl SystemActions for WindowsActions {
         winsys::set_affinity(pid, mask)
     }
 
-    // ---- Dump and Explorer restart (ticket 98) ----
+    // ---- Dumps and Explorer ----
     fn write_dump(&self, pid: u32, name: &str, dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
         winsys::write_dump(pid, name, dir)
     }
@@ -34,7 +34,7 @@ impl SystemActions for WindowsActions {
         winsys::restart_explorer(pid)
     }
 
-    // ---- Elevation, administrator check and the remaining actions (ticket 99) ----
+    // ---- Elevation and shell ----
     fn restart_elevated(&self, page: &str) -> Result<(), String> {
         crate::platform::restart_elevated(page)
     }
@@ -60,9 +60,8 @@ impl SystemActions for WindowsActions {
         winsys::open_power_options()
     }
 
-    // ---- (add the next group of actions below, in its own section) ----
 
-    // ---- Process priority and the process menu's reads (ticket 97) ----
+    // ---- Priority and reads ----
     fn set_priority(&self, pid: u32, class: &str) -> Result<(), String> {
         winsys::set_priority(pid, class)
     }
@@ -74,5 +73,8 @@ impl SystemActions for WindowsActions {
     }
     fn has_window(&self, pid: u32) -> bool {
         crate::proc_info::has_window(pid)
+    }
+    fn shell_pid(&self) -> Option<u32> {
+        winsys::shell_pid()
     }
 }

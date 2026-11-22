@@ -68,7 +68,7 @@ impl CorePage for ColorsPage {
             }
         }
         if s != *ctx.settings {
-            actions.push(Action::ChangeSettings(Box::new(s)));
+            actions.push(Action::ChangeSettings(crate::settings::SettingsChange::new(ctx.settings, s)));
             ui.ctx().request_repaint();
         }
     }
@@ -162,7 +162,6 @@ mod tests {
 
     use super::*;
     use crate::core_page::testing::{click, draw, draw_with};
-    use crate::core_page::{Histories, PerfHistory};
     use crate::sampler::Snapshot;
     use crate::test_ui::{context, flat_shapes, run};
     use crate::theme::Mode;
@@ -183,10 +182,9 @@ mod tests {
 
     /// One frame of Colors with `settings` and the CPU history `cpu`.
     fn frame(settings: &Settings, cpu: &VecDeque<f32>) -> egui::FullOutput {
-        let (snapshot, mem) = (Snapshot::default(), VecDeque::new());
-        let perf = PerfHistory::new();
-        let standalone = crate::page_processes::Standalone::default();
-        let page_ctx = PageCtx { settings, snapshot: &snapshot, histories: Histories { cpu, mem: &mem, perf: &perf }, system: &crate::system_lists::fake::FakeSystem::default(), processes: standalone.inputs() };
+        let snapshot = Snapshot::default();
+        let lent = crate::core_page::testing::Lent { cpu: cpu.clone(), ..Default::default() };
+        let page_ctx = lent.ctx(settings, &snapshot);
         run(&context(Mode::Dark), (1400.0, 900.0), vec![], |ui| ColorsPage.draw(ui, &page_ctx, &mut Vec::new()))
     }
 
@@ -232,7 +230,7 @@ mod tests {
             c.use_original(&mut expected);
         }
         let asked = click(&mut ColorsPage, &settings, &Snapshot::default(), "Use the default palette everywhere");
-        assert_eq!(asked, [Action::ChangeSettings(Box::new(expected))]);
+        assert_eq!(asked, [Action::ChangeSettings(crate::settings::SettingsChange::new(&settings, expected))]);
     }
 
     #[test]
@@ -243,7 +241,7 @@ mod tests {
         GraphColor::Cpu.use_original(&mut expected);
         let [r, g, b] = GraphColor::Cpu.original();
         let asked = click(&mut ColorsPage, &settings, &Snapshot::default(), &format!("Use default #{r:02x}{g:02x}{b:02x}"));
-        assert_eq!(asked, [Action::ChangeSettings(Box::new(expected))]);
+        assert_eq!(asked, [Action::ChangeSettings(crate::settings::SettingsChange::new(&settings, expected))]);
     }
 
     #[test]
