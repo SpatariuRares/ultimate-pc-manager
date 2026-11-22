@@ -459,12 +459,6 @@ impl TaskApp {
             Page::Core(Core::Summary) => self.page_summary(ui, actions),
             Page::Core(Core::Processes) => self.page_processes(ui, actions),
             Page::Addon(id) => self.addon_page(ui, id, actions),
-<<<<<<< HEAD
-            Page::Core(Core::AppHistory) => self.page_history(ui),
-=======
-            Page::Core(Core::Settings) => self.page_settings(ui, actions),
-            Page::Core(Core::Colors) => self.page_colors(ui),
->>>>>>> core-pages-78-79-81
             Page::Core(core) => self.draw_core_page(core, ui, actions),
         }
     }
