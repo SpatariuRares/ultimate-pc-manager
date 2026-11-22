@@ -157,6 +157,24 @@ their requests from the queue, but keeps them saved as on; the app closes when
 `AddonHost::can_close` is true, that is when none of those operations is still
 running.
 
+### Reading sensors
+
+A page or a Summary tile that shows sensor values (clocks, temperatures, power)
+reads them through `PageContext::sensors()` and takes nothing by hand. It asks
+in every frame it is drawn, and stores nothing: the host creates the shared
+sensor service's interest on the first ask, keeps it while the page or tile asks
+again in each frame, and drops it at the end of the first frame in which it did
+not (and when the add-on is turned off or stopped, including the close of the
+app). So there is nothing to drop in `page_hidden`, `summary_hidden` or `stop`.
+Refresh reads every sensor at once through every interest the host holds (page,
+tile, the core Summary). The core Summary asks the same way, through
+`AddonHost::core_sensors`; the app clears its old sensor frame when the host says
+Summary stopped asking.
+
+Only an interest that does not depend on what is on screen is taken by hand,
+through `AddonContext::sensors()`: a recording (Flight Recorder) or an alert
+(Power & Freq). Its add-on owns it and drops it itself.
+
 ### The registry
 
 A static list replaces the `Page` enum for everything that is not core:
