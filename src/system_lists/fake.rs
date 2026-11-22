@@ -4,7 +4,7 @@
 
 use std::sync::Mutex;
 
-use super::{ServiceRow, SystemLists};
+use super::{ServiceRow, StartupRow, SystemLists};
 
 struct State {
     services: Result<Vec<ServiceRow>, String>,
@@ -12,7 +12,10 @@ struct State {
     service_control: Result<(), String>,
     service_requests: Vec<(String, String)>,
 
-    // Startup entries state is added here.
+    startup: Vec<StartupRow>,
+    startup_reads: usize,
+    startup_outcome: Result<(), String>,
+    startup_requests: Vec<(String, bool)>,
 }
 
 pub struct FakeSystem {
@@ -22,7 +25,18 @@ pub struct FakeSystem {
 impl Default for FakeSystem {
     /// An empty, readable services list.
     fn default() -> Self {
-        FakeSystem { state: Mutex::new(State { services: Ok(Vec::new()), service_reads: 0, service_control: Ok(()), service_requests: Vec::new() }) }
+        FakeSystem {
+            state: Mutex::new(State {
+                services: Ok(Vec::new()),
+                service_reads: 0,
+                service_control: Ok(()),
+                service_requests: Vec::new(),
+                startup: Vec::new(),
+                startup_reads: 0,
+                startup_outcome: Ok(()),
+                startup_requests: Vec::new(),
+            }),
+        }
     }
 }
 
@@ -52,7 +66,25 @@ impl FakeSystem {
         self.state.lock().unwrap().service_requests.clone()
     }
 
-    // Startup entries scripts and records are added here.
+    /// The list the next startup reads return.
+    pub fn script_startup(&self, rows: Vec<StartupRow>) {
+        self.state.lock().unwrap().startup = rows;
+    }
+
+    /// Makes the next enable or disable fail with `reason`.
+    pub fn fail_startup_toggle(&self, reason: &str) {
+        self.state.lock().unwrap().startup_outcome = Err(reason.into());
+    }
+
+    /// How many times the startup list was read.
+    pub fn startup_reads(&self) -> usize {
+        self.state.lock().unwrap().startup_reads
+    }
+
+    /// Every enable or disable asked for, as (entry id, enable), in order.
+    pub fn startup_requests(&self) -> Vec<(String, bool)> {
+        self.state.lock().unwrap().startup_requests.clone()
+    }
 }
 
 impl SystemLists for FakeSystem {
@@ -68,5 +100,15 @@ impl SystemLists for FakeSystem {
         s.service_control.clone()
     }
 
-    // Startup entries are added here.
+    fn list_startup(&self) -> Vec<StartupRow> {
+        let mut s = self.state.lock().unwrap();
+        s.startup_reads += 1;
+        s.startup.clone()
+    }
+
+    fn set_startup_enabled(&self, id: &str, enable: bool) -> Result<(), String> {
+        let mut s = self.state.lock().unwrap();
+        s.startup_requests.push((id.to_string(), enable));
+        s.startup_outcome.clone()
+    }
 }
