@@ -9,7 +9,8 @@ use super::{ServiceRow, SystemLists};
 struct State {
     services: Result<Vec<ServiceRow>, String>,
     service_reads: usize,
-    // Service control state is added here.
+    service_control: Result<(), String>,
+    service_requests: Vec<(String, String)>,
 
     // Startup entries state is added here.
 }
@@ -21,7 +22,7 @@ pub struct FakeSystem {
 impl Default for FakeSystem {
     /// An empty, readable services list.
     fn default() -> Self {
-        FakeSystem { state: Mutex::new(State { services: Ok(Vec::new()), service_reads: 0 }) }
+        FakeSystem { state: Mutex::new(State { services: Ok(Vec::new()), service_reads: 0, service_control: Ok(()), service_requests: Vec::new() }) }
     }
 }
 
@@ -41,7 +42,15 @@ impl FakeSystem {
         self.state.lock().unwrap().service_reads
     }
 
-    // Service control scripts and records are added here.
+    /// Makes the next service controls fail with `reason`.
+    pub fn fail_service_control(&self, reason: &str) {
+        self.state.lock().unwrap().service_control = Err(reason.into());
+    }
+
+    /// Every service control asked for, as (service name, action), in order.
+    pub fn service_requests(&self) -> Vec<(String, String)> {
+        self.state.lock().unwrap().service_requests.clone()
+    }
 
     // Startup entries scripts and records are added here.
 }
@@ -53,7 +62,11 @@ impl SystemLists for FakeSystem {
         s.services.clone()
     }
 
-    // Service control is added here.
+    fn control_service(&self, name: &str, action: &str) -> Result<(), String> {
+        let mut s = self.state.lock().unwrap();
+        s.service_requests.push((name.into(), action.into()));
+        s.service_control.clone()
+    }
 
     // Startup entries are added here.
 }
