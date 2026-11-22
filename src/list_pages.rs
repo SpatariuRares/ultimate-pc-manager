@@ -79,15 +79,16 @@ pub mod testing {
         pub system: Arc<FakeSystem>,
         history: VecDeque<f32>,
         perf: crate::core_page::PerfHistory,
+        standalone: crate::page_processes::Standalone,
     }
 
     impl Env {
         pub fn new() -> Env {
-            Env { settings: Settings::default(), snapshot: Snapshot::default(), system: Arc::new(FakeSystem::default()), history: VecDeque::new(), perf: Default::default() }
+            Env { settings: Settings::default(), snapshot: Snapshot::default(), system: Arc::new(FakeSystem::default()), history: VecDeque::new(), perf: Default::default(), standalone: Default::default() }
         }
 
         pub fn ctx(&self) -> PageCtx<'_> {
-            PageCtx { settings: &self.settings, snapshot: &self.snapshot, histories: Histories { cpu: &self.history, mem: &self.history, perf: &self.perf }, system: &*self.system }
+            PageCtx { settings: &self.settings, snapshot: &self.snapshot, histories: Histories { cpu: &self.history, mem: &self.history, perf: &self.perf }, system: &*self.system, processes: self.standalone.inputs() }
         }
     }
 

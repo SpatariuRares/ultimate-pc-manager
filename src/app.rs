@@ -1079,7 +1079,7 @@ impl TaskApp {
         }
         let processes = ProcessInputs::new(&self.signatures, &*self.actions);
         let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
-        let page_ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories, processes };
+        let page_ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories, system: &*self.system, processes };
         self.pages.windows(ctx, &page_ctx, actions);
     }
 

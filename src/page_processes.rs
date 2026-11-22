@@ -1647,7 +1647,7 @@ pub(crate) mod tests {
             let (cpu, mem) = (Default::default(), Default::default());
             let perf = &self.signatures;
             let inputs = ProcessInputs::new(perf, &*self.system).with_columns(&self.addons);
-            let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories: crate::core_page::Histories { cpu: &cpu, mem: &mem, perf: &Default::default() }, processes: inputs };
+            let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories: crate::core_page::Histories { cpu: &cpu, mem: &mem, perf: &Default::default() }, system: &crate::system_lists::fake::FakeSystem::default(), processes: inputs };
             self.page.draw(ui, &ctx, actions);
             self.apply(actions);
         }
@@ -1656,7 +1656,7 @@ pub(crate) mod tests {
         /// becomes the latest.
         pub fn sample(&mut self, snap: crate::sampler::Snapshot) {
             let (cpu, mem) = (Default::default(), Default::default());
-            let ctx = PageCtx { settings: &self.settings, snapshot: &snap, histories: crate::core_page::Histories { cpu: &cpu, mem: &mem, perf: &Default::default() }, processes: ProcessInputs::new(&self.signatures, &*self.system) };
+            let ctx = PageCtx { settings: &self.settings, snapshot: &snap, histories: crate::core_page::Histories { cpu: &cpu, mem: &mem, perf: &Default::default() }, system: &crate::system_lists::fake::FakeSystem::default(), processes: ProcessInputs::new(&self.signatures, &*self.system) };
             self.page.on_sample(&ctx);
             self.snap = snap;
         }
@@ -1665,7 +1665,7 @@ pub(crate) mod tests {
         /// the actions it queued.
         pub fn windows_frame(&mut self, ctx: &egui::Context) -> (Vec<String>, Vec<Action>) {
             let (cpu, mem) = (Default::default(), Default::default());
-            let page_ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories: crate::core_page::Histories { cpu: &cpu, mem: &mem, perf: &Default::default() }, processes: ProcessInputs::new(&self.signatures, &*self.system) };
+            let page_ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories: crate::core_page::Histories { cpu: &cpu, mem: &mem, perf: &Default::default() }, system: &crate::system_lists::fake::FakeSystem::default(), processes: ProcessInputs::new(&self.signatures, &*self.system) };
             let mut actions = Vec::new();
             let out = crate::test_ui::run(ctx, (1400.0, 900.0), vec![], |ui| self.page.windows(ui.ctx(), &page_ctx, &mut actions));
             (crate::test_ui::texts(&out), actions)
