@@ -1589,7 +1589,7 @@ impl TaskApp {
                 self.say(format!("Copied \"{text}\""));
             }
             Action::Service(name, what) => {
-                match winsys::control_service(&name, what) {
+                match self.system.control_service(&name, what) {
                     Ok(()) => {
                         let verb = match what {
                             "start" => "Started",
@@ -2062,10 +2062,6 @@ mod tests {
         crate::system_lists::StartupRow { id: id.into(), name: name.into(), enabled, ..Default::default() }
     }
 
-    fn said(app: &TaskApp) -> Option<&str> {
-        app.message.as_ref().map(|m| m.0.as_str())
-    }
-
     /// An app on the Startup apps page, over a fake holding `rows`.
     fn startup_app(rows: Vec<crate::system_lists::StartupRow>) -> (TaskApp, std::sync::Arc<crate::system_lists::fake::FakeSystem>) {
         let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
@@ -2084,11 +2080,11 @@ mod tests {
         fake.script_startup(vec![entry("run|Steam", "Steam", false)]);
         app.run_action(&ctx, Action::Startup("run|Steam".into(), false));
         assert_eq!(fake.startup_requests(), vec![("run|Steam".to_string(), false)]);
-        assert_eq!(said(&app), Some("Steam disabled"));
+        assert_eq!(said(&app).as_deref(), Some("Steam disabled"));
         assert_eq!(fake.startup_reads(), reads + 1, "the list is read again");
         assert!(!app.startup.as_ref().unwrap()[0].enabled, "the reread state is kept");
         app.run_action(&ctx, Action::Startup("run|Steam".into(), true));
-        assert_eq!(said(&app), Some("Steam enabled"));
+        assert_eq!(said(&app).as_deref(), Some("Steam enabled"));
     }
 
     #[test]
@@ -2097,7 +2093,7 @@ mod tests {
         fake.fail_startup_toggle("Access denied. Run the app as administrator to change this entry.");
         let reads = fake.startup_reads();
         app.run_action(&egui::Context::default(), Action::Startup("run|Steam".into(), false));
-        assert_eq!(said(&app), Some("Access denied. Run the app as administrator to change this entry."));
+        assert_eq!(said(&app).as_deref(), Some("Access denied. Run the app as administrator to change this entry."));
         assert_eq!(fake.startup_reads(), reads + 1);
     }
 
@@ -2110,7 +2106,7 @@ mod tests {
         app.refresh_now();
         app.run_action(&egui::Context::default(), Action::Startup("run|Beta".into(), false));
         assert_eq!(fake.startup_requests(), vec![("run|Beta".to_string(), false)]);
-        assert_eq!(said(&app), Some("Beta disabled"));
+        assert_eq!(said(&app).as_deref(), Some("Beta disabled"));
     }
 
     #[test]
@@ -2121,7 +2117,7 @@ mod tests {
         let reads = fake.startup_reads();
         app.run_action(&egui::Context::default(), Action::Startup("run|Steam".into(), false));
         assert!(fake.startup_requests().is_empty(), "no entry is toggled");
-        assert_eq!(said(&app), Some("That startup app is no longer in the list"));
+        assert_eq!(said(&app).as_deref(), Some("That startup app is no longer in the list"));
         assert_eq!(fake.startup_reads(), reads + 1, "the list is read again");
     }
 
@@ -2136,6 +2132,31 @@ mod tests {
         app.refresh_now();
         assert_eq!(fake.startup_reads(), 1);
         assert_eq!(app.startup.as_ref().map(|l| l.len()), Some(1));
+    }
+
+    #[test]
+    fn a_service_control_reports_and_rereads_through_the_seam() {
+        let ctx = egui::Context::default();
+        for (what, said_text) in [("start", "Started Spooler"), ("stop", "Stopped Spooler"), ("restart", "Restarted Spooler")] {
+            let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+            let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
+            app.run_action(&ctx, Action::Service("Spooler".into(), what));
+            assert_eq!(fake.service_requests(), vec![("Spooler".to_string(), what.to_string())]);
+            assert_eq!(said(&app).as_deref(), Some(said_text));
+            assert_eq!(fake.service_reads(), 1, "{what} rereads the list");
+        }
+    }
+
+    #[test]
+    fn a_failed_service_control_says_the_error_and_still_rereads() {
+        let reason = "Access denied for \"Spooler\". Run the app as administrator to change services.";
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.fail_service_control(reason);
+        let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
+        app.run_action(&egui::Context::default(), Action::Service("Spooler".into(), "stop"));
+        assert_eq!(fake.service_requests().len(), 1);
+        assert_eq!(said(&app).as_deref(), Some(reason));
+        assert_eq!(fake.service_reads(), 1);
     }
 
     #[test]

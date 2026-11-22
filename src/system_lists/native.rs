@@ -11,7 +11,9 @@ impl SystemLists for NativeSystem {
         crate::winsys::list_services()
     }
 
-    // Service control is added here.
+    fn control_service(&self, name: &str, action: &str) -> Result<(), String> {
+        crate::winsys::control_service(name, action)
+    }
 
     fn list_startup(&self) -> Vec<StartupRow> {
         crate::winsys::list_startup()

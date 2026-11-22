@@ -35,7 +35,9 @@ pub trait SystemLists {
     /// Every service with its state, or why the list could not be read.
     fn list_services(&self) -> Result<Vec<ServiceRow>, String>;
 
-    // Service control (start, stop, restart) is added here.
+    /// Starts, stops or restarts a service (`action` is "start", "stop" or
+    /// "restart"), or says why it could not be done.
+    fn control_service(&self, name: &str, action: &str) -> Result<(), String>;
 
     /// Every startup entry with its state. Startup has no error state: a
     /// location that cannot be read simply lists nothing.
