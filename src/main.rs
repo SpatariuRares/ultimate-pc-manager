@@ -2,6 +2,7 @@
 
 mod app;
 mod core_page;
+mod page_summary;
 mod page_colors;
 mod page_settings;
 mod page_history;

@@ -7,10 +7,8 @@ use egui_extras::Column;
 use crate::app::{Action, ProcCol, TaskApp};
 use crate::settings::SPEEDS;
 use crate::page_perf::fmt_bytes_rate;
-use crate::platform::PageContext;
 use crate::process_view::{self, figure_of, percent, Chevron, FileTexts, Figures, Line, Pick, ProcessLine, Selection, Totals, ViewOptions};
 use crate::sampler::ProcRow;
-use crate::summary_view::Metric;
 use crate::theme::{self, Theme};
 use crate::widgets::parts::{self, cell_text, BandArea, CellInk, Mark, SidePanel, StatusBand, TABLE_ROW_HEIGHT};
 use crate::widgets::*;
@@ -20,74 +18,6 @@ use crate::page_system::system_sections;
 use crate::page_users::{accounts, users_headline};
 
 impl TaskApp {
-    pub fn page_summary(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        self.header(ui, "Summary");
-        let t = self.settings.theme();
-        // Drawn from the view built once per sample (see `summary_view`),
-        // taken out while drawing (not copied) and put back after.
-        self.read_summary_sensors();
-        self.summary_view();
-        let view = std::mem::take(&mut self.summary);
-        let colour = |m: Metric| match m {
-            Metric::Cpu => rgb(self.settings.cpu_color),
-            Metric::Memory => rgb(self.settings.mem_color),
-            Metric::Disk => rgb(self.settings.disk_color),
-            Metric::Network => rgb(self.settings.net_color),
-        };
-        let cards = view.cards().map(|c| (c, colour(c.metric)));
-        let band = &view.band;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            StatusBand::new(Mark::Dot(health_colour(&t, band.paused, band.providers)), &band.headline).sub(&band.sub).actions_width(0.0).show(ui, |_, _| {});
-            ui.add_space(14.0);
-            // The graphs on the left, the busiest processes beside them (under
-            // them in a narrow window), as on board P01.
-            let gap = 16.0;
-            let wide = ui.available_width() >= 900.0;
-            let aside = if wide { SUMMARY_ASIDE } else { ui.available_width() };
-            let main = if wide { ui.available_width() - aside - gap } else { ui.available_width() };
-            let graphs = |ui: &mut Ui| {
-                ui.set_width(main);
-                let w = ((main - 14.0) / 2.0).max(200.0);
-                for pair in cards.chunks(2) {
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = 14.0;
-                        for (c, color) in pair {
-                            card(ui, c.metric.title(), c.value_text(), *color, w, |ui| {
-                                ui.label(RichText::new(c.sub_text()).font(t.fonts.label.clone()).color(t.label));
-                                if c.metric == Metric::Cpu {
-                                    cpu_overview(ui, &t, &view, *color);
-                                } else {
-                                    graph(ui, vec2(ui.available_width(), 96.0), &c.history, c.max, *color);
-                                }
-                                if c.metric == Metric::Memory {
-                                    // "Available X · Cached Y · Swap Z".
-                                    ui.label(RichText::new(&view.memory_footer).font(t.fonts.label.clone()).color(t.label));
-                                }
-                            });
-                        }
-                    });
-                    ui.add_space(14.0);
-                }
-            };
-            if wide {
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = gap;
-                    ui.vertical(graphs);
-                    ui.vertical(|ui| top_processes(ui, &t, aside, &view.top));
-                });
-            } else {
-                ui.vertical(graphs);
-                top_processes(ui, &t, aside, &view.top);
-            }
-            // Summary's tiles, then the add-ons' after them.
-            crate::summary_tiles::tile_row(ui, &view.tiles);
-            let mut page = PageContext::new(&self.settings, &self.snap);
-            self.addons.summary_tiles(ui, &mut page);
-            actions.append(&mut page.actions);
-        });
-        self.summary = view;
-    }
-
     pub fn page_processes(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let t = theme::of_ui(ui);
         // The header: Process View ⌄, the filter, Refresh. Run new task
@@ -1017,87 +947,6 @@ impl ProcessesBand {
     }
 }
 
-/// How many of the busiest processes Summary lists.
-pub(crate) const SUMMARY_TOP: usize = 25;
-/// The width of Summary's process list beside the graphs.
-const SUMMARY_ASIDE: f32 = 340.0;
-
-/// The CPU Overview card's body: utilization with the kernel time under it
-/// (in Performance's kernel colour), their legend, the per-core squares
-/// and the "N logical processors · Speed X GHz" footer.
-fn cpu_overview(ui: &mut Ui, t: &Theme, view: &crate::summary_view::SummaryView, color: Color32) {
-    let kernel = t.graphs.kernel;
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 96.0), Sense::hover());
-    paint_graph(ui.painter(), rect, &[], view.cpu.max, color, true);
-    paint_series(ui.painter(), rect, &view.cpu_kernel, view.cpu.max, kernel);
-    paint_series(ui.painter(), rect, &view.cpu.history, view.cpu.max, color);
-    ui.horizontal(|ui| {
-        parts::legend_item(ui, "Utilization", color);
-        ui.add_space(8.0);
-        parts::legend_item(ui, "Kernel", kernel);
-    });
-    core_squares(ui, &view.per_core, color);
-    ui.label(RichText::new(&view.cpu_footer).font(t.fonts.label.clone()).color(t.label));
-}
-
-/// Summary's band line: "CPU 15.4% at 4.90 GHz · memory 40.5% · 389
-/// processes" (no speed without a reading).
-pub(crate) fn summary_sub(cpu: f32, freq_mhz: u64, memory: f64, procs: usize) -> String {
-    let speed = if freq_mhz > 0 { format!(" at {}", crate::metrics::fmt_ghz(freq_mhz as f32)) } else { String::new() };
-    let procs = if procs == 1 { "1 process".to_string() } else { format!("{procs} processes") };
-    format!("CPU {cpu:.1}%{speed} \u{b7} memory {memory:.1}% \u{b7} {procs}")
-}
-
-/// The `n` busiest processes by CPU (more memory first on a tie), without
-/// the idle process (pid 0).
-pub(crate) fn top_by_cpu(procs: &[ProcRow], n: usize) -> Vec<ProcRow> {
-    let mut top: Vec<&ProcRow> = procs.iter().filter(|p| p.pid != 0).collect();
-    top.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal).then(b.mem.cmp(&a.mem)));
-    top.into_iter().take(n).cloned().collect()
-}
-
-/// Summary's aside: the busiest processes in a panel, PID, name, CPU and
-/// memory, under a display-face heading in the CPU colour (the link blue in the light
-/// theme), as on board P01.
-fn top_processes(ui: &mut Ui, t: &Theme, width: f32, top: &[ProcRow]) {
-    egui::Frame::new()
-        .fill(t.panel)
-        .stroke(egui::Stroke::new(1.0, t.line))
-        .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin::same(16))
-        .show(ui, |ui| {
-            ui.set_width(width - 32.0);
-            // The CPU colour is made for dark surfaces; the link blue reads on the light panel.
-            let heading_ink = if t.mode == theme::Mode::Dark { t.graphs.cpu } else { t.link };
-            let heading = egui::text::LayoutJob::single_section(
-                "TOP CPU PROCESSES".into(),
-                egui::TextFormat { font_id: display_font(ui, 15.0), color: heading_ink, extra_letter_spacing: 2.0, ..Default::default() },
-            );
-            ui.label(heading);
-            ui.add_space(4.0);
-            let columns = [50.0, 0.0, 46.0, 66.0];
-            let row = |ui: &mut Ui, cells: [(&str, Color32); 4], size: f32| {
-                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), size + 10.0), Sense::hover());
-                let name_w = rect.width() - columns[0] - columns[2] - columns[3] - 18.0;
-                let mut x = rect.left();
-                for (i, (text, ink)) in cells.into_iter().enumerate() {
-                    let w = if i == 1 { name_w } else { columns[i] };
-                    let galley = fitted(ui, text, size, ink, false, w);
-                    let right = i != 1;
-                    let at = if right { x + w - galley.size().x } else { x };
-                    ui.painter().galley(egui::pos2(at, rect.center().y - galley.size().y / 2.0), galley, ink);
-                    x += w + 6.0;
-                }
-                rect
-            };
-            let head = row(ui, [("PID", t.label), ("Name", t.label), ("CPU", t.label), ("Memory", t.label)], 11.5);
-            ui.painter().hline(head.x_range(), head.bottom(), egui::Stroke::new(1.0, t.line));
-            for p in top {
-                let (pid, cpu, mem) = (p.pid.to_string(), format!("{:.1}%", p.cpu), fmt_mb(p.mem));
-                row(ui, [(&pid, t.label), (&p.name, t.text), (&cpu, t.soft), (&mem, t.soft)], 12.0);
-            }
-        });
-}
 
 /// The rows of the selected processes that still run, in the snapshot's
 /// order.
@@ -1338,15 +1187,6 @@ pub(crate) mod tests {
         let mut settings = crate::settings::Settings::default();
         settings.cpu_color = [0x12, 0x34, 0x56];
         (settings, Color32::from_rgb(0x12, 0x34, 0x56))
-    }
-
-    #[test]
-    fn a_custom_cpu_colour_reaches_summary() {
-        let (settings, cpu) = custom_cpu();
-        let mut app = TaskApp::headless(settings, crate::sampler::Snapshot::default());
-        let ctx = crate::test_ui::context(theme::Mode::Dark);
-        let out = crate::test_ui::run(&ctx, (1200.0, 800.0), vec![], |ui| app.page_summary(ui, &mut Vec::new()));
-        assert!(crate::test_ui::colours(&out).contains(&cpu));
     }
 
     #[test]
@@ -1671,22 +1511,6 @@ pub(crate) mod tests {
             proc(16244, "Code.exe", "spata", 8.0, 4_300_000_000),
             proc(8944, "explorer.exe", "spata", 0.0, 470_000_000),
         ]
-    }
-
-    #[test]
-    fn the_summary_band_sums_up_cpu_speed_memory_and_processes() {
-        assert_eq!(summary_sub(15.42, 4900, 40.5, 389), "CPU 15.4% at 4.90 GHz \u{b7} memory 40.5% \u{b7} 389 processes");
-        assert_eq!(summary_sub(0.0, 0, 0.0, 1), "CPU 0.0% \u{b7} memory 0.0% \u{b7} 1 process", "no speed reading: no speed");
-    }
-
-    #[test]
-    fn summary_lists_the_busiest_processes_without_the_idle_one() {
-        let top: Vec<u32> = top_by_cpu(&sample(), 3).iter().map(|p| p.pid).collect();
-        assert_eq!(top, vec![16244, 4, 35308], "by CPU, the idle process (pid 0) left out");
-        let mut tied = sample();
-        tied.push(proc(77, "tied.exe", "spata", 0.2, 9_000_000_000));
-        let top: Vec<u32> = top_by_cpu(&tied, 4).iter().map(|p| p.pid).collect();
-        assert_eq!(top, vec![16244, 4, 77, 35308], "equal CPU: more memory first");
     }
 
     #[test]

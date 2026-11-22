@@ -12,7 +12,7 @@ use crate::core_page::{Histories, PageCtx, SampleSlot};
 use crate::platform::PageContext;
 use crate::sampler::{Sampler, Snapshot};
 use crate::settings::{Settings, SPEEDS};
-use crate::widgets::{fmt_bytes, health_colour, local_ip, logo, nav_entry_back, nav_heading, push, refresh_button};
+use crate::widgets::{health_colour, local_ip, logo, nav_entry_back, nav_heading, push, refresh_button};
 use crate::system_lists::SystemLists;
 use crate::winsys;
 
@@ -200,14 +200,9 @@ pub struct TaskApp {
     pub pages: crate::core_page::CorePages,
     /// Long histories for the Performance page graphs, by series name.
     pub ph: crate::core_page::PerfHistory,
-    /// What the Summary page draws, built once per new sample.
-    pub summary: crate::summary_view::SummaryView,
     /// The machine's fixed facts (base clock, disk models, GPUs) when set (tests);
     /// otherwise the machine's are read (see [`TaskApp::machine`]).
     pub machine_info: Option<crate::perfdata::StaticInfo>,
-    /// The latest sensor frame Summary's tiles read (GPU temperature and
-    /// power, S.M.A.R.T.); `None` when no sensor has reported.
-    pub summary_frame: Option<std::sync::Arc<crate::sensors::Frame>>,
     pub page: Page,
     #[allow(dead_code)]
     pub nav_open: bool,
@@ -326,9 +321,7 @@ impl TaskApp {
             mem_hist: VecDeque::new(),
             pages: Default::default(),
             ph: BTreeMap::new(),
-            summary: Default::default(),
             machine_info: None,
-            summary_frame: None,
             page,
             nav_open: true,
 
@@ -365,7 +358,6 @@ impl TaskApp {
             closing: false,
         };
         app.process_table_saved = app.settings.process_table.clone();
-        app.rebuild_summary();
         app
     }
 
@@ -378,7 +370,6 @@ impl TaskApp {
         let addons = AddonHost::from_section(&serde_json::json!({}));
         let mut app = Self::recording_build(settings, sampler, addons);
         app.snap = snap;
-        app.rebuild_summary();
         app
     }
 
@@ -390,9 +381,7 @@ impl TaskApp {
     pub fn headless_over(settings: Settings, sensors: crate::sensors::SensorService, fill: impl FnMut(&mut Snapshot) + Send + 'static) -> Self {
         let sampler = Sampler::start_with(settings.interval_ms(), sensors.clone(), move || Box::new(fill));
         let addons = AddonHost::over_sensors(sensors);
-        let mut app = Self::recording_build(settings, sampler, addons);
-        app.rebuild_summary();
-        app
+        Self::recording_build(settings, sampler, addons)
     }
 
     /// A headless app on Summary whose system actions are recorded and
@@ -456,7 +445,6 @@ impl TaskApp {
     /// reaches it through [`crate::core_page::CorePages`]).
     pub(crate) fn draw_page(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         match self.page {
-            Page::Core(Core::Summary) => self.page_summary(ui, actions),
             Page::Core(Core::Processes) => self.page_processes(ui, actions),
             Page::Addon(id) => self.addon_page(ui, id, actions),
             Page::Core(core) => self.draw_core_page(core, ui, actions),
@@ -553,7 +541,6 @@ impl TaskApp {
         self.proc_view.track(&s.procs, now, self.settings.show_exited);
         self.sample_pages(SampleSlot::Summary, &s);
         self.snap = s;
-        self.rebuild_summary();
         let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
         self.pages.on_sample(SampleSlot::Last, &PageCtx { settings: &self.settings, snapshot: &self.snap, histories, system: &*self.system });
         self.ask_signatures();
@@ -596,7 +583,7 @@ impl TaskApp {
     pub(crate) fn end_frame(&mut self) {
         let dropped = self.addons.end_frame();
         if dropped.contains(&crate::addons::leases::Surface::Summary) {
-            self.summary_frame = None;
+            self.pages.summary.drop_frame();
         }
     }
 
@@ -618,21 +605,6 @@ impl TaskApp {
                     self.addons.read_held_sensors();
                 }
             }
-        }
-    }
-
-    pub fn fmt_net(&self, bytes_per_sec: f64) -> String {
-        if self.settings.bits_per_second {
-            let b = bytes_per_sec * 8.0;
-            if b >= 1e9 {
-                format!("{:.1} Gbps", b / 1e9)
-            } else if b >= 1e6 {
-                format!("{:.1} Mbps", b / 1e6)
-            } else {
-                format!("{:.0} Kbps", b / 1e3)
-            }
-        } else {
-            format!("{}/s", fmt_bytes(bytes_per_sec as u64))
         }
     }
 
@@ -2505,6 +2477,18 @@ mod tests {
         let texts = page_texts(&mut app);
         assert!(texts.iter().any(|t| t == "System Info"), "its title: {texts:?}");
         assert!(texts.iter().any(|t| t == "Logical processors"), "its cards: {texts:?}");
+        assert!(texts.iter().any(|t| t.trim() == "Refresh"), "the header's Refresh: {texts:?}");
+    }
+
+    #[test]
+    fn summary_is_drawn_for_its_page_under_the_standard_header_and_follows_each_new_sample() {
+        let (mut app, feed) = TaskApp::fed(Settings::default(), Snapshot::default());
+        app.page = Page::Core(Core::Summary);
+        feed.send(Snapshot { seq: 1, cpu_total: 42.0, ..Default::default() }).expect("sent");
+        app.pull_samples();
+        let texts = page_texts(&mut app);
+        assert!(texts.iter().any(|t| t == "Summary"), "its title: {texts:?}");
+        assert!(texts.iter().any(|t| t == "42%"), "the new sample is on its cards: {texts:?}");
         assert!(texts.iter().any(|t| t.trim() == "Refresh"), "the header's Refresh: {texts:?}");
     }
 
