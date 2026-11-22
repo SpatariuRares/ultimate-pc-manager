@@ -11,7 +11,8 @@ use crate::widgets::parts::{
     self, cell_text, column_heading, design_table, facts, list_with_panel, CellInk, Mark, SidePanel, StatusBand, TABLE_HEADER_HEIGHT, TABLE_ROW_HEIGHT,
 };
 use crate::widgets::{first_path, fmt_bytes, refresh_button};
-use crate::winsys::{self, ServiceRow, StartupRow};
+use crate::system_lists::ServiceRow;
+use crate::winsys::{self, StartupRow};
 
 /// Space between the header, the band and the list.
 const GAP: f32 = 8.0;
@@ -89,15 +90,21 @@ pub fn history_headline(minutes: u64) -> String {
 }
 
 impl TaskApp {
+    /// The one place the services list is read: every reader (first draw,
+    /// Refresh, F5, the sidebar, Go to services, a control) comes here.
+    pub fn reload_services(&mut self) {
+        self.services = Some(self.system.list_services());
+    }
+
     pub fn page_services(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         if self.services.is_none() {
-            self.services = Some(winsys::list_services());
+            self.reload_services();
         }
         ui.horizontal(|ui| {
             self.page_title(ui, "Services");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if refresh_button(ui).clicked() {
-                    self.services = Some(winsys::list_services());
+                    self.reload_services();
                 }
                 let sel = self.svc_selected.clone();
                 for (label, what) in SERVICE_ACTIONS.into_iter().rev() {
@@ -469,6 +476,75 @@ mod tests {
     fn the_startup_band_counts_the_enabled_apps() {
         assert_eq!(startup_headline(&[startup(true), startup(false), startup(true)]), "2 of 3 startup apps are enabled");
         assert_eq!(startup_headline(&[startup(true), startup(false)]), "1 of 2 startup apps is enabled");
+    }
+
+    fn running(name: &str) -> ServiceRow {
+        ServiceRow { name: name.into(), status: "Running".into(), ..service("Running") }
+    }
+
+    /// An app whose services come from a fake the test keeps.
+    fn app_on(fake: &std::sync::Arc<crate::system_lists::fake::FakeSystem>) -> TaskApp {
+        app().on_system(fake.clone())
+    }
+
+    fn draw_services(app: &mut TaskApp) -> Vec<String> {
+        words(|ui| app.page_services(ui, &mut Vec::new()))
+    }
+
+    #[test]
+    fn the_first_draw_of_services_reads_the_list_once() {
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.script_services(vec![running("WSearch"), running("Spooler")]);
+        let mut app = app_on(&fake);
+        let first = draw_services(&mut app);
+        let second = draw_services(&mut app);
+        assert_eq!(fake.service_reads(), 1, "drawn twice, read once");
+        assert!(has(&first, "WSearch") && has(&second, "Spooler"), "{first:?}");
+        assert!(has(&first, "2 services (2 running, 0 stopped)"), "{first:?}");
+    }
+
+    #[test]
+    fn refresh_on_services_rereads_the_list() {
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.script_services(vec![running("WSearch")]);
+        let mut app = app_on(&fake);
+        let ctx = crate::test_ui::context(theme::Mode::Dark);
+        let size = (1300.0, 800.0);
+        let out = crate::test_ui::run(&ctx, size, vec![], |ui| app.page_services(ui, &mut Vec::new()));
+        let refresh = crate::test_ui::flat_shapes(&out)
+            .iter()
+            .find_map(|sh| match sh {
+                egui::Shape::Text(g) if g.galley.text().trim() == "Refresh" => Some(g.visual_bounding_rect().center()),
+                _ => None,
+            })
+            .expect("a Refresh button");
+        fake.script_services(vec![running("WSearch"), running("Spooler")]);
+        let press = |pressed| egui::Event::PointerButton { pos: refresh, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        crate::test_ui::run(&ctx, size, vec![egui::Event::PointerMoved(refresh), press(true)], |ui| app.page_services(ui, &mut Vec::new()));
+        crate::test_ui::run(&ctx, size, vec![press(false)], |ui| app.page_services(ui, &mut Vec::new()));
+        assert_eq!(fake.service_reads(), 2, "the first draw and the click");
+        let shown = draw_services(&mut app);
+        assert!(has(&shown, "Spooler"), "the reread list is shown: {shown:?}");
+    }
+
+    #[test]
+    fn f5_on_services_rereads_the_list() {
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        let mut app = app_on(&fake);
+        app.page = crate::app::Page::Core(crate::addons::Core::Services);
+        draw_services(&mut app);
+        app.refresh_now();
+        assert_eq!(fake.service_reads(), 2);
+    }
+
+    #[test]
+    fn a_failed_services_read_shows_the_band_with_its_reason() {
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.fail_services("Access is denied. (os error 5)");
+        let mut app = app_on(&fake);
+        let shown = draw_services(&mut app);
+        assert!(has(&shown, "The services could not be read"), "{shown:?}");
+        assert!(has(&shown, "Access is denied. (os error 5)"), "{shown:?}");
     }
 
     #[test]

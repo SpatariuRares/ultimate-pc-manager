@@ -12,7 +12,8 @@ use crate::platform::PageContext;
 use crate::sampler::{Sampler, Snapshot};
 use crate::settings::{Settings, SPEEDS};
 use crate::widgets::{fmt_bytes, health_colour, local_ip, logo, nav_entry_back, nav_heading, push, refresh_button};
-use crate::winsys::{self, ServiceRow, StartupRow};
+use crate::system_lists::{ServiceRow, SystemLists};
+use crate::winsys::{self, StartupRow};
 
 /// The open page: one of the core pages, or the page of an add-on (by its
 /// registry id; the add-on draws it through the host).
@@ -228,6 +229,9 @@ pub struct TaskApp {
     pub following: Option<crate::process_view::Follow>,
     /// Processes: which tree rows are open and which groups are folded.
     pub proc_view: crate::process_view::ViewState,
+    /// What the Services and Startup apps pages read and control: the
+    /// machine in the app, a fake in tests (see [`crate::system_lists`]).
+    pub(crate) system: std::sync::Arc<dyn SystemLists>,
     pub services: Option<Result<Vec<ServiceRow>, String>>,
     pub svc_selected: Option<String>,
     pub startup: Option<Vec<StartupRow>>,
@@ -265,8 +269,8 @@ pub struct TaskApp {
     pub message: Option<(String, Instant)>,
     /// What the app asks of the system (see [`crate::system_actions`]): the
     /// Windows adapter, or in tests a recording one that acts on nothing.
-    pub system: std::sync::Arc<dyn crate::system_actions::SystemActions>,
-    /// The recording adapter behind `system` when the app is headless.
+    pub actions: std::sync::Arc<dyn crate::system_actions::SystemActions>,
+    /// The recording adapter behind `actions` when the app is headless.
     #[cfg(test)]
     recording: Option<std::sync::Arc<crate::system_actions::RecordingActions>>,
     /// App history: per program name, (CPU seconds, disk bytes).
@@ -307,8 +311,7 @@ impl TaskApp {
             Landing::Page(id) => (Page::of(id), None, false),
             Landing::AddonSettings(sel) => (Page::Core(Core::Settings), sel, true),
         };
-        let system = std::sync::Arc::new(crate::system_actions::WindowsActions);
-        let mut app = Self::build(settings, sampler, addons, page, screenshot, system);
+        let mut app = Self::build(settings, sampler, addons, page, screenshot, std::sync::Arc::new(crate::system_lists::native::NativeSystem), std::sync::Arc::new(crate::system_actions::WindowsActions));
         app.addon_selected = addon_selected;
         app.show_addons = show_addons;
         crate::theme::install_fonts(&cc.egui_ctx);
@@ -317,7 +320,15 @@ impl TaskApp {
     }
 
     /// An app on `page` with `settings`, before any frame is drawn.
-    fn build(settings: Settings, sampler: Sampler, addons: AddonHost, page: Page, screenshot: Option<String>, system: std::sync::Arc<dyn crate::system_actions::SystemActions>) -> Self {
+    fn build(
+        settings: Settings,
+        sampler: Sampler,
+        addons: AddonHost,
+        page: Page,
+        screenshot: Option<String>,
+        system: std::sync::Arc<dyn SystemLists>,
+        actions: std::sync::Arc<dyn crate::system_actions::SystemActions>,
+    ) -> Self {
         let mut app = TaskApp {
             addons,
             addon_selected: None,
@@ -344,6 +355,7 @@ impl TaskApp {
             reveal_selected: false,
             following: None,
             proc_view: Default::default(),
+            system,
             services: None,
             svc_selected: None,
             startup: None,
@@ -362,7 +374,7 @@ impl TaskApp {
             wait_chains: Vec::new(),
             file_activity: Vec::new(),
             message: None,
-            system,
+            actions,
             #[cfg(test)]
             recording: None,
             history: BTreeMap::new(),
@@ -413,7 +425,8 @@ impl TaskApp {
     #[cfg(test)]
     fn recording_build(settings: Settings, sampler: Sampler, addons: AddonHost) -> Self {
         let recording = std::sync::Arc::new(crate::system_actions::RecordingActions::default());
-        let mut app = Self::build(settings, sampler, addons, Page::Core(Core::Summary), None, recording.clone());
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        let mut app = Self::build(settings, sampler, addons, Page::Core(Core::Summary), None, fake, recording.clone());
         app.recording = Some(recording);
         app
     }
@@ -423,6 +436,14 @@ impl TaskApp {
     #[cfg(test)]
     pub fn recording(&self) -> std::sync::Arc<crate::system_actions::RecordingActions> {
         self.recording.clone().expect("only a headless app records")
+    }
+
+    /// This app over `system` instead of the default fake: tests keep their
+    /// own `Arc<FakeSystem>` to script it and read what was asked.
+    #[cfg(test)]
+    pub fn on_system(mut self, system: std::sync::Arc<dyn SystemLists>) -> Self {
+        self.system = system;
+        self
     }
 
     /// [`TaskApp::headless`] with a sender standing in for the sampler.
@@ -561,7 +582,7 @@ impl TaskApp {
     pub fn refresh_now(&mut self) {
         self.sampler.refresh();
         match self.page {
-            Page::Core(Core::Services) => self.services = Some(winsys::list_services()),
+            Page::Core(Core::Services) => self.reload_services(),
             Page::Core(Core::Startup) => self.startup = Some(winsys::list_startup()),
             p => {
                 // An add-on refreshes itself and reads its sensors; for a core
@@ -898,7 +919,7 @@ impl TaskApp {
         if resp.clicked() {
             self.page = p;
             match p {
-                Page::Core(Core::Services) if self.services.is_none() => self.services = Some(winsys::list_services()),
+                Page::Core(Core::Services) if self.services.is_none() => self.reload_services(),
                 Page::Core(Core::Startup) if self.startup.is_none() => self.startup = Some(winsys::list_startup()),
                 _ => {}
             }
@@ -1355,7 +1376,7 @@ impl TaskApp {
         let first = || self.snap.services.get(&pid).and_then(|v| v.first()).map(|s| s.name.clone());
         self.svc_selected = service.or_else(first);
         self.search = pid.to_string();
-        self.services = Some(winsys::list_services());
+        self.reload_services();
         self.page = Page::Core(Core::Services);
     }
 
@@ -1383,7 +1404,7 @@ impl TaskApp {
 
     fn run_action(&mut self, ctx: &egui::Context, a: Action) {
         match a {
-            Action::End { pid, force, tree, name } => match self.system.end_process(pid, force, tree) {
+            Action::End { pid, force, tree, name } => match self.actions.end_process(pid, force, tree) {
                 Ok(()) => {
                     self.say(format!("Ended {name}"));
                     self.sampler.refresh_requested.store(true, Ordering::Relaxed);
@@ -1392,7 +1413,7 @@ impl TaskApp {
             },
             Action::EndMany { pids, force, tree } => {
                 // Every one is tried; the first failure is said.
-                let system = self.system.clone();
+                let system = self.actions.clone();
                 let failed: Vec<String> = pids.iter().filter_map(|&pid| system.end_process(pid, force, tree).err()).collect();
                 match failed.into_iter().next() {
                     None => self.say(format!("Ended {} processes", pids.len())),
@@ -1514,19 +1535,19 @@ impl TaskApp {
                 self.settings.save();
             }
             Action::Suspend(pids) => {
-                let system = self.system.clone();
+                let system = self.actions.clone();
                 self.each_process(&pids, "Suspended", |pid| system.suspend_process(pid))
             }
             Action::Resume(pids) => {
-                let system = self.system.clone();
+                let system = self.actions.clone();
                 self.each_process(&pids, "Resumed", |pid| system.resume_process(pid))
             }
             Action::Efficiency(pids) => {
-                let system = self.system.clone();
+                let system = self.actions.clone();
                 self.each_process(&pids, "Efficiency mode on for", |pid| system.set_efficiency(pid))
             }
             Action::Affinity(pids, mask) => {
-                let system = self.system.clone();
+                let system = self.actions.clone();
                 self.each_process(&pids, "Processor affinity set for", |pid| system.set_affinity(pid, mask))
             }
             Action::ProcessView(item) => self.apply_process_view(item),
@@ -1579,7 +1600,7 @@ impl TaskApp {
                     }
                     Err(e) => self.say(e),
                 }
-                self.services = Some(winsys::list_services());
+                self.reload_services();
             }
             Action::Startup(i, enable) => {
                 if let Some(row) = self.startup.as_ref().and_then(|l| l.get(i)).cloned() {
@@ -2016,6 +2037,21 @@ mod tests {
         assert_eq!(app.search, "200", "filtered to the services of its host");
         app.run_action(&ctx, Action::GoToServices { pid: 200, service: Some("Schedule".into()) });
         assert_eq!(app.svc_selected.as_deref(), Some("Schedule"), "a service row's own service");
+    }
+
+    #[test]
+    fn go_to_services_reads_the_list_through_the_seam() {
+        let row = |name: &str, pid| crate::system_lists::ServiceRow { name: name.into(), pid, status: "Running".into(), ..Default::default() };
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.script_services(vec![row("Winmgmt", 200), row("Spooler", 0)]);
+        let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
+        app.run_action(&egui::Context::default(), Action::GoToServices { pid: 200, service: None });
+        assert_eq!(app.page, Page::Core(Core::Services));
+        assert_eq!(fake.service_reads(), 1);
+        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        let shown = crate::test_ui::texts(&crate::test_ui::run(&ctx, (1300.0, 800.0), vec![], |ui| app.page_services(ui, &mut Vec::new())));
+        assert_eq!(fake.service_reads(), 1, "the page does not read it again");
+        assert!(shown.iter().any(|w| w == "Winmgmt") && !shown.iter().any(|w| w == "Spooler"), "the host's services only: {shown:?}");
     }
 
     #[test]

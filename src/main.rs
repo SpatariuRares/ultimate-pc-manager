@@ -20,6 +20,7 @@ mod sampler;
 mod sensors;
 mod settings;
 mod summary_view;
+mod system_lists;
 mod summary_tiles;
 mod system_actions;
 mod signature;
