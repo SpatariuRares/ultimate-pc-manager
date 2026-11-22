@@ -51,6 +51,87 @@ pub fn engine_cell_names(types: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// "…luid_0x00000000_0x0001670C_phys_0…" → (luid, text after the luid).
+fn parse_luid(n: &str) -> Option<(u64, &str)> {
+    let i = n.find("luid_0x")?;
+    let rest = &n[i + 5..];
+    let mut it = rest.splitn(3, '_');
+    let hi = u64::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
+    let lo = u64::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
+    Some(((hi << 32) | lo, it.next().unwrap_or("")))
+}
+
+/// "VideoDecode" → "Video decode", "High Priority 3D" → "High priority 3d",
+/// "3D" → "3D", "Compute_0" → "Compute 0" (as the page shows them).
+fn pretty_engine(ty: &str) -> String {
+    let mut s = String::new();
+    let mut prev_lower = false;
+    for ch in ty.chars() {
+        if ch.is_uppercase() && prev_lower {
+            s.push(' ');
+        }
+        prev_lower = ch.is_lowercase();
+        s.push(if ch == '_' { ' ' } else { ch });
+    }
+    let s = s.to_lowercase();
+    if s == "3d" {
+        return "3D".into();
+    }
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => s,
+    }
+}
+
+/// The GPU adapters from what the "GPU Engine" and "GPU Adapter Memory"
+/// counters list. Engine instances
+/// ("pid_1234_luid_0x00000000_0x0001670C_phys_0_eng_3_engtype_Copy") are
+/// summed over processes per engine, then the busiest engine of each type is
+/// kept; every engine is also its own cell, repeated types numbered (see
+/// [`engine_cell_names`]). Memory instances name only the adapter. Adapters
+/// come in luid order.
+pub fn gpu_adapters(engines: &[(String, f64)], dedicated: &[(String, f64)], shared: &[(String, f64)]) -> Vec<GpuLive> {
+    use std::collections::BTreeMap;
+    let mut eng: BTreeMap<(u64, u32), (String, f64)> = BTreeMap::new();
+    for (n, v) in engines {
+        let Some((luid, rest)) = parse_luid(n) else { continue };
+        let Some(i) = rest.find("eng_") else { continue };
+        let Some((idx, ty)) = rest[i + 4..].split_once("_engtype_") else { continue };
+        let e = eng.entry((luid, idx.parse().unwrap_or(0))).or_insert_with(|| (pretty_engine(ty), 0.0));
+        e.1 += v;
+    }
+    let mut gpus: BTreeMap<u64, GpuLive> = BTreeMap::new();
+    for ((luid, _), (name, v)) in eng {
+        let g = gpus.entry(luid).or_insert_with(|| GpuLive { luid, ..Default::default() });
+        let v = (v as f32).clamp(0.0, 100.0);
+        g.cells.push((name.clone(), v));
+        match g.engines.iter_mut().find(|e| e.0 == name) {
+            Some(e) => e.1 = e.1.max(v),
+            None => g.engines.push((name, v)),
+        }
+        g.util = g.util.max(v);
+    }
+    for g in gpus.values_mut() {
+        let types: Vec<String> = g.cells.iter().map(|c| c.0.clone()).collect();
+        for (cell, name) in g.cells.iter_mut().zip(engine_cell_names(&types)) {
+            cell.0 = name;
+        }
+    }
+    for (memory, is_dedicated) in [(dedicated, true), (shared, false)] {
+        for (n, v) in memory {
+            let Some((luid, _)) = parse_luid(n) else { continue };
+            let g = gpus.entry(luid).or_insert_with(|| GpuLive { luid, ..Default::default() });
+            if is_dedicated {
+                g.dedicated = v.max(0.0) as u64
+            } else {
+                g.shared = v.max(0.0) as u64
+            }
+        }
+    }
+    gpus.into_values().collect()
+}
+
 /// Each process's GPU utilisation from the "GPU Engine" counter instances
 /// ("pid_1234_luid_..._eng_3_engtype_Copy"): the sum of its engines, in
 /// percent, at most 100. Instances that name no process are skipped.
@@ -139,7 +220,7 @@ pub const OPTIONAL: &[&str] = &[counter::PERF, counter::COMPR, counter::PAGEFILE
 /// are in no query of the [`Collector`], and the Sampler adds the ones that
 /// did not answer to [`PerfLive::unanswered`] when it merges what the
 /// providers counted (see `sampler::counters_into`).
-pub const PROVIDED: &[&str] = &[counter::PERF, counter::IDLE, counter::DREAD, counter::DWRITE, counter::POWER];
+pub const PROVIDED: &[&str] = &[counter::PERF, counter::IDLE, counter::DREAD, counter::DWRITE, counter::POWER, counter::GPU, counter::GDED, counter::GSH];
 
 /// [`COUNTERS`] and [`OPTIONAL`] the [`Collector`] itself reads.
 fn collected() -> impl Iterator<Item = &'static str> {
@@ -329,9 +410,6 @@ mod imp {
         (counter::KERNEL, r"\Processor(*)\% Privileged Time"),
         (counter::PAGEIN, r"\Memory\Pages Input/sec"),
         (counter::DRESP, r"\PhysicalDisk(*)\Avg. Disk sec/Transfer"),
-        (counter::GPU, r"\GPU Engine(*)\Utilization Percentage"),
-        (counter::GDED, r"\GPU Adapter Memory(*)\Dedicated Usage"),
-        (counter::GSH, r"\GPU Adapter Memory(*)\Shared Usage"),
         (counter::COMPR, r"\Process(Memory Compression)\Working Set"),
         (counter::PAGEFILE, r"\Paging File(_Total)\% Usage"),
     ];
@@ -461,45 +539,6 @@ mod imp {
             }
             l.disks = disks.into_values().collect();
 
-            // GPU engines: "pid_1234_luid_0x00000000_0x0001670C_phys_0_eng_3_engtype_Copy".
-            // Sum over processes per engine, then keep the busiest engine of each type.
-            let mut eng: BTreeMap<(u64, u32), (String, f64)> = BTreeMap::new();
-            let engines = self.fmt(counter::GPU);
-            l.gpu_by_pid = super::gpu_by_pid(&engines);
-            for (n, v) in engines {
-                let Some((luid, rest)) = parse_luid(&n) else { continue };
-                let Some(i) = rest.find("eng_") else { continue };
-                let Some((idx, ty)) = rest[i + 4..].split_once("_engtype_") else { continue };
-                let e = eng.entry((luid, idx.parse().unwrap_or(0))).or_insert_with(|| (pretty_engine(ty), 0.0));
-                e.1 += v;
-            }
-            let mut gpus: BTreeMap<u64, GpuLive> = BTreeMap::new();
-            for ((luid, _), (name, v)) in eng {
-                let g = gpus.entry(luid).or_insert_with(|| GpuLive { luid, ..Default::default() });
-                let v = (v as f32).clamp(0.0, 100.0);
-                g.cells.push((name.clone(), v));
-                match g.engines.iter_mut().find(|e| e.0 == name) {
-                    Some(e) => e.1 = e.1.max(v),
-                    None => g.engines.push((name, v)),
-                }
-                g.util = g.util.max(v);
-            }
-            // Every engine its own cell: repeated types numbered.
-            for g in gpus.values_mut() {
-                let types: Vec<String> = g.cells.iter().map(|c| c.0.clone()).collect();
-                for (cell, name) in g.cells.iter_mut().zip(super::engine_cell_names(&types)) {
-                    cell.0 = name;
-                }
-            }
-            for (key, f) in [(counter::GDED, 0), (counter::GSH, 1)] {
-                for (n, v) in self.fmt(key) {
-                    let Some((luid, _)) = parse_luid(&n) else { continue };
-                    let g = gpus.entry(luid).or_insert_with(|| GpuLive { luid, ..Default::default() });
-                    if f == 0 { g.dedicated = v.max(0.0) as u64 } else { g.shared = v.max(0.0) as u64 }
-                }
-            }
-            l.gpus = gpus.into_values().collect();
-
             l.compressed = self.fmt(counter::COMPR).first().map(|x| x.1.max(0.0) as u64).unwrap_or(0);
             l.pagefile_pct = self.fmt(counter::PAGEFILE).first().map(|x| x.1 as f32).unwrap_or(0.0);
 
@@ -529,39 +568,6 @@ mod imp {
                     PdhCloseQuery(self.q);
                 }
             }
-        }
-    }
-
-    /// "…luid_0x00000000_0x0001670C_phys_0…" → (luid, text after the luid).
-    fn parse_luid(n: &str) -> Option<(u64, &str)> {
-        let i = n.find("luid_0x")?;
-        let rest = &n[i + 5..];
-        let mut it = rest.splitn(3, '_');
-        let hi = u64::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
-        let lo = u64::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
-        Some(((hi << 32) | lo, it.next().unwrap_or("")))
-    }
-
-    /// "VideoDecode" → "Video decode", "High Priority 3D" → "High priority 3d",
-    /// "3D" → "3D", "Compute_0" → "Compute 0" (as the page shows them).
-    fn pretty_engine(ty: &str) -> String {
-        let mut s = String::new();
-        let mut prev_lower = false;
-        for ch in ty.chars() {
-            if ch.is_uppercase() && prev_lower {
-                s.push(' ');
-            }
-            prev_lower = ch.is_lowercase();
-            s.push(if ch == '_' { ' ' } else { ch });
-        }
-        let s = s.to_lowercase();
-        if s == "3d" {
-            return "3D".into();
-        }
-        let mut c = s.chars();
-        match c.next() {
-            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-            None => s,
         }
     }
 

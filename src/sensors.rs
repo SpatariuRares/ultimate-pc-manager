@@ -21,6 +21,8 @@ pub mod ryzen;
 pub mod power_plan;
 /// The disk provider (physical disk counters).
 pub mod disk;
+/// The GPU engine and adapter memory counters (the per-adapter figures of the core pages).
+pub mod gpu_counters;
 /// Power source, battery, thermal state and ACPI thermal zones.
 pub mod power;
 /// Video cards (pure): readings, heading line, card matching.
