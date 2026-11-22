@@ -2,6 +2,9 @@
 
 mod app;
 mod core_page;
+mod page_history;
+mod page_services;
+mod page_startup;
 mod page_system;
 mod page_users;
 mod cpu_topology;
