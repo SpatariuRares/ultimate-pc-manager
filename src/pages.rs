@@ -1,18 +1,14 @@
 //! Summary and Processes pages (System Info and Users are in `page_system`
 //! and `page_users`).
 
-use egui::{vec2, Align, Color32, Layout, RichText, Sense, Ui};
-use egui_extras::Column;
+use egui::{vec2, Color32, RichText, Sense, Ui};
 
-use crate::app::{Action, ProcCol, TaskApp};
-use crate::settings::SPEEDS;
-use crate::page_perf::fmt_bytes_rate;
+use crate::app::{Action, TaskApp};
 use crate::platform::PageContext;
-use crate::process_view::{self, figure_of, percent, Chevron, FileTexts, Figures, Line, Pick, ProcessLine, Selection, Totals, ViewOptions};
 use crate::sampler::ProcRow;
 use crate::summary_view::Metric;
 use crate::theme::{self, Theme};
-use crate::widgets::parts::{self, cell_text, BandArea, CellInk, Mark, SidePanel, StatusBand, TABLE_ROW_HEIGHT};
+use crate::widgets::parts::{self, Mark, StatusBand};
 use crate::widgets::*;
 #[cfg(test)]
 use crate::page_system::system_sections;
@@ -196,6 +192,15 @@ pub(crate) mod tests {
         assert!(crate::test_ui::colours(&out).contains(&cpu));
     }
 
+    fn disk_sample() -> crate::sampler::Snapshot {
+        let row = |pid, name: &str, read, write| ProcRow { disk_read: read, disk_write: write, ..proc(pid, name, "spata", 1.0, 1_000_000) };
+        crate::sampler::Snapshot {
+            procs: vec![row(11, "reads-least.exe", 100.0, 900.0), row(12, "reads-most.exe", 900.0, 100.0), row(13, "reads-some.exe", 500.0, 500.0)],
+            mem_total: 16_000_000_000,
+            ..Default::default()
+        }
+    }
+
     fn sample() -> Vec<ProcRow> {
         vec![
             proc(0, "System Idle Process", "", 90.0, 0),
@@ -296,8 +301,7 @@ pub(crate) mod tests {
             assert!(texts.iter().any(|t| t == label), "Settings shows {label}: {texts:?}");
         }
         assert!(texts.iter().any(|t| t.starts_with("Hides services and processes whose program file carries a verified Microsoft Windows signature")));
-        let menu: Vec<&str> = app
-            .process_view_items()
+        let menu: Vec<&str> = crate::page_processes::process_view_items(&app.settings)
             .iter()
             .filter_map(|i| match i {
                 parts::DropItem::Item { label, .. } => Some(*label),

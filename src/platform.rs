@@ -105,8 +105,6 @@ pub enum Action {
     /// "Restart as Administrator": starts this app again elevated (UAC
     /// asks) on Processes and closes this window; a refusal is said.
     RestartAsAdministrator,
-    /// Refresh now (the Refresh button of a page that draws its own header).
-    Refresh,
     /// A change of the settings the Processes page asks for.
     Processes(crate::page_processes::ProcessesChange),
     /// Create memory dump file: a full dump of the process `pid` (named
@@ -122,6 +120,10 @@ pub enum Action {
     /// that records sensors for other pages (see
     /// [`crate::addons::AddonHost::record_sensors`]); nothing when it is off.
     RecordSensors(bool),
+    /// Refresh now (the Refresh button of a page that draws its own header).
+    Refresh,
+    /// A choice Performance saves (see [`crate::page_perf::PerfSetting`]).
+    PerfSetting(crate::page_perf::PerfSetting),
 }
 
 /// Said when Restart ends Windows Explorer but explorer.exe does not start

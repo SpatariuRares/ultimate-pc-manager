@@ -1647,9 +1647,28 @@ pub(crate) mod tests {
             let (cpu, mem) = (Default::default(), Default::default());
             let perf = &self.signatures;
             let inputs = ProcessInputs::new(perf, &*self.system).with_columns(&self.addons);
-            let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories: crate::core_page::Histories { cpu: &cpu, mem: &mem }, processes: inputs };
+            let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories: crate::core_page::Histories { cpu: &cpu, mem: &mem, perf: &Default::default() }, processes: inputs };
             self.page.draw(ui, &ctx, actions);
             self.apply(actions);
+        }
+
+        /// A new sample, as the app delivers it: the page sees it, then it
+        /// becomes the latest.
+        pub fn sample(&mut self, snap: crate::sampler::Snapshot) {
+            let (cpu, mem) = (Default::default(), Default::default());
+            let ctx = PageCtx { settings: &self.settings, snapshot: &snap, histories: crate::core_page::Histories { cpu: &cpu, mem: &mem, perf: &Default::default() }, processes: ProcessInputs::new(&self.signatures, &*self.system) };
+            self.page.on_sample(&ctx);
+            self.snap = snap;
+        }
+
+        /// One frame of what the page keeps open, with the texts it drew and
+        /// the actions it queued.
+        pub fn windows_frame(&mut self, ctx: &egui::Context) -> (Vec<String>, Vec<Action>) {
+            let (cpu, mem) = (Default::default(), Default::default());
+            let page_ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories: crate::core_page::Histories { cpu: &cpu, mem: &mem, perf: &Default::default() }, processes: ProcessInputs::new(&self.signatures, &*self.system) };
+            let mut actions = Vec::new();
+            let out = crate::test_ui::run(ctx, (1400.0, 900.0), vec![], |ui| self.page.windows(ui.ctx(), &page_ctx, &mut actions));
+            (crate::test_ui::texts(&out), actions)
         }
 
         /// What the app's handler does with the settings the page asks for.
@@ -1667,8 +1686,6 @@ pub(crate) mod tests {
             });
         }
     }
-
-    use super::*;
 
     #[test]
     fn end_task_in_the_detail_panel_asks_before_ending() {
@@ -2583,23 +2600,23 @@ pub(crate) mod tests {
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let draw = |app: &mut Shown| crate::test_ui::texts(&crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new())));
         let mut followed = Shown::headless(crate::settings::Settings::default(), many_sample(9_000_000));
-        followed.follow(Some(1000));
+        followed.page.follow(Some(1000));
         assert!(draw(&mut followed).iter().any(|t| t == "p0.exe"), "on top by memory");
-        assert_eq!(followed.selected, Selection::only(1000), "following selects the row");
+        assert_eq!(followed.page.selected, Selection::only(1000), "following selects the row");
         // The next snapshot puts it last (Memory, largest first).
         let mut plain = Shown::headless(crate::settings::Settings::default(), many_sample(1));
         assert!(!draw(&mut plain).iter().any(|t| t == "p0.exe"), "last is out of view unfollowed");
         followed.snap = many_sample(1);
-        followed.selected = Selection::only(1001);
+        followed.page.selected = Selection::only(1001);
         draw(&mut followed);
         let texts = draw(&mut followed);
-        assert_eq!(followed.selected, Selection::only(1000), "still selected");
+        assert_eq!(followed.page.selected, Selection::only(1000), "still selected");
         assert!(texts.iter().any(|t| t == "p0.exe"), "scrolled into view: {texts:?}");
         // Stop following: the selection is the user's again.
-        followed.follow(None);
-        followed.selected = Selection::only(1001);
+        followed.page.follow(None);
+        followed.page.selected = Selection::only(1001);
         draw(&mut followed);
-        assert_eq!(followed.selected, Selection::only(1001));
+        assert_eq!(followed.page.selected, Selection::only(1001));
     }
 
     #[test]
@@ -3094,5 +3111,70 @@ pub(crate) mod tests {
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         processes_frame_into(&ctx, &mut app, vec![key(egui::Key::Delete)], &mut Vec::new());
         assert_eq!(app.page.confirm_end, None, "Delete on a service does not end its host");
+    }
+
+    // ---- The page through the interface: samples, windows, jobs ----
+
+    #[test]
+    fn a_process_that_ended_between_two_samples_is_kept_in_the_table_as_exited() {
+        let ctx = crate::test_ui::context(theme::Mode::Dark);
+        let mut shown = Shown::headless(Settings::default(), crate::sampler::Snapshot::default());
+        shown.sample(crate::sampler::Snapshot { procs: vec![proc(21, "gone.exe", "spata", 0.0, 1), proc(22, "stays.exe", "spata", 0.0, 1)], ..Default::default() });
+        shown.sample(crate::sampler::Snapshot { procs: vec![proc(22, "stays.exe", "spata", 0.0, 1)], ..Default::default() });
+        let texts = crate::test_ui::texts(&crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| shown.page_processes(ui, &mut Vec::new())));
+        assert!(texts.iter().any(|t| t == "gone.exe"), "kept a moment, tinted: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Exited"), "{texts:?}");
+    }
+
+    #[test]
+    fn the_page_asks_before_ending_after_it_was_hidden_and_shown_again() {
+        let ctx = crate::test_ui::context(theme::Mode::Dark);
+        let mut shown = Shown::headless(Settings::default(), disk_sample());
+        click_row(&ctx, &mut shown, "reads-most.exe", egui::Modifiers::NONE, 1.0);
+        // Hidden: no frame of the page is drawn, samples keep arriving.
+        shown.sample(disk_sample());
+        shown.sample(disk_sample());
+        processes_frame(&ctx, &mut shown, vec![key(egui::Key::Delete)], egui::Modifiers::NONE, 5.0);
+        let (texts, _) = shown.windows_frame(&ctx);
+        let (texts_next, _) = shown.windows_frame(&ctx);
+        assert!(texts.iter().chain(&texts_next).any(|t| t == "End reads-most.exe?"), "the selection is kept: {texts:?}");
+    }
+
+    #[test]
+    fn a_dump_that_is_written_asks_to_show_it_and_one_that_fails_queues_its_message() {
+        let ctx = crate::test_ui::context(theme::Mode::Dark);
+        let mut shown = Shown::headless(Settings::default(), disk_sample());
+        let path = std::path::PathBuf::from(r"C:\Temp\Code-4242.dmp");
+        let (tx, rx) = std::sync::mpsc::channel();
+        shown.page.watch_dump(rx);
+        let (texts, actions) = shown.windows_frame(&ctx);
+        assert!(!texts.iter().any(|t| t == DUMP_QUESTION) && actions.is_empty(), "nothing yet: {texts:?}");
+        tx.send(Ok(path)).unwrap();
+        shown.windows_frame(&ctx);
+        let (texts, _) = shown.windows_frame(&ctx);
+        assert!(texts.iter().any(|t| t == DUMP_QUESTION), "{texts:?}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        shown.page.watch_dump(rx);
+        tx.send(Err("Windows could not write the memory dump file.".into())).unwrap();
+        let (_, actions) = shown.windows_frame(&ctx);
+        assert_eq!(actions, [Action::Say("Windows could not write the memory dump file.".into())]);
+    }
+
+    #[test]
+    fn a_restart_of_explorer_that_ends_says_so_and_asks_for_a_refresh() {
+        let ctx = crate::test_ui::context(theme::Mode::Dark);
+        let mut shown = Shown::headless(Settings::default(), disk_sample());
+        let (tx, rx) = std::sync::mpsc::channel();
+        shown.page.watch_restart(rx);
+        tx.send(Ok(())).unwrap();
+        let (_, actions) = shown.windows_frame(&ctx);
+        assert_eq!(actions, [Action::Say("Restarted Windows Explorer".into()), Action::Refresh]);
+    }
+
+    #[test]
+    fn the_refresh_button_of_the_header_queues_a_refresh() {
+        let mut shown = Shown::headless(Settings::default(), disk_sample());
+        let actions = click_text(&mut shown, "      Refresh");
+        assert!(actions.contains(&Action::Refresh), "{actions:?}");
     }
 }
