@@ -1172,7 +1172,7 @@ impl TaskApp {
                     });
                 });
             if done {
-                match winsys::run_new_task(&text) {
+                match self.actions.run_new_task(&text) {
                     Ok(()) => self.say(format!("Started \"{}\"", text.trim())),
                     Err(e) => self.say(e),
                 }
@@ -1334,14 +1334,15 @@ impl TaskApp {
         }
     }
 
-    /// Restart on the shell's Windows Explorer: `restart` (which waits up
-    /// to several seconds) runs on a worker thread; the status bar says
+    /// Restart on the shell's Windows Explorer: the system call (which waits
+    /// up to several seconds) runs on a worker thread; the status bar says
     /// how it went on a later frame ([`Self::finished_restarts`]).
-    fn restart_explorer_with(&mut self, ctx: &egui::Context, pid: u32, restart: fn(u32) -> Result<(), String>) {
+    fn restart_explorer(&mut self, ctx: &egui::Context, pid: u32) {
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
+        let system = self.actions.clone();
         let spawned = std::thread::Builder::new().name("restart-explorer".into()).spawn(move || {
-            let _ = tx.send(restart(pid));
+            let _ = tx.send(system.restart_explorer(pid));
             ctx.request_repaint();
         });
         match spawned {
@@ -1466,7 +1467,7 @@ impl TaskApp {
                 Err(e) => self.say(e),
             },
             Action::OpenLocation(path) => {
-                if let Err(e) = winsys::open_file_location(&path) {
+                if let Err(e) = self.actions.open_file_location(&path) {
                     self.say(e);
                 }
             }
@@ -1485,7 +1486,7 @@ impl TaskApp {
             }
             Action::Say(text) => self.say(text),
             Action::ShowInExplorer(path) => {
-                if winsys::reveal_in_explorer(&path).is_err() {
+                if self.actions.reveal_in_explorer(&path).is_err() {
                     self.say(crate::platform::REVEAL_FAILED.to_string());
                 }
             }
@@ -1561,11 +1562,11 @@ impl TaskApp {
                 if self.file_activity.iter().any(|w| w.pid == pid) {
                     ctx.move_to_top(egui::LayerId::new(egui::Order::Middle, crate::file_activity::window_id(pid)));
                 } else {
-                    let admin = crate::platform::is_admin();
+                    let admin = self.actions.is_admin();
                     self.file_activity.push(crate::file_activity::FileActivity::open(pid, &self.snap.procs, admin));
                 }
             }
-            Action::RestartAsAdministrator => match crate::platform::restart_elevated(Core::Processes.id()) {
+            Action::RestartAsAdministrator => match self.actions.restart_elevated(Core::Processes.id()) {
                 // The elevated copy takes over; this one closes.
                 Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 Err(e) => self.say(e),
@@ -1596,8 +1597,9 @@ impl TaskApp {
                 // taken by `finished_dumps`.
                 let (tx, rx) = std::sync::mpsc::channel();
                 let ctx = ctx.clone();
+                let system = self.actions.clone();
                 let spawned = std::thread::Builder::new().name("memory-dump".into()).spawn(move || {
-                    let _ = tx.send(winsys::write_dump(pid, &name, &std::env::temp_dir()));
+                    let _ = tx.send(system.write_dump(pid, &name, &std::env::temp_dir()));
                     ctx.request_repaint();
                 });
                 match spawned {
@@ -1607,20 +1609,20 @@ impl TaskApp {
             }
             Action::UacVirtualization(pids) => {
                 // Every one is tried; the first refusal is said.
-                if let Some(e) = pids.iter().find_map(|&pid| winsys::toggle_uac_virtualization(pid).err()) {
+                if let Some(e) = pids.iter().find_map(|&pid| self.actions.toggle_uac_virtualization(pid).err()) {
                     self.say(e);
                 }
             }
             Action::BringToFront(pid) => {
-                if let Err(e) = crate::proc_info::bring_to_front(pid) {
+                if let Err(e) = self.actions.bring_to_front(pid) {
                     self.say(e);
                 }
             }
             Action::Follow(pid) => self.follow(pid),
-            Action::RestartExplorer(pid) => self.restart_explorer_with(ctx, pid, winsys::restart_explorer),
+            Action::RestartExplorer(pid) => self.restart_explorer(ctx, pid),
             Action::GoToServices { pid, service } => self.go_to_services(pid, service),
             Action::OpenPowerOptions => {
-                if let Err(e) = winsys::open_power_options() {
+                if let Err(e) = self.actions.open_power_options() {
                     self.say(e);
                 }
             }
@@ -1904,6 +1906,126 @@ mod tests {
         each_process_action_reports(affinity, request, "Processor affinity set for");
     }
 
+
+    // ---- Elevation, administrator check and the remaining actions ----
+
+    #[test]
+    fn restart_as_administrator_closes_the_app_when_the_elevated_copy_takes_over() {
+        use crate::system_actions::Request;
+        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, Action::RestartAsAdministrator);
+        assert_eq!(app.recording().requests(), [Request::RestartElevated(Core::Processes.id().into())], "asks to reopen on Processes");
+        assert!(closes(&ctx), "the elevated copy takes over: this one closes");
+        assert_eq!(said(&app), None, "nothing to say when it goes through");
+    }
+
+    #[test]
+    fn restart_as_administrator_that_is_cancelled_says_why_and_keeps_the_app_open() {
+        use crate::system_actions::Request;
+        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        let mut app = app_with_three_processes();
+        app.recording().fail(Request::RestartElevated(Core::Processes.id().into()), "Administrator rights were not granted.");
+        app.run_action(&ctx, Action::RestartAsAdministrator);
+        assert_eq!(said(&app).as_deref(), Some("Administrator rights were not granted."));
+        assert!(!closes(&ctx), "cancelled: the app stays open");
+    }
+
+    /// Whether the app asked its window to close since the last frame.
+    fn closes(ctx: &egui::Context) -> bool {
+        let out = crate::test_ui::run(ctx, (400.0, 300.0), vec![], |_| {});
+        out.viewport_output.values().any(|v| v.commands.iter().any(|c| matches!(c, egui::ViewportCommand::Close)))
+    }
+
+    #[test]
+    fn file_activity_follows_the_administrator_answer_of_the_seam() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.recording().set_admin(false);
+        app.run_action(&ctx, Action::FileActivity(A));
+        assert!(!app.file_activity[0].tracing(), "the seam says not administrator: no trace, whatever the test run is");
+        app.close_file_activity();
+    }
+
+    #[test]
+    fn uac_virtualization_tries_every_process_and_reports_only_the_first_refusal() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, Action::UacVirtualization(vec![A, B]));
+        assert_eq!(said(&app), None, "nothing to say when all go through");
+        assert_eq!(app.recording().requests(), [Request::UacVirtualization(A), Request::UacVirtualization(B)]);
+        app.recording().fail(Request::UacVirtualization(A), "Access is denied.");
+        app.recording().fail(Request::UacVirtualization(B), "Not supported.");
+        app.run_action(&ctx, Action::UacVirtualization(vec![A, B, C]));
+        assert_eq!(said(&app).as_deref(), Some("Access is denied."), "the first refusal only");
+        assert_eq!(app.recording().requests()[2..], [Request::UacVirtualization(A)], "the search stops at the first refusal");
+    }
+
+    /// The actions that say nothing unless they fail: asks the seam for
+    /// exactly `request`, says nothing when it goes through and its error
+    /// when it does not.
+    fn error_only_action(action: Action, request: crate::system_actions::Request) {
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, action.clone());
+        assert_eq!(said(&app), None, "nothing to say when it goes through");
+        assert_eq!(app.recording().requests(), [request.clone()]);
+        app.recording().fail(request, "It failed: reason.");
+        app.run_action(&ctx, action);
+        assert_eq!(said(&app).as_deref(), Some("It failed: reason."));
+    }
+
+    #[test]
+    fn bring_to_front_says_only_its_error() {
+        error_only_action(Action::BringToFront(A), crate::system_actions::Request::BringToFront(A));
+    }
+
+    #[test]
+    fn open_file_location_says_only_its_error() {
+        error_only_action(Action::OpenLocation(r"C:\Tools\tool.exe".into()), crate::system_actions::Request::OpenFileLocation(r"C:\Tools\tool.exe".into()));
+    }
+
+    #[test]
+    fn open_power_options_says_only_its_error() {
+        error_only_action(Action::OpenPowerOptions, crate::system_actions::Request::OpenPowerOptions);
+    }
+
+    #[test]
+    fn show_in_file_explorer_says_that_it_could_not_when_it_fails_and_nothing_otherwise() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        let path = std::path::PathBuf::from(r"C:\Tools\tool.dmp");
+        app.run_action(&ctx, Action::ShowInExplorer(path.clone()));
+        assert_eq!(said(&app), None);
+        assert_eq!(app.recording().requests(), [Request::RevealInExplorer(path.clone())]);
+        app.recording().fail(Request::RevealInExplorer(path.clone()), "any");
+        app.run_action(&ctx, Action::ShowInExplorer(path));
+        assert_eq!(said(&app).as_deref(), Some(crate::platform::REVEAL_FAILED));
+    }
+
+    #[test]
+    fn run_new_task_starts_the_trimmed_text_and_says_so_or_says_its_error() {
+        use crate::system_actions::Request;
+        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        let mut app = app_with_three_processes();
+        app.run_dialog = Some("  notepad ".into());
+        let enter = egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        // One frame to take focus, one with Enter.
+        for events in [vec![], vec![enter]] {
+            crate::test_ui::run(&ctx, (800.0, 600.0), events, |ui| app.dialogs(ui.ctx(), &mut Vec::new()));
+        }
+        assert_eq!(app.recording().requests(), [Request::RunNewTask("  notepad ".into())]);
+        assert_eq!(said(&app).as_deref(), Some("Started \"notepad\""));
+        app.recording().fail(Request::RunNewTask("nope".into()), "Windows cannot find 'nope'.");
+        app.run_dialog = Some("nope".into());
+        for events in [vec![], vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]] {
+            crate::test_ui::run(&ctx, (800.0, 600.0), events, |ui| app.dialogs(ui.ctx(), &mut Vec::new()));
+        }
+        assert_eq!(said(&app).as_deref(), Some("Windows cannot find 'nope'."));
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_headless_app_never_acts_on_a_real_process() {
@@ -1966,38 +2088,80 @@ mod tests {
         assert_eq!((app.page, app.selected.single(), app.ask_show_microsoft), (Page::Core(Core::Processes), Some(900), None), "the option is off");
     }
 
+    /// Frames until the status bar says something (or 10 s pass): the
+    /// finished background jobs are taken on each.
+    fn frames_until_said(app: &mut TaskApp) -> Option<String> {
+        use std::time::{Duration, Instant};
+        let until = Instant::now() + Duration::from_secs(10);
+        while app.message.is_none() && app.dump_question.is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+            app.finished_restarts();
+            app.finished_dumps();
+        }
+        said(app)
+    }
+
     #[test]
     fn restarting_explorer_runs_off_the_ui_thread_and_says_how_it_went_on_a_later_frame() {
+        use crate::system_actions::Request;
         use std::time::{Duration, Instant};
-        fn slow(pid: u32) -> Result<(), String> {
-            assert_eq!(pid, 4242);
-            std::thread::sleep(Duration::from_millis(500));
-            Ok(())
-        }
-        fn refused(_: u32) -> Result<(), String> {
-            Err(crate::platform::EXPLORER_NOT_RESTARTED.to_string())
-        }
-        let said = |app: &TaskApp| app.message.as_ref().map(|(m, _)| m.clone());
-        let wait = |app: &mut TaskApp| {
-            let until = Instant::now() + Duration::from_secs(10);
-            while said(app).is_none() && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(20));
-                app.finished_restarts();
-            }
-        };
         let ctx = egui::Context::default();
         let mut app = with_windows_process(false);
         app.message = None;
+        app.recording().delay(Request::RestartExplorer(4242), Duration::from_millis(500));
         let started = Instant::now();
-        app.restart_explorer_with(&ctx, 4242, slow);
+        app.run_action(&ctx, Action::RestartExplorer(4242));
         assert!(started.elapsed() < Duration::from_millis(250), "the UI thread does not wait: {:?}", started.elapsed());
-        assert_eq!(said(&app), None, "nothing to say yet");
-        wait(&mut app);
-        assert_eq!(said(&app).as_deref(), Some("Restarted Windows Explorer"));
+        assert_eq!(app.message, None, "nothing to say yet");
+        assert_eq!(frames_until_said(&mut app).as_deref(), Some("Restarted Windows Explorer"));
+        assert_eq!(app.recording().requests(), [Request::RestartExplorer(4242)]);
+    }
+
+    #[test]
+    fn a_restart_of_explorer_that_could_not_end_or_restart_it_says_why() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        for said in [crate::platform::EXPLORER_NOT_ENDED, crate::platform::EXPLORER_NOT_RESTARTED] {
+            let mut app = with_windows_process(false);
+            app.message = None;
+            app.recording().fail(Request::RestartExplorer(4242), said);
+            app.run_action(&ctx, Action::RestartExplorer(4242));
+            assert_eq!(frames_until_said(&mut app).as_deref(), Some(said));
+        }
+    }
+
+    #[test]
+    fn a_dump_is_written_off_the_ui_thread_then_asks_to_show_the_file() {
+        use crate::system_actions::Request;
+        use std::time::{Duration, Instant};
+        let ctx = egui::Context::default();
+        let mut app = with_windows_process(false);
         app.message = None;
-        app.restart_explorer_with(&ctx, 4242, refused);
-        wait(&mut app);
-        assert_eq!(said(&app).as_deref(), Some(crate::platform::EXPLORER_NOT_RESTARTED));
+        let dir = std::env::temp_dir();
+        let asked = Request::Dump { pid: 4242, name: "Code.exe".into(), dir: dir.clone() };
+        app.recording().delay(asked.clone(), Duration::from_millis(500));
+        let started = Instant::now();
+        app.run_action(&ctx, Action::Dump { pid: 4242, name: "Code.exe".into() });
+        assert!(started.elapsed() < Duration::from_millis(250), "the UI thread does not wait: {:?}", started.elapsed());
+        assert_eq!(app.dump_question, None, "not written yet");
+        frames_until_said(&mut app);
+        assert_eq!(app.dump_question, Some(dir.join("Code.exe-4242.dmp")));
+        assert_eq!(app.message, None);
+        assert_eq!(app.recording().requests(), [asked]);
+    }
+
+    #[test]
+    fn a_dump_that_fails_says_the_dump_failure_text_and_asks_nothing() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = with_windows_process(false);
+        app.message = None;
+        let asked = Request::Dump { pid: 4242, name: "Code.exe".into(), dir: std::env::temp_dir() };
+        app.recording().fail(asked.clone(), winsys::DUMP_FAILED);
+        app.run_action(&ctx, Action::Dump { pid: 4242, name: "Code.exe".into() });
+        assert_eq!(frames_until_said(&mut app).as_deref(), Some(winsys::DUMP_FAILED));
+        assert_eq!(app.dump_question, None);
+        assert_eq!(app.recording().requests(), [asked]);
     }
 
     #[test]
