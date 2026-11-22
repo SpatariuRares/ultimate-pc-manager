@@ -13,6 +13,10 @@ use crate::sampler::Snapshot;
 use crate::settings::Settings;
 use crate::system_lists::SystemLists;
 
+/// The Performance history: one series per name (`cpu`, `cpu.k`, `net.r`,
+/// ...), newest last. Performance draws it and Summary reads from it.
+pub type PerfHistory = std::collections::BTreeMap<String, VecDeque<f32>>;
+
 /// Histories more than one page reads; the app owns them and lends them.
 #[derive(Clone, Copy)]
 pub struct Histories<'a> {
@@ -20,6 +24,8 @@ pub struct Histories<'a> {
     pub cpu: &'a VecDeque<f32>,
     /// Memory used, in percent, per sample (Summary, Colors).
     pub mem: &'a VecDeque<f32>,
+    /// The Performance series (Performance, Summary).
+    pub perf: &'a PerfHistory,
 }
 
 /// What a page is given: the settings, the latest snapshot and the app's
@@ -77,6 +83,7 @@ pub trait CorePage {
 /// Every core page that has moved to the interface, one field each.
 #[derive(Default)]
 pub struct CorePages {
+    pub performance: crate::page_perf::PerformancePage,
     pub system_info: crate::page_system::SystemInfoPage,
     pub users: crate::page_users::UsersPage,
     pub services: crate::page_services::ServicesPage,
@@ -88,6 +95,7 @@ impl CorePages {
     /// Each moved page with its identity: one line per page.
     fn all_mut(&mut self) -> Vec<(Core, &mut dyn CorePage)> {
         vec![
+            (Core::Performance, &mut self.performance),
             (Core::SystemInfo, &mut self.system_info),
             (Core::Users, &mut self.users),
             (Core::Services, &mut self.services),
@@ -135,8 +143,9 @@ pub mod testing {
     /// The same with the app's short histories given.
     pub fn draw_with(page: &mut dyn CorePage, settings: &Settings, snapshot: &Snapshot, cpu: &VecDeque<f32>, mem: &VecDeque<f32>) -> Drawn {
         let ctx = crate::test_ui::context(Mode::Dark);
+        let perf = PerfHistory::new();
         let system = crate::system_lists::fake::FakeSystem::default();
-        draw_in(&ctx, page, &PageCtx { settings, snapshot, histories: Histories { cpu, mem }, system: &system })
+        draw_in(&ctx, page, &PageCtx { settings, snapshot, histories: Histories { cpu, mem, perf: &perf }, system: &system })
     }
 
     /// Draws in `ctx` (draw again in the same one to keep what egui
@@ -175,9 +184,9 @@ mod tests {
         let mut summary = Recorder { name: "summary", slot: SampleSlot::Summary, log: log.clone() };
         let settings = Settings::default();
         let snapshot = Snapshot { seq: 7, ..Default::default() };
-        let (cpu, mem) = (VecDeque::new(), VecDeque::new());
+        let (cpu, mem, history) = (VecDeque::new(), VecDeque::new(), PerfHistory::new());
         let system = crate::system_lists::fake::FakeSystem::default();
-        let ctx = PageCtx { settings: &settings, snapshot: &snapshot, histories: Histories { cpu: &cpu, mem: &mem }, system: &system };
+        let ctx = PageCtx { settings: &settings, snapshot: &snapshot, histories: Histories { cpu: &cpu, mem: &mem, perf: &history }, system: &system };
         deliver([&mut summary as &mut dyn CorePage, &mut perf].into_iter(), SampleSlot::Performance, &ctx);
         assert_eq!(*log.borrow(), ["perf saw seq 7"]);
         deliver([&mut summary as &mut dyn CorePage, &mut perf].into_iter(), SampleSlot::Summary, &ctx);

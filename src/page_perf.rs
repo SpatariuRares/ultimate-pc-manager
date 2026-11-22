@@ -11,7 +11,10 @@ use std::collections::VecDeque;
 use egui::{vec2, Align2, Color32, CornerRadius, FontFamily, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui};
 
 use crate::app::{PerfItem, TaskApp};
-use crate::perfdata;
+use crate::core_page::{CorePage, PageCtx, PerfHistory};
+use crate::platform::Action;
+use crate::settings::Settings;
+use crate::perfdata::{self, StaticInfo};
 use crate::sampler::Snapshot;
 use crate::theme::{self, Mode, Theme};
 use crate::widgets::{cpu_brand, fmt_uptime, local_ip, refresh_button};
@@ -211,6 +214,148 @@ impl TaskApp {
             gap(&mut self.ph, crate::metrics::DISKS_TOTAL);
         }
     }
+}
+
+/// A choice Performance asks the app to save.
+#[derive(Clone, PartialEq, Debug)]
+pub enum PerfSetting {
+    /// The selected device, by its key (see [`PerfItem::key`]).
+    Device(String),
+    /// Graphs per logical processor (true) or overall (false).
+    Logical(bool),
+    /// Kernel times drawn in the CPU graphs.
+    Kernel(bool),
+    /// GPU graphs by engine (true) or overall (false).
+    GpuEngines(bool),
+}
+
+impl PerfSetting {
+    /// Applies the choice to `settings` (the app saves them after).
+    pub fn apply(self, settings: &mut Settings) {
+        match self {
+            PerfSetting::Device(key) => settings.perf_device = key,
+            PerfSetting::Logical(on) => settings.perf_logical = on,
+            PerfSetting::Kernel(on) => settings.perf_kernel = on,
+            PerfSetting::GpuEngines(on) => settings.perf_gpu_engines = on,
+        }
+    }
+}
+
+/// The Performance page. Its own state is the device chosen; the series it
+/// draws are the app's Performance history (shared with Summary).
+#[derive(Default)]
+pub struct PerformancePage {
+    /// Chosen since the app started; until then the saved choice
+    /// (`Settings::perf_device`) stands.
+    chosen: Option<PerfItem>,
+}
+
+impl PerformancePage {
+    fn selected(&self, settings: &Settings) -> PerfItem {
+        self.chosen.unwrap_or_else(|| PerfItem::from_key(&settings.perf_device))
+    }
+
+    fn frame<'a>(&self, ctx: &'a PageCtx) -> Frame<'a> {
+        Frame { ph: ctx.histories.perf, settings: ctx.settings, snap: ctx.snapshot, machine: machine_of(ctx.snapshot, None), perf: self.selected(ctx.settings) }
+    }
+
+    /// The "Performance" menu added to the menu bar on this page.
+    pub fn menu(&mut self, ui: &mut Ui, ctx: &PageCtx, actions: &mut Vec<Action>) {
+        let frame = self.frame(ctx);
+        ui.menu_button("Performance", |ui| {
+            ui.menu_button("Change graph to", |ui| {
+                let logical = ctx.settings.perf_logical;
+                if ui.button(format!("{}Overall utilization", if logical { "   " } else { "\u{2022} " })).clicked() {
+                    actions.push(Action::PerfSetting(PerfSetting::Logical(false)));
+                    ui.close();
+                }
+                if ui.button(format!("{}Logical processors", if logical { "\u{2022} " } else { "   " })).clicked() {
+                    actions.push(Action::PerfSetting(PerfSetting::Logical(true)));
+                    ui.close();
+                }
+            });
+            let mut k = ctx.settings.perf_kernel;
+            if ui.checkbox(&mut k, "Show kernel times").changed() {
+                actions.push(Action::PerfSetting(PerfSetting::Kernel(k)));
+            }
+            ui.separator();
+            if ui.button("Copy").clicked() {
+                ui.ctx().copy_text(frame.copy_text());
+                actions.push(Action::Say("Copied".into()));
+                ui.close();
+            }
+        });
+    }
+}
+
+impl CorePage for PerformancePage {
+    fn draw(&mut self, ui: &mut Ui, ctx: &PageCtx, actions: &mut Vec<Action>) {
+        let t = theme::of_ui(ui);
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(26.0, 40.0), Sense::hover());
+            if !crate::widgets::icons::draw(ui.painter(), r.center(), crate::addons::Core::Performance.id()) {
+                crate::widgets::plain_icon(ui.painter(), r.center(), t.label);
+            }
+            ui.label(egui::RichText::new("Performance").font(t.fonts.page_title.clone()).color(t.text));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if refresh_button(ui).clicked() {
+                    actions.push(Action::Refresh);
+                }
+            });
+        });
+        ui.add_space(4.0);
+        let before = actions.len();
+        self.frame(ctx).page(ui, actions);
+        // A click on a tile chooses the device at once, not after the app
+        // has saved it.
+        for a in &actions[before..] {
+            if let Action::PerfSetting(PerfSetting::Device(key)) = a {
+                self.chosen = Some(PerfItem::from_key(key));
+            }
+        }
+    }
+}
+
+/// What the page reads while it draws: the sample, the settings, the
+/// machine's facts and the Performance history, with the device chosen.
+struct Frame<'a> {
+    ph: &'a PerfHistory,
+    settings: &'a Settings,
+    snap: &'a Snapshot,
+    machine: &'a StaticInfo,
+    perf: PerfItem,
+}
+
+/// The machine's facts: `fixed` when set (tests), else the sample's, else
+/// none known.
+pub(crate) fn machine_of<'a>(snap: &'a Snapshot, fixed: Option<&'a StaticInfo>) -> &'a StaticInfo {
+    static NONE: std::sync::OnceLock<StaticInfo> = std::sync::OnceLock::new();
+    fixed.or(snap.machine.as_deref()).unwrap_or_else(|| NONE.get_or_init(StaticInfo::default))
+}
+
+/// The device list Performance shows and Summary's tiles are mapped from
+/// (one source, so the two pages never disagree).
+pub(crate) fn devices(settings: &Settings, snap: &Snapshot, machine: &StaticInfo, ph: &PerfHistory) -> Vec<Dev> {
+    Frame { ph, settings, snap, machine, perf: PerfItem::Cpu }.devices()
+}
+
+impl TaskApp {
+    /// The figures under the graphs of `item`, from the latest sample.
+    pub(crate) fn stats(&self, item: PerfItem) -> Stats {
+        Frame { ph: &self.ph, settings: &self.settings, snap: &self.snap, machine: self.machine(), perf: item }.stats(item)
+    }
+}
+
+impl<'a> Frame<'a> {
+    fn machine(&self) -> &StaticInfo {
+        self.machine
+    }
+
+    /// The CPU's base frequency in MHz, from the machine's fixed facts
+    /// (0 when unknown).
+    fn base_mhz(&self) -> Option<f64> {
+        crate::metrics::base_clock_mhz(Some(self.machine.cpu.base_mhz as f64), None, None)
+    }
 
     /// The graph palette with the user's saved colours.
     fn graphs(&self) -> theme::GraphPalette {
@@ -317,45 +462,6 @@ impl TaskApp {
         v
     }
 
-    fn select_device(&mut self, item: PerfItem) {
-        if self.perf != item {
-            self.perf = item;
-            self.settings.perf_device = item.key();
-            self.settings.save();
-        }
-    }
-
-    /// The "Performance" menu added to the menu bar on this page.
-    pub fn performance_menu(&mut self, ui: &mut Ui) {
-        ui.menu_button("Performance", |ui| {
-            ui.menu_button("Change graph to", |ui| {
-                let logical = self.settings.perf_logical;
-                if ui.button(format!("{}Overall utilization", if logical { "   " } else { "\u{2022} " })).clicked() {
-                    self.settings.perf_logical = false;
-                    self.settings.save();
-                    ui.close();
-                }
-                if ui.button(format!("{}Logical processors", if logical { "\u{2022} " } else { "   " })).clicked() {
-                    self.settings.perf_logical = true;
-                    self.settings.save();
-                    ui.close();
-                }
-            });
-            let mut k = self.settings.perf_kernel;
-            if ui.checkbox(&mut k, "Show kernel times").changed() {
-                self.settings.perf_kernel = k;
-                self.settings.save();
-            }
-            ui.separator();
-            if ui.button("Copy").clicked() {
-                let t = self.copy_text();
-                ui.ctx().copy_text(t);
-                self.say("Copied");
-                ui.close();
-            }
-        });
-    }
-
     /// Everything shown for the selected device, as plain text.
     fn copy_text(&self) -> String {
         let devs = self.devices();
@@ -369,17 +475,8 @@ impl TaskApp {
         out
     }
 
-    pub fn page_performance(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            self.page_title(ui, "Performance");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if refresh_button(ui).clicked() {
-                    self.refresh_now();
-                }
-            });
-        });
-        ui.add_space(4.0);
-
+    /// Draws the device list and the chosen device below the header.
+    fn page(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let devs = self.devices();
         // A device can be missing for a moment (CPU Power before the first
         // sample): show the CPU meanwhile but keep the saved choice.
@@ -392,7 +489,6 @@ impl TaskApp {
         let list = Rect::from_min_max(Pos2::new(full.left() - 21.0, full.top()), Pos2::new(full.left() + 215.0, full.bottom()));
         let t = theme::of_ui(ui);
         ui.painter().rect_filled(Rect::from_min_max(list.min, list.max + vec2(0.0, 8.0)), CornerRadius::ZERO, t.panel);
-        let mut clicked = None;
         for (i, d) in devs.iter().enumerate() {
             let r = Rect::from_min_size(list.min + vec2(2.0, 2.0 + i as f32 * 64.0), vec2(list.width() - 4.0, 56.0));
             if r.top() > list.bottom() {
@@ -400,17 +496,14 @@ impl TaskApp {
             }
             let resp = ui.interact(r, ui.id().with(("perf-device", i)), Sense::click());
             if resp.clicked() {
-                clicked = Some(d.item);
+                actions.push(Action::PerfSetting(PerfSetting::Device(d.item.key())));
             }
             self.paint_tile(ui.painter(), r, d, d.item == shown, resp.hovered());
-        }
-        if let Some(item) = clicked {
-            self.select_device(item);
         }
 
         let detail = Rect::from_min_max(Pos2::new(list.right() + 30.0, full.top()), Pos2::new(full.right() - 4.0, full.bottom()));
         if let Some(d) = devs.iter().find(|d| d.item == shown) {
-            self.paint_detail(ui, detail, d);
+            self.paint_detail(ui, detail, d, actions);
         }
     }
 
@@ -460,7 +553,7 @@ impl TaskApp {
         }
     }
 
-    fn paint_detail(&mut self, ui: &mut Ui, area: Rect, d: &Dev) {
+    fn paint_detail(&self, ui: &mut Ui, area: Rect, d: &Dev, actions: &mut Vec<Action>) {
         let p = ui.painter().clone();
         let t = theme::of_ui(ui);
         let (title, sub) = self.detail_titles(d);
@@ -522,8 +615,8 @@ impl TaskApp {
         };
         p.text(Pos2::new(area.left() + 2.0, label_y), Align2::LEFT_TOP, label, text(12.0), t.label);
         match d.item {
-            PerfItem::Cpu => self.cpu_graph_menu(ui, Pos2::new(area.right(), label_y)),
-            PerfItem::Gpu(_) => self.gpu_toggle(ui, Pos2::new(area.right(), label_y - 4.0)),
+            PerfItem::Cpu => self.cpu_graph_menu(ui, Pos2::new(area.right(), label_y), actions),
+            PerfItem::Gpu(_) => self.gpu_toggle(ui, Pos2::new(area.right(), label_y - 4.0), actions),
             _ => {}
         }
 
@@ -558,7 +651,7 @@ impl TaskApp {
     }
 
     /// "CPUs Expanded ⌄": choose overall or per-processor graphs.
-    fn cpu_graph_menu(&mut self, ui: &mut Ui, right_top: Pos2) {
+    fn cpu_graph_menu(&self, ui: &mut Ui, right_top: Pos2, actions: &mut Vec<Action>) {
         let t = theme::of_ui(ui);
         let label = if self.settings.perf_logical { "CPUs Expanded" } else { "CPU Overall" };
         let galley = ui.painter().layout_no_wrap(label.into(), text(12.0), t.link);
@@ -572,24 +665,21 @@ impl TaskApp {
         egui::Popup::menu(&resp).show(|ui| {
             let logical = self.settings.perf_logical;
             if ui.button(format!("{}Overall utilization", if logical { "   " } else { "\u{2022} " })).clicked() {
-                self.settings.perf_logical = false;
-                self.settings.save();
+                actions.push(Action::PerfSetting(PerfSetting::Logical(false)));
             }
             if ui.button(format!("{}Logical processors", if logical { "\u{2022} " } else { "   " })).clicked() {
-                self.settings.perf_logical = true;
-                self.settings.save();
+                actions.push(Action::PerfSetting(PerfSetting::Logical(true)));
             }
             ui.separator();
             let mut k = self.settings.perf_kernel;
             if ui.checkbox(&mut k, "Show kernel times").changed() {
-                self.settings.perf_kernel = k;
-                self.settings.save();
+                actions.push(Action::PerfSetting(PerfSetting::Kernel(k)));
             }
         });
     }
 
     /// The "Overall | Engines" switch for GPUs.
-    fn gpu_toggle(&mut self, ui: &mut Ui, right_top: Pos2) {
+    fn gpu_toggle(&self, ui: &mut Ui, right_top: Pos2, actions: &mut Vec<Action>) {
         let t = theme::of_ui(ui);
         let w = 69.0;
         let whole = Rect::from_min_size(Pos2::new(right_top.x - 2.0 * w, right_top.y), vec2(2.0 * w, 20.0));
@@ -604,8 +694,7 @@ impl TaskApp {
             }
             ui.painter().text(r.center(), Align2::CENTER_CENTER, label, text(12.0), if on { t.on_primary } else { t.link });
             if resp.clicked() && !on {
-                self.settings.perf_gpu_engines = engines;
-                self.settings.save();
+                actions.push(Action::PerfSetting(PerfSetting::GpuEngines(engines)));
             }
         }
         ui.painter().rect_stroke(whole, CornerRadius::ZERO, Stroke::new(1.0, self.graphs().gpu), StrokeKind::Inside);
@@ -1063,14 +1152,126 @@ fn paint_icon(p: &Painter, c: Pos2, icon: Icon) {
 mod tests {
     use super::*;
 
+    use crate::core_page::testing::draw;
+    use crate::core_page::Histories;
+
+    const HARD_FAULTS: &str = "Hard faults, pages read from disk (file-backed paging included)";
+
+    fn shows(texts: &[String], word: &str) -> bool {
+        texts.iter().any(|t| t == word)
+    }
+
+    /// One frame of `page` in `ctx` with the given Performance history.
+    fn frame_with(ctx: &egui::Context, page: &mut PerformancePage, settings: &Settings, snap: &Snapshot, ph: &PerfHistory, events: Vec<egui::Event>) -> (Vec<String>, Vec<Action>, egui::FullOutput) {
+        let (cpu, mem) = (VecDeque::new(), VecDeque::new());
+        let pc = PageCtx { settings, snapshot: snap, histories: Histories { cpu: &cpu, mem: &mem, perf: ph }, system: &crate::system_lists::fake::FakeSystem::default() };
+        let mut actions = Vec::new();
+        let out = crate::test_ui::run(ctx, (1400.0, 900.0), events, |ui| page.draw(ui, &pc, &mut actions));
+        (crate::test_ui::texts(&out), actions, out)
+    }
+
+    /// The events of a click on the first text `word` drawn in `out`.
+    fn click_on(out: &egui::FullOutput, word: &str) -> Vec<egui::Event> {
+        let at = crate::test_ui::flat_shapes(out)
+            .into_iter()
+            .find_map(|s| match s {
+                egui::Shape::Text(t) if t.galley.text() == word => Some(t.pos + vec2(6.0, 6.0)),
+                _ => None,
+            })
+            .expect("the word is drawn");
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        vec![egui::Event::PointerMoved(at), button(true), button(false)]
+    }
+
+    #[test]
+    fn it_draws_the_device_list_and_the_cpu_from_a_snapshot_without_the_app() {
+        let drawn = draw(&mut PerformancePage::default(), &Settings::default(), &Snapshot::default());
+        for word in ["Performance", "CPU", "Memory", "Network", "% Utilization by logical processor"] {
+            assert!(shows(&drawn.texts, word), "{word} is drawn");
+        }
+        assert!(!shows(&drawn.texts, HARD_FAULTS), "the CPU is the device shown, not Memory");
+        assert!(drawn.actions.is_empty(), "drawing alone asks for nothing");
+    }
+
+    #[test]
+    fn it_opens_on_the_device_saved_in_the_settings() {
+        let mut settings = Settings::default();
+        settings.perf_device = "memory".into();
+        let drawn = draw(&mut PerformancePage::default(), &settings, &Snapshot::default());
+        assert!(shows(&drawn.texts, HARD_FAULTS), "Memory is shown");
+        assert!(!shows(&drawn.texts, "% Utilization by logical processor"), "not the CPU");
+    }
+
+    #[test]
+    fn a_click_on_a_device_shows_it_and_asks_the_app_to_save_the_choice() {
+        let ctx = crate::test_ui::context(Mode::Dark);
+        let (settings, snap, ph) = (Settings::default(), Snapshot::default(), PerfHistory::new());
+        let mut page = PerformancePage::default();
+        let (_, _, first) = frame_with(&ctx, &mut page, &settings, &snap, &ph, vec![]);
+        let (_, actions, _) = frame_with(&ctx, &mut page, &settings, &snap, &ph, click_on(&first, "Memory"));
+        assert_eq!(actions, [Action::PerfSetting(PerfSetting::Device("memory".into()))]);
+        let (texts, actions, _) = frame_with(&ctx, &mut page, &settings, &snap, &ph, vec![]);
+        assert!(shows(&texts, HARD_FAULTS), "Memory stays shown with the saved setting not yet applied");
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn a_device_missing_for_a_moment_shows_the_cpu_and_keeps_the_saved_choice() {
+        let mut settings = Settings::default();
+        settings.perf_device = "power".into();
+        let mut page = PerformancePage::default();
+        let drawn = draw(&mut page, &settings, &Snapshot::default());
+        assert!(shows(&drawn.texts, "% Utilization by logical processor"), "the CPU meanwhile");
+        let mut live = Snapshot::default();
+        live.perf.cpu_power_w = Some(12.5);
+        let drawn = draw(&mut page, &settings, &live);
+        assert!(shows(&drawn.texts, "CPU package power"), "the saved device once it exists");
+    }
+
+    #[test]
+    fn the_cpu_graph_menu_asks_for_the_settings_it_changes_through_actions() {
+        let ctx = crate::test_ui::context(Mode::Dark);
+        let (settings, snap, ph) = (Settings::default(), Snapshot::default(), PerfHistory::new());
+        let mut page = PerformancePage::default();
+        let (texts, actions, first) = frame_with(&ctx, &mut page, &settings, &snap, &ph, vec![]);
+        assert!(shows(&texts, "CPUs Expanded"));
+        assert!(actions.is_empty());
+        // Opening the menu and choosing "Logical processors".
+        let _ = frame_with(&ctx, &mut page, &settings, &snap, &ph, click_on(&first, "CPUs Expanded"));
+        let (_, _, open) = frame_with(&ctx, &mut page, &settings, &snap, &ph, vec![]);
+        let (_, actions, _) = frame_with(&ctx, &mut page, &settings, &snap, &ph, click_on(&open, "   Overall utilization"));
+        assert_eq!(actions, [Action::PerfSetting(PerfSetting::Logical(false))]);
+    }
+
+    #[test]
+    fn refresh_is_asked_of_the_app() {
+        let ctx = crate::test_ui::context(Mode::Dark);
+        let (settings, snap, ph) = (Settings::default(), Snapshot::default(), PerfHistory::new());
+        let mut page = PerformancePage::default();
+        let (_, _, first) = frame_with(&ctx, &mut page, &settings, &snap, &ph, vec![]);
+        let (_, actions, _) = frame_with(&ctx, &mut page, &settings, &snap, &ph, click_on(&first, "      Refresh"));
+        assert_eq!(actions, [Action::Refresh]);
+    }
+
+    #[test]
+    fn the_graph_draws_the_history_the_app_lends() {
+        let (settings, snap) = (Settings::default(), Snapshot::default());
+        let ctx = crate::test_ui::context(Mode::Dark);
+        let shapes = |ph: &PerfHistory| {
+            let (_, _, out) = frame_with(&ctx, &mut PerformancePage::default(), &settings, &snap, ph, vec![]);
+            crate::test_ui::flat_shapes(&out).len()
+        };
+        let ph: PerfHistory = [("cpu".to_string(), (0..60).map(|i| (i % 50) as f32).collect::<VecDeque<f32>>())].into();
+        assert!(shapes(&ph) > shapes(&PerfHistory::new()), "a history adds a line to the graph");
+    }
+
     #[test]
     fn a_custom_cpu_colour_reaches_performance() {
         let (settings, cpu) = crate::pages::tests::custom_cpu();
-        let mut app = TaskApp::headless(settings, Snapshot::default());
-        app.perf = PerfItem::Cpu;
-        assert_eq!(app.devices()[0].color, cpu, "the CPU tile");
+        let snap = Snapshot::default();
+        assert_eq!(devices(&settings, &snap, machine_of(&snap, None), &PerfHistory::new())[0].color, cpu, "the CPU tile");
         let ctx = crate::test_ui::context(Mode::Dark);
-        let out = crate::test_ui::run(&ctx, (1300.0, 800.0), vec![], |ui| app.page_performance(ui));
+        let (_, _, out) = frame_with(&ctx, &mut PerformancePage::default(), &settings, &snap, &PerfHistory::new(), vec![]);
         let drawn = crate::test_ui::colours(&out);
         assert!(drawn.contains(&cpu), "the CPU graph");
         assert!(!drawn.contains(&theme::GRAPHS.cpu), "no default CPU colour left");
@@ -1163,7 +1364,7 @@ mod tests {
     fn network_device(net: Vec<crate::sampler::NetRow>) -> Dev {
         let mut app = TaskApp::headless(crate::settings::Settings::default(), Snapshot { seq: 1, net, ..Default::default() });
         app.settings.bits_per_second = false;
-        app.devices().into_iter().find(|d| d.item == PerfItem::Network).expect("a Network device")
+        devices(&app.settings, &app.snap, app.machine(), &app.ph).into_iter().find(|d| d.item == PerfItem::Network).expect("a Network device")
     }
 
     #[test]

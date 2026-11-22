@@ -118,6 +118,10 @@ pub enum Action {
     /// that records sensors for other pages (see
     /// [`crate::addons::AddonHost::record_sensors`]); nothing when it is off.
     RecordSensors(bool),
+    /// Refresh now (the Refresh button of a page that draws its own header).
+    Refresh,
+    /// A choice Performance saves (see [`crate::page_perf::PerfSetting`]).
+    PerfSetting(crate::page_perf::PerfSetting),
 }
 
 /// Said when Restart ends Windows Explorer but explorer.exe does not start

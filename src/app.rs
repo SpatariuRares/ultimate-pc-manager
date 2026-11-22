@@ -205,7 +205,7 @@ pub struct TaskApp {
     /// [`crate::core_page`]).
     pub pages: crate::core_page::CorePages,
     /// Long histories for the Performance page graphs, by series name.
-    pub ph: BTreeMap<String, VecDeque<f32>>,
+    pub ph: crate::core_page::PerfHistory,
     /// What the Summary page draws, built once per new sample.
     pub summary: crate::summary_view::SummaryView,
     /// The machine's fixed facts (base clock, disk models, GPUs) when set (tests);
@@ -217,7 +217,6 @@ pub struct TaskApp {
     pub page: Page,
     #[allow(dead_code)]
     pub nav_open: bool,
-    pub perf: PerfItem,
     pub search: String,
     /// The Processes table's layout as last saved (see
     /// [`TaskApp::process_table_unsaved`]).
@@ -340,7 +339,6 @@ impl TaskApp {
             summary_frame: None,
             page,
             nav_open: true,
-            perf: PerfItem::Cpu,
 
             search: String::new(),
             process_table_saved: Default::default(),
@@ -374,7 +372,6 @@ impl TaskApp {
             close_questions: None,
             closing: false,
         };
-        app.perf = PerfItem::from_key(&app.settings.perf_device);
         app.process_table_saved = app.settings.process_table.clone();
         app.rebuild_summary();
         app
@@ -468,7 +465,6 @@ impl TaskApp {
     pub(crate) fn draw_page(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         match self.page {
             Page::Core(Core::Summary) => self.page_summary(ui, actions),
-            Page::Core(Core::Performance) => self.page_performance(ui),
             Page::Core(Core::Processes) => self.page_processes(ui, actions),
             Page::Addon(id) => self.addon_page(ui, id, actions),
             Page::Core(Core::Settings) => self.page_settings(ui, actions),
@@ -484,7 +480,7 @@ impl TaskApp {
         if let Some(title) = title {
             self.header(ui, title);
         }
-        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
+        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
         let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories, system: &*self.system };
         if let Some(page) = self.pages.page_mut(core) {
             page.draw(ui, &ctx, actions);
@@ -568,14 +564,14 @@ impl TaskApp {
         self.sample_pages(SampleSlot::Summary, &s);
         self.snap = s;
         self.rebuild_summary();
-        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
+        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
         self.pages.on_sample(SampleSlot::Last, &PageCtx { settings: &self.settings, snapshot: &self.snap, histories, system: &*self.system });
         self.ask_signatures();
     }
 
     /// Delivers the new sample `s` to the core pages of `slot`.
     fn sample_pages(&mut self, slot: SampleSlot, s: &Snapshot) {
-        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
+        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
         self.pages.on_sample(slot, &PageCtx { settings: &self.settings, snapshot: s, histories, system: &*self.system });
     }
 
@@ -599,7 +595,7 @@ impl TaskApp {
         self.sampler.refresh();
         match self.page {
             Page::Core(c) if self.pages.page_mut(c).is_some() => {
-                let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist };
+                let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
                 let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories, system: &*self.system };
                 if let Some(page) = self.pages.page_mut(c) {
                     page.refresh(&ctx);
@@ -848,7 +844,9 @@ impl TaskApp {
                         }
                     });
                     if self.page == Page::Core(Core::Performance) {
-                        self.performance_menu(ui);
+                        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
+                        let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories, system: &*self.system };
+                        self.pages.performance.menu(ui, &ctx, actions);
                     }
                     // An add-on's own menu, when it belongs in the menu bar.
                     if let Page::Addon(id) = self.page {
@@ -1431,7 +1429,7 @@ impl TaskApp {
                 }
                 self.sampler.refresh_requested.store(true, Ordering::Relaxed);
             }
-            Action::Priority(pid, p) => match winsys::set_priority(pid, p) {
+            Action::Priority(pid, p) => match self.actions.set_priority(pid, p) {
                 Ok(()) => self.say(format!("Priority set to {p}")),
                 Err(e) => self.say(e),
             },
@@ -1498,6 +1496,11 @@ impl TaskApp {
                 }
             }
             Action::UpdateSpeed(i) => self.set_speed(i),
+            Action::Refresh => self.refresh_now(),
+            Action::PerfSetting(change) => {
+                change.apply(&mut self.settings);
+                self.settings.save();
+            }
             Action::ExportCsv { file_name, text } => {
                 let Some(path) = crate::platform::pick_csv(file_name) else { return };
                 // With a byte order mark, as the other exports: Excel then
@@ -1847,6 +1850,26 @@ mod tests {
         app.run_action(&ctx, action(vec![A, B, C]));
         assert_eq!(said(&app).as_deref(), Some("Access denied: first."), "the first failure");
         assert_eq!(app.recording().requests()[before..], [request(A), request(B), request(C)], "every process is tried");
+    }
+
+    #[test]
+    fn set_priority_says_it_and_asks_the_seam() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, Action::Priority(B, "High"));
+        assert_eq!(said(&app).as_deref(), Some("Priority set to High"));
+        assert_eq!(app.recording().requests(), [crate::system_actions::Request::Priority(B, "High".into())]);
+    }
+
+    #[test]
+    fn set_priority_says_the_failure_and_does_not_refresh() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.recording().fail(crate::system_actions::Request::Priority(B, "Low".into()), "Access denied: this process can't be changed.");
+        app.run_action(&ctx, Action::Priority(B, "Low"));
+        assert_eq!(said(&app).as_deref(), Some("Access denied: this process can't be changed."));
+        assert!(!refreshed(&app), "Priority does not refresh the table");
+        assert_eq!(app.recording().requests(), [crate::system_actions::Request::Priority(B, "Low".into())]);
     }
 
     #[test]
@@ -2456,7 +2479,7 @@ mod tests {
 
     #[test]
     fn refresh_on_a_moved_page_still_asks_the_sampler_for_a_sample() {
-        for core in [Core::SystemInfo, Core::Users, Core::Services, Core::Startup, Core::AppHistory] {
+        for core in [Core::SystemInfo, Core::Users, Core::Performance, Core::Services, Core::Startup, Core::AppHistory] {
             let mut app = app_with_three_processes();
             app.page = Page::Core(core);
             app.refresh_now();
@@ -2505,5 +2528,46 @@ mod tests {
         feed.send(busy("late.exe", false)).expect("sent");
         app.pull_samples();
         assert!(!page_texts(&mut app).iter().any(|w| w == "late.exe"), "paused, nothing is counted");
+    }
+
+    #[test]
+    fn performance_is_drawn_for_its_page_with_its_own_header() {
+        let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
+        app.page = Page::Core(Core::Performance);
+        let texts = page_texts(&mut app);
+        assert!(texts.iter().any(|t| t == "Performance"), "its title: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Memory"), "its device list: {texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("Run new task")), "no standard header: {texts:?}");
+    }
+
+    #[test]
+    fn the_device_chosen_on_performance_is_saved_in_the_settings() {
+        let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
+        app.run_action(&egui::Context::default(), Action::PerfSetting(crate::page_perf::PerfSetting::Device("memory".into())));
+        assert_eq!(app.settings.perf_device, "memory");
+    }
+
+    #[test]
+    fn the_refresh_button_of_performance_asks_the_sampler_for_a_sample() {
+        let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
+        app.run_action(&egui::Context::default(), Action::Refresh);
+        assert!(refreshed(&app));
+    }
+
+    #[test]
+    fn pausing_freezes_the_performance_history_and_refresh_still_adds_a_point() {
+        let (mut app, feed) = TaskApp::fed(Settings::default(), Snapshot::default());
+        let points = |app: &TaskApp| app.ph.get("cpu").map_or(0, |h| h.len());
+        feed.send(Snapshot::default()).expect("sent");
+        app.pull_samples();
+        let running = points(&app);
+        assert!(running > 0, "a running sample adds a point");
+        app.settings.speed = SPEEDS.iter().position(|s| s.1 == 0).expect("a Paused speed");
+        feed.send(Snapshot::default()).expect("sent");
+        app.pull_samples();
+        assert_eq!(points(&app), running, "paused, the history stays");
+        feed.send(Snapshot { forced: true, ..Default::default() }).expect("sent");
+        app.pull_samples();
+        assert_eq!(points(&app), running + 1, "Refresh still adds a point");
     }
 }
