@@ -220,7 +220,7 @@ pub const OPTIONAL: &[&str] = &[counter::PERF, counter::COMPR, counter::PAGEFILE
 /// are in no query of the [`Collector`], and the Sampler adds the ones that
 /// did not answer to [`PerfLive::unanswered`] when it merges what the
 /// providers counted (see `sampler::counters_into`).
-pub const PROVIDED: &[&str] = &[counter::PERF, counter::IDLE, counter::DREAD, counter::DWRITE, counter::POWER, counter::GPU, counter::GDED, counter::GSH];
+pub const PROVIDED: &[&str] = &[counter::PERF, counter::IDLE, counter::DREAD, counter::DWRITE, counter::POWER, counter::GPU, counter::GDED, counter::GSH, counter::KERNEL, counter::PAGEIN, counter::DRESP, counter::COMPR, counter::PAGEFILE, PERF_INFO];
 
 /// [`COUNTERS`] and [`OPTIONAL`] the [`Collector`] itself reads.
 fn collected() -> impl Iterator<Item = &'static str> {
@@ -335,19 +335,17 @@ pub fn info() -> &'static StaticInfo {
     I.get_or_init(imp::static_info)
 }
 
-#[cfg(windows)]
-pub use imp::Collector;
-
-#[cfg(not(windows))]
+/// What the performance-data collector still reads: nothing. Every counter
+/// comes from the sensor service's providers (see `sampler::counters_into`);
+/// the collector is removed with the rest of the old path.
 pub struct Collector;
-#[cfg(not(windows))]
+
 impl Collector {
     pub fn new() -> Self {
         Collector
     }
-    /// No performance counters off Windows: none answered.
     pub fn sample(&mut self) -> PerfLive {
-        PerfLive { unanswered: collected().chain([PERF_INFO]).collect(), ..Default::default() }
+        PerfLive { unanswered: collected().collect(), ..Default::default() }
     }
 }
 #[cfg(not(windows))]
@@ -402,173 +400,6 @@ mod imp {
             n += 1;
         }
         String::from_utf16_lossy(std::slice::from_raw_parts(p, n))
-    }
-
-    // ------------------------------------------------------------ live data
-
-    const PATHS: &[(&str, &str)] = &[
-        (counter::KERNEL, r"\Processor(*)\% Privileged Time"),
-        (counter::PAGEIN, r"\Memory\Pages Input/sec"),
-        (counter::DRESP, r"\PhysicalDisk(*)\Avg. Disk sec/Transfer"),
-        (counter::COMPR, r"\Process(Memory Compression)\Working Set"),
-        (counter::PAGEFILE, r"\Paging File(_Total)\% Usage"),
-    ];
-
-    /// A PDH query holding every counter the page needs.
-    pub struct Collector {
-        q: PDH_HQUERY,
-        c: BTreeMap<&'static str, PDH_HCOUNTER>,
-        /// The counters that gave at least one value since `sample` began.
-        answered: std::cell::RefCell<std::collections::BTreeSet<&'static str>>,
-    }
-
-    impl Collector {
-        pub fn new() -> Self {
-            let mut q: PDH_HQUERY = null_mut();
-            let mut c = BTreeMap::new();
-            unsafe {
-                if PdhOpenQueryW(null(), 0, &mut q) == 0 {
-                    for (k, p) in PATHS {
-                        let mut h: PDH_HCOUNTER = null_mut();
-                        let w = wide(p);
-                        if PdhAddEnglishCounterW(q, w.as_ptr(), 0, &mut h) == 0 {
-                            c.insert(*k, h);
-                        }
-                    }
-                    PdhCollectQueryData(q);
-                } else {
-                    q = null_mut();
-                }
-            }
-            Collector { q, c, answered: Default::default() }
-        }
-
-        /// The counter's values; a counter that gives any is noted as
-        /// answered for this sample.
-        fn fmt(&self, k: &str) -> Vec<(String, f64)> {
-            let Some((&key, &h)) = self.c.get_key_value(k) else { return Vec::new() };
-            let values = self.fmt_values(h);
-            if !values.is_empty() {
-                self.answered.borrow_mut().insert(key);
-            }
-            values
-        }
-
-        /// The counter's current values by instance name, leaving out the
-        /// instances without valid data (empty when the counter gave none).
-        fn fmt_values(&self, h: PDH_HCOUNTER) -> Vec<(String, f64)> {
-            unsafe {
-                let flags = PDH_FMT_DOUBLE | PDH_FMT_NOCAP100;
-                let (mut size, mut count) = (0u32, 0u32);
-                if PdhGetFormattedCounterArrayW(h, flags, &mut size, &mut count, null_mut()) != PDH_MORE_DATA || size == 0 {
-                    return Vec::new();
-                }
-                let mut buf = vec![0u64; size as usize / 8 + 1];
-                let items = buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
-                if PdhGetFormattedCounterArrayW(h, flags, &mut size, &mut count, items) != 0 {
-                    return Vec::new();
-                }
-                (0..count as usize)
-                    .filter_map(|i| {
-                        let it = &*items.add(i);
-                        // 0 = valid data, 1 = new data.
-                        (it.FmtValue.CStatus <= 1).then(|| (from_wide(it.szName), it.FmtValue.Anonymous.doubleValue))
-                    })
-                    .collect()
-            }
-        }
-
-        /// Raw values: for "per second" counters the first value is the
-        /// running total since boot.
-        fn raw(&self, k: &str) -> Vec<(String, i64)> {
-            let Some(&h) = self.c.get(k) else { return Vec::new() };
-            unsafe {
-                let (mut size, mut count) = (0u32, 0u32);
-                if PdhGetRawCounterArrayW(h, &mut size, &mut count, null_mut()) != PDH_MORE_DATA || size == 0 {
-                    return Vec::new();
-                }
-                let mut buf = vec![0u64; size as usize / 8 + 1];
-                let items = buf.as_mut_ptr() as *mut PDH_RAW_COUNTER_ITEM_W;
-                if PdhGetRawCounterArrayW(h, &mut size, &mut count, items) != 0 {
-                    return Vec::new();
-                }
-                (0..count as usize)
-                    .filter_map(|i| {
-                        let it = &*items.add(i);
-                        (it.RawValue.CStatus <= 1).then(|| (from_wide(it.szName), it.RawValue.FirstValue))
-                    })
-                    .collect()
-            }
-        }
-
-        pub fn sample(&mut self) -> PerfLive {
-            // Until a counter gives a value, it has not answered.
-            let mut l = PerfLive { unanswered: collected().collect(), ..Default::default() };
-            self.answered.borrow_mut().clear();
-            if self.q.is_null() {
-                l.unanswered.insert(PERF_INFO);
-                return l;
-            }
-            unsafe {
-                PdhCollectQueryData(self.q);
-            }
-
-            let mut cores: Vec<(usize, f32)> = Vec::new();
-            for (n, v) in self.fmt(counter::KERNEL) {
-                if n == "_Total" {
-                    l.kernel_total = (v as f32).clamp(0.0, 100.0);
-                } else if let Ok(i) = n.parse::<usize>() {
-                    cores.push((i, (v as f32).clamp(0.0, 100.0)));
-                }
-            }
-            cores.sort_by_key(|c| c.0);
-            l.kernel_per_core = cores.into_iter().map(|c| c.1).collect();
-            l.hard_faults = self.fmt(counter::PAGEIN).first().map(|x| x.1 as f32).unwrap_or(0.0);
-            l.page_ins = self.raw(counter::PAGEIN).first().map(|x| x.1.max(0) as u64).unwrap_or(0);
-
-            // Physical disks: instances look like "0 C: D:". The sensor
-            // service's providers give the rest of a disk (see
-            // `sampler::counters_into`).
-            let mut disks: BTreeMap<u32, DiskLive> = BTreeMap::new();
-            for (n, v) in self.fmt(counter::DRESP) {
-                if let Some(d) = disk_number(&n) {
-                    let e = disks.entry(d).or_default();
-                    e.number = d;
-                    e.resp_ms = (v * 1000.0) as f32;
-                }
-            }
-            l.disks = disks.into_values().collect();
-
-            l.compressed = self.fmt(counter::COMPR).first().map(|x| x.1.max(0.0) as u64).unwrap_or(0);
-            l.pagefile_pct = self.fmt(counter::PAGEFILE).first().map(|x| x.1 as f32).unwrap_or(0.0);
-
-            unsafe {
-                let mut pi: PERFORMANCE_INFORMATION = zeroed();
-                pi.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
-                if GetPerformanceInfo(&mut pi, pi.cb) != 0 {
-                    let page = pi.PageSize as u64;
-                    l.threads = pi.ThreadCount;
-                    l.handles = pi.HandleCount;
-                    l.commit = pi.CommitTotal as u64 * page;
-                    l.commit_limit = pi.CommitLimit as u64 * page;
-                    l.cached = pi.SystemCache as u64 * page;
-                } else {
-                    l.unanswered.insert(PERF_INFO);
-                }
-            }
-            l.unanswered.retain(|k| !self.answered.borrow().contains(k));
-            l
-        }
-    }
-
-    impl Drop for Collector {
-        fn drop(&mut self) {
-            if !self.q.is_null() {
-                unsafe {
-                    PdhCloseQuery(self.q);
-                }
-            }
-        }
     }
 
     // ---------------------------------------------------------- static facts

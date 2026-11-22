@@ -215,6 +215,7 @@ impl DiskCounters {
                 (counter::IDLE, r"\PhysicalDisk(*)\% Idle Time"),
                 (counter::DREAD, r"\PhysicalDisk(*)\Disk Read Bytes/sec"),
                 (counter::DWRITE, r"\PhysicalDisk(*)\Disk Write Bytes/sec"),
+                (counter::DRESP, r"\PhysicalDisk(*)\Avg. Disk sec/Transfer"),
             ]),
             #[cfg(windows)]
             collected: Instant::now(),
@@ -279,7 +280,8 @@ impl DiskCounters {
             }
         }
         disks.sort_by_key(|d| d.number);
-        self.counted = counted.into();
+        // The average response time is only reported (the readings have no row for it).
+        self.counted = counted.into_iter().chain([q.counted(counter::DRESP, false)]).collect();
         disks
     }
 }

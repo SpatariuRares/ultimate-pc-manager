@@ -249,8 +249,8 @@ fn counters_into(perf: &mut crate::perfdata::PerfLive, frame: Option<&crate::sen
     let level = set(counter::PERF).and_then(|c| c.instance("_Total"));
     perf.cpu_perf_pct = level.map_or(0.0, |i| i.value as f32);
     let mut disks: std::collections::BTreeMap<u32, crate::perfdata::DiskLive> = perf.disks.drain(..).map(|d| (d.number, d)).collect();
-    let mut answered = [level.is_some(), false, false, false];
-    for (n, key) in [counter::IDLE, counter::DREAD, counter::DWRITE].into_iter().enumerate() {
+    let mut answered = [level.is_some(), false, false, false, false];
+    for (n, key) in [counter::IDLE, counter::DREAD, counter::DWRITE, counter::DRESP].into_iter().enumerate() {
         let Some(counted) = set(key) else { continue };
         answered[n + 1] = true;
         for instance in &counted.instances {
@@ -261,13 +261,44 @@ fn counters_into(perf: &mut crate::perfdata::PerfLive, frame: Option<&crate::sen
             match n {
                 0 => disk.active = (100.0 - instance.value as f32).clamp(0.0, 100.0),
                 1 => (disk.read_bps, disk.total_read) = (instance.value.max(0.0), total),
-                _ => (disk.write_bps, disk.total_written) = (instance.value.max(0.0), total),
+                2 => (disk.write_bps, disk.total_written) = (instance.value.max(0.0), total),
+                // Seconds per transfer.
+                _ => disk.resp_ms = (instance.value * 1000.0) as f32,
             }
         }
     }
     perf.disks = disks.into_values().collect();
-    for (ok, key) in answered.into_iter().zip([counter::PERF, counter::IDLE, counter::DREAD, counter::DWRITE]) {
+    for (ok, key) in answered.into_iter().zip([counter::PERF, counter::IDLE, counter::DREAD, counter::DWRITE, counter::DRESP]) {
         if !ok {
+            perf.unanswered.insert(key);
+        }
+    }
+    // Kernel time per processor and in total; the pages read from disk
+    // (per second and since boot); the memory the compression process holds;
+    // the page file in use; GetPerformanceInfo. Each is a gap when it gave
+    // nothing.
+    let first = |key: &str| set(key).and_then(|c| c.instances.first());
+    let mut cores: Vec<(usize, f32)> = Vec::new();
+    for i in set(counter::KERNEL).iter().flat_map(|c| &c.instances) {
+        if i.name == "_Total" {
+            perf.kernel_total = (i.value as f32).clamp(0.0, 100.0);
+        } else if let Ok(n) = i.name.parse::<usize>() {
+            cores.push((n, (i.value as f32).clamp(0.0, 100.0)));
+        }
+    }
+    cores.sort_by_key(|c| c.0);
+    perf.kernel_per_core = cores.into_iter().map(|c| c.1).collect();
+    perf.hard_faults = first(counter::PAGEIN).map_or(0.0, |i| i.value as f32);
+    perf.page_ins = first(counter::PAGEIN).and_then(|i| i.raw).map_or(0, |r| r.max(0) as u64);
+    perf.compressed = first(counter::COMPR).map_or(0, |i| i.value.max(0.0) as u64);
+    perf.pagefile_pct = first(counter::PAGEFILE).map_or(0.0, |i| i.value as f32);
+    if let Some(info) = set(crate::perfdata::PERF_INFO) {
+        let named = |name: &str| info.instance(name).map_or(0.0, |i| i.value.max(0.0));
+        (perf.threads, perf.handles) = (named("threads") as u32, named("handles") as u32);
+        (perf.commit, perf.commit_limit, perf.cached) = (named("commit") as u64, named("commit_limit") as u64, named("cached") as u64);
+    }
+    for key in [counter::KERNEL, counter::PAGEIN, counter::COMPR, counter::PAGEFILE, crate::perfdata::PERF_INFO] {
+        if set(key).is_none() {
             perf.unanswered.insert(key);
         }
     }
@@ -407,19 +438,26 @@ fn system_fill() -> Fill {
             }
             snap.uptime = System::uptime();
             snap.perf = perf.sample();
-            snap.compressed = match snap.perf.compressed {
-                0 => snap
-                    .procs
-                    .iter()
-                    .find(|p| p.name.eq_ignore_ascii_case("Memory Compression"))
-                    .map(|p| p.mem)
-                    .unwrap_or(0),
-                c => c,
-            };
-            if snap.swap_used == 0 && snap.perf.pagefile_pct > 0.0 {
-                snap.swap_used = (snap.swap_total as f64 * snap.perf.pagefile_pct as f64 / 100.0) as u64;
-            }
     })
+}
+
+/// The memory figures that need the counters and the system's own reading
+/// together: the compressed memory is the compression process's working set
+/// when the counter did not give it, and the page file in use is its
+/// percentage of the total when the system reported none.
+fn memory_from_counters(snap: &mut Snapshot) {
+    snap.compressed = match snap.perf.compressed {
+        0 => snap
+            .procs
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case("Memory Compression"))
+            .map(|p| p.mem)
+            .unwrap_or(0),
+        c => c,
+    };
+    if snap.swap_used == 0 && snap.perf.pagefile_pct > 0.0 {
+        snap.swap_used = (snap.swap_total as f64 * snap.perf.pagefile_pct as f64 / 100.0) as u64;
+    }
 }
 
 /// The frame the sampler builds a snapshot from: of the providers' reads
@@ -457,6 +495,7 @@ fn run(tx: Sender<Snapshot>, interval: Arc<AtomicU64>, refresh_now: Arc<AtomicBo
         snap.forced = forced;
         counters_into(&mut snap.perf, counted_frame(&interest, refresh.as_ref()).as_deref());
         merge_gpu(&mut snap.procs, &snap.perf.gpu_by_pid);
+        memory_from_counters(&mut snap);
         seq += 1;
         snap.seq = seq;
         if tx.send(snap).is_err() {
@@ -516,7 +555,7 @@ mod tests {
         assert!(!by_host.contains_key(&9), "a service whose host is not listed is left out");
     }
 
-    use crate::perfdata::{counter, PerfLive, DiskLive};
+    use crate::perfdata::{counter, PerfLive};
     use crate::sensors::model::{CounterSet, Instance};
 
     fn frame_of(sets: Vec<CounterSet>) -> crate::sensors::Frame {
@@ -533,6 +572,12 @@ mod tests {
             CounterSet::new(counter::DREAD, vec![Instance::new("0 C:", 2_000.0).with_raw(9_000_000), Instance::new("1 D:", 0.0).with_raw(5), Instance::new("_Total", 2_000.0).with_raw(9_000_005)]),
             CounterSet::new(counter::DWRITE, vec![Instance::new("0 C:", 500.0).with_raw(7_000_000), Instance::new("1 D:", 0.0).with_raw(0), Instance::new("_Total", 500.0).with_raw(7_000_000)]),
             CounterSet::new(counter::POWER, vec![Instance::new("rapl_package0_core0_core", 3_000.0), Instance::new("rapl_package0_pkg", 47_500.0)]),
+            CounterSet::new(counter::DRESP, vec![Instance::new("0 C:", 0.0035), Instance::new("_Total", 0.0035)]),
+            CounterSet::new(counter::KERNEL, vec![Instance::new("1", 4.0), Instance::new("0", 8.0), Instance::new("_Total", 6.0)]),
+            CounterSet::new(counter::PAGEIN, vec![Instance::new("", 120.0).with_raw(9_000)]),
+            CounterSet::new(counter::COMPR, vec![Instance::new("memory compression", 4096.0)]),
+            CounterSet::new(counter::PAGEFILE, vec![Instance::new("_total", 40.0)]),
+            CounterSet::new(crate::perfdata::PERF_INFO, vec![Instance::new("threads", 2_000.0), Instance::new("handles", 90_000.0), Instance::new("commit", 8e9), Instance::new("commit_limit", 3e10), Instance::new("cached", 4e9)]),
         ]
     }
 
@@ -548,11 +593,14 @@ mod tests {
     }
 
     #[test]
-    fn a_disk_keeps_the_response_time_the_collector_read() {
-        let mut perf = PerfLive { disks: vec![DiskLive { number: 1, resp_ms: 3.5, ..Default::default() }, DiskLive { number: 2, resp_ms: 9.0, ..Default::default() }], ..Default::default() };
+    fn the_system_counters_come_from_the_frame_with_the_kernel_cores_in_order() {
+        let mut perf = PerfLive::default();
         counters_into(&mut perf, Some(&frame_of(counted())));
-        let resp: Vec<(u32, f32)> = perf.disks.iter().map(|d| (d.number, d.resp_ms)).collect();
-        assert_eq!(resp, [(0, 0.0), (1, 3.5), (2, 9.0)], "a disk only the collector saw is kept");
+        assert_eq!(perf.disks[0].resp_ms, 3.5, "seconds per transfer, shown in ms");
+        assert_eq!((perf.kernel_total, perf.kernel_per_core.clone()), (6.0, vec![8.0, 4.0]));
+        assert_eq!((perf.hard_faults, perf.page_ins), (120.0, 9_000));
+        assert_eq!((perf.compressed, perf.pagefile_pct), (4096, 40.0));
+        assert_eq!((perf.threads, perf.handles, perf.commit, perf.commit_limit, perf.cached), (2_000, 90_000, 8_000_000_000, 30_000_000_000, 4_000_000_000));
     }
 
     #[test]
@@ -561,7 +609,7 @@ mod tests {
         let only_idle = counted().into_iter().filter(|c| c.key == counter::IDLE).collect();
         counters_into(&mut perf, Some(&frame_of(only_idle)));
         let gaps: Vec<&str> = perf.unanswered.iter().copied().collect();
-        assert_eq!(gaps, [counter::DREAD, counter::DWRITE, counter::PERF]);
+        assert_eq!(gaps, [counter::COMPR, counter::DREAD, counter::DRESP, counter::DWRITE, counter::KERNEL, counter::PAGEFILE, counter::PAGEIN, counter::PERF, crate::perfdata::PERF_INFO]);
         assert!(perf.answered(counter::IDLE));
         assert_eq!(perf.cpu_power_w, None, "no energy meter: no figure");
     }
@@ -571,7 +619,7 @@ mod tests {
         let mut perf = PerfLive::default();
         counters_into(&mut perf, None);
         let gaps: Vec<&str> = perf.unanswered.iter().copied().collect();
-        assert_eq!(gaps, [counter::DREAD, counter::DWRITE, counter::IDLE, counter::PERF]);
+        assert_eq!(gaps, [counter::COMPR, counter::DREAD, counter::DRESP, counter::DWRITE, counter::IDLE, counter::KERNEL, counter::PAGEFILE, counter::PAGEIN, counter::PERF, crate::perfdata::PERF_INFO]);
         assert!(perf.disks.is_empty());
     }
 

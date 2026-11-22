@@ -23,6 +23,8 @@ pub mod power_plan;
 pub mod disk;
 /// The GPU engine and adapter memory counters (the per-adapter figures of the core pages).
 pub mod gpu_counters;
+/// Kernel time, pages read, compression, page file and the performance info.
+pub mod system_counters;
 /// Power source, battery, thermal state and ACPI thermal zones.
 pub mod power;
 /// Video cards (pure): readings, heading line, card matching.

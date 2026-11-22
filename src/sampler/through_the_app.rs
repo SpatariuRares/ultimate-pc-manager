@@ -369,6 +369,11 @@ fn on_this_pc_the_real_counter_providers_fill_the_snapshot() {
     assert!(perf.answered(counter::IDLE) && perf.answered(counter::DREAD) && perf.answered(counter::DWRITE), "disk counters answered");
     assert!(perf.disks.iter().any(|d| d.total_read > 0), "raw totals since boot come through");
     assert!(perf.cpu_perf_pct > 0.0, "the processor performance level");
+    for key in [counter::KERNEL, counter::PAGEIN, counter::DRESP, crate::perfdata::PERF_INFO] {
+        assert!(perf.answered(key), "{key} answered");
+    }
+    assert!(perf.threads > 0 && perf.handles > 0 && perf.commit > 0, "GetPerformanceInfo's figures: {perf:?}");
+    assert!(perf.page_ins > 0, "pages read since boot");
     assert_eq!(service.threads_in(ProviderGroup::Hardware), 0, "only the counters run");
 }
 
