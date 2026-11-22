@@ -174,7 +174,9 @@ fn caption_for(shown: Duration) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderGroup {
     /// Windows performance counters (processor information, disks, energy
-    /// meter): what the core pages are built from.
+    /// meter): what the core pages are built from. Read once when the group
+    /// starts and then only when asked ([`Interest::read_now`]): the
+    /// Sampler asks at every tick.
     Counters,
     /// Everything that talks to hardware or vendor libraries: read only
     /// while a page, tile, recording or alert looks at it.
@@ -415,6 +417,7 @@ impl Drop for Alive<'_> {
 /// every interval of its group (or Refresh), until its run ends.
 fn work(shared: &Shared, born: u64, i: usize) {
     let group = shared.factories[i].0.index();
+    let on_demand = shared.factories[i].0 == ProviderGroup::Counters;
     // A provider that panics (a crashing vendor library) fails alone.
     let built = catch_unwind(AssertUnwindSafe(|| {
         let mut provider = (shared.factories[i].1)();
@@ -432,6 +435,7 @@ fn work(shared: &Shared, born: u64, i: usize) {
         }
         st.slots[i].name = provider.name();
         st.slots[i].timeout = provider.timeout();
+        st.slots[i].hidden = !provider.listed();
         if let Err(why) = available {
             // Hardware this PC lacks (AMD's SDK on an Intel PC): no source
             // line, no rows.
@@ -463,6 +467,9 @@ fn work(shared: &Shared, born: u64, i: usize) {
                 }
                 let wait = match (last_read, st.groups[group].interval_ms) {
                     (None, _) => break,
+                    // The counters keep no clock of their own: the Sampler
+                    // asks for each read (see `Interest::set_interval_ms`).
+                    (Some(_), _) if on_demand => Duration::from_secs(1),
                     (Some(_), 0) => Duration::from_secs(1),
                     (Some(t), ms) => match Duration::from_millis(ms).checked_sub(t.elapsed()) {
                         Some(left) if !left.is_zero() => left,
@@ -476,10 +483,10 @@ fn work(shared: &Shared, born: u64, i: usize) {
             hardware_wanted = st.wanted(ProviderGroup::Hardware);
         }
         let started = Instant::now();
-        let Ok((readings, counted, machine)) = catch_unwind(AssertUnwindSafe(|| {
+        let Ok((readings, counted)) = catch_unwind(AssertUnwindSafe(|| {
             provider.hardware_wanted(hardware_wanted);
             let readings = provider.read(started);
-            (readings, provider.counted(), provider.machine())
+            (readings, provider.counted())
         })) else {
             fail(shared, born, i);
             return;
@@ -496,9 +503,27 @@ fn work(shared: &Shared, born: u64, i: usize) {
         slot.busy_since = None;
         slot.report = Some(readings);
         slot.counted = counted;
-        slot.machine = machine.or(slot.machine.take());
         slot.report_kick = slot.started_kick;
+        let facts_known = slot.machine.is_some();
         publish(&mut st, false);
+        drop(st);
+        if facts_known {
+            continue;
+        }
+        // The machine's facts are asked once the read is out, so a slow one
+        // never holds up the first figures: they join the frame when read.
+        let Ok(facts) = catch_unwind(AssertUnwindSafe(|| provider.machine())) else {
+            fail(shared, born, i);
+            return;
+        };
+        if let Some(facts) = facts {
+            let mut st = shared.lock();
+            if st.groups[group].run != born {
+                return;
+            }
+            st.slots[i].machine = Some(facts);
+            publish(&mut st, false);
+        }
     }
 }
 
@@ -669,13 +694,16 @@ impl Interest {
         Arc::make_mut(&mut self.shared.lock().stats).reset(crate::platform::local_secs());
     }
 
-    /// The app's update interval; 0 = Paused (no reads but on Refresh). It
-    /// is the interval of the groups this interest asks for (the last one to
-    /// set it wins): a group nobody sets keeps its own.
+    /// How often the hardware is read (an add-on's or a page's interval);
+    /// 0 = Paused (no reads but on Refresh). It is the interval of the
+    /// [`ProviderGroup::Hardware`] group when this interest asks for it (the
+    /// last one to set it wins). The counters have no interval: the Sampler
+    /// reads them once per tick, at the app's update speed
+    /// ([`Interest::read_now`]), whatever any add-on asks.
     pub fn set_interval_ms(&self, ms: u64) {
         let mut st = self.shared.lock();
         let mut changed = false;
-        for g in self.scope {
+        for g in self.scope.iter().filter(|g| **g == ProviderGroup::Hardware) {
             let gs = &mut st.groups[g.index()];
             changed |= gs.interval_ms != ms;
             gs.interval_ms = ms;
@@ -715,9 +743,7 @@ impl Drop for Interest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sensors::model::{Device, Frame, Group, Reading, Unit};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
+    use crate::sensors::model::{Device, Group, Instance, Unit};
 
     /// A provider that counts its reads and gives one reading.
     struct Fake {
@@ -1285,15 +1311,17 @@ mod tests {
     }
 
     #[test]
-    fn the_update_speed_belongs_to_the_group_of_the_interest_that_sets_it() {
+    fn an_update_speed_sets_the_hardwares_and_never_the_counters_which_are_read_when_asked() {
         let (service, counter_reads, hardware_reads) = two_groups();
         let always = service.interest_in(ProviderGroup::Counters);
-        let page = service.interest_in(ProviderGroup::Hardware);
+        let page = service.interest();
         until("one read each", || counter_reads.load(Ordering::SeqCst) >= 1 && hardware_reads.load(Ordering::SeqCst) >= 1);
-        always.set_interval_ms(600_000);
+        always.set_interval_ms(10);
         page.set_interval_ms(10);
         until("the hardware reads fast", || hardware_reads.load(Ordering::SeqCst) >= 5);
-        assert_eq!(counter_reads.load(Ordering::SeqCst), 1, "the counters keep their own speed");
+        assert_eq!(counter_reads.load(Ordering::SeqCst), 1, "no interval reads the counters");
+        always.read_now();
+        until("the counters read when asked", || counter_reads.load(Ordering::SeqCst) == 2);
     }
 
     #[test]
@@ -1318,7 +1346,7 @@ mod tests {
     /// A provider that counts disks: "0 C:" with a raw total, and "_Total".
     struct Counting {
         name: &'static str,
-        sets: Vec<crate::sensors::model::CounterSet>,
+        sets: Vec<CounterSet>,
         delay: Duration,
     }
 
@@ -1330,7 +1358,7 @@ mod tests {
             std::thread::sleep(self.delay);
             Vec::new()
         }
-        fn counted(&mut self) -> Vec<crate::sensors::model::CounterSet> {
+        fn counted(&mut self) -> Vec<CounterSet> {
             self.sets.clone()
         }
         fn timeout(&self) -> Duration {
@@ -1338,12 +1366,11 @@ mod tests {
         }
     }
 
-    fn counting(name: &'static str, delay_ms: u64, sets: Vec<crate::sensors::model::CounterSet>) -> Factory {
+    fn counting(name: &'static str, delay_ms: u64, sets: Vec<CounterSet>) -> Factory {
         Arc::new(move || Box::new(Counting { name, sets: sets.clone(), delay: Duration::from_millis(delay_ms) }))
     }
 
-    fn disk_sets() -> Vec<crate::sensors::model::CounterSet> {
-        use crate::sensors::model::{CounterSet, Instance};
+    fn disk_sets() -> Vec<CounterSet> {
         vec![CounterSet::new("dread", vec![Instance::new("0 C:", 2_000.0).with_raw(9_000_000), Instance::new("_Total", 2_000.0)])]
     }
 
@@ -1382,7 +1409,7 @@ mod tests {
                 fn read(&mut self, _at: Instant) -> Vec<Reading> {
                     Vec::new()
                 }
-                fn counted(&mut self) -> Vec<crate::sensors::model::CounterSet> {
+                fn counted(&mut self) -> Vec<CounterSet> {
                     disk_sets()
                 }
             }
@@ -1396,7 +1423,6 @@ mod tests {
 
     #[test]
     fn the_first_provider_that_answered_a_counter_gives_it() {
-        use crate::sensors::model::{CounterSet, Instance};
         let empty = vec![CounterSet::new("dread", Vec::new())];
         let other = vec![CounterSet::new("dread", vec![Instance::new("1", 7.0)])];
         let service = SensorService::new(vec![counting("first", 0, empty), counting("second", 0, other), counting("third", 0, disk_sets())]);
@@ -1405,6 +1431,32 @@ mod tests {
         let frame = interest.latest().unwrap();
         assert_eq!(frame.counters.len(), 1, "one set per key");
         assert!(frame.counter("dread").unwrap().instance("1").is_some());
+    }
+
+    #[test]
+    fn a_provider_that_is_not_listed_is_left_out_of_the_sources_but_still_reports() {
+        struct Quiet;
+        impl Provider for Quiet {
+            fn name(&self) -> &'static str {
+                "quiet"
+            }
+            fn listed(&self) -> bool {
+                false
+            }
+            fn read(&mut self, _at: Instant) -> Vec<Reading> {
+                Vec::new()
+            }
+            fn machine(&mut self) -> Option<Arc<crate::perfdata::StaticInfo>> {
+                Some(Arc::default())
+            }
+        }
+        let quiet: Factory = Arc::new(|| Box::new(Quiet));
+        let (shown, _) = fake("shown", 0, None);
+        let service = SensorService::grouped(vec![(ProviderGroup::Counters, quiet), (ProviderGroup::Counters, shown)]);
+        let interest = service.interest_in(ProviderGroup::Counters);
+        until("the facts", || interest.latest().is_some_and(|f| f.machine.is_some()));
+        let names: Vec<&str> = interest.latest().unwrap().sources.iter().map(|s| s.name).collect();
+        assert_eq!(names, ["shown"]);
     }
 
     #[test]

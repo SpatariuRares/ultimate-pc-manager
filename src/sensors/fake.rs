@@ -24,6 +24,8 @@ pub struct Script {
     pub reads: AtomicUsize,
     /// How long a read takes.
     pub delay: Mutex<Duration>,
+    /// How long reading the machine's facts takes.
+    pub machine_delay: Mutex<Duration>,
     /// What the last read was told about the hardware sensors.
     pub hardware_wanted: Mutex<Option<bool>>,
 }
@@ -81,6 +83,7 @@ impl Provider for Fake {
         std::mem::take(&mut self.counted)
     }
     fn machine(&mut self) -> Option<Arc<StaticInfo>> {
+        std::thread::sleep(*self.script.machine_delay.lock().unwrap());
         self.script.machine.lock().unwrap().clone().map(Arc::new)
     }
     fn timeout(&self) -> Duration {

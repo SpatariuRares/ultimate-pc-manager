@@ -52,10 +52,17 @@ pub trait Provider {
         Vec::new()
     }
     /// The machine's fixed facts, when this provider reports them (see
-    /// [`crate::sensors::machine::MachineFacts`]); called with
-    /// [`Provider::counted`]. Default: none.
+    /// [`crate::sensors::machine::MachineFacts`]). Asked after a read is
+    /// published, on the same thread, until it reports them: reading them
+    /// may be slow and never holds up the first figures. Default: none.
     fn machine(&mut self) -> Option<Arc<StaticInfo>> {
         None
+    }
+    /// Whether "Sources on this PC" lists it. A provider that reports no
+    /// readings (only the machine's facts) is not a source of any figure.
+    /// Default: yes.
+    fn listed(&self) -> bool {
+        true
     }
     /// The longest one read may take before its readings are reported as
     /// "not responding" (the other providers go on meanwhile).

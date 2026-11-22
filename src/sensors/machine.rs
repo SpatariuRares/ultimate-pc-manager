@@ -64,16 +64,17 @@ pub fn smbios_table() -> Option<Vec<u8>> {
 /// Its name in "Sources on this PC".
 const SOURCE: &str = "Machine information";
 
-/// Reports the machine's fixed facts, read once when it starts (they do not
-/// change while Windows runs). A counter provider, so the core pages have
-/// them without anything turning the hardware sensors on.
+/// Reports the machine's fixed facts, read once (they do not change while
+/// Windows runs), when the service asks for them after its first read. A
+/// counter provider, so the core pages have them without anything turning
+/// the hardware sensors on.
 pub struct MachineFacts {
-    facts: Arc<StaticInfo>,
+    facts: Option<Arc<StaticInfo>>,
 }
 
 impl MachineFacts {
     pub fn new() -> Self {
-        MachineFacts { facts: Arc::new(read()) }
+        MachineFacts { facts: None }
     }
 }
 
@@ -82,12 +83,17 @@ impl Provider for MachineFacts {
         SOURCE
     }
 
+    /// It has no readings, so "Sources on this PC" does not list it.
+    fn listed(&self) -> bool {
+        false
+    }
+
     fn read(&mut self, _at: Instant) -> Vec<Reading> {
         Vec::new()
     }
 
     fn machine(&mut self) -> Option<Arc<StaticInfo>> {
-        Some(self.facts.clone())
+        Some(self.facts.get_or_insert_with(|| Arc::new(read())).clone())
     }
 }
 
@@ -512,6 +518,13 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn the_machine_facts_provider_is_not_a_source_of_any_figure() {
+        assert!(!MachineFacts::new().listed(), "it reports no readings, so \"Sources on this PC\" does not list it");
+    }
+
     /// Every source file, with its path under `src/`.
     fn sources() -> Vec<(String, String)> {
         fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
@@ -530,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn nothing_reads_the_collectors_global_machine_information() {
+    fn nothing_reads_the_global_machine_information() {
         for (file, src) in sources() {
             if file.ends_with("machine.rs") {
                 continue; // this test names what it forbids

@@ -5,8 +5,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::app::{ProviderState, TaskApp};
-use crate::app::PerfItem;
+use crate::app::{PerfItem, ProviderState, TaskApp};
 use crate::perfdata::{counter, DiskLive, PerfLive};
 use crate::sampler::Snapshot;
 use crate::sensors::fake::{self, Script};
@@ -16,7 +15,6 @@ use crate::sensors::SensorService;
 use crate::settings::Settings;
 
 const NORMAL: usize = 2;
-const SLOW: usize = 3;
 const PAUSED: usize = 4;
 
 fn settings(speed: usize) -> Settings {
@@ -39,14 +37,11 @@ fn counted(perf: f64) -> Vec<CounterSet> {
     .collect()
 }
 
-/// An app whose counters are what `script` says, with the collector's gaps
-/// (`collector_gaps`) in every snapshot.
-fn app_over(script: &Arc<Script>, speed: usize, collector_gaps: &'static [&'static str]) -> (TaskApp, SensorService) {
-    let service = SensorService::grouped(vec![(ProviderGroup::Counters, fake::provider("Windows counters", script))]);
-    let app = TaskApp::headless_over(settings(speed), service.clone(), move |snap: &mut Snapshot| {
-        sysinfo_part(snap);
-        snap.perf.unanswered = collector_gaps.iter().copied().collect();
-    });
+/// An app whose counters are what `script` says, over the sysinfo part of a
+/// PC.
+fn app_over(script: &Arc<Script>, speed: usize) -> (TaskApp, SensorService) {
+    let service = counters_over(script);
+    let app = TaskApp::headless_over(settings(speed), service.clone(), sysinfo_part);
     (app, service)
 }
 
@@ -63,15 +58,10 @@ fn pull_until(app: &mut TaskApp, what: &str, cond: impl Fn(&TaskApp) -> bool) {
     }
 }
 
-/// The same figures as a hand-built snapshot.
-fn by_hand(perf: f32) -> TaskApp {
-    by_hand_all(perf)
-}
-
 #[test]
 fn a_headless_app_over_fake_providers_shows_their_figures_on_the_core_pages() {
     let script = Script::new(counted(110.0));
-    let (mut app, _service) = app_over(&script, NORMAL, &[]);
+    let (mut app, _service) = app_over(&script, NORMAL);
     app.machine_info = Some(crate::summary_view::tests::clocked(3_400));
     pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
     let mut hand = by_hand(110.0);
@@ -87,15 +77,14 @@ fn a_headless_app_over_fake_providers_shows_their_figures_on_the_core_pages() {
 
 #[test]
 fn a_required_counter_with_no_value_is_a_gap_and_degrades_the_state_an_optional_one_does_not() {
-    // Every other source answered (the collector reports no gap).
     let script = Script::new(counted(110.0).into_iter().filter(|c| c.key != counter::DWRITE).collect());
-    let (mut app, _service) = app_over(&script, NORMAL, &[]);
+    let (mut app, _service) = app_over(&script, NORMAL);
     pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
     assert!(!app.snap.perf.answered(counter::DWRITE), "no write rate: a gap");
     assert_eq!(ProviderState::of(&app.snap), ProviderState::Degraded);
 
     let script = Script::new(counted(110.0).into_iter().filter(|c| c.key != counter::PERF).collect());
-    let (mut app, _service) = app_over(&script, NORMAL, &[]);
+    let (mut app, _service) = app_over(&script, NORMAL);
     pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
     assert!(!app.snap.perf.answered(counter::PERF), "no performance level: a gap");
     assert_eq!(ProviderState::of(&app.snap), ProviderState::Healthy, "an optional counter never degrades");
@@ -104,8 +93,7 @@ fn a_required_counter_with_no_value_is_a_gap_and_degrades_the_state_an_optional_
 #[test]
 fn when_no_counter_answers_the_state_is_unavailable() {
     let script = Script::new(Vec::new());
-    // The collector's own sources failed too.
-    let (mut app, _service) = app_over(&script, NORMAL, &[counter::KERNEL, counter::PAGEIN, counter::DRESP, crate::perfdata::PERF_INFO]);
+    let (mut app, _service) = app_over(&script, NORMAL);
     pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
     assert_eq!(ProviderState::of(&app.snap), ProviderState::Unavailable);
     assert_eq!(ProviderState::of(&Snapshot::default()), ProviderState::Waiting, "nothing sampled yet");
@@ -114,7 +102,7 @@ fn when_no_counter_answers_the_state_is_unavailable() {
 #[test]
 fn paused_a_new_reading_does_not_change_the_pages_and_refresh_reads_once_after_the_request() {
     let script = Script::new(counted(110.0));
-    let (mut app, _service) = app_over(&script, PAUSED, &[]);
+    let (mut app, _service) = app_over(&script, PAUSED);
     pull_until(&mut app, "the sample taken at start", |a| a.snap.seq >= 1);
     assert_eq!(app.snap.perf.cpu_perf_pct, 110.0);
     let reads = script.reads();
@@ -128,7 +116,6 @@ fn paused_a_new_reading_does_not_change_the_pages_and_refresh_reads_once_after_t
     app.refresh_now();
     pull_until(&mut app, "the Refresh sample", |a| a.snap.seq >= 2);
     assert_eq!(app.snap.perf.cpu_perf_pct, 55.0, "built from a frame read after the Refresh, not the old one");
-    std::thread::sleep(Duration::from_millis(300));
     assert_eq!(script.reads(), reads + 1, "Refresh reads once");
 }
 
@@ -152,18 +139,43 @@ fn the_first_figures_do_not_wait_for_the_hardware_sensors() {
     assert_eq!(hardware.reads(), 1, "and the hardware provider is still in its first read");
 }
 
+const FAST: usize = 0;
+
+/// The next sample the Sampler sends.
+fn next_sample(app: &TaskApp) -> Snapshot {
+    app.sampler.rx.recv_timeout(Duration::from_secs(10)).expect("the Sampler sends a sample")
+}
+
+fn counters_over(script: &Arc<Script>) -> SensorService {
+    SensorService::grouped(vec![(ProviderGroup::Counters, fake::provider("Windows counters", script))])
+}
+
 #[test]
-fn the_core_pages_follow_the_settings_speed_whatever_a_page_asks_of_the_sensors() {
+fn the_counters_are_read_once_per_tick_at_the_settings_speed_whatever_interval_an_addon_asks() {
     let script = Script::new(counted(110.0));
-    let (mut app, service) = app_over(&script, SLOW, &[]);
-    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
-    // A page that wants the sensors every 20 ms.
-    let page = service.interest();
-    page.set_interval_ms(20);
-    std::thread::sleep(Duration::from_millis(700));
-    app.pull_samples();
-    assert_eq!(app.snap.seq, 1, "Slow: one sample every two seconds, not every 20 ms");
-    drop(page);
+    let service = counters_over(&script);
+    let app = TaskApp::headless_over(settings(FAST), service.clone(), |_: &mut Snapshot| {});
+    // An add-on that wants the sensors every 20 ms (Power & Freq does).
+    let addon = service.interest();
+    addon.set_interval_ms(20);
+    for tick in 1..=3 {
+        let snap = next_sample(&app);
+        assert_eq!(snap.seq, tick);
+        assert_eq!(script.reads(), tick as usize, "one read per Sampler tick, not one per 20 ms: tick {tick}");
+    }
+    drop(addon);
+}
+
+#[test]
+fn a_snapshots_counters_come_from_a_read_that_began_after_its_tick() {
+    let script = Script::new(counted(100.0));
+    let app = TaskApp::headless_over(settings(FAST), counters_over(&script), |_: &mut Snapshot| {});
+    assert_eq!(next_sample(&app).perf.cpu_perf_pct, 100.0);
+    for level in [120.0, 140.0, 90.0] {
+        // The PC changes right after a sample: the next tick starts a quarter of a second later.
+        script.set(counted(level));
+        assert_eq!(next_sample(&app).perf.cpu_perf_pct, level as f32, "not a frame read before the tick");
+    }
 }
 
 #[test]
@@ -173,10 +185,11 @@ fn the_settings_speed_is_the_counters_speed_and_not_the_hardwares() {
     let service = SensorService::grouped(vec![(ProviderGroup::Counters, fake::provider("Windows counters", &counters)), (ProviderGroup::Hardware, fake::provider("Vendor GPU", &hardware))]);
     let looking = service.interest_in(ProviderGroup::Hardware);
     looking.set_interval_ms(10);
-    let mut app = TaskApp::headless_over(settings(SLOW), service.clone(), |_: &mut Snapshot| {});
-    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
-    std::thread::sleep(Duration::from_millis(700));
-    assert!(counters.reads() <= 2, "the counters read at the settings speed: {}", counters.reads());
+    let app = TaskApp::headless_over(settings(FAST), service.clone(), |_: &mut Snapshot| {});
+    for tick in 1..=2 {
+        next_sample(&app);
+        assert_eq!(counters.reads(), tick, "the counters read at the settings speed");
+    }
     assert!(hardware.reads() > 10, "the hardware at the speed of the page that looks: {}", hardware.reads());
 }
 
@@ -212,12 +225,8 @@ fn more_counted() -> Vec<CounterSet> {
     ]
 }
 
-fn all_counted() -> Vec<CounterSet> {
-    counted(110.0)
-}
-
-/// A hand-built snapshot with the same figures `all_counted` counts.
-fn by_hand_all(perf_level: f32) -> TaskApp {
+/// A hand-built snapshot with the same figures `counted(perf_level)` counts.
+fn by_hand(perf_level: f32) -> TaskApp {
     let disk = DiskLive { number: 0, active: 50.0, read_bps: 3_000_000.0, write_bps: 1_000_000.0, total_read: 9_000_000, total_written: 4_000_000, resp_ms: 3.5, ..Default::default() };
     let perf = PerfLive {
         cpu_perf_pct: perf_level,
@@ -248,8 +257,7 @@ fn sysinfo_part(snap: &mut Snapshot) {
 }
 
 fn app_filled(script: &Arc<Script>, fill: impl FnMut(&mut Snapshot) + Send + 'static) -> TaskApp {
-    let service = SensorService::grouped(vec![(ProviderGroup::Counters, fake::provider("Windows counters", script))]);
-    TaskApp::headless_over(settings(NORMAL), service, fill)
+    TaskApp::headless_over(settings(NORMAL), counters_over(script), fill)
 }
 
 fn top(app: &TaskApp, item: PerfItem, key: &str) -> String {
@@ -257,14 +265,14 @@ fn top(app: &TaskApp, item: PerfItem, key: &str) -> String {
 }
 
 #[test]
-fn the_memory_and_disk_figures_the_provider_counted_show_as_the_collector_showed_them() {
-    let script = Script::new(all_counted());
+fn the_memory_and_disk_figures_the_provider_counted_show_as_hand_built_ones_do() {
+    let script = Script::new(counted(110.0));
     let mut app = app_filled(&script, |snap: &mut Snapshot| {
         sysinfo_part(snap);
         snap.swap_used = 2_000_000_000;
     });
     pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
-    let mut hand = by_hand_all(110.0);
+    let mut hand = by_hand(110.0);
     for key in ["Committed", "Cached", "Compressed", "Page ins", "Hard faults", "Swap used"] {
         assert_eq!(top(&app, PerfItem::Memory, key), top(&hand, PerfItem::Memory, key), "Memory > {key}");
     }
@@ -277,13 +285,13 @@ fn the_memory_and_disk_figures_the_provider_counted_show_as_the_collector_showed
 
 #[test]
 fn kernel_time_from_the_provider_fills_the_kernel_series_and_a_failed_counter_is_a_gap() {
-    let script = Script::new(all_counted());
+    let script = Script::new(counted(110.0));
     let mut app = app_filled(&script, sysinfo_part);
     pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
     assert_eq!(app.summary_view().cpu_kernel.last().copied(), Some(6.0), "kernel time of the whole CPU");
     assert_eq!(ProviderState::of(&app.snap), ProviderState::Healthy);
 
-    script.set(all_counted().into_iter().filter(|c| c.key != counter::KERNEL).collect());
+    script.set(counted(110.0).into_iter().filter(|c| c.key != counter::KERNEL).collect());
     let seq = app.snap.seq;
     pull_until(&mut app, "a sample without the kernel counter", |a| a.snap.seq > seq && !a.snap.perf.answered(counter::KERNEL));
     assert!(app.summary_view().cpu_kernel.last().is_some_and(|v| v.is_nan()), "a gap in the kernel series, not 0");
@@ -293,7 +301,7 @@ fn kernel_time_from_the_provider_fills_the_kernel_series_and_a_failed_counter_is
 #[test]
 fn a_failed_page_input_or_response_time_counter_degrades_the_state() {
     for gone in [counter::PAGEIN, counter::DRESP] {
-        let script = Script::new(all_counted().into_iter().filter(|c| c.key != gone).collect());
+        let script = Script::new(counted(110.0).into_iter().filter(|c| c.key != gone).collect());
         let mut app = app_filled(&script, sysinfo_part);
         pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
         assert!(!app.snap.perf.answered(gone), "{gone} did not answer");
@@ -304,7 +312,7 @@ fn a_failed_page_input_or_response_time_counter_degrades_the_state() {
 #[test]
 fn the_compressed_memory_and_the_page_file_counters_are_optional() {
     for gone in [counter::COMPR, counter::PAGEFILE] {
-        let script = Script::new(all_counted().into_iter().filter(|c| c.key != gone).collect());
+        let script = Script::new(counted(110.0).into_iter().filter(|c| c.key != gone).collect());
         let mut app = app_filled(&script, sysinfo_part);
         pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
         assert!(!app.snap.perf.answered(gone));
@@ -314,7 +322,7 @@ fn the_compressed_memory_and_the_page_file_counters_are_optional() {
 
 #[test]
 fn a_failed_performance_info_call_is_degraded_and_cached_is_a_gap() {
-    let script = Script::new(all_counted().into_iter().filter(|c| c.key != crate::perfdata::PERF_INFO).collect());
+    let script = Script::new(counted(110.0).into_iter().filter(|c| c.key != crate::perfdata::PERF_INFO).collect());
     let mut app = app_filled(&script, sysinfo_part);
     pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
     assert_eq!(ProviderState::of(&app.snap), ProviderState::Degraded);
@@ -327,12 +335,12 @@ fn without_a_compression_counter_the_compressed_memory_is_the_compression_proces
         sysinfo_part(snap);
         snap.procs.push(crate::sampler::ProcRow { pid: 4, name: "Memory Compression".into(), mem: 300 * 1024 * 1024, ..Default::default() });
     };
-    let script = Script::new(all_counted().into_iter().filter(|c| c.key != counter::COMPR).collect());
+    let script = Script::new(counted(110.0).into_iter().filter(|c| c.key != counter::COMPR).collect());
     let mut app = app_filled(&script, compression);
     pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
     assert_eq!(top(&app, PerfItem::Memory, "Compressed"), "300.0 MB");
     // The counter, when it answers, wins over the process.
-    let script = Script::new(all_counted());
+    let script = Script::new(counted(110.0));
     let mut app = app_filled(&script, compression);
     pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
     assert_eq!(top(&app, PerfItem::Memory, "Compressed"), "512.0 MB");
@@ -340,7 +348,7 @@ fn without_a_compression_counter_the_compressed_memory_is_the_compression_proces
 
 #[test]
 fn when_sysinfo_sees_no_page_file_use_the_page_file_counters_percent() {
-    let script = Script::new(all_counted());
+    let script = Script::new(counted(110.0));
     let mut app = app_filled(&script, sysinfo_part);
     pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
     assert_eq!(app.snap.swap_used, 4_000_000_000, "40 % of the 10 GB page file");
@@ -370,7 +378,7 @@ fn row(app: &TaskApp, item: PerfItem, name: &str) -> Option<String> {
 fn the_core_pages_show_the_machine_facts_their_providers_report() {
     let script = Script::new(counted(110.0));
     *script.machine.lock().unwrap() = Some(machine_facts(3_400));
-    let (mut app, _service) = app_over(&script, NORMAL, &[]);
+    let (mut app, _service) = app_over(&script, NORMAL);
     pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
     let top = app.stats(PerfItem::Cpu).top;
     assert!(top.iter().any(|(k, v)| k == "Speed" && v == "3.74 GHz"), "the base clock the provider reported x the performance level: {top:?}");
@@ -381,7 +389,7 @@ fn the_core_pages_show_the_machine_facts_their_providers_report() {
 #[test]
 fn without_machine_facts_the_speed_and_base_speed_are_blank() {
     let script = Script::new(counted(110.0));
-    let (mut app, _service) = app_over(&script, NORMAL, &[]);
+    let (mut app, _service) = app_over(&script, NORMAL);
     pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
     let top = app.stats(PerfItem::Cpu).top;
     assert!(top.iter().any(|(k, v)| k == "Speed" && v == "\u{2014}"), "no base clock: no speed: {top:?}");
@@ -392,7 +400,7 @@ fn without_machine_facts_the_speed_and_base_speed_are_blank() {
 fn the_override_of_the_machine_wins_over_what_the_providers_report() {
     let script = Script::new(counted(110.0));
     *script.machine.lock().unwrap() = Some(machine_facts(3_400));
-    let (mut app, _service) = app_over(&script, NORMAL, &[]);
+    let (mut app, _service) = app_over(&script, NORMAL);
     app.machine_info = Some(crate::summary_view::tests::clocked(2_000));
     pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1 && a.snap.machine.is_some());
     let top = app.stats(PerfItem::Cpu).top;
@@ -403,7 +411,7 @@ fn the_override_of_the_machine_wins_over_what_the_providers_report() {
 fn the_machine_facts_stay_when_a_later_reading_has_none() {
     let script = Script::new(counted(110.0));
     *script.machine.lock().unwrap() = Some(machine_facts(3_400));
-    let (mut app, _service) = app_over(&script, NORMAL, &[]);
+    let (mut app, _service) = app_over(&script, NORMAL);
     pull_until(&mut app, "the first sample", |a| a.snap.machine.is_some());
     let seq = app.snap.seq;
     *script.machine.lock().unwrap() = None;
@@ -454,7 +462,7 @@ const LUID: u64 = 0x1670C;
 #[test]
 fn the_gpu_figures_of_the_core_pages_come_from_the_provider() {
     let script = Script::new(counted(110.0).into_iter().chain(gpu_counted()).collect());
-    let (mut app, _service) = app_over(&script, NORMAL, &[]);
+    let (mut app, _service) = app_over(&script, NORMAL);
     pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
     let gpus = &app.snap.perf.gpus;
     assert_eq!(gpus.len(), 1);
@@ -476,8 +484,7 @@ fn the_gpu_figures_of_the_core_pages_come_from_the_provider() {
 #[test]
 fn each_process_shows_the_gpu_of_its_engines_and_one_without_engines_shows_zero() {
     let script = Script::new(counted(110.0).into_iter().chain(gpu_counted()).collect());
-    let service = SensorService::grouped(vec![(ProviderGroup::Counters, fake::provider("Windows counters", &script))]);
-    let mut app = TaskApp::headless_over(settings(NORMAL), service, |snap: &mut Snapshot| {
+    let mut app = TaskApp::headless_over(settings(NORMAL), counters_over(&script), |snap: &mut Snapshot| {
         let row = |pid, gpu| crate::sampler::ProcRow { pid, gpu, ..Default::default() };
         snap.procs = vec![row(1234, 99.0), row(88, 99.0), row(77, 99.0)];
     });
@@ -489,7 +496,7 @@ fn each_process_shows_the_gpu_of_its_engines_and_one_without_engines_shows_zero(
 #[test]
 fn flight_recorder_is_handed_the_gpu_engines_in_every_sample() {
     let script = Script::new(counted(110.0).into_iter().chain(gpu_counted()).collect());
-    let (app, _service) = app_over(&script, NORMAL, &[]);
+    let (app, _service) = app_over(&script, NORMAL);
     // The samples as they go to the add-ons (the app hands each one on).
     let mut seen = Vec::new();
     let end = Instant::now() + Duration::from_secs(10);
@@ -508,8 +515,63 @@ fn flight_recorder_is_handed_the_gpu_engines_in_every_sample() {
 #[test]
 fn a_pc_whose_gpu_counters_give_nothing_has_no_gpu_figures_and_no_gap_for_them() {
     let script = Script::new(counted(110.0));
-    let (mut app, _service) = app_over(&script, NORMAL, &[]);
+    let (mut app, _service) = app_over(&script, NORMAL);
     pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
     assert!(app.snap.perf.gpus.is_empty() && app.snap.perf.gpu_by_pid.is_empty());
     assert_eq!(ProviderState::of(&app.snap), ProviderState::Healthy, "no GPU driver is not a problem");
+}
+
+#[test]
+fn the_first_figures_do_not_wait_for_the_machine_facts() {
+    let script = Script::new(counted(110.0));
+    *script.machine.lock().unwrap() = Some(machine_facts(3_400));
+    *script.machine_delay.lock().unwrap() = Duration::from_millis(1_500);
+    let start = Instant::now();
+    let app = TaskApp::headless_over(settings(FAST), counters_over(&script), |_: &mut Snapshot| {});
+    let first = next_sample(&app);
+    assert!(start.elapsed() < Duration::from_millis(700), "the first snapshot waited for the facts: {:?}", start.elapsed());
+    assert_eq!(first.perf.cpu_perf_pct, 110.0, "with its counter figures");
+    assert!(first.machine.is_none(), "the facts come when they are read");
+    let mut seen = first;
+    while seen.machine.is_none() {
+        seen = next_sample(&app);
+    }
+    assert_eq!(seen.machine.unwrap().cpu.base_mhz, 3_400);
+}
+
+#[test]
+fn a_provider_that_stops_answering_turns_its_figures_into_gaps_and_degrades_the_state() {
+    let (disks, rest): (Vec<_>, Vec<_>) = counted(110.0).into_iter().partition(|c| [counter::PERF, counter::IDLE, counter::DREAD, counter::DWRITE, counter::POWER].contains(&c.key));
+    let (disks, rest) = (Script::new(disks), Script::new(rest));
+    let service = SensorService::grouped(vec![(ProviderGroup::Counters, fake::provider("Disk counters", &disks)), (ProviderGroup::Counters, fake::provider("System counters", &rest))]);
+    let mut app = TaskApp::headless_over(settings(FAST), service, sysinfo_part);
+    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+    assert_eq!(app.summary_view().cpu_kernel.last().copied(), Some(6.0));
+    assert_eq!(ProviderState::of(&app.snap), ProviderState::Healthy);
+    // The system counters stop answering (a read that never ends).
+    rest.slow(Duration::from_secs(20));
+    pull_until(&mut app, "the read timeout", |a| !a.snap.perf.answered(counter::KERNEL));
+    assert!(app.summary_view().cpu_kernel.last().is_some_and(|v| v.is_nan()), "a gap, not 0 and not the old figure");
+    assert_eq!(ProviderState::of(&app.snap), ProviderState::Degraded);
+    assert_eq!(crate::app::status_parts(false, ProviderState::of(&app.snap), 0, "", 1)[0], "Native providers degraded");
+    assert!(app.snap.perf.answered(counter::DREAD), "the other provider's figures stay");
+}
+
+#[test]
+fn one_reading_gives_a_core_page_and_an_addon_the_same_speed() {
+    let script = Script::cpu(crate::sensors::cpu::CpuSample { name: "Test CPU".into(), base_mhz: Some(3_400.0), performance_percent: Some(110.0), ..Default::default() });
+    *script.machine.lock().unwrap() = Some(machine_facts(3_400));
+    let service = counters_over(&script);
+    let mut app = TaskApp::headless_over(settings(FAST), service.clone(), |_: &mut Snapshot| {});
+    // What an add-on reads: the latest frame, as Power & Freq's Core Average does.
+    let addon = service.interest();
+    for (level, shown) in [(110.0, "3.74 GHz"), (150.0, "5.10 GHz")] {
+        script.cpu.lock().unwrap().as_mut().unwrap().performance_percent = Some(level);
+        script.set(vec![CounterSet::new(counter::PERF, vec![Instance::new("_Total", level)])]);
+        pull_until(&mut app, "a sample of this reading", |a| a.snap.perf.cpu_perf_pct == level as f32 && a.snap.machine.is_some());
+        let frame = addon.latest().expect("a frame");
+        let hz = frame.reading(crate::sensors::cpu::CORE_AVERAGE).and_then(|r| r.value).expect("Core Average");
+        assert_eq!(crate::metrics::fmt_ghz((hz / 1e6) as f32), shown, "the add-on");
+        assert_eq!(top(&app, PerfItem::Cpu, "Speed"), shown, "the core page");
+    }
 }

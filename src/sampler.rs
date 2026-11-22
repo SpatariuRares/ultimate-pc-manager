@@ -4,10 +4,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::perfdata::{counter, PerfLive};
+use crate::sensors::model::{CounterSet, Instance};
 use crate::sensors::service::{Interest, ProviderGroup, Ticket};
 use crate::sensors::SensorService;
 use sysinfo::{
@@ -150,22 +152,21 @@ impl Snapshot {
 }
 
 /// What fills a snapshot with everything the sensor service does not give
-/// it: processes, memory, networks, the counters the performance-data
-/// collector still reads. It runs on the sampler's thread.
+/// it: processes, memory, networks, disks. It runs on the sampler's thread.
 pub type Fill = Box<dyn FnMut(&mut Snapshot)>;
 
-/// The longest the sampler waits for the counter providers' frame (a
-/// provider that does not answer is "not responding" long before).
+/// The longest the sampler waits for the counter providers' frame. A
+/// provider that does not answer ends the wait at its own read timeout (it
+/// is "not responding"); this is only the backstop.
 const FRAME_WAIT: Duration = Duration::from_secs(15);
 
 pub struct Sampler {
     pub rx: Receiver<Snapshot>,
     /// Milliseconds between samples; 0 means paused.
     pub interval_ms: Arc<AtomicU64>,
-    pub refresh_now: Arc<AtomicBool>,
-    /// The sampler's interest in the performance-counter providers, held
-    /// for as long as the app runs, and the Refresh it asked for last.
-    counters: Option<(Arc<Interest>, Arc<Mutex<Option<Ticket>>>)>,
+    /// Set to take a sample at once ("Refresh", also while paused); the
+    /// sampler clears it when it takes one.
+    pub refresh_requested: Arc<AtomicBool>,
 }
 
 impl Sampler {
@@ -180,32 +181,28 @@ impl Sampler {
     pub fn start_with(interval_ms: u64, service: SensorService, make_fill: impl FnOnce() -> Fill + Send + 'static) -> Self {
         let (tx, rx) = channel();
         let interval = Arc::new(AtomicU64::new(interval_ms));
-        let refresh_now = Arc::new(AtomicBool::new(true));
-        // Taken now, so the counters start reading while the rest warms up.
-        let interest = Arc::new(service.interest_in(ProviderGroup::Counters));
-        interest.set_interval_ms(interval_ms);
-        let asked = Arc::new(Mutex::new(None));
-        let (i2, r2, c2, a2) = (interval.clone(), refresh_now.clone(), interest.clone(), asked.clone());
+        let refresh_requested = Arc::new(AtomicBool::new(true));
+        // Taken now, so the counters start reading while the rest warms up;
+        // held by the sampler's thread for as long as the app runs.
+        let interest = service.interest_in(ProviderGroup::Counters);
+        let (i2, r2) = (interval.clone(), refresh_requested.clone());
         thread::Builder::new()
             .name("sampler".into())
-            .spawn(move || run(tx, i2, r2, c2, a2, make_fill()))
+            .spawn(move || run(tx, i2, r2, interest, make_fill()))
             .expect("start sampler thread");
-        Sampler { rx, interval_ms: interval, refresh_now, counters: Some((interest, asked)) }
+        Sampler { rx, interval_ms: interval, refresh_requested }
     }
 
     /// A sampler that never samples (tests feed `rx` themselves).
     #[cfg(test)]
     pub fn detached(rx: Receiver<Snapshot>) -> Self {
-        Sampler { rx, interval_ms: Default::default(), refresh_now: Default::default(), counters: None }
+        Sampler { rx, interval_ms: Default::default(), refresh_requested: Default::default() }
     }
 
-    /// "Refresh": takes a sample now (also while paused), made from counters
-    /// read after this call.
+    /// "Refresh": takes a sample now (also while paused). Like every sample
+    /// it is made from counters read after it began.
     pub fn refresh(&self) {
-        if let Some((interest, asked)) = &self.counters {
-            *asked.lock().unwrap_or_else(|e| e.into_inner()) = Some(interest.read_now());
-        }
-        self.refresh_now.store(true, Ordering::Relaxed);
+        self.refresh_requested.store(true, Ordering::Relaxed);
     }
 }
 
@@ -240,49 +237,101 @@ fn services_by_host(running: &[crate::winsys::RunningService], procs: &[ProcRow]
     out
 }
 
+/// What fills `perf` from one counter that answered.
+type Fill1 = fn(&mut PerfLive, &CounterSet);
+
+/// Every counter the provider state counts ([`crate::perfdata::COUNTERS`],
+/// [`crate::perfdata::OPTIONAL`] and the GetPerformanceInfo call), with what
+/// it fills. A counter that gave nothing (no frame yet, a provider with a
+/// problem or not responding) is in `perf.unanswered` and its figures are
+/// gaps, not zeros: this table is the one place a reading becomes an answer
+/// or a gap, and [`crate::app::ProviderState::of`] the one place the gaps
+/// become a state. The GPU and energy counters are in no health list (a PC
+/// without a GPU driver or an energy meter never answers them), so they are
+/// filled apart.
+const FILLS: &[(&str, Fill1)] = &[
+    (counter::PERF, performance_level),
+    (counter::IDLE, disk_activity),
+    (counter::DREAD, disk_reads),
+    (counter::DWRITE, disk_writes),
+    (counter::DRESP, disk_response),
+    (counter::KERNEL, kernel_time),
+    (counter::PAGEIN, pages_read),
+    (counter::COMPR, compressed_memory),
+    (counter::PAGEFILE, page_file),
+    (crate::perfdata::PERF_INFO, performance_info),
+];
+
+/// The counter `key` of `frame`, when it answered.
+fn answered<'a>(frame: Option<&'a crate::sensors::Frame>, key: &str) -> Option<&'a CounterSet> {
+    frame.and_then(|f| f.counter(key)).filter(|c| c.answered())
+}
+
 /// Puts what the sensor service's providers counted into `perf`: the CPU
 /// performance level, every disk's activity and rates (with the totals since
-/// boot), the GPU adapters with each process's GPU share and the package
-/// power. A counter that gave nothing (no frame yet, a
-/// provider with a problem or not responding) is in `unanswered`: its
-/// figures are gaps, not zeros.
-fn counters_into(perf: &mut crate::perfdata::PerfLive, frame: Option<&crate::sensors::Frame>) {
-    use crate::perfdata::counter;
-    let set = |key: &str| frame.and_then(|f| f.counter(key)).filter(|c| c.answered());
-    let level = set(counter::PERF).and_then(|c| c.instance("_Total"));
-    perf.cpu_perf_pct = level.map_or(0.0, |i| i.value as f32);
-    let mut disks: std::collections::BTreeMap<u32, crate::perfdata::DiskLive> = perf.disks.drain(..).map(|d| (d.number, d)).collect();
-    let mut answered = [level.is_some(), false, false, false, false];
-    for (n, key) in [counter::IDLE, counter::DREAD, counter::DWRITE, counter::DRESP].into_iter().enumerate() {
-        let Some(counted) = set(key) else { continue };
-        answered[n + 1] = true;
-        for instance in &counted.instances {
-            let Some(number) = crate::sensors::disk::disk_number(&instance.name) else { continue };
-            let disk = disks.entry(number).or_default();
-            disk.number = number;
-            let total = instance.raw.map_or(0, |r| r.max(0) as u64);
-            match n {
-                0 => disk.active = (100.0 - instance.value as f32).clamp(0.0, 100.0),
-                1 => (disk.read_bps, disk.total_read) = (instance.value.max(0.0), total),
-                2 => (disk.write_bps, disk.total_written) = (instance.value.max(0.0), total),
-                // Seconds per transfer.
-                _ => disk.resp_ms = (instance.value * 1000.0) as f32,
+/// boot), the memory counters, the GPU adapters with each process's GPU
+/// share and the package power.
+fn counters_into(perf: &mut PerfLive, frame: Option<&crate::sensors::Frame>) {
+    for &(key, fill) in FILLS {
+        match answered(frame, key) {
+            Some(counted) => fill(perf, counted),
+            None => {
+                perf.unanswered.insert(key);
             }
         }
     }
-    perf.disks = disks.into_values().collect();
-    for (ok, key) in answered.into_iter().zip([counter::PERF, counter::IDLE, counter::DREAD, counter::DWRITE, counter::DRESP]) {
-        if !ok {
-            perf.unanswered.insert(key);
+    gpus_into(perf, frame);
+    power_into(perf, answered(frame, counter::POWER));
+}
+
+fn performance_level(perf: &mut PerfLive, counted: &CounterSet) {
+    perf.cpu_perf_pct = counted.instance("_Total").map_or(0.0, |i| i.value as f32);
+}
+
+/// The disk numbered `number`, added in order when `perf` has none yet.
+fn disk_of(perf: &mut PerfLive, number: u32) -> &mut crate::perfdata::DiskLive {
+    let at = perf.disks.binary_search_by_key(&number, |d| d.number).unwrap_or_else(|at| {
+        perf.disks.insert(at, crate::perfdata::DiskLive { number, ..Default::default() });
+        at
+    });
+    &mut perf.disks[at]
+}
+
+/// Gives every disk instance ("0 C:", not "_Total") of `counted` to `fill`.
+fn for_each_disk(perf: &mut PerfLive, counted: &CounterSet, fill: impl Fn(&mut crate::perfdata::DiskLive, &Instance)) {
+    for instance in &counted.instances {
+        if let Some(number) = crate::sensors::disk::disk_number(&instance.name) {
+            fill(disk_of(perf, number), instance);
         }
     }
-    // Kernel time per processor and in total; the pages read from disk
-    // (per second and since boot); the memory the compression process holds;
-    // the page file in use; GetPerformanceInfo. Each is a gap when it gave
-    // nothing.
-    let first = |key: &str| set(key).and_then(|c| c.instances.first());
+}
+
+/// The bytes since boot an instance counted.
+fn since_boot(instance: &Instance) -> u64 {
+    instance.raw.map_or(0, |r| r.max(0) as u64)
+}
+
+fn disk_activity(perf: &mut PerfLive, counted: &CounterSet) {
+    for_each_disk(perf, counted, |disk, i| disk.active = (100.0 - i.value as f32).clamp(0.0, 100.0));
+}
+
+fn disk_reads(perf: &mut PerfLive, counted: &CounterSet) {
+    for_each_disk(perf, counted, |disk, i| (disk.read_bps, disk.total_read) = (i.value.max(0.0), since_boot(i)));
+}
+
+fn disk_writes(perf: &mut PerfLive, counted: &CounterSet) {
+    for_each_disk(perf, counted, |disk, i| (disk.write_bps, disk.total_written) = (i.value.max(0.0), since_boot(i)));
+}
+
+/// Seconds per transfer, shown in milliseconds.
+fn disk_response(perf: &mut PerfLive, counted: &CounterSet) {
+    for_each_disk(perf, counted, |disk, i| disk.resp_ms = (i.value * 1000.0) as f32);
+}
+
+/// Kernel time per processor (in processor order) and in total.
+fn kernel_time(perf: &mut PerfLive, counted: &CounterSet) {
     let mut cores: Vec<(usize, f32)> = Vec::new();
-    for i in set(counter::KERNEL).iter().flat_map(|c| &c.instances) {
+    for i in &counted.instances {
         if i.name == "_Total" {
             perf.kernel_total = (i.value as f32).clamp(0.0, 100.0);
         } else if let Ok(n) = i.name.parse::<usize>() {
@@ -291,33 +340,51 @@ fn counters_into(perf: &mut crate::perfdata::PerfLive, frame: Option<&crate::sen
     }
     cores.sort_by_key(|c| c.0);
     perf.kernel_per_core = cores.into_iter().map(|c| c.1).collect();
-    perf.hard_faults = first(counter::PAGEIN).map_or(0.0, |i| i.value as f32);
-    perf.page_ins = first(counter::PAGEIN).and_then(|i| i.raw).map_or(0, |r| r.max(0) as u64);
-    perf.compressed = first(counter::COMPR).map_or(0, |i| i.value.max(0.0) as u64);
-    perf.pagefile_pct = first(counter::PAGEFILE).map_or(0.0, |i| i.value as f32);
-    if let Some(info) = set(crate::perfdata::PERF_INFO) {
-        let named = |name: &str| info.instance(name).map_or(0.0, |i| i.value.max(0.0));
-        (perf.threads, perf.handles) = (named("threads") as u32, named("handles") as u32);
-        (perf.commit, perf.commit_limit, perf.cached) = (named("commit") as u64, named("commit_limit") as u64, named("cached") as u64);
-    }
-    for key in [counter::KERNEL, counter::PAGEIN, counter::COMPR, counter::PAGEFILE, crate::perfdata::PERF_INFO] {
-        if set(key).is_none() {
-            perf.unanswered.insert(key);
-        }
-    }
-    // The GPU adapters and each process's share. No GPU counters (no driver)
-    // is no adapter, not a gap: the GPU keys are in no health list.
-    let instances = |key: &str| set(key).map(|c| c.instances.iter().map(|i| (i.name.clone(), i.value)).collect::<Vec<_>>()).unwrap_or_default();
+}
+
+/// The pages read from disk, per second and since boot.
+fn pages_read(perf: &mut PerfLive, counted: &CounterSet) {
+    let Some(first) = counted.instances.first() else { return };
+    perf.hard_faults = first.value as f32;
+    perf.page_ins = since_boot(first);
+}
+
+/// The memory the compression process holds.
+fn compressed_memory(perf: &mut PerfLive, counted: &CounterSet) {
+    perf.compressed = counted.instances.first().map_or(0, |i| i.value.max(0.0) as u64);
+}
+
+/// The page file in use, in percent.
+fn page_file(perf: &mut PerfLive, counted: &CounterSet) {
+    perf.pagefile_pct = counted.instances.first().map_or(0.0, |i| i.value as f32);
+}
+
+/// GetPerformanceInfo: threads, handles, commit, its limit and the cache.
+fn performance_info(perf: &mut PerfLive, counted: &CounterSet) {
+    let named = |name: &str| counted.instance(name).map_or(0.0, |i| i.value.max(0.0));
+    (perf.threads, perf.handles) = (named("threads") as u32, named("handles") as u32);
+    (perf.commit, perf.commit_limit, perf.cached) = (named("commit") as u64, named("commit_limit") as u64, named("cached") as u64);
+}
+
+/// The GPU adapters and each process's share. No GPU counters (no driver) is
+/// no adapter, not a gap.
+fn gpus_into(perf: &mut PerfLive, frame: Option<&crate::sensors::Frame>) {
+    let instances = |key: &str| answered(frame, key).map(|c| c.instances.iter().map(|i| (i.name.clone(), i.value)).collect::<Vec<_>>()).unwrap_or_default();
     let engines = instances(counter::GPU);
     perf.gpu_by_pid = crate::perfdata::gpu_by_pid(&engines);
     perf.gpus = crate::perfdata::gpu_adapters(&engines, &instances(counter::GDED), &instances(counter::GSH));
-    // Windows' energy meter reports the RAPL package rail in milliwatts.
-    perf.cpu_power_w = set(counter::POWER).and_then(|c| {
-        c.instances.iter().find(|i| {
-            let name = i.name.to_ascii_lowercase();
-            name.contains("package0") && name.ends_with("_pkg")
+}
+
+/// Windows' energy meter reports the RAPL package rail in milliwatts.
+fn power_into(perf: &mut PerfLive, counted: Option<&CounterSet>) {
+    perf.cpu_power_w = counted
+        .and_then(|c| {
+            c.instances.iter().find(|i| {
+                let name = i.name.to_ascii_lowercase();
+                name.contains("package0") && name.ends_with("_pkg")
+            })
         })
-    }).map(|i| i.value as f32 / 1000.0);
+        .map(|i| i.value as f32 / 1000.0);
 }
 
 /// Fills a snapshot from the system (see [`Fill`]); built on the sampler's
@@ -460,12 +527,13 @@ fn memory_from_counters(snap: &mut Snapshot) {
 }
 
 /// The frame the sampler builds a snapshot from: of the providers' reads
-/// after `refresh` when it asks for one, else the latest; waits for the
-/// providers' first answers, never for the hardware ones.
-fn counted_frame(interest: &Interest, refresh: Option<&Ticket>) -> Option<Arc<crate::sensors::Frame>> {
+/// after `ticket` when it has one, else the latest; waits for the providers'
+/// answers (a provider that stops answering ends the wait at its read
+/// timeout), never for the hardware ones.
+fn counted_frame(interest: &Interest, ticket: Option<&Ticket>) -> Option<Arc<crate::sensors::Frame>> {
     let start = Instant::now();
     loop {
-        let frame = match refresh {
+        let frame = match ticket {
             Some(ticket) => interest.latest_after(ticket),
             None => interest.latest(),
         };
@@ -476,24 +544,29 @@ fn counted_frame(interest: &Interest, refresh: Option<&Ticket>) -> Option<Arc<cr
     }
 }
 
-fn run(tx: Sender<Snapshot>, interval: Arc<AtomicU64>, refresh_now: Arc<AtomicBool>, interest: Arc<Interest>, asked: Arc<Mutex<Option<Ticket>>>, mut fill: Fill) {
+/// The sampler's thread: one snapshot per tick, at the app's update speed
+/// (and on Refresh, also while paused), until the app drops the receiver.
+/// `counters` is its interest in the counter providers, held for as long as
+/// it runs.
+fn run(tx: Sender<Snapshot>, interval: Arc<AtomicU64>, refresh_requested: Arc<AtomicBool>, counters: Interest, mut fill: Fill) {
     let mut seq = 0u64;
     let mut machine = None;
     loop {
         let ms = interval.load(Ordering::Relaxed);
-        let forced = refresh_now.swap(false, Ordering::Relaxed);
-        // The providers read at the app's update speed, and not at all
-        // while it is paused.
-        interest.set_interval_ms(ms);
+        let forced = refresh_requested.swap(false, Ordering::Relaxed);
         if ms == 0 && !forced {
             thread::sleep(Duration::from_millis(100));
             continue;
         }
-        let refresh = if forced { asked.lock().unwrap_or_else(|e| e.into_inner()).take() } else { None };
+        // The counters are read once per tick, whatever any add-on asks of
+        // the sensors, and the snapshot is built from a read that began
+        // after the tick did: ask now, so they read while `fill` works. The
+        // first tick takes the read the providers began with at start.
+        let ticket = (seq > 0).then(|| counters.read_now());
         let mut snap = Snapshot::default();
         fill(&mut snap);
         snap.forced = forced;
-        let frame = counted_frame(&interest, refresh.as_ref());
+        let frame = counted_frame(&counters, ticket.as_ref());
         counters_into(&mut snap.perf, frame.as_deref());
         merge_gpu(&mut snap.procs, &snap.perf.gpu_by_pid);
         memory_from_counters(&mut snap);
@@ -509,7 +582,7 @@ fn run(tx: Sender<Snapshot>, interval: Arc<AtomicU64>, refresh_now: Arc<AtomicBo
         let target = Duration::from_millis(if ms == 0 { 100 } else { ms });
         let start = Instant::now();
         while start.elapsed() < target {
-            if refresh_now.load(Ordering::Relaxed) {
+            if refresh_requested.load(Ordering::Relaxed) {
                 break;
             }
             let cur = interval.load(Ordering::Relaxed);
@@ -559,8 +632,14 @@ mod tests {
         assert!(!by_host.contains_key(&9), "a service whose host is not listed is left out");
     }
 
-    use crate::perfdata::{counter, PerfLive};
-    use crate::sensors::model::{CounterSet, Instance};
+    #[test]
+    fn every_source_the_provider_state_counts_has_a_way_into_the_snapshot() {
+        let filled: Vec<&str> = FILLS.iter().map(|f| f.0).collect();
+        for key in crate::perfdata::COUNTERS.iter().chain(crate::perfdata::OPTIONAL).copied().chain([crate::perfdata::PERF_INFO]) {
+            assert!(filled.contains(&key), "{key} is in FILLS");
+        }
+        assert_eq!(filled.len(), crate::perfdata::COUNTERS.len() + crate::perfdata::OPTIONAL.len() + 1, "and nothing else");
+    }
 
     fn frame_of(sets: Vec<CounterSet>) -> crate::sensors::Frame {
         let mut frame = crate::sensors::Frame::build(1, &[], Vec::new());

@@ -1281,7 +1281,7 @@ impl TaskApp {
             match result {
                 Ok(()) => {
                     self.say("Restarted Windows Explorer".to_string());
-                    self.sampler.refresh_now.store(true, Ordering::Relaxed);
+                    self.sampler.refresh_requested.store(true, Ordering::Relaxed);
                 }
                 Err(e) => self.say(e),
             }
@@ -1302,7 +1302,7 @@ impl TaskApp {
                 _ => self.say(format!("{done} {} processes", pids.len())),
             },
         }
-        self.sampler.refresh_now.store(true, Ordering::Relaxed);
+        self.sampler.refresh_requested.store(true, Ordering::Relaxed);
     }
 
     /// "Turn it off": Hide Microsoft Services and Processes goes off and
@@ -1359,7 +1359,7 @@ impl TaskApp {
             Action::End { pid, force, tree, name } => match winsys::end_process(pid, force, tree) {
                 Ok(()) => {
                     self.say(format!("Ended {name}"));
-                    self.sampler.refresh_now.store(true, Ordering::Relaxed);
+                    self.sampler.refresh_requested.store(true, Ordering::Relaxed);
                 }
                 Err(e) => self.say(e),
             },
@@ -1370,7 +1370,7 @@ impl TaskApp {
                     None => self.say(format!("Ended {} processes", pids.len())),
                     Some(e) => self.say(e),
                 }
-                self.sampler.refresh_now.store(true, Ordering::Relaxed);
+                self.sampler.refresh_requested.store(true, Ordering::Relaxed);
             }
             Action::Priority(pid, p) => match winsys::set_priority(pid, p) {
                 Ok(()) => self.say(format!("Priority set to {p}")),
@@ -1599,7 +1599,7 @@ mod tests {
     fn f5_still_asks_for_a_new_snapshot() {
         let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
         press(&mut app, egui::Key::F5, egui::Modifiers::NONE);
-        assert!(app.sampler.refresh_now.load(Ordering::Relaxed));
+        assert!(app.sampler.refresh_requested.load(Ordering::Relaxed));
         assert_eq!(app.run_dialog, None);
     }
 
@@ -1609,13 +1609,13 @@ mod tests {
         let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
         let f5 = || egui::Event::Key { key: egui::Key::F5, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
         crate::test_ui::run(&ctx, (400.0, 300.0), vec![f5()], |ui| app.shortcuts(ui.ctx()));
-        assert!(app.sampler.refresh_now.swap(false, Ordering::Relaxed), "the press refreshes");
+        assert!(app.sampler.refresh_requested.swap(false, Ordering::Relaxed), "the press refreshes");
         // Held down: the key repeats without a release in between.
         crate::test_ui::run(&ctx, (400.0, 300.0), vec![f5(), f5()], |ui| app.shortcuts(ui.ctx()));
-        assert!(!app.sampler.refresh_now.load(Ordering::Relaxed), "key repeats refresh nothing more");
+        assert!(!app.sampler.refresh_requested.load(Ordering::Relaxed), "key repeats refresh nothing more");
         let up = egui::Event::Key { key: egui::Key::F5, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE };
         crate::test_ui::run(&ctx, (400.0, 300.0), vec![up, f5()], |ui| app.shortcuts(ui.ctx()));
-        assert!(app.sampler.refresh_now.load(Ordering::Relaxed), "the next press refreshes again");
+        assert!(app.sampler.refresh_requested.load(Ordering::Relaxed), "the next press refreshes again");
     }
 
     #[test]
