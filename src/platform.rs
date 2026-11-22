@@ -597,6 +597,15 @@ impl AddonContext {
         (AddonContext { runner: runner.clone(), admin: false, dialogs: false, sensors, leases, queue: Default::default() }, runner)
     }
 
+    /// [`AddonContext::recording`] over a sensor service of the test's own
+    /// (made of fake providers).
+    #[cfg(test)]
+    pub fn recording_over(sensors: SensorService) -> (Self, Arc<RecordingRunner>) {
+        let runner = Arc::new(RecordingRunner::default());
+        let leases = Leases::new(sensors.clone());
+        (AddonContext { runner: runner.clone(), admin: false, dialogs: false, sensors, leases, queue: Default::default() }, runner)
+    }
+
     /// The shared sensor service. It runs only while someone holds an
     /// [`crate::sensors::Interest`]. For anything that is drawn, take nothing
     /// by hand: a page or tile reads sensors through [`PageContext::sensors`]

@@ -287,8 +287,10 @@ impl TaskApp {
         if let Some(mode) = crate::theme::mode_from_args(&std::env::args().collect::<Vec<_>>()) {
             settings.theme_for_this_run(mode == crate::theme::Mode::Dark);
         }
-        let sampler = Sampler::start(settings.interval_ms());
         let mut addons = AddonHost::from_section(&settings.addons);
+        // The sampler reads the performance counters through the sensor
+        // service every page shares, so each counter is read once.
+        let sampler = Sampler::start(settings.interval_ms(), addons.context().sensors().clone());
         // `--page <id or name>` opens a given page (handy for pictures of it).
         let args: Vec<String> = std::env::args().collect();
         // Flags owned by add-ons (e.g. `--scan`); one that is off ignores them.
@@ -375,10 +377,23 @@ impl TaskApp {
     #[cfg(test)]
     pub fn headless(settings: Settings, snap: Snapshot) -> Self {
         let (_, rx) = std::sync::mpsc::channel();
-        let sampler = Sampler { rx, interval_ms: Default::default(), refresh_now: Default::default() };
+        let sampler = Sampler::detached(rx);
         let addons = AddonHost::from_section(&serde_json::json!({}));
         let mut app = Self::build(settings, sampler, addons, Page::Core(Core::Summary), None);
         app.snap = snap;
+        app.rebuild_summary();
+        app
+    }
+
+    /// An app for tests over a sensor service made of fake providers: a real
+    /// sampler holds its interest in the counter providers (the rest of a
+    /// snapshot, `fill`, is the test's) and the add-ons read the same
+    /// service. Samples reach the app when the test calls `pull_samples`.
+    #[cfg(test)]
+    pub fn headless_over(settings: Settings, sensors: crate::sensors::SensorService, fill: impl FnMut(&mut Snapshot) + Send + 'static) -> Self {
+        let sampler = Sampler::start_with(settings.interval_ms(), sensors.clone(), move || Box::new(fill));
+        let addons = AddonHost::over_sensors(sensors);
+        let mut app = Self::build(settings, sampler, addons, Page::Core(Core::Summary), None);
         app.rebuild_summary();
         app
     }
@@ -517,7 +532,7 @@ impl TaskApp {
     }
 
     pub fn refresh_now(&mut self) {
-        self.sampler.refresh_now.store(true, Ordering::Relaxed);
+        self.sampler.refresh();
         match self.page {
             Page::Core(Core::Services) => self.services = Some(winsys::list_services()),
             Page::Core(Core::Startup) => self.startup = Some(winsys::list_startup()),

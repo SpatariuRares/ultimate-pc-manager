@@ -40,6 +40,9 @@ pub mod npu;
 #[cfg(windows)]
 /// A PDH counter query (Windows performance counters).
 mod pdh;
+#[cfg(test)]
+/// A fake provider whose figures a test sets.
+pub mod fake;
 /// Firmware tables (SMBIOS): bus clock, motherboard, memory (#60).
 pub mod smbios;
 /// The firmware provider: Bus Clock, Motherboard and Memory (#60).

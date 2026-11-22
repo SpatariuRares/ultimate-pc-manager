@@ -648,6 +648,14 @@ impl AddonHost {
         Self::for_tests_with(registry(), section)
     }
 
+    /// The standard registry with every add-on on, over a context whose
+    /// sensor service is `sensors` (made of fake providers).
+    #[cfg(test)]
+    pub fn over_sensors(sensors: crate::sensors::SensorService) -> Self {
+        let (context, _) = AddonContext::recording_over(sensors);
+        Self::with_context(registry(), &serde_json::json!({}), context)
+    }
+
     /// Like [`AddonHost::for_tests`], with a registry of the test's own.
     #[cfg(test)]
     pub fn for_tests_with(entries: Vec<Entry>, section: &serde_json::Value) -> (Self, std::sync::Arc<crate::platform::RecordingRunner>) {

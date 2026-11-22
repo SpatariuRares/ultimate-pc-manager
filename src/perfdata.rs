@@ -135,6 +135,17 @@ pub const COUNTERS: &[&str] = &[counter::KERNEL, counter::PAGEIN, counter::IDLE,
 /// Counters a healthy PC may never answer (VMs, no page file): gaps, but not counted in the provider state.
 pub const OPTIONAL: &[&str] = &[counter::PERF, counter::COMPR, counter::PAGEFILE];
 
+/// The counters the sensor service's providers read for the Sampler: they
+/// are in no query of the [`Collector`], and the Sampler adds the ones that
+/// did not answer to [`PerfLive::unanswered`] when it merges what the
+/// providers counted (see `sampler::counters_into`).
+pub const PROVIDED: &[&str] = &[counter::PERF, counter::IDLE, counter::DREAD, counter::DWRITE, counter::POWER];
+
+/// [`COUNTERS`] and [`OPTIONAL`] the [`Collector`] itself reads.
+fn collected() -> impl Iterator<Item = &'static str> {
+    COUNTERS.iter().chain(OPTIONAL).copied().filter(|k| !PROVIDED.contains(k))
+}
+
 /// Not a counter but the GetPerformanceInfo call (threads, handles, commit,
 /// cached): in `unanswered` when the call failed, so its figures are gaps.
 /// The provider state counts it with [`COUNTERS`] (see [`SOURCES`]).
@@ -255,7 +266,7 @@ impl Collector {
     }
     /// No performance counters off Windows: none answered.
     pub fn sample(&mut self) -> PerfLive {
-        PerfLive { unanswered: COUNTERS.iter().chain(OPTIONAL).copied().chain([PERF_INFO]).collect(), ..Default::default() }
+        PerfLive { unanswered: collected().chain([PERF_INFO]).collect(), ..Default::default() }
     }
 }
 #[cfg(not(windows))]
@@ -298,6 +309,7 @@ mod imp {
 
     const PDH_FMT_NOCAP100: u32 = 0x8000;
 
+    use crate::sensors::disk::disk_number;
     use crate::winsys::wide;
 
     unsafe fn from_wide(p: *const u16) -> String {
@@ -315,16 +327,11 @@ mod imp {
 
     const PATHS: &[(&str, &str)] = &[
         (counter::KERNEL, r"\Processor(*)\% Privileged Time"),
-        (counter::PERF, r"\Processor Information(_Total)\% Processor Performance"),
         (counter::PAGEIN, r"\Memory\Pages Input/sec"),
-        (counter::IDLE, r"\PhysicalDisk(*)\% Idle Time"),
-        (counter::DREAD, r"\PhysicalDisk(*)\Disk Read Bytes/sec"),
-        (counter::DWRITE, r"\PhysicalDisk(*)\Disk Write Bytes/sec"),
         (counter::DRESP, r"\PhysicalDisk(*)\Avg. Disk sec/Transfer"),
         (counter::GPU, r"\GPU Engine(*)\Utilization Percentage"),
         (counter::GDED, r"\GPU Adapter Memory(*)\Dedicated Usage"),
         (counter::GSH, r"\GPU Adapter Memory(*)\Shared Usage"),
-        (counter::POWER, r"\Energy Meter(*)\Power"),
         (counter::COMPR, r"\Process(Memory Compression)\Working Set"),
         (counter::PAGEFILE, r"\Paging File(_Total)\% Usage"),
     ];
@@ -418,7 +425,7 @@ mod imp {
 
         pub fn sample(&mut self) -> PerfLive {
             // Until a counter gives a value, it has not answered.
-            let mut l = PerfLive { unanswered: COUNTERS.iter().chain(OPTIONAL).copied().collect(), ..Default::default() };
+            let mut l = PerfLive { unanswered: collected().collect(), ..Default::default() };
             self.answered.borrow_mut().clear();
             if self.q.is_null() {
                 l.unanswered.insert(PERF_INFO);
@@ -438,40 +445,18 @@ mod imp {
             }
             cores.sort_by_key(|c| c.0);
             l.kernel_per_core = cores.into_iter().map(|c| c.1).collect();
-            l.cpu_perf_pct = self.fmt(counter::PERF).first().map(|x| x.1 as f32).unwrap_or(0.0);
             l.hard_faults = self.fmt(counter::PAGEIN).first().map(|x| x.1 as f32).unwrap_or(0.0);
             l.page_ins = self.raw(counter::PAGEIN).first().map(|x| x.1.max(0) as u64).unwrap_or(0);
 
-            // Physical disks: instances look like "0 C: D:".
-            let num = |n: &str| -> Option<u32> {
-                if n == "_Total" { None } else { n.split_whitespace().next()?.parse().ok() }
-            };
+            // Physical disks: instances look like "0 C: D:". The sensor
+            // service's providers give the rest of a disk (see
+            // `sampler::counters_into`).
             let mut disks: BTreeMap<u32, DiskLive> = BTreeMap::new();
-            for (n, v) in self.fmt(counter::IDLE) {
-                if let Some(d) = num(&n) {
+            for (n, v) in self.fmt(counter::DRESP) {
+                if let Some(d) = disk_number(&n) {
                     let e = disks.entry(d).or_default();
                     e.number = d;
-                    e.active = (100.0 - v as f32).clamp(0.0, 100.0);
-                }
-            }
-            for (key, f) in [(counter::DREAD, 0), (counter::DWRITE, 1), (counter::DRESP, 2)] {
-                for (n, v) in self.fmt(key) {
-                    if let Some(d) = num(&n) {
-                        let e = disks.entry(d).or_default();
-                        e.number = d;
-                        match f {
-                            0 => e.read_bps = v.max(0.0),
-                            1 => e.write_bps = v.max(0.0),
-                            _ => e.resp_ms = (v * 1000.0) as f32,
-                        }
-                    }
-                }
-            }
-            for (key, f) in [(counter::DREAD, 0), (counter::DWRITE, 1)] {
-                for (n, v) in self.raw(key) {
-                    if let Some(e) = num(&n).and_then(|d| disks.get_mut(&d)) {
-                        if f == 0 { e.total_read = v.max(0) as u64 } else { e.total_written = v.max(0) as u64 }
-                    }
+                    e.resp_ms = (v * 1000.0) as f32;
                 }
             }
             l.disks = disks.into_values().collect();
@@ -514,14 +499,6 @@ mod imp {
                 }
             }
             l.gpus = gpus.into_values().collect();
-
-            // Windows' energy meter reports the RAPL package rail in milliwatts.
-            for (n, v) in self.fmt(counter::POWER) {
-                let n = n.to_ascii_lowercase();
-                if n.contains("package0") && n.ends_with("_pkg") {
-                    l.cpu_power_w = Some(v as f32 / 1000.0);
-                }
-            }
 
             l.compressed = self.fmt(counter::COMPR).first().map(|x| x.1.max(0.0) as u64).unwrap_or(0);
             l.pagefile_pct = self.fmt(counter::PAGEFILE).first().map(|x| x.1 as f32).unwrap_or(0.0);

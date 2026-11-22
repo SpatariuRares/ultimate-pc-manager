@@ -4,10 +4,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::sensors::service::{Interest, ProviderGroup, Ticket};
+use crate::sensors::SensorService;
 use sysinfo::{
     Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind,
     Users,
@@ -144,25 +146,63 @@ impl Snapshot {
     }
 }
 
+/// What fills a snapshot with everything the sensor service does not give
+/// it: processes, memory, networks, the counters the performance-data
+/// collector still reads. It runs on the sampler's thread.
+pub type Fill = Box<dyn FnMut(&mut Snapshot)>;
+
+/// The longest the sampler waits for the counter providers' frame (a
+/// provider that does not answer is "not responding" long before).
+const FRAME_WAIT: Duration = Duration::from_secs(15);
+
 pub struct Sampler {
     pub rx: Receiver<Snapshot>,
     /// Milliseconds between samples; 0 means paused.
     pub interval_ms: Arc<AtomicU64>,
     pub refresh_now: Arc<AtomicBool>,
+    /// The sampler's interest in the performance-counter providers, held
+    /// for as long as the app runs, and the Refresh it asked for last.
+    counters: Option<(Arc<Interest>, Arc<Mutex<Option<Ticket>>>)>,
 }
 
 impl Sampler {
-    pub fn start(interval_ms: u64) -> Self {
+    /// Starts sampling the PC; the counters the sensor service's providers
+    /// read come from `service` (the one every page shares).
+    pub fn start(interval_ms: u64, service: SensorService) -> Self {
+        Self::start_with(interval_ms, service, system_fill)
+    }
+
+    /// Like [`Sampler::start`], filling a snapshot with `make_fill()` (built
+    /// on the sampler's thread) instead of reading the system.
+    pub fn start_with(interval_ms: u64, service: SensorService, make_fill: impl FnOnce() -> Fill + Send + 'static) -> Self {
         let (tx, rx) = channel();
         let interval = Arc::new(AtomicU64::new(interval_ms));
         let refresh_now = Arc::new(AtomicBool::new(true));
-        let i2 = interval.clone();
-        let r2 = refresh_now.clone();
+        // Taken now, so the counters start reading while the rest warms up.
+        let interest = Arc::new(service.interest_in(ProviderGroup::Counters));
+        interest.set_interval_ms(interval_ms);
+        let asked = Arc::new(Mutex::new(None));
+        let (i2, r2, c2, a2) = (interval.clone(), refresh_now.clone(), interest.clone(), asked.clone());
         thread::Builder::new()
             .name("sampler".into())
-            .spawn(move || run(tx, i2, r2))
+            .spawn(move || run(tx, i2, r2, c2, a2, make_fill()))
             .expect("start sampler thread");
-        Sampler { rx, interval_ms: interval, refresh_now }
+        Sampler { rx, interval_ms: interval, refresh_now, counters: Some((interest, asked)) }
+    }
+
+    /// A sampler that never samples (tests feed `rx` themselves).
+    #[cfg(test)]
+    pub fn detached(rx: Receiver<Snapshot>) -> Self {
+        Sampler { rx, interval_ms: Default::default(), refresh_now: Default::default(), counters: None }
+    }
+
+    /// "Refresh": takes a sample now (also while paused), made from counters
+    /// read after this call.
+    pub fn refresh(&self) {
+        if let Some((interest, asked)) = &self.counters {
+            *asked.lock().unwrap_or_else(|e| e.into_inner()) = Some(interest.read_now());
+        }
+        self.refresh_now.store(true, Ordering::Relaxed);
     }
 }
 
@@ -197,7 +237,51 @@ fn services_by_host(running: &[crate::winsys::RunningService], procs: &[ProcRow]
     out
 }
 
-fn run(tx: Sender<Snapshot>, interval: Arc<AtomicU64>, refresh_now: Arc<AtomicBool>) {
+/// Puts what the sensor service's providers counted into `perf`: the CPU
+/// performance level, every disk's activity and rates (with the totals since
+/// boot) and the package power. A counter that gave nothing (no frame yet, a
+/// provider with a problem or not responding) is in `unanswered`: its
+/// figures are gaps, not zeros.
+fn counters_into(perf: &mut crate::perfdata::PerfLive, frame: Option<&crate::sensors::Frame>) {
+    use crate::perfdata::counter;
+    let set = |key: &str| frame.and_then(|f| f.counter(key)).filter(|c| c.answered());
+    let level = set(counter::PERF).and_then(|c| c.instance("_Total"));
+    perf.cpu_perf_pct = level.map_or(0.0, |i| i.value as f32);
+    let mut disks: std::collections::BTreeMap<u32, crate::perfdata::DiskLive> = perf.disks.drain(..).map(|d| (d.number, d)).collect();
+    let mut answered = [level.is_some(), false, false, false];
+    for (n, key) in [counter::IDLE, counter::DREAD, counter::DWRITE].into_iter().enumerate() {
+        let Some(counted) = set(key) else { continue };
+        answered[n + 1] = true;
+        for instance in &counted.instances {
+            let Some(number) = crate::sensors::disk::disk_number(&instance.name) else { continue };
+            let disk = disks.entry(number).or_default();
+            disk.number = number;
+            let total = instance.raw.map_or(0, |r| r.max(0) as u64);
+            match n {
+                0 => disk.active = (100.0 - instance.value as f32).clamp(0.0, 100.0),
+                1 => (disk.read_bps, disk.total_read) = (instance.value.max(0.0), total),
+                _ => (disk.write_bps, disk.total_written) = (instance.value.max(0.0), total),
+            }
+        }
+    }
+    perf.disks = disks.into_values().collect();
+    for (ok, key) in answered.into_iter().zip([counter::PERF, counter::IDLE, counter::DREAD, counter::DWRITE]) {
+        if !ok {
+            perf.unanswered.insert(key);
+        }
+    }
+    // Windows' energy meter reports the RAPL package rail in milliwatts.
+    perf.cpu_power_w = set(counter::POWER).and_then(|c| {
+        c.instances.iter().find(|i| {
+            let name = i.name.to_ascii_lowercase();
+            name.contains("package0") && name.ends_with("_pkg")
+        })
+    }).map(|i| i.value as f32 / 1000.0);
+}
+
+/// Fills a snapshot from the system (see [`Fill`]); built on the sampler's
+/// thread, where it warms up.
+fn system_fill() -> Fill {
     let mut sys = System::new();
     let users = Users::new_with_refreshed_list();
     let mut disks = Disks::new_with_refreshed_list();
@@ -212,7 +296,6 @@ fn run(tx: Sender<Snapshot>, interval: Arc<AtomicU64>, refresh_now: Arc<AtomicBo
     sys.refresh_cpu_all();
     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
     let mut last = Instant::now();
-    let mut seq = 0u64;
     let mut disk_tick = 0u32;
     let mut perf = crate::perfdata::Collector::new();
     let mut facts = crate::proc_info::Reader::default();
@@ -221,123 +304,152 @@ fn run(tx: Sender<Snapshot>, interval: Arc<AtomicU64>, refresh_now: Arc<AtomicBo
     let _ = crate::perfdata::info();
     // A short first wait so CPU usage has two points to compare.
     thread::sleep(Duration::from_millis(250));
+    Box::new(move |snap: &mut Snapshot| {
+            sys.refresh_cpu_all();
+            sys.refresh_memory();
+            sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+            networks.refresh(true);
+            disk_tick += 1;
+            if disk_tick % 10 == 1 {
+                disks.refresh(true);
+            }
+            let now = Instant::now();
+            let secs = now.duration_since(last).as_secs_f64().max(0.05);
+            last = now;
+            let ncpu = sys.cpus().len().max(1) as f32;
+
+            let mut dr = 0.0;
+            let mut dw = 0.0;
+            for (pid, p) in sys.processes() {
+                let du = p.disk_usage();
+                let r = du.read_bytes as f64 / secs;
+                let w = du.written_bytes as f64 / secs;
+                dr += r;
+                dw += w;
+                let user = p
+                    .user_id()
+                    .and_then(|u| users.get_user_by_id(u))
+                    .map(|u| u.name().to_string())
+                    .unwrap_or_default();
+                let cmd = p
+                    .cmd()
+                    .iter()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                snap.procs.push(ProcRow {
+                    pid: pid.as_u32(),
+                    parent: p.parent().map(|x| x.as_u32()),
+                    name: p.name().to_string_lossy().into_owned(),
+                    // `proc_info` reads the real status below.
+                    status: "Running".into(),
+                    user,
+                    cpu: (p.cpu_usage() / ncpu).clamp(0.0, 100.0),
+                    mem: p.memory(),
+                    disk_read: r,
+                    disk_write: w,
+                    run_time: p.run_time(),
+                    exe: p.exe().map(|e| e.display().to_string()).unwrap_or_default(),
+                    cmd,
+                    ..Default::default()
+                });
+            }
+            facts.fill(&mut snap.procs);
+            // The services under their hosts; a description is read once per
+            // service.
+            let running = crate::winsys::running_services();
+            for s in &running {
+                if !descriptions.contains_key(&s.name) {
+                    descriptions.insert(s.name.clone(), crate::winsys::service_description(&s.name));
+                }
+            }
+            snap.services = Arc::new(services_by_host(&running, &snap.procs, &descriptions));
+            snap.cpu_total = sys.global_cpu_usage();
+            snap.cpu_per_core = sys.cpus().iter().map(|c| c.cpu_usage()).collect();
+            snap.cpu_freq_mhz = sys.cpus().first().map(|c| c.frequency()).unwrap_or(0);
+            snap.cpu_freqs = sys.cpus().iter().map(|c| c.frequency()).collect();
+            snap.mem_total = sys.total_memory();
+            snap.mem_used = sys.used_memory();
+            snap.mem_avail = sys.available_memory();
+            snap.swap_total = sys.total_swap();
+            snap.swap_used = sys.used_swap();
+            snap.disk_read_bps = dr;
+            snap.disk_write_bps = dw;
+            for (name, data) in networks.iter() {
+                snap.net.push(NetRow {
+                    name: name.clone(),
+                    rx_bps: data.received() as f64 / secs,
+                    tx_bps: data.transmitted() as f64 / secs,
+                    total_rx: data.total_received(),
+                    total_tx: data.total_transmitted(),
+                });
+            }
+            snap.net.sort_by(|a, b| {
+                (b.total_rx + b.total_tx).cmp(&(a.total_rx + a.total_tx))
+            });
+            for d in disks.list() {
+                snap.disks.push(DiskRow {
+                    name: d.name().to_string_lossy().into_owned(),
+                    mount: d.mount_point().display().to_string(),
+                    fs: d.file_system().to_string_lossy().into_owned(),
+                    kind: format!("{:?}", d.kind()),
+                    total: d.total_space(),
+                    free: d.available_space(),
+                    removable: d.is_removable(),
+                });
+            }
+            snap.uptime = System::uptime();
+            snap.perf = perf.sample();
+            merge_gpu(&mut snap.procs, &snap.perf.gpu_by_pid);
+            snap.compressed = match snap.perf.compressed {
+                0 => snap
+                    .procs
+                    .iter()
+                    .find(|p| p.name.eq_ignore_ascii_case("Memory Compression"))
+                    .map(|p| p.mem)
+                    .unwrap_or(0),
+                c => c,
+            };
+            if snap.swap_used == 0 && snap.perf.pagefile_pct > 0.0 {
+                snap.swap_used = (snap.swap_total as f64 * snap.perf.pagefile_pct as f64 / 100.0) as u64;
+            }
+    })
+}
+
+/// The frame the sampler builds a snapshot from: of the providers' reads
+/// after `refresh` when it asks for one, else the latest; waits for the
+/// providers' first answers, never for the hardware ones.
+fn counted_frame(interest: &Interest, refresh: Option<&Ticket>) -> Option<Arc<crate::sensors::Frame>> {
+    let start = Instant::now();
+    loop {
+        let frame = match refresh {
+            Some(ticket) => interest.latest_after(ticket),
+            None => interest.latest(),
+        };
+        if frame.is_some() || start.elapsed() >= FRAME_WAIT {
+            return frame;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn run(tx: Sender<Snapshot>, interval: Arc<AtomicU64>, refresh_now: Arc<AtomicBool>, interest: Arc<Interest>, asked: Arc<Mutex<Option<Ticket>>>, mut fill: Fill) {
+    let mut seq = 0u64;
     loop {
         let ms = interval.load(Ordering::Relaxed);
         let forced = refresh_now.swap(false, Ordering::Relaxed);
+        // The providers read at the app's update speed, and not at all
+        // while it is paused.
+        interest.set_interval_ms(ms);
         if ms == 0 && !forced {
             thread::sleep(Duration::from_millis(100));
             continue;
         }
-        sys.refresh_cpu_all();
-        sys.refresh_memory();
-        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
-        networks.refresh(true);
-        disk_tick += 1;
-        if disk_tick % 10 == 1 {
-            disks.refresh(true);
-        }
-        let now = Instant::now();
-        let secs = now.duration_since(last).as_secs_f64().max(0.05);
-        last = now;
-        let ncpu = sys.cpus().len().max(1) as f32;
-
+        let refresh = if forced { asked.lock().unwrap_or_else(|e| e.into_inner()).take() } else { None };
         let mut snap = Snapshot::default();
-        let mut dr = 0.0;
-        let mut dw = 0.0;
-        for (pid, p) in sys.processes() {
-            let du = p.disk_usage();
-            let r = du.read_bytes as f64 / secs;
-            let w = du.written_bytes as f64 / secs;
-            dr += r;
-            dw += w;
-            let user = p
-                .user_id()
-                .and_then(|u| users.get_user_by_id(u))
-                .map(|u| u.name().to_string())
-                .unwrap_or_default();
-            let cmd = p
-                .cmd()
-                .iter()
-                .map(|s| s.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join(" ");
-            snap.procs.push(ProcRow {
-                pid: pid.as_u32(),
-                parent: p.parent().map(|x| x.as_u32()),
-                name: p.name().to_string_lossy().into_owned(),
-                // `proc_info` reads the real status below.
-                status: "Running".into(),
-                user,
-                cpu: (p.cpu_usage() / ncpu).clamp(0.0, 100.0),
-                mem: p.memory(),
-                disk_read: r,
-                disk_write: w,
-                run_time: p.run_time(),
-                exe: p.exe().map(|e| e.display().to_string()).unwrap_or_default(),
-                cmd,
-                ..Default::default()
-            });
-        }
-        facts.fill(&mut snap.procs);
-        // The services under their hosts; a description is read once per
-        // service.
-        let running = crate::winsys::running_services();
-        for s in &running {
-            if !descriptions.contains_key(&s.name) {
-                descriptions.insert(s.name.clone(), crate::winsys::service_description(&s.name));
-            }
-        }
-        snap.services = Arc::new(services_by_host(&running, &snap.procs, &descriptions));
+        fill(&mut snap);
         snap.forced = forced;
-        snap.cpu_total = sys.global_cpu_usage();
-        snap.cpu_per_core = sys.cpus().iter().map(|c| c.cpu_usage()).collect();
-        snap.cpu_freq_mhz = sys.cpus().first().map(|c| c.frequency()).unwrap_or(0);
-        snap.cpu_freqs = sys.cpus().iter().map(|c| c.frequency()).collect();
-        snap.mem_total = sys.total_memory();
-        snap.mem_used = sys.used_memory();
-        snap.mem_avail = sys.available_memory();
-        snap.swap_total = sys.total_swap();
-        snap.swap_used = sys.used_swap();
-        snap.disk_read_bps = dr;
-        snap.disk_write_bps = dw;
-        for (name, data) in networks.iter() {
-            snap.net.push(NetRow {
-                name: name.clone(),
-                rx_bps: data.received() as f64 / secs,
-                tx_bps: data.transmitted() as f64 / secs,
-                total_rx: data.total_received(),
-                total_tx: data.total_transmitted(),
-            });
-        }
-        snap.net.sort_by(|a, b| {
-            (b.total_rx + b.total_tx).cmp(&(a.total_rx + a.total_tx))
-        });
-        for d in disks.list() {
-            snap.disks.push(DiskRow {
-                name: d.name().to_string_lossy().into_owned(),
-                mount: d.mount_point().display().to_string(),
-                fs: d.file_system().to_string_lossy().into_owned(),
-                kind: format!("{:?}", d.kind()),
-                total: d.total_space(),
-                free: d.available_space(),
-                removable: d.is_removable(),
-            });
-        }
-        snap.uptime = System::uptime();
-        snap.perf = perf.sample();
-        merge_gpu(&mut snap.procs, &snap.perf.gpu_by_pid);
-        snap.compressed = match snap.perf.compressed {
-            0 => snap
-                .procs
-                .iter()
-                .find(|p| p.name.eq_ignore_ascii_case("Memory Compression"))
-                .map(|p| p.mem)
-                .unwrap_or(0),
-            c => c,
-        };
-        if snap.swap_used == 0 && snap.perf.pagefile_pct > 0.0 {
-            snap.swap_used = (snap.swap_total as f64 * snap.perf.pagefile_pct as f64 / 100.0) as u64;
-        }
+        counters_into(&mut snap.perf, counted_frame(&interest, refresh.as_ref()).as_deref());
         seq += 1;
         snap.seq = seq;
         if tx.send(snap).is_err() {
@@ -358,6 +470,9 @@ fn run(tx: Sender<Snapshot>, interval: Arc<AtomicU64>, refresh_now: Arc<AtomicBo
         }
     }
 }
+
+#[cfg(test)]
+mod through_the_app;
 
 #[cfg(test)]
 mod tests {
@@ -392,5 +507,73 @@ mod tests {
         );
         assert_eq!((by_host[&3000][0].group.as_str(), by_host[&3000][0].registration.as_str()), ("", "Own process"));
         assert!(!by_host.contains_key(&9), "a service whose host is not listed is left out");
+    }
+
+    use crate::perfdata::{counter, PerfLive, DiskLive};
+    use crate::sensors::model::{CounterSet, Instance};
+
+    fn frame_of(sets: Vec<CounterSet>) -> crate::sensors::Frame {
+        let mut frame = crate::sensors::Frame::build(1, &[], Vec::new());
+        frame.counters = sets;
+        frame
+    }
+
+    /// What a PC with two disks and an energy meter counts.
+    fn counted() -> Vec<CounterSet> {
+        vec![
+            CounterSet::new(counter::PERF, vec![Instance::new("_Total", 108.5), Instance::new("0,_Total", 108.5), Instance::new("0,0", 90.0)]),
+            CounterSet::new(counter::IDLE, vec![Instance::new("0 C:", 75.0), Instance::new("1 D:", 100.0), Instance::new("_Total", 80.0)]),
+            CounterSet::new(counter::DREAD, vec![Instance::new("0 C:", 2_000.0).with_raw(9_000_000), Instance::new("1 D:", 0.0).with_raw(5), Instance::new("_Total", 2_000.0).with_raw(9_000_005)]),
+            CounterSet::new(counter::DWRITE, vec![Instance::new("0 C:", 500.0).with_raw(7_000_000), Instance::new("1 D:", 0.0).with_raw(0), Instance::new("_Total", 500.0).with_raw(7_000_000)]),
+            CounterSet::new(counter::POWER, vec![Instance::new("rapl_package0_core0_core", 3_000.0), Instance::new("rapl_package0_pkg", 47_500.0)]),
+        ]
+    }
+
+    #[test]
+    fn the_performance_level_the_disks_and_the_package_power_come_from_the_frame() {
+        let mut perf = PerfLive::default();
+        counters_into(&mut perf, Some(&frame_of(counted())));
+        assert_eq!(perf.cpu_perf_pct, 108.5);
+        let disks: Vec<(u32, f32, f64, f64, u64, u64)> = perf.disks.iter().map(|d| (d.number, d.active, d.read_bps, d.write_bps, d.total_read, d.total_written)).collect();
+        assert_eq!(disks, [(0, 25.0, 2_000.0, 500.0, 9_000_000, 7_000_000), (1, 0.0, 0.0, 0.0, 5, 0)], "_Total is not a disk");
+        assert_eq!(perf.cpu_power_w, Some(47.5));
+        assert!(perf.unanswered.is_empty(), "every counter answered: {:?}", perf.unanswered);
+    }
+
+    #[test]
+    fn a_disk_keeps_the_response_time_the_collector_read() {
+        let mut perf = PerfLive { disks: vec![DiskLive { number: 1, resp_ms: 3.5, ..Default::default() }, DiskLive { number: 2, resp_ms: 9.0, ..Default::default() }], ..Default::default() };
+        counters_into(&mut perf, Some(&frame_of(counted())));
+        let resp: Vec<(u32, f32)> = perf.disks.iter().map(|d| (d.number, d.resp_ms)).collect();
+        assert_eq!(resp, [(0, 0.0), (1, 3.5), (2, 9.0)], "a disk only the collector saw is kept");
+    }
+
+    #[test]
+    fn a_counter_nobody_answered_is_a_gap_and_the_others_are_not() {
+        let mut perf = PerfLive::default();
+        let only_idle = counted().into_iter().filter(|c| c.key == counter::IDLE).collect();
+        counters_into(&mut perf, Some(&frame_of(only_idle)));
+        let gaps: Vec<&str> = perf.unanswered.iter().copied().collect();
+        assert_eq!(gaps, [counter::DREAD, counter::DWRITE, counter::PERF]);
+        assert!(perf.answered(counter::IDLE));
+        assert_eq!(perf.cpu_power_w, None, "no energy meter: no figure");
+    }
+
+    #[test]
+    fn without_a_frame_no_provided_counter_answered() {
+        let mut perf = PerfLive::default();
+        counters_into(&mut perf, None);
+        let gaps: Vec<&str> = perf.unanswered.iter().copied().collect();
+        assert_eq!(gaps, [counter::DREAD, counter::DWRITE, counter::IDLE, counter::PERF]);
+        assert!(perf.disks.is_empty());
+    }
+
+    #[test]
+    fn a_counter_that_gave_no_instance_has_not_answered() {
+        let mut perf = PerfLive::default();
+        let mut sets = counted();
+        sets[2] = CounterSet::new(counter::DREAD, Vec::new());
+        counters_into(&mut perf, Some(&frame_of(sets)));
+        assert!(!perf.answered(counter::DREAD) && perf.answered(counter::DWRITE));
     }
 }
