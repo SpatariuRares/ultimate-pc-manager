@@ -87,7 +87,7 @@ impl PowerFreq {
         if let Some(why) = self.watcher.as_ref().and_then(|w| w.problem()) {
             ui.label(RichText::new(why).size(11.0).color(t.red));
         }
-        let frame = self.watcher.as_ref().and_then(|w| w.frame()).or_else(|| self.sensors.as_ref().and_then(|s| s.latest()));
+        let frame = self.watcher.as_ref().and_then(|w| w.frame());
         let tracked = self.watcher.as_ref().map(|w| w.tracked()).unwrap_or_default();
         let mut delete = None;
         for (i, rule) in self.alerts.iter_mut().enumerate() {

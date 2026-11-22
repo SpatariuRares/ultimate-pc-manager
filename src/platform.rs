@@ -25,6 +25,7 @@ pub mod toast;
 pub mod uninstaller;
 pub mod winget;
 
+use crate::addons::leases::{Leases, Sensors, Surface};
 use crate::sampler::Snapshot;
 use crate::sensors::SensorService;
 use crate::settings::Settings;
@@ -154,18 +155,30 @@ pub struct PageContext<'a> {
     /// The other add-ons that are on, asked by [`PageContext::owner_of`]
     /// (set by the host while it draws an add-on's page).
     pub owners: Option<Owners<'a>>,
+    /// Where the host keeps the sensor interest of the surface being drawn
+    /// (set by the host; see [`PageContext::sensors`]).
+    pub lease: Option<(Leases, Surface)>,
 }
 
 impl<'a> PageContext<'a> {
     /// A context with these settings and sample and no action queued.
     pub fn new(settings: &'a Settings, sample: &'a Snapshot) -> Self {
-        PageContext { settings, sample, actions: Vec::new(), owners: None }
+        PageContext { settings, sample, actions: Vec::new(), owners: None, lease: None }
     }
 
     /// The row of another add-on that is on which owns `path` (None when
     /// no add-on that is on claims it).
     pub fn owner_of(&self, path: &std::path::Path) -> Option<Owner> {
         self.owners.and_then(|ask| ask(path))
+    }
+
+    /// The shared sensor service, for what is drawn now: the latest frame,
+    /// history, statistics and "read now". Asking is what keeps the service
+    /// running: the host keeps the interest while this is asked in every
+    /// frame and drops it at the end of the first frame it is not. Store
+    /// nothing: ask again at every draw. None outside a host.
+    pub fn sensors(&self) -> Option<Sensors> {
+        self.lease.as_ref().map(|(leases, surface)| leases.ask(*surface))
     }
 
     /// The colour of secondary text in the current theme.
@@ -561,6 +574,7 @@ pub struct AddonContext {
     admin: bool,
     dialogs: bool,
     sensors: SensorService,
+    leases: Leases,
     queue: install_queue::InstallQueue,
 }
 
@@ -568,7 +582,8 @@ impl AddonContext {
     /// The real context: launches programs and shows dialogs.
     pub fn system() -> Self {
         let sensors = SensorService::new(crate::sensors::provider::standard());
-        AddonContext { runner: Arc::new(SystemRunner), admin: is_admin(), dialogs: true, sensors, queue: Default::default() }
+        let leases = Leases::new(sensors.clone());
+        AddonContext { runner: Arc::new(SystemRunner), admin: is_admin(), dialogs: true, sensors, leases, queue: Default::default() }
     }
 
     /// A context for tests: not admin, no dialogs, an executor that
@@ -578,14 +593,24 @@ impl AddonContext {
     pub fn recording() -> (Self, Arc<RecordingRunner>) {
         let runner = Arc::new(RecordingRunner::default());
         let sensors = SensorService::new(vec![crate::sensors::cpu::made_up(), crate::sensors::power_plan::made_up()]);
-        (AddonContext { runner: runner.clone(), admin: false, dialogs: false, sensors, queue: Default::default() }, runner)
+        let leases = Leases::new(sensors.clone());
+        (AddonContext { runner: runner.clone(), admin: false, dialogs: false, sensors, leases, queue: Default::default() }, runner)
     }
 
     /// The shared sensor service. It runs only while someone holds an
-    /// [`crate::sensors::Interest`] (take one while your page is shown;
-    /// drop it in `page_hidden` and `stop`).
+    /// [`crate::sensors::Interest`]. A page or tile never holds one: it
+    /// reads sensors through [`PageContext::sensors`] while it draws, and the
+    /// host keeps the interest while it is drawn, drops it at the end of the
+    /// first frame it is not, and when the add-on is turned off. Only an
+    /// interest that does not depend on what is on screen (a recording, an
+    /// alert) is taken here, by the add-on that owns it, and dropped by it.
     pub fn sensors(&self) -> &SensorService {
         &self.sensors
+    }
+
+    /// The host's keeper of the interests that depend on what is on screen.
+    pub fn leases(&self) -> &Leases {
+        &self.leases
     }
 
     /// The app's install queue: every install, update or uninstall job
