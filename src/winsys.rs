@@ -1,14 +1,8 @@
 //! Windows-only lists and actions: services, startup apps,
 //! process priority. Other systems get empty lists and a clear message.
 
-#[derive(Clone, Debug, Default)]
-pub struct ServiceRow {
-    pub name: String,
-    pub display: String,
-    pub pid: u32,
-    pub status: String,
-    pub start_type: String,
-}
+/// The Services page's row (the page owns it; this adapter fills it).
+pub use crate::system_lists::ServiceRow;
 
 /// A running Win32 service and the process that hosts it.
 #[derive(Clone, Debug, Default, PartialEq)]
