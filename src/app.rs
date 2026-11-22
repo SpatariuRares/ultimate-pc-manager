@@ -1294,14 +1294,15 @@ impl TaskApp {
         }
     }
 
-    /// Restart on the shell's Windows Explorer: `restart` (which waits up
-    /// to several seconds) runs on a worker thread; the status bar says
+    /// Restart on the shell's Windows Explorer: the system call (which waits
+    /// up to several seconds) runs on a worker thread; the status bar says
     /// how it went on a later frame ([`Self::finished_restarts`]).
-    fn restart_explorer_with(&mut self, ctx: &egui::Context, pid: u32, restart: fn(u32) -> Result<(), String>) {
+    fn restart_explorer(&mut self, ctx: &egui::Context, pid: u32) {
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
+        let system = self.actions.clone();
         let spawned = std::thread::Builder::new().name("restart-explorer".into()).spawn(move || {
-            let _ = tx.send(restart(pid));
+            let _ = tx.send(system.restart_explorer(pid));
             ctx.request_repaint();
         });
         match spawned {
@@ -1556,8 +1557,9 @@ impl TaskApp {
                 // taken by `finished_dumps`.
                 let (tx, rx) = std::sync::mpsc::channel();
                 let ctx = ctx.clone();
+                let system = self.actions.clone();
                 let spawned = std::thread::Builder::new().name("memory-dump".into()).spawn(move || {
-                    let _ = tx.send(winsys::write_dump(pid, &name, &std::env::temp_dir()));
+                    let _ = tx.send(system.write_dump(pid, &name, &std::env::temp_dir()));
                     ctx.request_repaint();
                 });
                 match spawned {
@@ -1577,7 +1579,7 @@ impl TaskApp {
                 }
             }
             Action::Follow(pid) => self.follow(pid),
-            Action::RestartExplorer(pid) => self.restart_explorer_with(ctx, pid, winsys::restart_explorer),
+            Action::RestartExplorer(pid) => self.restart_explorer(ctx, pid),
             Action::GoToServices { pid, service } => self.go_to_services(pid, service),
             Action::OpenPowerOptions => {
                 if let Err(e) = winsys::open_power_options() {
@@ -1932,7 +1934,7 @@ mod tests {
             app.finished_restarts();
             app.finished_dumps();
         }
-        app.message.as_ref().map(|(m, _)| m.clone())
+        said(app)
     }
 
     #[test]
@@ -1991,10 +1993,11 @@ mod tests {
         let mut app = with_windows_process(false);
         app.message = None;
         let asked = Request::Dump { pid: 4242, name: "Code.exe".into(), dir: std::env::temp_dir() };
-        app.recording().fail(asked, winsys::DUMP_FAILED);
+        app.recording().fail(asked.clone(), winsys::DUMP_FAILED);
         app.run_action(&ctx, Action::Dump { pid: 4242, name: "Code.exe".into() });
         assert_eq!(frames_until_said(&mut app).as_deref(), Some(winsys::DUMP_FAILED));
         assert_eq!(app.dump_question, None);
+        assert_eq!(app.recording().requests(), [asked]);
     }
 
     #[test]
