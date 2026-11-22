@@ -65,9 +65,10 @@ fn reasons_text(flags: u32) -> String {
     if words.is_empty() { NO_LIMIT.into() } else { words.join(", ") }
 }
 
-/// The effective clock (Hz): base clock × % Processor Performance / 100.
-pub fn effective_hz(base_mhz: f64, performance_percent: f64) -> f64 {
-    base_mhz * 1e6 * performance_percent / 100.0
+/// The effective clock (Hz): base clock × % Processor Performance / 100,
+/// by the rule every page shares; `None` when either input is unknown.
+pub fn effective_hz(base_mhz: Option<f64>, performance_percent: Option<f64>) -> Option<f64> {
+    crate::metrics::cpu_speed_mhz(base_mhz, performance_percent).map(|mhz| mhz * 1e6)
 }
 
 /// The logical processor of a `Processor Information` instance ("g,n"),
@@ -123,7 +124,7 @@ impl CpuSample {
         for (i, c) in self.cores.iter().enumerate() {
             out.push(row(&format!("cpu.core{i}.utilization_percent"), Group::Utilization, &format!("CPU {i}"), Unit::Percent, c.utilization_percent.map(|u| u.clamp(0.0, 100.0))));
         }
-        let effective = self.base_mhz.zip(self.performance_percent).map(|(b, p)| effective_hz(b, p));
+        let effective = effective_hz(self.base_mhz, self.performance_percent);
         out.push(row(CORE_AVERAGE, Group::Clocks, "Core Average", Unit::Hz, effective));
         out.push(row("cpu.package.frequency.average_reported_hz", Group::Clocks, "Reported Clock", Unit::Hz, mhz(reported_avg)));
         out.push(row(BASE_HZ, Group::General, "Base Frequency", Unit::Hz, mhz(self.base_mhz)));
@@ -227,7 +228,8 @@ impl CpuCounters {
         q.collect();
         self.collected = Instant::now();
         let total = |key: &str| q.values(key).into_iter().find(|(n, _)| n == "_Total").map(|(_, v)| v);
-        s.base_mhz = total("freq").filter(|v| *v > 0.0).or_else(|| power.first().map(|p| p.0));
+        let machine = Some(crate::perfdata::info().cpu.base_mhz as f64);
+        s.base_mhz = crate::metrics::base_clock_mhz(machine, total("freq"), power.first().map(|p| p.0));
         s.performance_percent = total("perf");
         s.utilization_percent = total("util");
         for (key, set) in [
@@ -349,9 +351,10 @@ mod tests {
 
     #[test]
     fn the_effective_clock_is_the_base_times_processor_performance() {
-        assert_eq!(effective_hz(4_700.0, 100.0), 4.7e9);
-        assert!((effective_hz(4_700.0, 108.7) - 5.1089e9).abs() < 1e3, "boost above the base");
-        assert_eq!(effective_hz(4_700.0, 50.0), 2.35e9, "below the base");
+        let hz = |b, p| effective_hz(Some(b), Some(p)).unwrap();
+        assert_eq!(hz(4_700.0, 100.0), 4.7e9);
+        assert!((hz(4_700.0, 108.7) - 5.1089e9).abs() < 1e3, "boost above the base");
+        assert_eq!(hz(4_700.0, 50.0), 2.35e9, "below the base");
     }
 
     #[test]
