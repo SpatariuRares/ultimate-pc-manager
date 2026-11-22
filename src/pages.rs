@@ -252,6 +252,7 @@ impl TaskApp {
         }
         let following = self.following.as_ref().map(|f| f.pid);
         let services = self.snap.services.clone();
+        let system = self.actions.clone();
         let mut new_sort = None;
         let mut new_sel = None;
         let mut service_sel = None;
@@ -449,6 +450,7 @@ impl TaskApp {
                                     services: Some(&*services),
                                     windowed: None,
                                 };
+                                let state = crate::widgets::read_menu_state(&*system, p, &rows, &state);
                                 process_menu(ui, p, &rows, &state, actions);
                             });
                         });
@@ -2608,6 +2610,30 @@ pub(crate) mod tests {
             Some(MenuEntry::Sub { items, .. }) => items.clone(),
             other => vec![other.unwrap_or_else(|| panic!("Set affinity in {:?}", labels(&entries))).clone()],
         }
+    }
+
+    #[test]
+    fn the_process_menu_reads_priority_affinity_and_window_through_the_seam() {
+        use crate::winsys::Affinity;
+        let app = TaskApp::headless(crate::settings::Settings::default(), tree_sample());
+        let seam = app.recording();
+        let (p, q) = (proc(4_000_000_001, "a.exe", "spata", 0.0, 0), proc(4_000_000_002, "b.exe", "spata", 0.0, 0));
+        let mask = Affinity::Mask { process: 0b01, system: 0b11 };
+        seam.script_priority(p.pid, "High");
+        seam.script_affinity(p.pid, mask);
+        seam.script_window(p.pid);
+        let blank = MenuState { priority: None, ..no_view_state(&[]) };
+        let one = crate::widgets::read_menu_state(&*seam, &p, &[&p], &blank);
+        assert_eq!((one.priority, one.affinity, one.windowed), (Some("High"), Some(mask), Some(true)));
+        let ticked = menu_entries(&p, &[&p], &one);
+        let sub = ticked.iter().find_map(|e| match e { MenuEntry::Sub { label: "Set priority", items } => Some(items.clone()), _ => None }).expect("Set priority");
+        assert!(sub.iter().any(|e| matches!(e, MenuEntry::Item { label, checked: Some(true), .. } if label == "High")), "High is ticked");
+        // Several rows: no priority; the affinity is still the row's own.
+        let many = crate::widgets::read_menu_state(&*seam, &p, &[&p, &q], &blank);
+        assert_eq!((many.priority, many.affinity, many.windowed), (None, Some(mask), None));
+        // A process the adapter knows nothing about: nothing ticked, no window.
+        let none = crate::widgets::read_menu_state(&*seam, &q, &[&q], &blank);
+        assert_eq!((none.priority, none.affinity, none.windowed), (None, None, Some(false)));
     }
 
     #[test]

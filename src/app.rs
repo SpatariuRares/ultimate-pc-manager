@@ -1421,7 +1421,7 @@ impl TaskApp {
                 }
                 self.sampler.refresh_requested.store(true, Ordering::Relaxed);
             }
-            Action::Priority(pid, p) => match winsys::set_priority(pid, p) {
+            Action::Priority(pid, p) => match self.actions.set_priority(pid, p) {
                 Ok(()) => self.say(format!("Priority set to {p}")),
                 Err(e) => self.say(e),
             },
@@ -1832,6 +1832,26 @@ mod tests {
         app.run_action(&ctx, action(vec![A, B, C]));
         assert_eq!(said(&app).as_deref(), Some("Access denied: first."), "the first failure");
         assert_eq!(app.recording().requests()[before..], [request(A), request(B), request(C)], "every process is tried");
+    }
+
+    #[test]
+    fn set_priority_says_it_and_asks_the_seam() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, Action::Priority(B, "High"));
+        assert_eq!(said(&app).as_deref(), Some("Priority set to High"));
+        assert_eq!(app.recording().requests(), [crate::system_actions::Request::Priority(B, "High".into())]);
+    }
+
+    #[test]
+    fn set_priority_says_the_failure_and_does_not_refresh() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.recording().fail(crate::system_actions::Request::Priority(B, "Low".into()), "Access denied: this process can't be changed.");
+        app.run_action(&ctx, Action::Priority(B, "Low"));
+        assert_eq!(said(&app).as_deref(), Some("Access denied: this process can't be changed."));
+        assert!(!refreshed(&app), "Priority does not refresh the table");
+        assert_eq!(app.recording().requests(), [crate::system_actions::Request::Priority(B, "Low".into())]);
     }
 
     #[test]

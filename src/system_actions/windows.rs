@@ -27,4 +27,18 @@ impl SystemActions for WindowsActions {
     }
 
     // ---- (add the next group of actions below, in its own section) ----
+
+    // ---- Process priority and the process menu's reads (ticket 97) ----
+    fn set_priority(&self, pid: u32, class: &str) -> Result<(), String> {
+        winsys::set_priority(pid, class)
+    }
+    fn priority_of(&self, pid: u32) -> Option<&'static str> {
+        winsys::get_priority(pid)
+    }
+    fn affinity_of(&self, pid: u32) -> Option<winsys::Affinity> {
+        winsys::get_affinity(pid)
+    }
+    fn has_window(&self, pid: u32) -> bool {
+        crate::proc_info::has_window(pid)
+    }
 }
