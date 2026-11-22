@@ -26,5 +26,13 @@ impl SystemActions for WindowsActions {
         winsys::set_affinity(pid, mask)
     }
 
+    // ---- Dump and Explorer restart (ticket 98) ----
+    fn write_dump(&self, pid: u32, name: &str, dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        winsys::write_dump(pid, name, dir)
+    }
+    fn restart_explorer(&self, pid: u32) -> Result<(), String> {
+        winsys::restart_explorer(pid)
+    }
+
     // ---- (add the next group of actions below, in its own section) ----
 }

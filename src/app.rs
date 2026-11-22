@@ -1922,38 +1922,79 @@ mod tests {
         assert_eq!((app.page, app.selected.single(), app.ask_show_microsoft), (Page::Core(Core::Processes), Some(900), None), "the option is off");
     }
 
+    /// Frames until the status bar says something (or 10 s pass): the
+    /// finished background jobs are taken on each.
+    fn frames_until_said(app: &mut TaskApp) -> Option<String> {
+        use std::time::{Duration, Instant};
+        let until = Instant::now() + Duration::from_secs(10);
+        while app.message.is_none() && app.dump_question.is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+            app.finished_restarts();
+            app.finished_dumps();
+        }
+        app.message.as_ref().map(|(m, _)| m.clone())
+    }
+
     #[test]
     fn restarting_explorer_runs_off_the_ui_thread_and_says_how_it_went_on_a_later_frame() {
+        use crate::system_actions::Request;
         use std::time::{Duration, Instant};
-        fn slow(pid: u32) -> Result<(), String> {
-            assert_eq!(pid, 4242);
-            std::thread::sleep(Duration::from_millis(500));
-            Ok(())
-        }
-        fn refused(_: u32) -> Result<(), String> {
-            Err(crate::platform::EXPLORER_NOT_RESTARTED.to_string())
-        }
-        let said = |app: &TaskApp| app.message.as_ref().map(|(m, _)| m.clone());
-        let wait = |app: &mut TaskApp| {
-            let until = Instant::now() + Duration::from_secs(10);
-            while said(app).is_none() && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(20));
-                app.finished_restarts();
-            }
-        };
         let ctx = egui::Context::default();
         let mut app = with_windows_process(false);
         app.message = None;
+        app.recording().delay(Request::RestartExplorer(4242), Duration::from_millis(500));
         let started = Instant::now();
-        app.restart_explorer_with(&ctx, 4242, slow);
+        app.run_action(&ctx, Action::RestartExplorer(4242));
         assert!(started.elapsed() < Duration::from_millis(250), "the UI thread does not wait: {:?}", started.elapsed());
-        assert_eq!(said(&app), None, "nothing to say yet");
-        wait(&mut app);
-        assert_eq!(said(&app).as_deref(), Some("Restarted Windows Explorer"));
+        assert_eq!(app.message, None, "nothing to say yet");
+        assert_eq!(frames_until_said(&mut app).as_deref(), Some("Restarted Windows Explorer"));
+        assert_eq!(app.recording().requests(), [Request::RestartExplorer(4242)]);
+    }
+
+    #[test]
+    fn a_restart_of_explorer_that_could_not_end_or_restart_it_says_why() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        for said in [crate::platform::EXPLORER_NOT_ENDED, crate::platform::EXPLORER_NOT_RESTARTED] {
+            let mut app = with_windows_process(false);
+            app.message = None;
+            app.recording().fail(Request::RestartExplorer(4242), said);
+            app.run_action(&ctx, Action::RestartExplorer(4242));
+            assert_eq!(frames_until_said(&mut app).as_deref(), Some(said));
+        }
+    }
+
+    #[test]
+    fn a_dump_is_written_off_the_ui_thread_then_asks_to_show_the_file() {
+        use crate::system_actions::Request;
+        use std::time::{Duration, Instant};
+        let ctx = egui::Context::default();
+        let mut app = with_windows_process(false);
         app.message = None;
-        app.restart_explorer_with(&ctx, 4242, refused);
-        wait(&mut app);
-        assert_eq!(said(&app).as_deref(), Some(crate::platform::EXPLORER_NOT_RESTARTED));
+        let dir = std::env::temp_dir();
+        let asked = Request::Dump { pid: 4242, name: "Code.exe".into(), dir: dir.clone() };
+        app.recording().delay(asked.clone(), Duration::from_millis(500));
+        let started = Instant::now();
+        app.run_action(&ctx, Action::Dump { pid: 4242, name: "Code.exe".into() });
+        assert!(started.elapsed() < Duration::from_millis(250), "the UI thread does not wait: {:?}", started.elapsed());
+        assert_eq!(app.dump_question, None, "not written yet");
+        frames_until_said(&mut app);
+        assert_eq!(app.dump_question, Some(dir.join("Code.exe-4242.dmp")));
+        assert_eq!(app.message, None);
+        assert_eq!(app.recording().requests(), [asked]);
+    }
+
+    #[test]
+    fn a_dump_that_fails_says_the_dump_failure_text_and_asks_nothing() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = with_windows_process(false);
+        app.message = None;
+        let asked = Request::Dump { pid: 4242, name: "Code.exe".into(), dir: std::env::temp_dir() };
+        app.recording().fail(asked, winsys::DUMP_FAILED);
+        app.run_action(&ctx, Action::Dump { pid: 4242, name: "Code.exe".into() });
+        assert_eq!(frames_until_said(&mut app).as_deref(), Some(winsys::DUMP_FAILED));
+        assert_eq!(app.dump_question, None);
     }
 
     #[test]
