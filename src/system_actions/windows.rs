@@ -32,6 +32,31 @@ impl SystemActions for WindowsActions {
     }
     fn restart_explorer(&self, pid: u32) -> Result<(), String> {
         winsys::restart_explorer(pid)
+
+    // ---- Elevation, administrator check and the remaining actions (ticket 99) ----
+    fn restart_elevated(&self, page: &str) -> Result<(), String> {
+        crate::platform::restart_elevated(page)
+    }
+    fn is_admin(&self) -> bool {
+        crate::platform::is_admin()
+    }
+    fn toggle_uac_virtualization(&self, pid: u32) -> Result<(), String> {
+        winsys::toggle_uac_virtualization(pid)
+    }
+    fn bring_to_front(&self, pid: u32) -> Result<(), String> {
+        crate::proc_info::bring_to_front(pid)
+    }
+    fn open_file_location(&self, path: &str) -> Result<(), String> {
+        winsys::open_file_location(path)
+    }
+    fn reveal_in_explorer(&self, path: &std::path::Path) -> Result<(), String> {
+        winsys::reveal_in_explorer(path)
+    }
+    fn run_new_task(&self, cmdline: &str) -> Result<(), String> {
+        winsys::run_new_task(cmdline)
+    }
+    fn open_power_options(&self) -> Result<(), String> {
+        winsys::open_power_options()
     }
 
     // ---- (add the next group of actions below, in its own section) ----

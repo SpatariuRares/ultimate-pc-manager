@@ -16,6 +16,9 @@ pub struct RecordingActions {
     /// Scripted waits: a request equal to the first of a pair takes that long
     /// to answer (like a real dump or Explorer restart).
     delays: Mutex<Vec<(Request, std::time::Duration)>>,
+
+    /// What `is_admin` answers (not elevated unless a test says so).
+    admin: std::sync::atomic::AtomicBool,
 }
 
 impl RecordingActions {
@@ -32,6 +35,10 @@ impl RecordingActions {
     /// From now on `request` takes `wait` to answer.
     pub fn delay(&self, request: Request, wait: std::time::Duration) {
         self.delays.lock().unwrap_or_else(|e| e.into_inner()).push((request, wait));
+
+    /// From now on the seam says the app does (or does not) run as administrator.
+    pub fn set_admin(&self, admin: bool) {
+        self.admin.store(admin, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Notes `request` and answers it: its scripted failure, else success.
@@ -74,6 +81,31 @@ impl SystemActions for RecordingActions {
     }
     fn restart_explorer(&self, pid: u32) -> Result<(), String> {
         self.record(Request::RestartExplorer(pid))
+
+    // ---- Elevation, administrator check and the remaining actions (ticket 99) ----
+    fn restart_elevated(&self, page: &str) -> Result<(), String> {
+        self.record(Request::RestartElevated(page.into()))
+    }
+    fn is_admin(&self) -> bool {
+        self.admin.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn toggle_uac_virtualization(&self, pid: u32) -> Result<(), String> {
+        self.record(Request::UacVirtualization(pid))
+    }
+    fn bring_to_front(&self, pid: u32) -> Result<(), String> {
+        self.record(Request::BringToFront(pid))
+    }
+    fn open_file_location(&self, path: &str) -> Result<(), String> {
+        self.record(Request::OpenFileLocation(path.into()))
+    }
+    fn reveal_in_explorer(&self, path: &std::path::Path) -> Result<(), String> {
+        self.record(Request::RevealInExplorer(path.into()))
+    }
+    fn run_new_task(&self, cmdline: &str) -> Result<(), String> {
+        self.record(Request::RunNewTask(cmdline.into()))
+    }
+    fn open_power_options(&self) -> Result<(), String> {
+        self.record(Request::OpenPowerOptions)
     }
 
     // ---- (add the next group of actions below, in its own section) ----
