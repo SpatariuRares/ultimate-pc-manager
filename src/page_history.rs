@@ -155,7 +155,7 @@ mod tests {
         let shown = texts(&ui, &mut page, &env.ctx());
         assert!(has(&shown, "busy.exe"), "{shown:?}");
         assert!(has(&shown, "0:00:00"), "two cores at 100% for a moment: {shown:?}");
-        assert!(shown.iter().any(|t| t.trim().ends_with("MiB")), "the disk traffic of that moment: {shown:?}");
+        assert!(shown.iter().any(|t| t.trim().ends_with("MB")), "the disk traffic of that moment (MB): {shown:?}");
     }
 
     #[test]

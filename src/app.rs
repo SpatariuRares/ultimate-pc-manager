@@ -2298,7 +2298,7 @@ mod tests {
         assert_eq!(fake.startup_requests(), vec![("run|Steam".to_string(), false)]);
         assert_eq!(said(&app).as_deref(), Some("Steam disabled"));
         assert_eq!(fake.startup_reads(), reads + 1, "the list is read again");
-        assert!(page_texts(&mut app).iter().any(|w| w == "0 of 1 startup apps is enabled"), "the reread state is kept");
+        assert!(page_texts(&mut app).iter().any(|w| w == "0 of 1 startup apps are enabled"), "the reread state is kept");
         app.run_action(&ctx, Action::Startup("run|Steam".into(), true));
         assert_eq!(said(&app).as_deref(), Some("Steam enabled"));
     }
