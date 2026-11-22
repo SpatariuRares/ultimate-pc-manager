@@ -2054,10 +2054,6 @@ mod tests {
         assert!(shown.iter().any(|w| w == "Winmgmt") && !shown.iter().any(|w| w == "Spooler"), "the host's services only: {shown:?}");
     }
 
-    fn said(app: &TaskApp) -> Option<&str> {
-        app.message.as_ref().map(|(m, _)| m.as_str())
-    }
-
     #[test]
     fn a_service_control_reports_and_rereads_through_the_seam() {
         let ctx = egui::Context::default();
@@ -2066,7 +2062,7 @@ mod tests {
             let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
             app.run_action(&ctx, Action::Service("Spooler".into(), what));
             assert_eq!(fake.service_requests(), vec![("Spooler".to_string(), what.to_string())]);
-            assert_eq!(said(&app), Some(said_text));
+            assert_eq!(said(&app).as_deref(), Some(said_text));
             assert_eq!(fake.service_reads(), 1, "{what} rereads the list");
         }
     }
@@ -2079,7 +2075,7 @@ mod tests {
         let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
         app.run_action(&egui::Context::default(), Action::Service("Spooler".into(), "stop"));
         assert_eq!(fake.service_requests().len(), 1);
-        assert_eq!(said(&app), Some(reason));
+        assert_eq!(said(&app).as_deref(), Some(reason));
         assert_eq!(fake.service_reads(), 1);
     }
 
