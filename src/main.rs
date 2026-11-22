@@ -21,6 +21,7 @@ mod sensors;
 mod settings;
 mod summary_view;
 mod summary_tiles;
+mod system_actions;
 mod signature;
 #[cfg(test)]
 mod test_ui;
