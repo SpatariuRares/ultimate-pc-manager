@@ -63,29 +63,29 @@ impl SystemActions for RecordingActions {
     }
 
     // ---- Elevation, administrator check and the remaining actions (ticket 99) ----
-    fn restart_elevated(&self, _page: &str) -> Result<(), String> {
-        Ok(())
+    fn restart_elevated(&self, page: &str) -> Result<(), String> {
+        self.record(Request::RestartElevated(page.into()))
     }
     fn is_admin(&self) -> bool {
-        false
+        self.admin.load(std::sync::atomic::Ordering::Relaxed)
     }
-    fn toggle_uac_virtualization(&self, _pid: u32) -> Result<(), String> {
-        Ok(())
+    fn toggle_uac_virtualization(&self, pid: u32) -> Result<(), String> {
+        self.record(Request::UacVirtualization(pid))
     }
-    fn bring_to_front(&self, _pid: u32) -> Result<(), String> {
-        Ok(())
+    fn bring_to_front(&self, pid: u32) -> Result<(), String> {
+        self.record(Request::BringToFront(pid))
     }
-    fn open_file_location(&self, _path: &str) -> Result<(), String> {
-        Ok(())
+    fn open_file_location(&self, path: &str) -> Result<(), String> {
+        self.record(Request::OpenFileLocation(path.into()))
     }
-    fn reveal_in_explorer(&self, _path: &std::path::Path) -> Result<(), String> {
-        Ok(())
+    fn reveal_in_explorer(&self, path: &std::path::Path) -> Result<(), String> {
+        self.record(Request::RevealInExplorer(path.into()))
     }
-    fn run_new_task(&self, _cmdline: &str) -> Result<(), String> {
-        Ok(())
+    fn run_new_task(&self, cmdline: &str) -> Result<(), String> {
+        self.record(Request::RunNewTask(cmdline.into()))
     }
     fn open_power_options(&self) -> Result<(), String> {
-        Ok(())
+        self.record(Request::OpenPowerOptions)
     }
 
     // ---- (add the next group of actions below, in its own section) ----

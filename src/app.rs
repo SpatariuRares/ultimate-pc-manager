@@ -1937,7 +1937,7 @@ mod tests {
 
     #[test]
     fn open_file_location_says_only_its_error() {
-        error_only_action(Action::OpenLocation(r"C:\Tools	ool.exe".into()), crate::system_actions::Request::OpenFileLocation(r"C:\Tools	ool.exe".into()));
+        error_only_action(Action::OpenLocation(r"C:\Tools\tool.exe".into()), crate::system_actions::Request::OpenFileLocation(r"C:\Tools\tool.exe".into()));
     }
 
     #[test]
@@ -1950,7 +1950,7 @@ mod tests {
         use crate::system_actions::Request;
         let ctx = egui::Context::default();
         let mut app = app_with_three_processes();
-        let path = std::path::PathBuf::from(r"C:\Tools	ool.dmp");
+        let path = std::path::PathBuf::from(r"C:\Tools\tool.dmp");
         app.run_action(&ctx, Action::ShowInExplorer(path.clone()));
         assert_eq!(said(&app), None);
         assert_eq!(app.recording().requests(), [Request::RevealInExplorer(path.clone())]);
