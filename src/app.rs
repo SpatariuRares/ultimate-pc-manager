@@ -2453,7 +2453,7 @@ mod tests {
         let texts = page_texts(&mut app);
         assert!(texts.iter().any(|t| t == "System Info"), "its title: {texts:?}");
         assert!(texts.iter().any(|t| t == "Logical processors"), "its cards: {texts:?}");
-        assert!(texts.iter().any(|t| t == "Refresh"), "the header's Refresh: {texts:?}");
+        assert!(texts.iter().any(|t| t.trim() == "Refresh"), "the header's Refresh: {texts:?}");
     }
 
     #[test]

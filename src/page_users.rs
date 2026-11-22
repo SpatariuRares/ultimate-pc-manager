@@ -22,7 +22,6 @@ impl CorePage for UsersPage {
     }
 
     fn draw(&mut self, ui: &mut Ui, ctx: &PageCtx, _actions: &mut Vec<Action>) {
-        if true { return; } // RED-TEMP
         let t = ctx.settings.theme();
         let accounts = accounts(&ctx.snapshot.procs);
         let n: usize = accounts.iter().map(|a| a.procs.len()).sum();

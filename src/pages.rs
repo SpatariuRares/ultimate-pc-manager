@@ -1,11 +1,10 @@
-//! Summary, Processes, System Info and Users pages.
-
-use std::collections::BTreeMap;
+//! Summary and Processes pages (System Info and Users are in `page_system`
+//! and `page_users`).
 
 use egui::{vec2, Align, Color32, Layout, RichText, Sense, Ui};
 use egui_extras::Column;
 
-use crate::app::{status_parts, Action, ProcCol, TaskApp};
+use crate::app::{Action, ProcCol, TaskApp};
 use crate::settings::SPEEDS;
 use crate::page_perf::fmt_bytes_rate;
 use crate::platform::PageContext;

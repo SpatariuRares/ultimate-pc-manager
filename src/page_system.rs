@@ -19,7 +19,6 @@ impl CorePage for SystemInfoPage {
     }
 
     fn draw(&mut self, ui: &mut Ui, ctx: &PageCtx, _actions: &mut Vec<Action>) {
-        if true { return; } // RED-TEMP
         let t = theme::of_ui(ui);
         let s = ctx.snapshot;
         let computer = sysinfo::System::host_name().unwrap_or_default();
@@ -119,7 +118,8 @@ mod tests {
 
     #[test]
     fn it_says_updates_are_paused_when_they_are() {
-        let paused = Settings { speed: crate::settings::SPEEDS.len() - 1, ..Default::default() };
+        let mut paused = Settings::default();
+        paused.speed = crate::settings::SPEEDS.len() - 1;
         assert_eq!(paused.interval_ms(), 0, "the last speed pauses");
         let drawn = draw(&mut SystemInfoPage, &paused, &snapshot());
         assert!(drawn.texts.iter().any(|t| t == "Updates paused"), "{:?}", drawn.texts);
