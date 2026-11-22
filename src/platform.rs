@@ -43,7 +43,8 @@ pub enum Action {
     SearchOnline(String),
     Copy(String),
     Service(String, &'static str),
-    Startup(usize, bool),
+    /// Enable or disable a startup entry, named by its stable id.
+    Startup(String, bool),
     /// A short message in the status bar.
     Say(String),
     /// Opens Windows' Power Options (the app never changes the plan).

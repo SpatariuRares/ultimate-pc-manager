@@ -379,7 +379,8 @@ fn the_core_pages_show_the_machine_facts_their_providers_report() {
     let script = Script::new(counted(110.0));
     *script.machine.lock().unwrap() = Some(machine_facts(3_400));
     let (mut app, _service) = app_over(&script, NORMAL);
-    pull_until(&mut app, "the first sample", |a| a.snap.seq >= 1);
+    // The facts join the frame after the first figures (a read of their own).
+    pull_until(&mut app, "the machine facts", |a| a.snap.seq >= 1 && a.snap.machine.is_some());
     let top = app.stats(PerfItem::Cpu).top;
     assert!(top.iter().any(|(k, v)| k == "Speed" && v == "3.74 GHz"), "the base clock the provider reported x the performance level: {top:?}");
     assert_eq!(row(&app, PerfItem::Cpu, "Base speed:").as_deref(), Some("3.40 GHz"));
