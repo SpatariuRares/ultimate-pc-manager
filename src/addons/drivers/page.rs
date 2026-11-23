@@ -5,6 +5,9 @@
 //! and a side panel for the selected driver. Windows built-in drivers and
 //! kernel modules are one click away.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use egui::{vec2, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, Ui};
 
 use super::engine::{self as drivers, DeviceDriver, DriverUpdate, Hub, KernelDriver, KernelFigures, KernelScope};
@@ -215,10 +218,202 @@ fn maker_downloads(d: &DeviceDriver) -> Option<(&'static str, &'static str)> {
     }
 }
 
-/// One row of the device list: the first of a run of identical entries.
-struct Folded<'a> {
-    dev: &'a DeviceDriver,
+/// What a device row says on its second line, first match wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sub {
+    /// Windows Update offers an older driver than the installed one.
+    OlderOffer,
+    /// A third-party driver old enough for "check the maker".
+    CheckMaker,
+    /// Identical entries folded into this row.
+    Folded,
+    NotConnected,
+    Problem,
+}
+
+/// One device row: the first of a run of identical entries.
+struct DeviceRow {
+    /// Index into the devices snapshot.
+    dev: usize,
+    /// Identical entries folded into this row.
     count: usize,
+    /// Index of the update Windows Update offers for it.
+    update: Option<usize>,
+    /// Years old, when "check the maker" applies.
+    check: Option<i64>,
+    sub: Option<Sub>,
+}
+
+/// One line of the device list: a kind's heading or a driver.
+enum Item {
+    Kind { name: &'static str, count: usize },
+    Device(DeviceRow),
+}
+
+impl Item {
+    fn height(&self) -> f32 {
+        match self {
+            Item::Kind { .. } => 32.0,
+            Item::Device(r) if r.sub.is_some() => 40.0,
+            Item::Device(_) => 30.0,
+        }
+    }
+}
+
+/// What the derived data depends on besides the lists.
+#[derive(Clone, PartialEq)]
+struct Inputs {
+    search: String,
+    show_disconnected: bool,
+    scope: Scope,
+    kernel_filter: KernelScope,
+    old_years: i64,
+    today: (i64, u32, u32),
+}
+
+/// Everything the page works out from the lists and the filter: scope
+/// counts, the device list's kinds and folded rows, the kernel rows and
+/// their figures. It is built once and reused every frame until the data
+/// or a filter changes (see [`DriversPage::derived`]); the one place to
+/// add a count, a scope or a column's precomputed value.
+pub struct Derived {
+    devices: Arc<[DeviceDriver]>,
+    kernel: Arc<[KernelDriver]>,
+    updates: Option<Arc<[DriverUpdate]>>,
+    inputs: Inputs,
+    /// Third-party drivers after folding, for the scope button.
+    hardware_count: usize,
+    /// Windows built-in drivers after folding, for the scope button.
+    builtin_count: usize,
+    /// Devices matching the scope and the search, before folding.
+    matching: usize,
+    /// The device list, kind by kind (empty on the kernel scope).
+    items: Vec<Item>,
+    /// Where each item starts, without the gaps between items.
+    tops: Vec<f32>,
+    /// Indexes into `kernel` left after the scope and the search.
+    kernel_rows: Vec<usize>,
+    /// Each kernel scope with its count.
+    kernel_counts: Vec<(KernelScope, usize)>,
+    figures: KernelFigures,
+}
+
+impl Derived {
+    fn build(devices: &Arc<[DeviceDriver]>, kernel: &Arc<[KernelDriver]>, updates: &Option<Arc<[DriverUpdate]>>, inputs: Inputs) -> Derived {
+        let scoped = |hardware: bool| -> Vec<usize> {
+            devices
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.third_party() == hardware && (inputs.show_disconnected || d.present))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let hardware_count = fold(devices, scoped(true)).len();
+        let builtin_count = fold(devices, scoped(false)).len();
+        let q = inputs.search.trim().to_lowercase();
+
+        let mut items = Vec::new();
+        let mut matching = 0;
+        if inputs.scope != Scope::Kernel {
+            let matches: Vec<usize> = scoped(inputs.scope == Scope::Hardware)
+                .into_iter()
+                .filter(|&i| {
+                    let d = &devices[i];
+                    q.is_empty() || [&d.name, &d.provider, &d.manufacturer, &d.class].iter().any(|s| s.to_lowercase().contains(&q))
+                })
+                .collect();
+            matching = matches.len();
+            // The first offer for a device wins.
+            let mut offered: HashMap<&str, usize> = HashMap::new();
+            for (i, u) in updates.iter().flat_map(|u| u.iter()).enumerate() {
+                if let Some(id) = u.device.as_deref() {
+                    offered.entry(id).or_insert(i);
+                }
+            }
+            // Group by kind, keep a stable order inside each group.
+            let mut groups: Vec<(&'static str, Vec<usize>)> = Vec::new();
+            for i in matches {
+                let k = kind_of(&devices[i].class);
+                match groups.iter_mut().find(|g| g.0 == k) {
+                    Some(g) => g.1.push(i),
+                    None => groups.push((k, vec![i])),
+                }
+            }
+            groups.sort_by_key(|g| kind_rank(g.0));
+            for (kind, mut idx) in groups {
+                idx.sort_by_cached_key(|&i| devices[i].name.to_lowercase());
+                let rows = fold(devices, idx);
+                items.push(Item::Kind { name: kind, count: rows.len() });
+                for (dev, count) in rows {
+                    let d = &devices[dev];
+                    let update = offered.get(d.instance_id.as_str()).copied();
+                    let older = update.and_then(|i| updates.as_ref().map(|u| &u[i])).is_some_and(|u| !u.worth_installing());
+                    let check = check_the_maker(d, inputs.today, inputs.old_years);
+                    let sub = if older {
+                        Some(Sub::OlderOffer)
+                    } else if check.is_some() {
+                        Some(Sub::CheckMaker)
+                    } else if count > 1 {
+                        Some(Sub::Folded)
+                    } else if !d.present {
+                        Some(Sub::NotConnected)
+                    } else if d.problem != 0 {
+                        Some(Sub::Problem)
+                    } else {
+                        None
+                    };
+                    items.push(Item::Device(DeviceRow { dev, count, update, check, sub }));
+                }
+            }
+        }
+        let mut tops = Vec::with_capacity(items.len());
+        let mut y = 0.0;
+        for it in &items {
+            tops.push(y);
+            y += it.height();
+        }
+
+        let kernel_rows = if inputs.scope == Scope::Kernel {
+            kernel
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| inputs.kernel_filter.matches(d))
+                .filter(|(_, d)| q.is_empty() || [&d.display, &d.service, &d.vendor].iter().any(|s| s.to_lowercase().contains(&q)))
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let kernel_counts = KernelScope::ALL.iter().map(|&s| (s, s.count(kernel))).collect();
+        Derived {
+            devices: devices.clone(),
+            kernel: kernel.clone(),
+            updates: updates.clone(),
+            hardware_count,
+            builtin_count,
+            matching,
+            items,
+            tops,
+            kernel_rows,
+            kernel_counts,
+            figures: KernelFigures::of(kernel),
+            inputs,
+        }
+    }
+
+    /// Still right for these lists and this filter.
+    fn is_for(&self, devices: &Arc<[DeviceDriver]>, kernel: &Arc<[KernelDriver]>, updates: &Option<Arc<[DriverUpdate]>>, inputs: &Inputs) -> bool {
+        let same_updates = match (&self.updates, updates) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        Arc::ptr_eq(&self.devices, devices) && Arc::ptr_eq(&self.kernel, kernel) && same_updates && self.inputs == *inputs
+    }
+
+    fn update_of(&self, row: &DeviceRow) -> Option<&DriverUpdate> {
+        row.update.and_then(|i| self.updates.as_ref().map(|u| &u[i]))
+    }
 }
 
 /// The page and its background work, while the add-on is on.
@@ -232,11 +427,54 @@ pub struct DriversPage {
     pub check_on_open: bool,
     /// Third-party drivers this many years old get "check the maker".
     pub old_years: i64,
+    /// The data worked out from the lists and the filter, reused until
+    /// either changes.
+    derived: Option<Arc<Derived>>,
+    /// How many times `derived` was built (a test reads it).
+    derived_builds: usize,
 }
 
 impl DriversPage {
     pub fn new(drv: Hub, context: AddonContext) -> Self {
-        DriversPage { drv, drv_ui: DriversUi::default(), context, said: Vec::new(), check_on_open: false, old_years: DEFAULT_OLD_YEARS }
+        DriversPage {
+            drv,
+            drv_ui: DriversUi::default(),
+            context,
+            said: Vec::new(),
+            check_on_open: false,
+            old_years: DEFAULT_OLD_YEARS,
+            derived: None,
+            derived_builds: 0,
+        }
+    }
+
+    /// How many times the counts and groups were worked out so far.
+    #[cfg(test)]
+    pub fn derived_builds(&self) -> usize {
+        self.derived_builds
+    }
+
+    /// The counts, groups and rows for these lists and the current filter:
+    /// built when the lists or a filter changed since the last call, else
+    /// the same data again.
+    fn derived(&mut self, devices: &Arc<[DeviceDriver]>, kernel: &Arc<[KernelDriver]>, updates: &Option<Arc<[DriverUpdate]>>) -> Arc<Derived> {
+        let inputs = Inputs {
+            search: self.drv_ui.search.clone(),
+            show_disconnected: self.drv_ui.show_disconnected,
+            scope: self.drv_ui.scope,
+            kernel_filter: self.drv_ui.kernel_filter,
+            old_years: self.old_years,
+            today: today(),
+        };
+        if let Some(d) = &self.derived {
+            if d.is_for(devices, kernel, updates, &inputs) {
+                return d.clone();
+            }
+        }
+        let d = Arc::new(Derived::build(devices, kernel, updates, inputs));
+        self.derived_builds += 1;
+        self.derived = Some(d.clone());
+        d
     }
 
     /// The page is shown: the first time, the list is read (and Windows
@@ -283,6 +521,7 @@ impl DriversPage {
         drop(st);
         let admin = self.context.is_admin();
         let idle = busy.is_none();
+        let view = self.derived(&devices, &kernel, &updates);
 
         // ------------------------------------------------ actions (the app's header has the title and Refresh)
         ui.horizontal(|ui| {
@@ -320,14 +559,10 @@ impl DriversPage {
         ui.add_space(12.0);
 
         // ------------------------------------------------ scope row
-        let show_disconnected = self.drv_ui.show_disconnected;
-        let present = move |d: &&DeviceDriver| show_disconnected || d.present;
-        let n_hw = fold(devices.iter().filter(|d| d.third_party()).filter(present).collect()).len();
-        let n_builtin = fold(devices.iter().filter(|d| !d.third_party()).filter(present).collect()).len();
         ui.horizontal(|ui| {
             let scopes = [
-                (Scope::Hardware, "Hardware drivers", n_hw),
-                (Scope::Builtin, "Windows built-in", n_builtin),
+                (Scope::Hardware, "Hardware drivers", view.hardware_count),
+                (Scope::Builtin, "Windows built-in", view.builtin_count),
                 (Scope::Kernel, "Kernel modules", kernel.len()),
             ];
             if let Some(scope) = parts::scope_group(ui, self.drv_ui.scope, &scopes).clicked {
@@ -344,11 +579,11 @@ impl DriversPage {
         if self.drv_ui.scope == Scope::Kernel {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                for s in KernelScope::ALL {
-                    ui.selectable_value(&mut self.drv_ui.kernel_filter, s, format!("{}  {}", s.label(), s.count(&kernel)));
+                for (s, n) in &view.kernel_counts {
+                    ui.selectable_value(&mut self.drv_ui.kernel_filter, *s, format!("{}  {}", s.label(), n));
                 }
                 ui.add_space(12.0);
-                let shown = self.kernel_rows(&kernel).len();
+                let shown = view.kernel_rows.len();
                 ui.label(RichText::new(format!("{shown} shown")).color(th.label).size(12.0));
                 if !listed_at.is_empty() {
                     ui.label(RichText::new(format!("Updated {listed_at}")).color(th.faint).size(12.0));
@@ -358,6 +593,8 @@ impl DriversPage {
         ui.add_space(10.0);
 
         // ------------------------------------------------ list + side panel
+        // A click or a keystroke above may have changed the filter.
+        let view = self.derived(&devices, &kernel, &updates);
         let area = ui.available_rect_before_wrap();
         ui.allocate_rect(area, Sense::hover());
         let side_w = 350.0f32.min(area.width() * 0.36);
@@ -367,22 +604,16 @@ impl DriversPage {
         let mut side_ui = ui.new_child(egui::UiBuilder::new().max_rect(side_rect));
         match self.drv_ui.scope {
             Scope::Kernel => {
-                self.kernel_list(&mut list_ui, actions, &kernel, admin, listing, kernel_error.as_deref());
+                self.kernel_list(&mut list_ui, actions, &view, admin, listing, kernel_error.as_deref());
                 self.kernel_side(&mut side_ui, actions, &kernel, admin, idle);
             }
             scope => {
-                let q = self.drv_ui.search.trim().to_lowercase();
-                let shown: Vec<&DeviceDriver> = devices
-                    .iter()
-                    .filter(|d| d.third_party() == (scope == Scope::Hardware))
-                    .filter(present)
-                    .filter(|d| q.is_empty() || [&d.name, &d.provider, &d.manufacturer, &d.class].iter().any(|s| s.to_lowercase().contains(&q)))
-                    .collect();
-                let note = list_note(listing, devices_error.as_deref(), devices.len(), shown.len(), !q.is_empty());
+                let searching = !self.drv_ui.search.trim().is_empty();
+                let note = list_note(listing, devices_error.as_deref(), devices.len(), view.matching, searching);
                 if let Some(note) = note {
                     show_note(&mut list_ui, &note, scope);
                 } else {
-                    self.device_list(&mut list_ui, actions, shown, updates.as_deref());
+                    self.device_list(&mut list_ui, actions, &view);
                 }
                 self.device_side(&mut side_ui, actions, &devices, updates.as_deref(), idle);
             }
@@ -529,22 +760,11 @@ impl DriversPage {
         }
     }
 
-    fn device_list(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, shown: Vec<&DeviceDriver>, updates: Option<&[DriverUpdate]>) {
+    /// The device list: only the rows in view are built, the rest of the
+    /// scroll area is reserved from the heights worked out with the rows.
+    fn device_list(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, view: &Derived) {
         let th = theme::of_ui(ui);
-        let update_for = |d: &DeviceDriver| updates.and_then(|u| u.iter().find(|x| x.device.as_deref() == Some(d.instance_id.as_str())));
-        // Group by kind, keep a stable order inside each group.
-        let mut groups: Vec<(&'static str, Vec<&DeviceDriver>)> = Vec::new();
-        for d in shown {
-            let k = kind_of(&d.class);
-            match groups.iter_mut().find(|g| g.0 == k) {
-                Some(g) => g.1.push(d),
-                None => groups.push((k, vec![d])),
-            }
-        }
-        groups.sort_by_key(|g| kind_rank(g.0));
-        for g in &mut groups {
-            g.1.sort_by_key(|d| d.name.to_lowercase());
-        }
+        let updates = view.updates.as_deref();
 
         let w = ui.available_width();
         let fixed = [140.0, 110.0, 130.0];
@@ -565,87 +785,105 @@ impl DriversPage {
         ui.painter().rect_filled(Rect::from_min_size(Pos2::new(hr.left(), hr.bottom() - 1.0), vec2(w, 1.0)), CornerRadius::ZERO, th.line);
 
         let mut clicked: Option<String> = None;
-        let (now, old_years) = (today(), self.old_years);
-        egui::ScrollArea::vertical().id_salt(("drv-device-list", self.drv_ui.scope == Scope::Hardware)).auto_shrink([false, false]).show(ui, |ui| {
-            for (kind, devs) in &groups {
-                let rows = fold(devs.clone());
-                let (gr, _) = ui.allocate_exact_size(vec2(w, 32.0), Sense::hover());
-                let t = ui.painter().text(Pos2::new(gr.left() + 10.0, gr.bottom() - 6.0), Align2::LEFT_BOTTOM, *kind, FontId::proportional(13.5), th.text);
-                ui.painter().text(Pos2::new(t.right() + 8.0, gr.bottom() - 6.0), Align2::LEFT_BOTTOM, rows.len().to_string(), text(12.0), th.faint);
-                for row in rows {
-                    let d = row.dev;
-                    let upd = update_for(d);
-                    let old = check_the_maker(d, now, old_years);
-                    let sub = if let Some(u) = upd.filter(|u| !u.worth_installing()) {
-                        Some((format!("Windows Update offers the older {}", u.version), th.faint))
-                    } else if let Some(y) = old {
-                        Some((format!("{y} years old: check the maker"), th.amber))
-                    } else if row.count > 1 {
-                        Some((format!("{} entries folded into one", row.count), th.faint))
-                    } else if !d.present {
-                        Some(("Not connected".to_string(), th.faint))
-                    } else if d.problem != 0 {
-                        Some((d.status(), th.red))
-                    } else {
-                        None
-                    };
-                    let h = if sub.is_some() { 40.0 } else { 30.0 };
-                    let (r, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
-                    let selected = self.drv_ui.selected_device.as_deref() == Some(d.instance_id.as_str());
-                    let p = ui.painter();
-                    parts::row_fill(p, r, selected, resp.hovered());
-                    let y1 = if sub.is_some() { r.top() + 12.0 } else { r.center().y };
-                    let cell = |i: usize, s: &str, col: Color32| {
-                        let s = fit(p, s, &text(13.0), cols[i]);
-                        p.text(Pos2::new(r.left() + xs[i], y1), Align2::LEFT_CENTER, s, text(13.0), col);
-                    };
-                    cell(0, &d.name, if selected { th.on_selected } else { th.text });
-                    cell(1, &d.provider, th.soft);
-                    cell(2, &d.version, th.soft);
-                    let (date, date_col) = if with_windows(d) {
-                        ("With Windows".to_string(), th.faint)
-                    } else if old.is_some() {
-                        (d.date.clone(), th.amber)
-                    } else {
-                        (d.date.clone(), th.soft)
-                    };
-                    cell(3, &date, date_col);
-                    match (updates, upd) {
-                        (None, _) => {}
-                        (Some(_), Some(u)) if u.worth_installing() => cell(4, &format!("New: {}", u.version), th.amber),
-                        (Some(_), _) => cell(4, "Up to date", th.green),
-                    }
-                    if let Some((s, col)) = &sub {
-                        let s = fit(p, s, &text(11.5), cols[0] + cols[1]);
-                        // A faint explaining line turns light blue on the selection.
-                        let col = if *col == th.faint { parts::sub_colour(&th, selected) } else { *col };
-                        p.text(Pos2::new(r.left() + xs[0], r.top() + 29.0), Align2::LEFT_CENTER, s, text(11.5), col);
-                    }
-                    if selected && self.drv_ui.scroll_to_selected {
-                        resp.scroll_to_me(Some(Align::Center));
-                        self.drv_ui.scroll_to_selected = false;
-                    }
-                    if resp.clicked() {
-                        clicked = Some(d.instance_id.clone());
-                    }
-                    let details = device_details(d, upd);
-                    let inf = d.inf_path();
-                    let name = d.name.clone();
-                    resp.context_menu(|ui| {
-                        if ui.button("Open the driver's folder").clicked() {
-                            actions.push(Action::OpenLocation(inf.clone()));
-                            ui.close();
-                        }
-                        if ui.button("Copy details").clicked() {
-                            actions.push(Action::Copy(details.clone()));
-                            ui.close();
-                        }
-                        if ui.button("Search online").clicked() {
-                            actions.push(Action::SearchOnline(format!("{name} driver")));
-                            ui.close();
-                        }
-                    });
+        let gap_y = ui.spacing().item_spacing.y;
+        let items = &view.items;
+        let top = |i: usize| view.tops[i] + i as f32 * gap_y;
+        let total = items.last().map_or(0.0, |last| top(items.len() - 1) + last.height());
+        egui::ScrollArea::vertical().id_salt(("drv-device-list", self.drv_ui.scope == Scope::Hardware)).auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
+            let origin = ui.cursor().min;
+            ui.allocate_rect(Rect::from_min_size(origin, vec2(w, total)), Sense::hover());
+            if self.drv_ui.scroll_to_selected {
+                let at = items.iter().position(|it| matches!(it, Item::Device(r) if self.drv_ui.selected_device.as_deref() == Some(view.devices[r.dev].instance_id.as_str())));
+                if let Some(i) = at {
+                    ui.scroll_to_rect(Rect::from_min_size(origin + vec2(0.0, top(i)), vec2(w, items[i].height())), Some(Align::Center));
+                    self.drv_ui.scroll_to_selected = false;
                 }
+            }
+            // The first index where `keeps_going` stops holding (items are in order).
+            let boundary = |keeps_going: &dyn Fn(usize) -> bool| {
+                let (mut lo, mut hi) = (0, items.len());
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    if keeps_going(mid) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo
+            };
+            let first = boundary(&|i| top(i) + items[i].height() < viewport.min.y);
+            let last = boundary(&|i| top(i) <= viewport.max.y);
+            for (i, item) in items.iter().enumerate().take(last).skip(first) {
+                let r = Rect::from_min_size(origin + vec2(0.0, top(i)), vec2(w, item.height()));
+                let row = match item {
+                    Item::Kind { name, count } => {
+                        let t = ui.painter().text(Pos2::new(r.left() + 10.0, r.bottom() - 6.0), Align2::LEFT_BOTTOM, *name, FontId::proportional(13.5), th.text);
+                        ui.painter().text(Pos2::new(t.right() + 8.0, r.bottom() - 6.0), Align2::LEFT_BOTTOM, count.to_string(), text(12.0), th.faint);
+                        continue;
+                    }
+                    Item::Device(row) => row,
+                };
+                let d = &view.devices[row.dev];
+                let upd = view.update_of(row);
+                let resp = ui.interact(r, ui.id().with(("drv-device", d.instance_id.as_str())), Sense::click());
+                let selected = self.drv_ui.selected_device.as_deref() == Some(d.instance_id.as_str());
+                let p = ui.painter();
+                parts::row_fill(p, r, selected, resp.hovered());
+                let sub = row.sub.map(|s| match s {
+                    Sub::OlderOffer => (format!("Windows Update offers the older {}", upd.map(|u| u.version.as_str()).unwrap_or_default()), th.faint),
+                    Sub::CheckMaker => (format!("{} years old: check the maker", row.check.unwrap_or_default()), th.amber),
+                    Sub::Folded => (format!("{} entries folded into one", row.count), th.faint),
+                    Sub::NotConnected => ("Not connected".to_string(), th.faint),
+                    Sub::Problem => (d.status(), th.red),
+                });
+                let y1 = if sub.is_some() { r.top() + 12.0 } else { r.center().y };
+                let cell = |i: usize, s: &str, col: Color32| {
+                    let s = fit(p, s, &text(13.0), cols[i]);
+                    p.text(Pos2::new(r.left() + xs[i], y1), Align2::LEFT_CENTER, s, text(13.0), col);
+                };
+                cell(0, &d.name, if selected { th.on_selected } else { th.text });
+                cell(1, &d.provider, th.soft);
+                cell(2, &d.version, th.soft);
+                let (date, date_col) = if with_windows(d) {
+                    ("With Windows".to_string(), th.faint)
+                } else if row.check.is_some() {
+                    (d.date.clone(), th.amber)
+                } else {
+                    (d.date.clone(), th.soft)
+                };
+                cell(3, &date, date_col);
+                match (updates, upd) {
+                    (None, _) => {}
+                    (Some(_), Some(u)) if u.worth_installing() => cell(4, &format!("New: {}", u.version), th.amber),
+                    (Some(_), _) => cell(4, "Up to date", th.green),
+                }
+                if let Some((s, col)) = &sub {
+                    let s = fit(p, s, &text(11.5), cols[0] + cols[1]);
+                    // A faint explaining line turns light blue on the selection.
+                    let col = if *col == th.faint { parts::sub_colour(&th, selected) } else { *col };
+                    p.text(Pos2::new(r.left() + xs[0], r.top() + 29.0), Align2::LEFT_CENTER, s, text(11.5), col);
+                }
+                if resp.clicked() {
+                    clicked = Some(d.instance_id.clone());
+                }
+                let details = device_details(d, upd);
+                let inf = d.inf_path();
+                let name = d.name.clone();
+                resp.context_menu(|ui| {
+                    if ui.button("Open the driver's folder").clicked() {
+                        actions.push(Action::OpenLocation(inf.clone()));
+                        ui.close();
+                    }
+                    if ui.button("Copy details").clicked() {
+                        actions.push(Action::Copy(details.clone()));
+                        ui.close();
+                    }
+                    if ui.button("Search online").clicked() {
+                        actions.push(Action::SearchOnline(format!("{name} driver")));
+                        ui.close();
+                    }
+                });
             }
         });
         if let Some(id) = clicked {
@@ -744,30 +982,19 @@ impl DriversPage {
         });
     }
 
-    /// The kernel modules left after the scope and the search box.
-    fn kernel_rows<'a>(&self, kernel: &'a [KernelDriver]) -> Vec<&'a KernelDriver> {
-        let q = self.drv_ui.search.trim().to_lowercase();
-        let scope = self.drv_ui.kernel_filter;
-        kernel
-            .iter()
-            .filter(|d| scope.matches(d))
-            .filter(|d| q.is_empty() || [&d.display, &d.service, &d.vendor].iter().any(|s| s.to_lowercase().contains(&q)))
-            .collect()
-    }
-
     #[allow(clippy::too_many_arguments)]
-    fn kernel_list(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, kernel: &[KernelDriver], admin: bool, listing: bool, error: Option<&str>) {
+    fn kernel_list(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, view: &Derived, admin: bool, listing: bool, error: Option<&str>) {
         let th = theme::of_ui(ui);
+        let kernel = &view.kernel;
         // Reading, failed or nothing reported: no figures to give.
         if let Some(note) = list_note(listing, error, kernel.len(), kernel.len(), false) {
             show_note(ui, &note, Scope::Kernel);
             return;
         }
-        kernel_tiles(ui, KernelFigures::of(kernel));
+        kernel_tiles(ui, view.figures);
         ui.add_space(10.0);
-        let q = self.drv_ui.search.trim().to_lowercase();
-        let rows = self.kernel_rows(kernel);
-        if let Some(note) = list_note(listing, error, kernel.len(), rows.len(), !q.is_empty()) {
+        let rows = &view.kernel_rows;
+        if let Some(note) = list_note(listing, error, kernel.len(), rows.len(), !self.drv_ui.search.trim().is_empty()) {
             show_note(ui, &note, Scope::Kernel);
             return;
         }
@@ -788,7 +1015,8 @@ impl DriversPage {
         ui.painter().rect_filled(Rect::from_min_size(Pos2::new(hr.left(), hr.bottom() - 1.0), vec2(w, 1.0)), CornerRadius::ZERO, th.line);
         let mut clicked = None;
         egui::ScrollArea::vertical().id_salt("drv-kernel-list").auto_shrink([false, false]).show_rows(ui, 28.0, rows.len(), |ui, range| {
-            for d in &rows[range] {
+            for &i in &rows[range] {
+                let d = &kernel[i];
                 let (r, resp) = ui.allocate_exact_size(vec2(w, 28.0), Sense::click());
                 let p = ui.painter();
                 let selected = self.drv_ui.selected_kernel.as_deref() == Some(d.service.as_str());
@@ -951,18 +1179,21 @@ fn n_font(n: usize) -> f32 {
 }
 
 /// Identical entries (same name, version and maker) become one row.
-fn fold(devs: Vec<&DeviceDriver>) -> Vec<Folded<'_>> {
-    let mut out: Vec<Folded> = Vec::new();
-    for d in devs {
-        match out.iter_mut().find(|f| f.dev.name == d.name && f.dev.version == d.version && f.dev.provider == d.provider) {
+/// Takes indexes into `devices` and gives back (index, how many) per row.
+fn fold(devices: &[DeviceDriver], idx: Vec<usize>) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for i in idx {
+        let d = &devices[i];
+        let same = |o: &DeviceDriver| o.name == d.name && o.version == d.version && o.provider == d.provider;
+        match out.iter_mut().find(|f| same(&devices[f.0])) {
             Some(f) => {
-                f.count += 1;
+                f.1 += 1;
                 // Prefer showing an entry that is plugged in.
-                if !f.dev.present && d.present {
-                    f.dev = d;
+                if !devices[f.0].present && d.present {
+                    f.0 = i;
                 }
             }
-            None => out.push(Folded { dev: d, count: 1 }),
+            None => out.push((i, 1)),
         }
     }
     out
@@ -1090,9 +1321,133 @@ mod tests {
         let a = DeviceDriver { name: "Apex 7".into(), version: "2.11.5.0".into(), provider: "SteelSeries".into(), present: true, ..Default::default() };
         let b = a.clone();
         let c = DeviceDriver { name: "Aerox 9".into(), ..a.clone() };
-        let rows = fold(vec![&a, &b, &c]);
+        let rows = fold(&[a, b, c], vec![0, 1, 2]);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].count, 2);
+        assert_eq!(rows[0].1, 2);
+    }
+
+    /// A reader that has nothing: the tests fill the hub's lists by hand.
+    struct NoReader;
+    impl crate::addons::drivers::ListingReader for NoReader {
+        fn devices(&self) -> Result<Vec<DeviceDriver>, String> {
+            Ok(Vec::new())
+        }
+        fn kernel(&self) -> Result<Vec<KernelDriver>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn page_with(devices: Vec<DeviceDriver>, kernel: Vec<KernelDriver>) -> DriversPage {
+        let (ctx, _) = AddonContext::recording();
+        let hub = Hub::new(ctx.clone(), Arc::new(NoReader));
+        {
+            let mut st = hub.lock();
+            st.devices = devices.into();
+            st.kernel = kernel.into();
+        }
+        let mut page = DriversPage::new(hub, ctx);
+        page.drv_ui.started = true;
+        page
+    }
+
+    fn gpu(name: &str) -> DeviceDriver {
+        DeviceDriver {
+            instance_id: name.into(),
+            name: name.into(),
+            class: "Display".into(),
+            provider: "Acme".into(),
+            version: "1.0.0.0".into(),
+            date: "2025-01-01".into(),
+            present: true,
+            ..Default::default()
+        }
+    }
+
+    /// Every text of one frame of the page, in drawing order.
+    fn frame(page: &mut DriversPage) -> Vec<String> {
+        fn texts(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 800.0))), ..Default::default() };
+        let mut out = Vec::new();
+        // Two passes: the first one only sizes what the page lays out.
+        for _ in 0..2 {
+            out.clear();
+            let output = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| page.ui(ui, &mut Vec::new()));
+            });
+            output.shapes.iter().for_each(|s| texts(&s.shape, &mut out));
+        }
+        out
+    }
+
+    #[test]
+    fn counts_and_groups_are_worked_out_once_per_change_of_data_or_filter() {
+        let mut page = page_with(vec![gpu("Alpha GPU"), gpu("Beta GPU")], vec![KernelDriver { service: "disk".into(), display: "Disk".into(), ..Default::default() }]);
+        for _ in 0..5 {
+            frame(&mut page);
+        }
+        assert_eq!(page.derived_builds(), 1, "five frames, nothing changed");
+
+        page.drv_ui.search = "alpha".into();
+        let shown = frame(&mut page);
+        frame(&mut page);
+        assert_eq!(page.derived_builds(), 2, "the filter changed once");
+        assert!(shown.iter().any(|t| t == "Alpha GPU") && !shown.iter().any(|t| t == "Beta GPU"));
+
+        page.drv.lock().devices = vec![gpu("Alpha GPU"), gpu("Beta GPU"), gpu("Gamma GPU")].into();
+        frame(&mut page);
+        frame(&mut page);
+        assert_eq!(page.derived_builds(), 3, "a new read of the devices");
+
+        page.drv_ui.scope = Scope::Kernel;
+        frame(&mut page);
+        frame(&mut page);
+        assert_eq!(page.derived_builds(), 4, "another scope");
+        page.drv_ui.kernel_filter = KernelScope::Loaded;
+        frame(&mut page);
+        frame(&mut page);
+        assert_eq!(page.derived_builds(), 5, "the kernel scope changed");
+    }
+
+    #[test]
+    fn the_page_shares_the_lists_instead_of_copying_them() {
+        let mut page = page_with(vec![gpu("Alpha GPU")], Vec::new());
+        frame(&mut page);
+        let st = page.drv.lock();
+        let view = page.derived.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&view.devices, &st.devices), "the page holds the hub's snapshot");
+    }
+
+    #[test]
+    fn rows_come_out_grouped_sorted_and_folded_as_before() {
+        let mut devices = vec![gpu("beta GPU"), gpu("Alpha GPU"), gpu("beta GPU")];
+        devices.push(DeviceDriver { class: "Net".into(), ..gpu("Zeta NIC") });
+        let mut page = page_with(devices, Vec::new());
+        let shown = frame(&mut page);
+        let at = |what: &str| shown.iter().position(|t| t == what).unwrap_or_else(|| panic!("{what} is shown: {shown:?}"));
+        assert!(at("Display") < at("Alpha GPU") && at("Alpha GPU") < at("beta GPU") && at("beta GPU") < at("Network") && at("Network") < at("Zeta NIC"), "{shown:?}");
+        assert!(shown.iter().any(|t| t == "2 entries folded into one"));
+        assert_eq!(shown.iter().filter(|t| *t == "beta GPU").count(), 1, "identical entries are one row");
+    }
+
+    #[test]
+    fn only_the_rows_in_view_are_built_and_the_selection_stays() {
+        let devices: Vec<DeviceDriver> = (0..3000).map(|i| gpu(&format!("Driver {i:04}"))).collect();
+        let mut page = page_with(devices, Vec::new());
+        page.drv_ui.selected_device = Some("Driver 0002".into());
+        let shown = frame(&mut page);
+        assert!(shown.iter().any(|t| t == "Driver 0000"), "the first rows are built");
+        assert!(!shown.iter().any(|t| t == "Driver 2999"), "the last row is not");
+        let rows = shown.iter().filter(|t| t.starts_with("Driver 0") || t.starts_with("Driver 1") || t.starts_with("Driver 2")).count();
+        assert!(rows < 100, "{rows} rows built for a screen of rows");
+        assert!(shown.iter().any(|t| t == "Open in Device Manager"), "the side panel shows the selected driver");
     }
 
     #[test]

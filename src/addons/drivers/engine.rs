@@ -285,8 +285,10 @@ pub struct HandCheck {
 /// Everything the Drivers page shows, filled by background threads.
 #[derive(Default)]
 pub struct State {
-    pub devices: Vec<DeviceDriver>,
-    pub kernel: Vec<KernelDriver>,
+    /// The lists are shared snapshots: the page takes a handle, never a
+    /// copy, and a new read replaces the whole snapshot.
+    pub devices: Arc<[DeviceDriver]>,
+    pub kernel: Arc<[KernelDriver]>,
     pub listed_at: String,
     pub listing: bool,
     /// Why the last read of the devices failed (then `devices` is empty).
@@ -294,7 +296,7 @@ pub struct State {
     /// Why the last read of the driver services failed (then `kernel` is empty).
     pub kernel_error: Option<String>,
     /// None until the first check.
-    pub updates: Option<Vec<DriverUpdate>>,
+    pub updates: Option<Arc<[DriverUpdate]>>,
     pub checked_at: String,
     /// The last check the user made by pressing Check in this session,
     /// shown on Summary (a check made when the page opened does not count).
@@ -452,8 +454,9 @@ impl Hub {
                     st.reboot_required = true;
                 }
                 st.message = Some(outcome.message);
-                if let Some(u) = st.updates.as_mut() {
-                    u.retain(|x| !done.contains(&x.id));
+                if let Some(u) = &st.updates {
+                    let left: Vec<DriverUpdate> = u.iter().filter(|x| !done.contains(&x.id)).cloned().collect();
+                    st.updates = Some(left.into());
                 }
             }
             if !done.is_empty() {
@@ -784,12 +787,16 @@ fn publish_listing(st: &mut State, devices: Result<Vec<DeviceDriver>, String>, k
     fn split<T>(read: Result<Vec<T>, String>) -> (Vec<T>, Option<String>) {
         read.map_or_else(|e| (Vec::new(), Some(e)), |list| (list, None))
     }
-    (st.devices, st.devices_error) = split(devices);
-    (st.kernel, st.kernel_error) = split(kernel);
+    let (devices, devices_error) = split(devices);
+    let (kernel, kernel_error) = split(kernel);
+    (st.devices, st.devices_error) = (devices.into(), devices_error);
+    (st.kernel, st.kernel_error) = (kernel.into(), kernel_error);
     st.listing = false;
     let State { devices, updates, .. } = st;
     if let Some(u) = updates {
-        match_updates(devices, u);
+        let mut list = u.to_vec();
+        match_updates(devices, &mut list);
+        *u = list.into();
     }
 }
 
@@ -807,7 +814,7 @@ fn publish_check(st: &mut State, found: Result<Vec<DriverUpdate>, String>, by_ha
                 let newer = list.iter().filter(|u| u.worth_installing()).count();
                 st.hand_check = Some(HandCheck { newer, at: at.to_string() });
             }
-            st.updates = Some(list);
+            st.updates = Some(list.into());
         }
         Err(e) => st.message = Some((format!("Could not check Windows Update: {e}"), true)),
     }
@@ -1096,7 +1103,7 @@ mod check_tests {
     /// A state with one device at driver version 2.0.0.0.
     fn state() -> State {
         let dev = DeviceDriver { instance_id: "dev".into(), hardware_ids: vec!["PCI\\X".into()], version: "2.0.0.0".into(), present: true, ..Default::default() };
-        State { devices: vec![dev], ..Default::default() }
+        State { devices: vec![dev].into(), ..Default::default() }
     }
 
     #[test]
@@ -1111,7 +1118,7 @@ mod check_tests {
 
         publish_check(&mut st, found(&[]), false, "15:00");
         assert_eq!(st.hand_check, Some(HandCheck { newer: 2, at: "14:03".into() }), "a later automatic check changes nothing on Summary");
-        assert_eq!(st.updates.as_ref().map(Vec::len), Some(0), "but the page shows its outcome");
+        assert_eq!(st.updates.as_ref().map(|u| u.len()), Some(0), "but the page shows its outcome");
     }
 
     #[test]
@@ -1150,7 +1157,7 @@ mod listing_tests {
 
     #[test]
     fn a_failed_read_drops_the_rows_of_the_last_one() {
-        let mut st = State { kernel: vec![KernelDriver::default()], ..Default::default() };
+        let mut st = State { kernel: vec![KernelDriver::default()].into(), ..Default::default() };
         publish_listing(&mut st, Ok(vec![]), Err("gone".into()));
         assert!(st.kernel.is_empty(), "rows of an older read do not pass for this one");
     }
