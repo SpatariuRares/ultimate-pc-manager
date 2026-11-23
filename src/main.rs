@@ -1,6 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod core_page;
+mod page_summary;
+mod page_colors;
+mod page_settings;
+mod page_history;
+mod page_services;
+mod page_startup;
+mod page_system;
+mod page_users;
 mod cpu_topology;
 mod addons;
 mod file_activity;
@@ -8,9 +17,8 @@ mod inspector;
 mod list_pages;
 mod metrics;
 mod page_perf;
-mod pages;
+mod page_processes;
 mod perfdata;
-mod pages2;
 mod path_cache;
 mod platform;
 mod pro;
@@ -20,7 +28,9 @@ mod sampler;
 mod sensors;
 mod settings;
 mod summary_view;
+mod system_lists;
 mod summary_tiles;
+mod system_actions;
 mod signature;
 #[cfg(test)]
 mod test_ui;

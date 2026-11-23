@@ -1,13 +1,14 @@
 //! Summary's view: everything the Summary page draws, built once per new
-//! sample (and when the pause or the units change) and stored on the app.
-//! The page only draws it, so no snapshot, history or process list is
+//! sample (and when the pause or the units change) and kept by the Summary
+//! page. The page only draws it, so no snapshot, history or process list is
 //! copied or sorted on every frame.
 //!
 //! A figure the app could not read is a gap (`None`), drawn as [`GAP`],
 //! never as 0.
 
-use crate::app::{status_parts, ProviderState, TaskApp};
-use crate::pages::{summary_sub, top_by_cpu, SUMMARY_TOP};
+use crate::app::{status_parts, ProviderState};
+use crate::core_page::{PageCtx, PerfHistory};
+use crate::page_summary::{summary_sub, top_by_cpu, SUMMARY_TOP};
 use std::collections::VecDeque;
 
 use crate::perfdata::{counter, PERF_INFO};
@@ -20,19 +21,19 @@ pub const GAP: &str = "\u{2014}";
 
 /// The newest [`HISTORY`] points of the sum of the Performance series
 /// `keys`, which grow together (one point per sample each).
-fn summed_history(app: &TaskApp, keys: &[&str]) -> VecDeque<f32> {
-    let series: Vec<&VecDeque<f32>> = keys.iter().filter_map(|k| app.ph.get(*k)).collect();
+fn summed_history(ph: &PerfHistory, keys: &[&str]) -> VecDeque<f32> {
+    let series: Vec<&VecDeque<f32>> = keys.iter().filter_map(|k| ph.get(*k)).collect();
     let len = series.iter().map(|h| h.len()).min().unwrap_or(0);
     let take = len.min(HISTORY);
     (len - take..len).map(|i| series.iter().map(|h| h[h.len() - len + i]).sum()).collect()
 }
 
 /// The Disk card: physical disk bytes, not process I/O.
-fn disk_card(app: &TaskApp, waiting: bool) -> Card {
-    let perf = &app.snap.perf;
+fn disk_card(ctx: &PageCtx, waiting: bool) -> Card {
+    let perf = &ctx.snapshot.perf;
     let read = !waiting && perf.answered(counter::DREAD) && perf.answered(counter::DWRITE);
     let rw = physical_disk_bps(&perf.disks).filter(|_| read);
-    let history = summed_history(app, &[DISKS_TOTAL]);
+    let history = summed_history(ctx.histories.perf, &[DISKS_TOTAL]);
     Card {
         metric: Metric::Disk,
         value: rw.map(|(r, w)| format!("{}/s", fmt_bytes((r + w) as u64))),
@@ -43,16 +44,33 @@ fn disk_card(app: &TaskApp, waiting: bool) -> Card {
 }
 
 /// The Network card: every adapter combined, with the adapter count.
-fn network_card(app: &TaskApp, waiting: bool) -> Card {
-    let all = combine_adapters(&app.snap.net);
-    let history = summed_history(app, &["net.r", "net.s"]);
+fn network_card(ctx: &PageCtx, waiting: bool) -> Card {
+    let all = combine_adapters(&ctx.snapshot.net);
+    let history = summed_history(ctx.histories.perf, &["net.r", "net.s"]);
+    let fmt_net = |bps: f64| fmt_net(ctx.settings.bits_per_second, bps);
     let (value, sub) = match (waiting, all.count) {
         (true, _) => (None, None),
         (false, 0) => (None, Some("No adapter".to_string())),
-        (false, 1) => (Some(app.fmt_net(all.rx_bps + all.tx_bps)), Some("1 adapter".to_string())),
-        (false, k) => (Some(app.fmt_net(all.rx_bps + all.tx_bps)), Some(format!("{k} adapters combined"))),
+        (false, 1) => (Some(fmt_net(all.rx_bps + all.tx_bps)), Some("1 adapter".to_string())),
+        (false, k) => (Some(fmt_net(all.rx_bps + all.tx_bps)), Some(format!("{k} adapters combined"))),
     };
     Card { metric: Metric::Network, value, sub, max: auto_max(&history, 1024.0), history: history.into() }
+}
+
+/// A network rate in bits per second or bytes per second, as set.
+fn fmt_net(bits_per_second: bool, bytes_per_sec: f64) -> String {
+    if bits_per_second {
+        let b = bytes_per_sec * 8.0;
+        if b >= 1e9 {
+            format!("{:.1} Gbps", b / 1e9)
+        } else if b >= 1e6 {
+            format!("{:.1} Mbps", b / 1e6)
+        } else {
+            format!("{:.0} Kbps", b / 1e3)
+        }
+    } else {
+        format!("{}/s", fmt_bytes(bytes_per_sec as u64))
+    }
 }
 
 /// Which figure a Summary card shows (the page picks its colour).
@@ -170,16 +188,17 @@ impl SummaryView {
         [&self.cpu, &self.memory, &self.disk, &self.network]
     }
 
-    /// The view of the app's current sample, histories and settings.
-    pub fn build(app: &TaskApp) -> Self {
-        let s = &app.snap;
-        let built = Built::of(&app.settings);
+    /// The view of the sample, histories and settings in `ctx`, with the
+    /// latest sensor `frame` (GPU temperature and power, S.M.A.R.T.).
+    pub fn build(ctx: &PageCtx, frame: Option<&crate::sensors::Frame>) -> Self {
+        let s = ctx.snapshot;
+        let built = Built::of(ctx.settings);
         let waiting = s.seq == 0;
         // Rounded to the 10 MHz the pages show, so that the card and the
         // band print the same digits. The machine's base clock is read only
         // when there is a performance level to apply it to.
         let speed_mhz = (!waiting && s.perf.answered(counter::PERF))
-            .then(|| cpu_speed_mhz(app.base_mhz(), Some(s.perf.cpu_perf_pct as f64)))
+            .then(|| cpu_speed_mhz(base_mhz(s), Some(s.perf.cpu_perf_pct as f64)))
             .flatten()
             .map(|mhz| (mhz / 10.0).round() as u64 * 10);
         let memory = pct(s.mem_used, s.mem_total);
@@ -200,20 +219,20 @@ impl SummaryView {
                 value: live(format!("{:.0}%", s.cpu_total)),
                 // The CPU speed, the same figure as in the band.
                 sub: speed_mhz.map(|mhz| fmt_ghz(mhz as f32)),
-                history: app.cpu_hist.iter().copied().collect(),
+                history: ctx.histories.cpu.iter().copied().collect(),
                 max: 100.0,
             },
             memory: Card {
                 metric: Metric::Memory,
                 value: live(format!("{memory:.0}%")),
                 sub: live(format!("{} / {}", fmt_bytes(s.mem_used), fmt_bytes(s.mem_total))),
-                history: app.mem_hist.iter().copied().collect(),
+                history: ctx.histories.mem.iter().copied().collect(),
                 max: 100.0,
             },
-            disk: disk_card(app, waiting),
-            network: network_card(app, waiting),
+            disk: disk_card(ctx, waiting),
+            network: network_card(ctx, waiting),
             per_core: s.cpu_per_core.clone(),
-            cpu_kernel: kernel_history(app),
+            cpu_kernel: kernel_history(ctx.histories.perf),
             cpu_footer: cpu_footer(s.cpu_per_core.len(), speed_mhz),
             memory_footer: memory_footer(s),
             band: Band {
@@ -222,8 +241,8 @@ impl SummaryView {
                 paused: built.paused,
                 providers,
             },
-            top: top_without_self(app),
-            tiles: app.summary_tiles(),
+            top: top_without_self(ctx),
+            tiles: crate::summary_tiles::summary_tiles(ctx, frame),
             built,
         }
     }
@@ -232,10 +251,10 @@ impl SummaryView {
 /// Summary's top CPU list: the busiest processes without the app itself
 /// unless "Show Task Manager in Reports" is on. Only the own-process part
 /// of Settings' hiding applies here, not Hide Microsoft.
-fn top_without_self(app: &TaskApp) -> Vec<ProcRow> {
-    let own = app.hide().own_pid;
+fn top_without_self(ctx: &PageCtx) -> Vec<ProcRow> {
+    let own = crate::process_view::Hide::new(ctx.settings, std::process::id(), Default::default()).own_pid;
     // The app is at most one row, so one spare row keeps the list full.
-    let mut top = top_by_cpu(&app.snap.procs, SUMMARY_TOP + 1);
+    let mut top = top_by_cpu(&ctx.snapshot.procs, SUMMARY_TOP + 1);
     top.retain(|p| Some(p.pid) != own);
     top.truncate(SUMMARY_TOP);
     top
@@ -243,8 +262,8 @@ fn top_without_self(app: &TaskApp) -> Vec<ProcRow> {
 
 /// The kernel-time history Performance keeps (`cpu.k`), cut to the last
 /// minute the Summary graphs show so it lines up with the utilization.
-fn kernel_history(app: &TaskApp) -> Vec<f32> {
-    let Some(h) = app.ph.get("cpu.k") else { return Vec::new() };
+fn kernel_history(ph: &PerfHistory) -> Vec<f32> {
+    let Some(h) = ph.get("cpu.k") else { return Vec::new() };
     h.iter().skip(h.len().saturating_sub(HISTORY)).copied().collect()
 }
 
@@ -269,32 +288,16 @@ fn memory_footer(s: &crate::sampler::Snapshot) -> String {
     format!("Available {available} \u{b7} Cached {cached} \u{b7} Swap {swap}")
 }
 
-impl TaskApp {
-    /// The CPU's base frequency in MHz, from the machine's fixed facts
-    /// (0 when unknown).
-    pub fn base_mhz(&self) -> Option<f64> {
-        crate::metrics::base_clock_mhz(Some(self.machine().cpu.base_mhz as f64), None, None)
-    }
-
-    /// Builds Summary's view from the current sample.
-    pub(crate) fn rebuild_summary(&mut self) {
-        self.summary = SummaryView::build(self);
-    }
-
-    /// Summary's view, rebuilt first if the pause, the network units or
-    /// "Show Task Manager in Reports" changed since it was built (the
-    /// figures stay those of the last sample).
-    pub fn summary_view(&mut self) -> &SummaryView {
-        if self.summary.built != Built::of(&self.settings) {
-            self.rebuild_summary();
-        }
-        &self.summary
-    }
+/// The CPU's base frequency in MHz, from the machine's fixed facts the
+/// sample carries (`None` when unknown).
+fn base_mhz(s: &crate::sampler::Snapshot) -> Option<f64> {
+    crate::metrics::base_clock_mhz(Some(crate::page_perf::machine_of(s, None).cpu.base_mhz as f64), None, None)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::app::TaskApp;
     use crate::perfdata::PerfLive;
     use crate::sampler::Snapshot;
     use crate::settings::{Settings, SPEEDS};
@@ -322,13 +325,23 @@ pub(crate) mod tests {
         crate::perfdata::StaticInfo { cpu: crate::perfdata::CpuInfo { base_mhz, ..Default::default() }, ..Default::default() }
     }
 
+    /// `snap` as read on a machine with a 3.40 GHz base clock.
+    fn on_this_machine(mut snap: Snapshot) -> Snapshot {
+        snap.machine = Some(std::sync::Arc::new(clocked(3_400)));
+        snap
+    }
+
     /// The Summary view of a headless app on `snap`, with a base clock of
     /// `base_mhz`.
     fn view_of(snap: Snapshot, base_mhz: u32) -> SummaryView {
-        let mut app = TaskApp::headless(Settings::default(), snap);
-        app.machine_info = Some(clocked(base_mhz));
-        app.rebuild_summary();
-        app.summary_view().clone()
+        view_with(&Settings::default(), snap, base_mhz)
+    }
+
+    /// The same with the settings given.
+    fn view_with(settings: &Settings, mut snap: Snapshot, base_mhz: u32) -> SummaryView {
+        snap.machine = Some(std::sync::Arc::new(clocked(base_mhz)));
+        let lent = crate::core_page::testing::Lent::default();
+        SummaryView::build(&lent.ctx(settings, &snap), None)
     }
 
     #[test]
@@ -361,13 +374,12 @@ pub(crate) mod tests {
     #[test]
     fn paused_updates_keep_the_last_view() {
         let (mut app, feed) = TaskApp::fed(Settings::default(), Snapshot::default());
-        app.machine_info = Some(clocked(3_400));
-        feed.send(sample()).expect("sent");
+        feed.send(on_this_machine(sample())).expect("sent");
         app.pull_samples();
         let before = app.summary_view().clone();
         assert_eq!(before.cpu.value_text(), "15%", "the first sample reached the view");
         app.settings.speed = SPEEDS.iter().position(|s| s.1 == 0).expect("a Paused speed");
-        feed.send(Snapshot { seq: 2, cpu_total: 99.0, ..sample() }).expect("sent");
+        feed.send(Snapshot { seq: 2, cpu_total: 99.0, ..on_this_machine(sample()) }).expect("sent");
         app.pull_samples();
         let paused = app.summary_view().clone();
         assert_eq!(paused.cards(), before.cards(), "paused, the figures stay those of the last sample");
@@ -486,10 +498,7 @@ pub(crate) mod tests {
         let mut settings = Settings::default();
         settings.show_self_in_reports = true;
         settings.hide_microsoft = true;
-        let mut app = TaskApp::headless(settings, crowded());
-        app.machine_info = Some(clocked(3_400));
-        app.rebuild_summary();
-        let view = app.summary_view().clone();
+        let view = view_with(&settings, crowded(), 3_400);
         assert_eq!(view.top.first().map(|p| p.pid), Some(std::process::id()), "the busiest, so first");
         assert_eq!(view.top.len(), 25);
     }

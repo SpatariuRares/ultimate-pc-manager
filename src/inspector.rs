@@ -122,7 +122,7 @@ impl Inspector {
 
     fn take_row(&mut self, procs: &[ProcRow]) {
         self.row = procs.iter().find(|p| p.pid == self.pid).cloned();
-        self.parent = self.row.as_ref().map(|p| crate::pages::parent_text(p, procs).0).unwrap_or_default();
+        self.parent = self.row.as_ref().map(|p| crate::page_processes::parent_text(p, procs).0).unwrap_or_default();
     }
 
     /// Takes the process again from `procs` and reads it again.

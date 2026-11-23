@@ -64,3 +64,11 @@ pub fn colours(out: &egui::FullOutput) -> Vec<egui::Color32> {
     }
     all
 }
+
+/// Settings whose CPU colour is the user's own, and that colour.
+pub fn custom_cpu() -> (crate::settings::Settings, egui::Color32) {
+    let chosen = [0x12, 0x34, 0x56];
+    let mut settings = crate::settings::Settings::default();
+    settings.cpu_color = chosen;
+    (settings, crate::widgets::rgb(chosen))
+}

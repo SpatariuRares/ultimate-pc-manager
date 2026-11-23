@@ -1668,7 +1668,7 @@ mod tests {
     #[test]
     fn a_custom_cpu_colour_reaches_power_and_freq() {
         use crate::sensors::model::{Device, DeviceKind, Group, Reading, Unit};
-        let (settings, cpu) = crate::pages::tests::custom_cpu();
+        let (settings, cpu) = crate::test_ui::custom_cpu();
         let disk = Device::new(DeviceKind::Disk, "disk0", "SSD");
         let speed = Reading::measure("disk.read", disk, Group::Speed, "Read Speed", Unit::BytesPerSec, "test", Instant::now()).with(Some(1e6), "");
         let frame = Frame::build(1, &[vec![speed]], Vec::new());
@@ -2124,8 +2124,14 @@ mod tests {
 
     #[test]
     fn an_alert_keeps_the_service_running_after_the_page_is_hidden() {
-        let mut host = power_freq_host(&serde_json::json!({ "power-freq": { "settings": { "alerts": [always_triggered()] } } }));
+        let power_freq = std::sync::Arc::<std::sync::Mutex<PowerFreq>>::default();
+        let entries = vec![crate::addons::Entry::Addon(Box::new(Hosted(std::sync::Arc::clone(&power_freq))))];
+        let section = serde_json::json!({ "power-freq": { "settings": { "alerts": [always_triggered()] } } });
+        let mut host = crate::addons::AddonHost::for_tests_with(entries, &section).0;
         draw_surfaces(&mut host, true, false);
+        // The watcher's thread takes its own interest when it starts: wait
+        // until it has (it evaluated a frame) before the page lets go of its.
+        until("the alert's watcher has a frame", || power_freq.lock().unwrap().watcher.as_ref().is_some_and(|w| w.frame().is_some()));
         host.end_frame(); // the page is not drawn any more
         std::thread::sleep(Duration::from_millis(50));
         assert!(host.context.sensors().threads() > 0, "the alert still watches");

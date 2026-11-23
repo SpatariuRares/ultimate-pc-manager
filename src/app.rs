@@ -1,4 +1,4 @@
-//! The window: a sidebar of pages and one panel per page (see pages.rs).
+//! The window: a sidebar of pages and one panel per page (see core_page.rs).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::Ordering;
@@ -8,11 +8,14 @@ use egui::{vec2, Align, Color32, Layout, Pos2, RichText, Sense, Stroke, Ui};
 
 use crate::addons::{AddonHost, Core, Landing};
 pub use crate::platform::Action;
+use crate::core_page::{Histories, PageCtx, SampleSlot};
+use crate::page_processes::{ProcView, ProcessInputs, ProcessesChange};
 use crate::platform::PageContext;
 use crate::sampler::{Sampler, Snapshot};
 use crate::settings::{Settings, SPEEDS};
-use crate::widgets::{fmt_bytes, health_colour, local_ip, logo, nav_entry_back, nav_heading, push, refresh_button};
-use crate::winsys::{self, ServiceRow, StartupRow};
+use crate::widgets::{health_colour, local_ip, logo, nav_entry_back, nav_heading, push, refresh_button};
+use crate::system_lists::SystemLists;
+use crate::winsys;
 
 /// The open page: one of the core pages, or the page of an add-on (by its
 /// registry id; the add-on draws it through the host).
@@ -178,95 +181,39 @@ impl PerfItem {
     }
 }
 
-/// Asked when another page goes to a process Hide Microsoft Services and
-/// Processes keeps out of the table.
-pub const SHOW_MICROSOFT_QUESTION: &str = "Processes does not list this process while Hide Microsoft Services and Processes is on. Turn it off?";
-
-/// Asked once Create memory dump file has written its file.
-pub const DUMP_QUESTION: &str = "Show it in File Explorer?";
-
 pub struct TaskApp {
     pub settings: Settings,
     /// The add-on registry and which add-ons are on.
     pub addons: AddonHost,
-    /// Settings › Add-ons: the add-on picked out (e.g. by `--page` on one that is off).
-    pub addon_selected: Option<&'static str>,
-    /// Settings shows its Add-ons tab (set by `--page`, then by the tabs).
-    pub show_addons: bool,
-    /// Settings: the category shown, and what "Find a setting" holds.
-    pub settings_view: crate::pages2::SettingsView,
     pub sampler: Sampler,
     pub snap: Snapshot,
     pub cpu_hist: VecDeque<f32>,
     pub mem_hist: VecDeque<f32>,
-    pub disk_hist: VecDeque<f32>,
-    pub net_hist: BTreeMap<String, VecDeque<f32>>,
+    /// The core pages that moved to the shared interface (see
+    /// [`crate::core_page`]).
+    pub pages: crate::core_page::CorePages,
     /// Long histories for the Performance page graphs, by series name.
-    pub ph: BTreeMap<String, VecDeque<f32>>,
-    /// What the Summary page draws, built once per new sample.
-    pub summary: crate::summary_view::SummaryView,
+    pub ph: crate::core_page::PerfHistory,
     /// The machine's fixed facts (base clock, disk models, GPUs) when set (tests);
     /// otherwise the machine's are read (see [`TaskApp::machine`]).
     pub machine_info: Option<crate::perfdata::StaticInfo>,
-    /// The latest sensor frame Summary's tiles read (GPU temperature and
-    /// power, S.M.A.R.T.); `None` when no sensor has reported.
-    pub summary_frame: Option<std::sync::Arc<crate::sensors::Frame>>,
     pub page: Page,
-    #[allow(dead_code)]
-    pub nav_open: bool,
-    pub perf: PerfItem,
-    pub search: String,
     /// The Processes table's layout as last saved (see
     /// [`TaskApp::process_table_unsaved`]).
     process_table_saved: crate::settings::ProcessTable,
-    /// The process rows selected on Processes (Ctrl and Shift add rows).
-    pub selected: crate::process_view::Selection,
-    /// Processes scrolls to the selected process once (after "Go to the
-    /// process" or type-ahead).
-    pub reveal_selected: bool,
-    /// Follow process: the process Processes keeps selected and in view.
-    pub following: Option<crate::process_view::Follow>,
-    /// Processes: which tree rows are open and which groups are folded.
-    pub proc_view: crate::process_view::ViewState,
-    pub services: Option<Result<Vec<ServiceRow>, String>>,
-    pub svc_selected: Option<String>,
-    pub startup: Option<Vec<StartupRow>>,
-    pub startup_selected: Option<usize>,
-    pub confirm_end: Option<crate::pages::EndAsk>,
-    /// Efficiency mode's question, open while it waits for an answer.
-    pub confirm_efficiency: Option<crate::pages::EfficiencyAsk>,
-    /// The processes Set priority ▸ Realtime waits to change while its
-    /// question is open.
-    pub confirm_realtime: Option<Vec<u32>>,
-    /// The process another page went to while "Hide Microsoft Services and
-    /// Processes" hides it: Processes asks whether to turn the option off.
-    pub ask_show_microsoft: Option<u32>,
-    /// The memory dump file just written, while [`DUMP_QUESTION`] waits
-    /// for an answer.
-    pub dump_question: Option<std::path::PathBuf>,
-    /// The memory dumps being written off the UI thread, each sending
-    /// the file written or why Windows refused.
-    dumps: Vec<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
-    /// Restarts of Windows Explorer running off the UI thread, each
-    /// sending how it went.
-    explorer_restarts: Vec<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// What the Services and Startup apps pages read and control: the
+    /// machine in the app, a fake in tests (see [`crate::system_lists`]).
+    pub(crate) system: std::sync::Arc<dyn SystemLists>,
     /// Who signed each program file, checked off the UI thread.
     pub signatures: crate::signature::Signatures,
-    /// Each program file's description, read off the UI thread.
-    pub descriptions: crate::version_info::Descriptions,
     pub run_dialog: Option<String>,
-    /// The open Process Inspector windows, one per process.
-    pub inspectors: Vec<crate::inspector::Inspector>,
-    /// The open Analyze wait chain windows, one per process.
-    pub wait_chains: Vec<crate::wait_chain::WaitChain>,
-    /// The open File activity windows, one per process; each holds its
-    /// trace, stopped when the window goes.
-    pub file_activity: Vec<crate::file_activity::FileActivity>,
     pub message: Option<(String, Instant)>,
-    /// App history: per program name, (CPU seconds, disk bytes).
-    pub history: BTreeMap<String, (f64, f64)>,
-    pub history_since: Instant,
-    last_sample_at: Option<Instant>,
+    /// What the app asks of the system (see [`crate::system_actions`]): the
+    /// Windows adapter, or in tests a recording one that acts on nothing.
+    pub actions: std::sync::Arc<dyn crate::system_actions::SystemActions>,
+    /// The recording adapter behind `actions` when the app is headless.
+    #[cfg(test)]
+    recording: Option<std::sync::Arc<crate::system_actions::RecordingActions>>,
     applied: Option<bool>,
     applied_top: Option<bool>,
     screenshot: Option<String>,
@@ -301,63 +248,44 @@ impl TaskApp {
             Landing::Page(id) => (Page::of(id), None, false),
             Landing::AddonSettings(sel) => (Page::Core(Core::Settings), sel, true),
         };
-        let mut app = Self::build(settings, sampler, addons, page, screenshot);
-        app.addon_selected = addon_selected;
-        app.show_addons = show_addons;
+        let mut app = Self::build(settings, sampler, addons, page, screenshot, std::sync::Arc::new(crate::system_lists::native::NativeSystem), std::sync::Arc::new(crate::system_actions::WindowsActions));
+        if show_addons {
+            app.pages.settings.open_addons(addon_selected);
+        }
         crate::theme::install_fonts(&cc.egui_ctx);
         app.apply_theme(&cc.egui_ctx);
         app
     }
 
     /// An app on `page` with `settings`, before any frame is drawn.
-    fn build(settings: Settings, sampler: Sampler, addons: AddonHost, page: Page, screenshot: Option<String>) -> Self {
+    fn build(
+        settings: Settings,
+        sampler: Sampler,
+        addons: AddonHost,
+        page: Page,
+        screenshot: Option<String>,
+        system: std::sync::Arc<dyn SystemLists>,
+        actions: std::sync::Arc<dyn crate::system_actions::SystemActions>,
+    ) -> Self {
         let mut app = TaskApp {
             addons,
-            addon_selected: None,
-            show_addons: false,
-            settings_view: Default::default(),
             settings,
             sampler,
             snap: Snapshot::default(),
             cpu_hist: VecDeque::new(),
             mem_hist: VecDeque::new(),
-            disk_hist: VecDeque::new(),
-            net_hist: BTreeMap::new(),
+            pages: Default::default(),
             ph: BTreeMap::new(),
-            summary: Default::default(),
             machine_info: None,
-            summary_frame: None,
             page,
-            nav_open: true,
-            perf: PerfItem::Cpu,
-
-            search: String::new(),
             process_table_saved: Default::default(),
-            selected: Default::default(),
-            reveal_selected: false,
-            following: None,
-            proc_view: Default::default(),
-            services: None,
-            svc_selected: None,
-            startup: None,
-            startup_selected: None,
-            confirm_end: None,
-            confirm_efficiency: None,
-            confirm_realtime: None,
-            ask_show_microsoft: None,
-            dump_question: None,
-            dumps: Vec::new(),
-            explorer_restarts: Vec::new(),
+            system,
             signatures: Default::default(),
-            descriptions: Default::default(),
             run_dialog: None,
-            inspectors: Vec::new(),
-            wait_chains: Vec::new(),
-            file_activity: Vec::new(),
             message: None,
-            history: BTreeMap::new(),
-            history_since: Instant::now(),
-            last_sample_at: None,
+            actions,
+            #[cfg(test)]
+            recording: None,
             applied: None,
             applied_top: None,
             screenshot,
@@ -366,9 +294,7 @@ impl TaskApp {
             close_questions: None,
             closing: false,
         };
-        app.perf = PerfItem::from_key(&app.settings.perf_device);
         app.process_table_saved = app.settings.process_table.clone();
-        app.rebuild_summary();
         app
     }
 
@@ -379,9 +305,8 @@ impl TaskApp {
         let (_, rx) = std::sync::mpsc::channel();
         let sampler = Sampler::detached(rx);
         let addons = AddonHost::from_section(&serde_json::json!({}));
-        let mut app = Self::build(settings, sampler, addons, Page::Core(Core::Summary), None);
+        let mut app = Self::recording_build(settings, sampler, addons);
         app.snap = snap;
-        app.rebuild_summary();
         app
     }
 
@@ -393,9 +318,33 @@ impl TaskApp {
     pub fn headless_over(settings: Settings, sensors: crate::sensors::SensorService, fill: impl FnMut(&mut Snapshot) + Send + 'static) -> Self {
         let sampler = Sampler::start_with(settings.interval_ms(), sensors.clone(), move || Box::new(fill));
         let addons = AddonHost::over_sensors(sensors);
-        let mut app = Self::build(settings, sampler, addons, Page::Core(Core::Summary), None);
-        app.rebuild_summary();
+        Self::recording_build(settings, sampler, addons)
+    }
+
+    /// A headless app on Summary whose system actions are recorded and
+    /// acted on nothing (see [`TaskApp::recording`]).
+    #[cfg(test)]
+    fn recording_build(settings: Settings, sampler: Sampler, addons: AddonHost) -> Self {
+        let recording = std::sync::Arc::new(crate::system_actions::RecordingActions::default());
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        let mut app = Self::build(settings, sampler, addons, Page::Core(Core::Summary), None, fake, recording.clone());
+        app.recording = Some(recording);
         app
+    }
+
+    /// The recording adapter of a headless app: what it was asked, and
+    /// what it is scripted to refuse.
+    #[cfg(test)]
+    pub fn recording(&self) -> std::sync::Arc<crate::system_actions::RecordingActions> {
+        self.recording.clone().expect("only a headless app records")
+    }
+
+    /// This app over `system` instead of the default fake: tests keep their
+    /// own `Arc<FakeSystem>` to script it and read what was asked.
+    #[cfg(test)]
+    pub fn on_system(mut self, system: std::sync::Arc<dyn SystemLists>) -> Self {
+        self.system = system;
+        self
     }
 
     /// [`TaskApp::headless`] with a sender standing in for the sampler.
@@ -426,6 +375,31 @@ impl TaskApp {
         }
         self.applied = Some(dark);
         crate::theme::apply(ctx, crate::theme::Mode::from_dark(dark));
+    }
+
+    /// Draws the page shown: one arm per core page that has not moved to
+    /// the shared interface (a moved page's arm is deleted; the last arm
+    /// reaches it through [`crate::core_page::CorePages`]).
+    pub(crate) fn draw_page(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        match self.page {
+            Page::Addon(id) => self.addon_page(ui, id, actions),
+            Page::Core(core) => self.draw_core_page(core, ui, actions),
+        }
+    }
+
+    /// A core page behind the shared interface: the standard header when
+    /// the page asks for one, then the page.
+    fn draw_core_page(&mut self, core: Core, ui: &mut Ui, actions: &mut Vec<Action>) {
+        let Some(title) = self.pages.page_mut(core).map(|p| p.title()) else { return };
+        if let Some(title) = title {
+            self.header(ui, title);
+        }
+        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
+        let processes = ProcessInputs::new(&self.signatures, &*self.actions);
+        let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories, system: &*self.system, processes };
+        if let Some(page) = self.pages.page_mut(core) {
+            page.draw_with_addons(ui, &ctx, &mut self.addons, actions);
+        }
     }
 
     /// The Design A theme of the dark or light setting.
@@ -487,32 +461,53 @@ impl TaskApp {
             got = Some(s);
         }
         let Some(s) = got else { return };
+        // The order a sample is handled in (the add-ons came first, above):
+        // the Performance history, the short histories, App history,
+        // process tracking, the Summary rebuild, signatures. A page's
+        // `on_sample` runs at its `SampleSlot`.
         self.push_perf(&s);
+        self.sample_pages(SampleSlot::Performance, &s);
         push(&mut self.cpu_hist, s.cpu_total);
         let mem_pct = if s.mem_total > 0 { s.mem_used as f32 * 100.0 / s.mem_total as f32 } else { 0.0 };
         push(&mut self.mem_hist, mem_pct);
-        push(&mut self.disk_hist, ((s.disk_read_bps + s.disk_write_bps) / 1_048_576.0) as f32);
-        for n in &s.net {
-            let h = self.net_hist.entry(n.name.clone()).or_default();
-            push(h, ((n.rx_bps + n.tx_bps) * 8.0 / 1000.0) as f32);
-        }
-        let now = Instant::now();
-        if let Some(prev) = self.last_sample_at {
-            let dt = now.duration_since(prev).as_secs_f64().min(10.0);
-            let ncpu = s.cpu_per_core.len().max(1) as f64;
-            for p in &s.procs {
-                let e = self.history.entry(p.name.clone()).or_default();
-                e.0 += p.cpu as f64 / 100.0 * ncpu * dt;
-                e.1 += (p.disk_read + p.disk_write) * dt;
-            }
-        }
-        self.last_sample_at = Some(now);
+        self.sample_pages(SampleSlot::AppHistory, &s);
         // The Processes view notices the processes that ended (it keeps
         // them a moment; the sampler does not).
-        self.proc_view.track(&s.procs, now, self.settings.show_exited);
+        self.sample_pages(SampleSlot::ProcessTracking, &s);
+        self.sample_pages(SampleSlot::Summary, &s);
         self.snap = s;
-        self.rebuild_summary();
+        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
+        let processes = ProcessInputs::new(&self.signatures, &*self.actions);
+        self.pages.on_sample(SampleSlot::Last, &PageCtx { settings: &self.settings, snapshot: &self.snap, histories, system: &*self.system, processes });
         self.ask_signatures();
+    }
+
+    /// Delivers the new sample `s` to the core pages of `slot`.
+    fn sample_pages(&mut self, slot: SampleSlot, s: &Snapshot) {
+        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
+        let processes = ProcessInputs::new(&self.signatures, &*self.actions);
+        self.pages.on_sample(slot, &PageCtx { settings: &self.settings, snapshot: s, histories, system: &*self.system, processes });
+    }
+
+    /// Keeps the settings a page changed: the sampler runs at the speed
+    /// they name, Hide Microsoft Services and Processes asks for the
+    /// signatures when it was just turned on, and they are saved. Summary
+    /// notices what it shows changed when it is next drawn.
+    fn change_settings(&mut self, change: crate::settings::SettingsChange) {
+        let mut new = self.settings.clone();
+        change.apply(&mut new);
+        self.adopt_settings(new);
+        self.settings.save();
+    }
+
+    /// [`Self::change_settings`] without the saving.
+    fn adopt_settings(&mut self, new: Settings) {
+        let hide_was_on = self.settings.hide_microsoft;
+        self.settings = new;
+        self.sampler.interval_ms.store(self.settings.interval_ms(), Ordering::Relaxed);
+        if self.settings.hide_microsoft && !hide_was_on {
+            self.ask_signatures();
+        }
     }
 
     pub fn set_speed(&mut self, idx: usize) {
@@ -527,15 +522,22 @@ impl TaskApp {
     pub(crate) fn end_frame(&mut self) {
         let dropped = self.addons.end_frame();
         if dropped.contains(&crate::addons::leases::Surface::Summary) {
-            self.summary_frame = None;
+            self.pages.summary.drop_frame();
         }
     }
 
     pub fn refresh_now(&mut self) {
         self.sampler.refresh();
         match self.page {
-            Page::Core(Core::Services) => self.services = Some(winsys::list_services()),
-            Page::Core(Core::Startup) => self.startup = Some(winsys::list_startup()),
+            Page::Core(c) if self.pages.page_mut(c).is_some() => {
+                let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
+                let processes = ProcessInputs::new(&self.signatures, &*self.actions);
+                let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories, system: &*self.system, processes };
+                if let Some(page) = self.pages.page_mut(c) {
+                    page.refresh(&ctx);
+                }
+                self.addons.read_held_sensors();
+            }
             p => {
                 // An add-on refreshes itself and reads its sensors; for a core
                 // page, only the sensors it holds (Summary's) are read.
@@ -543,21 +545,6 @@ impl TaskApp {
                     self.addons.read_held_sensors();
                 }
             }
-        }
-    }
-
-    pub fn fmt_net(&self, bytes_per_sec: f64) -> String {
-        if self.settings.bits_per_second {
-            let b = bytes_per_sec * 8.0;
-            if b >= 1e9 {
-                format!("{:.1} Gbps", b / 1e9)
-            } else if b >= 1e6 {
-                format!("{:.1} Mbps", b / 1e6)
-            } else {
-                format!("{:.0} Kbps", b / 1e3)
-            }
-        } else {
-            format!("{}/s", fmt_bytes(bytes_per_sec as u64))
         }
     }
 
@@ -616,19 +603,7 @@ impl eframe::App for TaskApp {
         self.nav_panel(ctx);
         self.status_bar(ctx, &mut actions);
         let frame = egui::Frame::new().fill(self.theme().page).inner_margin(egui::Margin { left: 22, right: 18, top: 0, bottom: 8 });
-        egui::CentralPanel::default().frame(frame).show(ctx, |ui| match self.page {
-            Page::Core(Core::Summary) => self.page_summary(ui, &mut actions),
-            Page::Core(Core::Performance) => self.page_performance(ui),
-            Page::Core(Core::Processes) => self.page_processes(ui, &mut actions),
-            Page::Core(Core::SystemInfo) => self.page_system(ui),
-            Page::Core(Core::Startup) => self.page_startup(ui, &mut actions),
-            Page::Core(Core::Users) => self.page_users(ui),
-            Page::Core(Core::Services) => self.page_services(ui, &mut actions),
-            Page::Addon(id) => self.addon_page(ui, id, &mut actions),
-            Page::Core(Core::AppHistory) => self.page_history(ui),
-            Page::Core(Core::Settings) => self.page_settings(ui, &mut actions),
-            Page::Core(Core::Colors) => self.page_colors(ui),
-        });
+        egui::CentralPanel::default().frame(frame).show(ctx, |ui| self.draw_page(ui, &mut actions));
         self.end_frame();
         self.dialogs(ctx, &mut actions);
         self.off_question(ctx);
@@ -790,7 +765,10 @@ impl TaskApp {
                         }
                     });
                     if self.page == Page::Core(Core::Performance) {
-                        self.performance_menu(ui);
+                        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
+                        let processes = ProcessInputs::new(&self.signatures, &*self.actions);
+                        let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories, system: &*self.system, processes };
+                        self.pages.performance.menu(ui, &ctx, actions);
                     }
                     // An add-on's own menu, when it belongs in the menu bar.
                     if let Page::Addon(id) = self.page {
@@ -871,8 +849,8 @@ impl TaskApp {
         if resp.clicked() {
             self.page = p;
             match p {
-                Page::Core(Core::Services) if self.services.is_none() => self.services = Some(winsys::list_services()),
-                Page::Core(Core::Startup) if self.startup.is_none() => self.startup = Some(winsys::list_startup()),
+                Page::Core(Core::Services) if !self.pages.services.is_loaded() => self.reload_services(),
+                Page::Core(Core::Startup) if !self.pages.startup.is_loaded() => self.reload_startup(),
                 _ => {}
             }
         }
@@ -891,7 +869,7 @@ impl TaskApp {
             .filter(|(_, t)| t.elapsed() < Duration::from_secs(6))
             .map(|(m, _)| m.clone());
         // Settings › Add-ons keeps its status line here while it is open.
-        let note = (self.page == Page::Core(Core::Settings) && self.show_addons)
+        let note = (self.page == Page::Core(Core::Settings) && self.pages.settings.showing_addons())
             .then(|| crate::addons::overview::Overview::of(&self.addons, None).status());
         let theme = self.theme();
         let [state, procs, ip, generation] = status_parts(paused, providers, s.procs.len(), &local_ip(), s.seq);
@@ -936,14 +914,6 @@ impl TaskApp {
         }
     }
 
-    /// The page title: an outline icon and a large, widely spaced heading.
-    pub fn page_title(&self, ui: &mut Ui, title: &str) {
-        let theme = self.theme();
-        let (r, _) = ui.allocate_exact_size(vec2(26.0, 40.0), Sense::hover());
-        self.page_icon(ui.painter(), r.center(), self.page, theme.label);
-        ui.label(RichText::new(title).font(theme.fonts.page_title.clone()).color(theme.text));
-    }
-
     /// The page of a migrated add-on: the app's header, then the add-on
     /// draws the rest through the host.
     fn addon_page(&mut self, ui: &mut Ui, id: &str, actions: &mut Vec<Action>) {
@@ -970,7 +940,7 @@ impl TaskApp {
     fn header_with(&mut self, ui: &mut Ui, title: &str, subtitle: Option<&str>, mut extra: impl FnMut(&mut Self, &mut Ui)) {
         let (mut refresh, mut run) = (false, false);
         ui.horizontal(|ui| {
-            self.page_title(ui, title);
+            crate::core_page::page_title(ui, self.page.id(), title);
             if let Some(sub) = subtitle {
                 ui.label(RichText::new(sub).color(ui.visuals().weak_text_color()));
             }
@@ -1042,24 +1012,6 @@ impl TaskApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
-        self.finished_dumps();
-        self.finished_restarts();
-        if self.dump_question.is_some() {
-            let (mut yes, mut no) = (false, false);
-            egui::Modal::new(egui::Id::new("dump-question")).show(ctx, |ui| {
-                ui.set_max_width(420.0);
-                ui.label(DUMP_QUESTION);
-                ui.add_space(10.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    use crate::widgets::parts::{outline_button, primary_button};
-                    yes = primary_button(ui, "Yes", true).clicked();
-                    no = outline_button(ui, "No", true).clicked();
-                });
-            });
-            if yes || no {
-                self.answer_dump(yes, actions);
-            }
-        }
         if let Some(mut text) = self.run_dialog.take() {
             let mut open = true;
             let mut done = false;
@@ -1084,7 +1036,7 @@ impl TaskApp {
                     });
                 });
             if done {
-                match winsys::run_new_task(&text) {
+                match self.actions.run_new_task(&text) {
                     Ok(()) => self.say(format!("Started \"{}\"", text.trim())),
                     Err(e) => self.say(e),
                 }
@@ -1092,199 +1044,31 @@ impl TaskApp {
                 self.run_dialog = Some(text);
             }
         }
-        if self.ask_show_microsoft.is_some() {
-            let (mut turn_off, mut cancel) = (false, false);
-            egui::Modal::new(egui::Id::new("show-microsoft-question")).show(ctx, |ui| {
-                ui.set_max_width(420.0);
-                ui.label(SHOW_MICROSOFT_QUESTION);
-                ui.add_space(10.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    use crate::widgets::parts::{outline_button, primary_button};
-                    turn_off = primary_button(ui, "Turn off", true).clicked();
-                    cancel = outline_button(ui, "Cancel", true).clicked();
-                });
-            });
-            if turn_off {
-                self.show_microsoft_and_go();
-                self.settings.save();
-            } else if cancel {
-                self.ask_show_microsoft = None;
-            }
-        }
-        if let Some(ask) = self.confirm_end.clone() {
-            let mut close = false;
-            let sub = self.sub_text();
-            egui::Window::new(ask.title())
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                .show(ctx, |ui| {
-                    ui.label(ask.question());
-                    if !ask.note().is_empty() {
-                        ui.label(RichText::new(ask.note()).color(sub));
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button(ask.title()).clicked() {
-                            actions.push(ask.action());
-                            close = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            close = true;
-                        }
-                    });
-                });
-            if close {
-                self.confirm_end = None;
-            }
-        }
-        if let Some(mut ask) = self.confirm_efficiency.clone() {
-            let (mut go, mut cancel) = (false, false);
-            egui::Modal::new(egui::Id::new("efficiency-question")).show(ctx, |ui| {
-                ui.set_max_width(420.0);
-                ui.label(crate::pages::EFFICIENCY_QUESTION);
-                ui.add_space(6.0);
-                ui.checkbox(&mut ask.dont_ask, "Don't ask again");
-                ui.add_space(10.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    use crate::widgets::parts::{outline_button, primary_button};
-                    go = primary_button(ui, ask.title(), true).clicked();
-                    cancel = outline_button(ui, "Cancel", true).clicked();
-                });
-            });
-            self.confirm_efficiency = if go || cancel { None } else { Some(ask.clone()) };
-            if go {
-                self.answer_efficiency(&ask, actions);
-                if ask.dont_ask {
-                    self.settings.save();
-                }
-            }
-        }
-        if let Some(pids) = self.confirm_realtime.clone() {
-            let (mut go, mut cancel) = (false, false);
-            egui::Modal::new(egui::Id::new("realtime-question")).show(ctx, |ui| {
-                ui.set_max_width(420.0);
-                ui.label(crate::pages::REALTIME_QUESTION);
-                ui.add_space(10.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    use crate::widgets::parts::{outline_button, primary_button};
-                    go = primary_button(ui, "Continue", true).clicked();
-                    cancel = outline_button(ui, "Cancel", true).clicked();
-                });
-            });
-            if go || cancel {
-                self.confirm_realtime = None;
-            }
-            if go {
-                Self::answer_realtime(&pids, actions);
-            }
-        }
-        // The Process Inspectors; a resize is saved with the Processes
-        // table's layout.
-        let procs = &self.snap.procs;
-        let width = &mut self.settings.process_table.inspector_width;
-        self.inspectors.retain_mut(|inspector| inspector.show(ctx, procs, width, actions));
-        self.wait_chains.retain_mut(|w| w.show(ctx));
-        // The File activity windows; closing one stops its trace.
-        let width = &mut self.settings.process_table.file_activity_width;
-        self.file_activity.retain_mut(|window| window.show(ctx, procs, width, actions));
+        let processes = ProcessInputs::new(&self.signatures, &*self.actions);
+        let histories = Histories { cpu: &self.cpu_hist, mem: &self.mem_hist, perf: &self.ph };
+        let page_ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories, system: &*self.system, processes };
+        self.pages.windows(ctx, &page_ctx, actions);
     }
 
     /// Closes every File activity window, stopping their traces (on exit).
     pub fn close_file_activity(&mut self) {
-        self.file_activity.clear();
+        self.pages.processes.close_file_activity();
     }
 
-    /// Efficiency mode agreed to: it runs, and "Don't ask again" turns
-    /// "Ask before applying Efficiency mode" off (the dialog saves it).
-    pub fn answer_efficiency(&mut self, ask: &crate::pages::EfficiencyAsk, actions: &mut Vec<Action>) {
-        if ask.dont_ask {
-            self.settings.ask_efficiency = false;
-        }
-        actions.push(Action::Efficiency(ask.pids.clone()));
-    }
-
-    /// Realtime priority agreed to: it is set on each of `pids`.
-    pub fn answer_realtime(pids: &[u32], actions: &mut Vec<Action>) {
-        actions.extend(pids.iter().map(|&pid| Action::Priority(pid, "Realtime")));
-    }
-
-    /// A memory dump is done: once written, [`DUMP_QUESTION`] is asked;
-    /// a refusal is said in the status bar.
-    pub fn dump_done(&mut self, result: Result<std::path::PathBuf, String>) {
-        match result {
-            Ok(path) => self.dump_question = Some(path),
-            Err(e) => self.say(e),
-        }
-    }
-
-    /// The answer to [`DUMP_QUESTION`]: Yes shows the file in File
-    /// Explorer.
-    pub fn answer_dump(&mut self, show: bool, actions: &mut Vec<Action>) {
-        if let Some(path) = self.dump_question.take() {
-            if show {
-                actions.push(Action::ShowInExplorer(path));
-            }
-        }
-    }
-
-    /// Takes the memory dumps whose writing has ended ([`Self::dump_done`]).
-    fn finished_dumps(&mut self) {
-        let mut done = Vec::new();
-        self.dumps.retain(|rx| match rx.try_recv() {
-            Ok(result) => {
-                done.push(result);
-                false
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => true,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                done.push(Err(winsys::DUMP_FAILED.to_string()));
-                false
-            }
-        });
-        for result in done {
-            self.dump_done(result);
-        }
-    }
-
-    /// Restart on the shell's Windows Explorer: `restart` (which waits up
-    /// to several seconds) runs on a worker thread; the status bar says
-    /// how it went on a later frame ([`Self::finished_restarts`]).
-    fn restart_explorer_with(&mut self, ctx: &egui::Context, pid: u32, restart: fn(u32) -> Result<(), String>) {
+    /// Restart on the shell's Windows Explorer: the system call (which waits
+    /// up to several seconds) runs on a worker thread; the status bar says
+    /// how it went on a later frame ([`crate::page_processes::ProcessesPage::watch_restart`]).
+    fn restart_explorer(&mut self, ctx: &egui::Context, pid: u32) {
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
+        let system = self.actions.clone();
         let spawned = std::thread::Builder::new().name("restart-explorer".into()).spawn(move || {
-            let _ = tx.send(restart(pid));
+            let _ = tx.send(system.restart_explorer(pid));
             ctx.request_repaint();
         });
         match spawned {
-            Ok(_) => self.explorer_restarts.push(rx),
+            Ok(_) => self.pages.processes.watch_restart(rx),
             Err(_) => self.say(crate::platform::EXPLORER_NOT_RESTARTED.to_string()),
-        }
-    }
-
-    /// Takes the restarts of Windows Explorer that have ended and says
-    /// how each went.
-    fn finished_restarts(&mut self) {
-        let mut done = Vec::new();
-        self.explorer_restarts.retain(|rx| match rx.try_recv() {
-            Ok(result) => {
-                done.push(result);
-                false
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => true,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                done.push(Err(crate::platform::EXPLORER_NOT_RESTARTED.to_string()));
-                false
-            }
-        });
-        for result in done {
-            match result {
-                Ok(()) => {
-                    self.say("Restarted Windows Explorer".to_string());
-                    self.sampler.refresh_requested.store(true, Ordering::Relaxed);
-                }
-                Err(e) => self.say(e),
-            }
         }
     }
 
@@ -1308,17 +1092,9 @@ impl TaskApp {
     /// "Turn it off": Hide Microsoft Services and Processes goes off and
     /// Processes shows the process asked for.
     pub fn show_microsoft_and_go(&mut self) {
-        if let Some(pid) = self.ask_show_microsoft.take() {
+        if let Some(pid) = self.pages.processes.ask_show_microsoft.take() {
             self.settings.hide_microsoft = false;
             self.go_to_process(pid);
-        }
-    }
-
-    /// Follow process on `pid`, or Stop following (`None`).
-    pub fn follow(&mut self, pid: Option<u32>) {
-        self.following = pid.map(crate::process_view::Follow::new);
-        if let Some(pid) = pid {
-            self.selected = crate::process_view::Selection::only(pid);
         }
     }
 
@@ -1326,18 +1102,56 @@ impl TaskApp {
     /// `pid`, with `service` or the host's first service selected.
     fn go_to_services(&mut self, pid: u32, service: Option<String>) {
         let first = || self.snap.services.get(&pid).and_then(|v| v.first()).map(|s| s.name.clone());
-        self.svc_selected = service.or_else(first);
-        self.search = pid.to_string();
-        self.services = Some(winsys::list_services());
+        self.pages.services.show(service.or_else(first), pid.to_string());
+        self.reload_services();
         self.page = Page::Core(Core::Services);
+    }
+
+    /// A Process View item: the saved options toggle here; the page keeps
+    /// the open rows and the exited processes.
+    pub(crate) fn apply_process_view(&mut self, item: ProcView) {
+        match item {
+            ProcView::Tree => {
+                self.settings.process_tree = !self.settings.process_tree;
+                self.settings.save();
+            }
+            ProcView::Smooth => {
+                self.settings.smooth_cpu = !self.settings.smooth_cpu;
+                self.settings.save();
+            }
+            ProcView::ShowExited => {
+                self.settings.show_exited = !self.settings.show_exited;
+                if !self.settings.show_exited {
+                    self.pages.processes.drop_exited();
+                }
+                self.settings.save();
+            }
+            ProcView::ExpandAll => self.pages.processes.expand_all(&self.snap.procs, self.snap.services.keys().copied()),
+            ProcView::CollapseAll => self.pages.processes.collapse_all(),
+        }
+    }
+
+    /// What the Processes page asked to change in the settings.
+    fn apply_processes_change(&mut self, change: ProcessesChange) {
+        match change {
+            ProcessesChange::Table(layout) => self.settings.process_table = layout,
+            ProcessesChange::InspectorWidth(width) => self.settings.process_table.inspector_width = width,
+            ProcessesChange::FileActivityWidth(width) => self.settings.process_table.file_activity_width = width,
+            ProcessesChange::EfficiencyAskOff => {
+                self.settings.ask_efficiency = false;
+                self.settings.save();
+            }
+            ProcessesChange::ShowMicrosoft => {
+                self.show_microsoft_and_go();
+                self.settings.save();
+            }
+        }
     }
 
     /// Opens Processes on `pid`: clears the search so the process is
     /// listed, selects it and scrolls to it.
     fn go_to_process(&mut self, pid: u32) {
-        self.search.clear();
-        self.selected = crate::process_view::Selection::only(pid);
-        self.reveal_selected = true;
+        self.pages.processes.go_to(pid);
         self.page = Page::Core(Core::Processes);
     }
 
@@ -1356,7 +1170,7 @@ impl TaskApp {
 
     fn run_action(&mut self, ctx: &egui::Context, a: Action) {
         match a {
-            Action::End { pid, force, tree, name } => match winsys::end_process(pid, force, tree) {
+            Action::End { pid, force, tree, name } => match self.actions.end_process(pid, force, tree) {
                 Ok(()) => {
                     self.say(format!("Ended {name}"));
                     self.sampler.refresh_requested.store(true, Ordering::Relaxed);
@@ -1365,19 +1179,20 @@ impl TaskApp {
             },
             Action::EndMany { pids, force, tree } => {
                 // Every one is tried; the first failure is said.
-                let failed: Vec<String> = pids.iter().filter_map(|&pid| winsys::end_process(pid, force, tree).err()).collect();
+                let system = self.actions.clone();
+                let failed: Vec<String> = pids.iter().filter_map(|&pid| system.end_process(pid, force, tree).err()).collect();
                 match failed.into_iter().next() {
                     None => self.say(format!("Ended {} processes", pids.len())),
                     Some(e) => self.say(e),
                 }
                 self.sampler.refresh_requested.store(true, Ordering::Relaxed);
             }
-            Action::Priority(pid, p) => match winsys::set_priority(pid, p) {
+            Action::Priority(pid, p) => match self.actions.set_priority(pid, p) {
                 Ok(()) => self.say(format!("Priority set to {p}")),
                 Err(e) => self.say(e),
             },
             Action::OpenLocation(path) => {
-                if let Err(e) = winsys::open_file_location(&path) {
+                if let Err(e) = self.actions.open_file_location(&path) {
                     self.say(e);
                 }
             }
@@ -1396,7 +1211,7 @@ impl TaskApp {
             }
             Action::Say(text) => self.say(text),
             Action::ShowInExplorer(path) => {
-                if winsys::reveal_in_explorer(&path).is_err() {
+                if self.actions.reveal_in_explorer(&path).is_err() {
                     self.say(crate::platform::REVEAL_FAILED.to_string());
                 }
             }
@@ -1433,12 +1248,19 @@ impl TaskApp {
                 // of the table: ask whether to turn the option off first.
                 let hidden = self.snap.procs.iter().find(|p| p.pid == pid).and_then(|p| self.hide().why(p));
                 if hidden == Some(crate::process_view::Hidden::Microsoft) {
-                    self.ask_show_microsoft = Some(pid);
+                    self.pages.processes.ask_show_microsoft = Some(pid);
                 } else {
                     self.go_to_process(pid);
                 }
             }
             Action::UpdateSpeed(i) => self.set_speed(i),
+            Action::ChangeSettings(change) => self.change_settings(change),
+            Action::SetAddon(id, on) => self.set_addon(id, on),
+            Action::Refresh => self.refresh_now(),
+            Action::PerfSetting(change) => {
+                change.apply(&mut self.settings);
+                self.settings.save();
+            }
             Action::ExportCsv { file_name, text } => {
                 let Some(path) = crate::platform::pick_csv(file_name) else { return };
                 // With a byte order mark, as the other exports: Excel then
@@ -1448,35 +1270,15 @@ impl TaskApp {
                     Err(e) => self.say(format!("Could not save: {e}")),
                 }
             }
-            Action::Inspect(pid) => {
-                // One window per process: inspecting it again brings its window up.
-                if self.inspectors.iter().any(|i| i.pid == pid) {
-                    ctx.move_to_top(egui::LayerId::new(egui::Order::Middle, crate::inspector::window_id(pid)));
-                } else {
-                    self.inspectors.push(crate::inspector::Inspector::open(pid, &self.snap.procs));
-                }
-            }
-            Action::AnalyzeWaitChain(pid) => {
-                // One window per process: analysing it again runs it again
-                // and brings its window up.
-                if let Some(w) = self.wait_chains.iter_mut().find(|w| w.pid == pid) {
-                    w.rerun(&self.snap.procs);
-                    ctx.move_to_top(egui::LayerId::new(egui::Order::Middle, crate::wait_chain::window_id(pid)));
-                } else {
-                    self.wait_chains.push(crate::wait_chain::WaitChain::open(pid, &self.snap.procs));
-                }
-            }
+            Action::Inspect(pid) => self.pages.processes.inspect(ctx, pid, &self.snap.procs),
+            Action::AnalyzeWaitChain(pid) => self.pages.processes.analyze_wait_chain(ctx, pid, &self.snap.procs),
             Action::FileActivity(pid) => {
-                // One window per process; the administrator check runs on
-                // the click (the menu item is never greyed).
-                if self.file_activity.iter().any(|w| w.pid == pid) {
-                    ctx.move_to_top(egui::LayerId::new(egui::Order::Middle, crate::file_activity::window_id(pid)));
-                } else {
-                    let admin = crate::platform::is_admin();
-                    self.file_activity.push(crate::file_activity::FileActivity::open(pid, &self.snap.procs, admin));
-                }
+                // The administrator check runs on the click (the menu item is
+                // never greyed).
+                let admin = self.actions.is_admin();
+                self.pages.processes.open_file_activity(ctx, pid, &self.snap.procs, admin);
             }
-            Action::RestartAsAdministrator => match crate::platform::restart_elevated(Core::Processes.id()) {
+            Action::RestartAsAdministrator => match self.actions.restart_elevated(Core::Processes.id()) {
                 // The elevated copy takes over; this one closes.
                 Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 Err(e) => self.say(e),
@@ -1485,41 +1287,55 @@ impl TaskApp {
                 self.settings.process_percents = percents;
                 self.settings.save();
             }
-            Action::Suspend(pids) => self.each_process(&pids, "Suspended", winsys::suspend_process),
-            Action::Resume(pids) => self.each_process(&pids, "Resumed", winsys::resume_process),
-            Action::Efficiency(pids) => self.each_process(&pids, "Efficiency mode on for", winsys::set_efficiency),
-            Action::Affinity(pids, mask) => self.each_process(&pids, "Processor affinity set for", |pid| winsys::set_affinity(pid, mask)),
+            Action::Suspend(pids) => {
+                let system = self.actions.clone();
+                self.each_process(&pids, "Suspended", |pid| system.suspend_process(pid))
+            }
+            Action::Resume(pids) => {
+                let system = self.actions.clone();
+                self.each_process(&pids, "Resumed", |pid| system.resume_process(pid))
+            }
+            Action::Efficiency(pids) => {
+                let system = self.actions.clone();
+                self.each_process(&pids, "Efficiency mode on for", |pid| system.set_efficiency(pid))
+            }
+            Action::Affinity(pids, mask) => {
+                let system = self.actions.clone();
+                self.each_process(&pids, "Processor affinity set for", |pid| system.set_affinity(pid, mask))
+            }
             Action::ProcessView(item) => self.apply_process_view(item),
+            Action::Processes(change) => self.apply_processes_change(change),
             Action::Dump { pid, name } => {
                 // A full dump can take seconds: written off the UI thread,
-                // taken by `finished_dumps`.
+                // taken by the Processes page.
                 let (tx, rx) = std::sync::mpsc::channel();
                 let ctx = ctx.clone();
+                let system = self.actions.clone();
                 let spawned = std::thread::Builder::new().name("memory-dump".into()).spawn(move || {
-                    let _ = tx.send(winsys::write_dump(pid, &name, &std::env::temp_dir()));
+                    let _ = tx.send(system.write_dump(pid, &name, &std::env::temp_dir()));
                     ctx.request_repaint();
                 });
                 match spawned {
-                    Ok(_) => self.dumps.push(rx),
+                    Ok(_) => self.pages.processes.watch_dump(rx),
                     Err(_) => self.say(winsys::DUMP_FAILED),
                 }
             }
             Action::UacVirtualization(pids) => {
                 // Every one is tried; the first refusal is said.
-                if let Some(e) = pids.iter().find_map(|&pid| winsys::toggle_uac_virtualization(pid).err()) {
+                if let Some(e) = pids.iter().find_map(|&pid| self.actions.toggle_uac_virtualization(pid).err()) {
                     self.say(e);
                 }
             }
             Action::BringToFront(pid) => {
-                if let Err(e) = crate::proc_info::bring_to_front(pid) {
+                if let Err(e) = self.actions.bring_to_front(pid) {
                     self.say(e);
                 }
             }
-            Action::Follow(pid) => self.follow(pid),
-            Action::RestartExplorer(pid) => self.restart_explorer_with(ctx, pid, winsys::restart_explorer),
+            Action::Follow(pid) => self.pages.processes.follow(pid),
+            Action::RestartExplorer(pid) => self.restart_explorer(ctx, pid),
             Action::GoToServices { pid, service } => self.go_to_services(pid, service),
             Action::OpenPowerOptions => {
-                if let Err(e) = winsys::open_power_options() {
+                if let Err(e) = self.actions.open_power_options() {
                     self.say(e);
                 }
             }
@@ -1528,7 +1344,7 @@ impl TaskApp {
                 self.say(format!("Copied \"{text}\""));
             }
             Action::Service(name, what) => {
-                match winsys::control_service(&name, what) {
+                match self.system.control_service(&name, what) {
                     Ok(()) => {
                         let verb = match what {
                             "start" => "Started",
@@ -1539,16 +1355,20 @@ impl TaskApp {
                     }
                     Err(e) => self.say(e),
                 }
-                self.services = Some(winsys::list_services());
+                self.reload_services();
             }
-            Action::Startup(i, enable) => {
-                if let Some(row) = self.startup.as_ref().and_then(|l| l.get(i)).cloned() {
-                    match winsys::set_startup_enabled(&row, enable) {
-                        Ok(()) => self.say(format!("{} {}", row.name, if enable { "enabled" } else { "disabled" })),
+            Action::Startup(id, enable) => {
+                // The entry is named by its id, so a reread since the click
+                // cannot change the target; a name is only for the message.
+                let name = self.pages.startup.name_of(&id);
+                match name {
+                    Some(name) => match self.system.set_startup_enabled(&id, enable) {
+                        Ok(()) => self.say(format!("{name} {}", if enable { "enabled" } else { "disabled" })),
                         Err(e) => self.say(e),
-                    }
-                    self.startup = Some(winsys::list_startup());
+                    },
+                    None => self.say(crate::system_lists::STARTUP_GONE),
                 }
+                self.reload_startup();
             }
         }
     }
@@ -1558,6 +1378,7 @@ impl TaskApp {
 mod tests {
     use super::*;
     use crate::addons::AddonHost;
+    use crate::page_processes::{DUMP_QUESTION, SHOW_MICROSOFT_QUESTION};
 
     use crate::addons::fake::test_registry;
     use serde_json::json;
@@ -1627,13 +1448,149 @@ mod tests {
     }
 
     #[test]
+    fn column_changes_on_the_processes_page_are_saved_once_the_mouse_is_up() {
+        let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
+        assert!(!app.process_table_unsaved(false), "nothing changed");
+        crate::page_processes::set_column_shown(&mut app.settings.process_table, ProcCol::Pid, false);
+        assert!(!app.process_table_unsaved(true), "not while a divider is dragged");
+        assert!(app.process_table_unsaved(false));
+        assert!(!app.process_table_unsaved(false), "saved once");
+    }
+
+    /// An add-on that notes the sequence number of each sample it gets.
+    struct Tap(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl crate::addons::Addon for Tap {
+        fn id(&self) -> &'static str {
+            "tap"
+        }
+        fn name(&self) -> &'static str {
+            "Tap"
+        }
+        fn description(&self) -> &'static str {
+            "Notes the samples."
+        }
+        fn requirements(&self) -> crate::addons::Requirements {
+            Default::default()
+        }
+        fn consumption(&self) -> crate::addons::Consumption {
+            crate::addons::Consumption { cpu: "None", network: "None", disk: "None", when: "Never" }
+        }
+        fn tier(&self) -> crate::addons::Tier {
+            crate::addons::Tier::Free
+        }
+        fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
+        fn on_sample(&mut self, s: &Snapshot) {
+            self.0.lock().unwrap().push(s.seq.to_string());
+        }
+    }
+
+    #[test]
+    fn a_new_sample_reaches_the_addons_and_then_the_processes_page() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let row = |name: &str, pid| crate::sampler::ProcRow { pid, name: name.into(), ..Default::default() };
+        let (mut app, tx) = TaskApp::fed(Settings::default(), Snapshot::default());
+        app.addons = AddonHost::for_tests_with(vec![crate::addons::Entry::Addon(Box::new(Tap(log.clone())))], &json!({ "tap": { "enabled": true } })).0;
+        tx.send(Snapshot { seq: 1, procs: vec![row("ended.exe", 31), row("stays.exe", 32)], ..Default::default() }).unwrap();
+        app.pull_samples();
+        tx.send(Snapshot { seq: 2, procs: vec![row("stays.exe", 32)], ..Default::default() }).unwrap();
+        app.pull_samples();
+        assert_eq!(*log.lock().unwrap(), ["1", "2"], "each sample reaches the add-on");
+        assert_eq!(app.snap.seq, 2);
+        // The page was given sample 2 after sample 1: it noticed the end.
+        let names = table_names(&mut app);
+        assert!(names.contains(&"ended.exe".to_string()) && names.contains(&"stays.exe".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn a_sample_is_handled_in_the_order_the_spec_names() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut app, tx) = TaskApp::fed(Settings::default(), Snapshot::default());
+        app.addons = AddonHost::for_tests_with(vec![crate::addons::Entry::Addon(Box::new(Tap(log.clone())))], &json!({ "tap": { "enabled": true } })).0;
+        app.pages.trace = Some(log.clone());
+        tx.send(Snapshot { seq: 1, ..Default::default() }).unwrap();
+        app.pull_samples();
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["1", "pages Performance", "pages AppHistory", "pages ProcessTracking", "pages Summary", "pages Last"],
+            "the add-ons first, then the pages in the order of their slots"
+        );
+        assert_eq!(app.cpu_hist.len(), 1, "the short histories are filled between the Performance and App history slots");
+    }
+
+    #[test]
+    fn a_settings_change_applies_only_what_its_page_changed() {
+        use crate::page_perf::PerfSetting;
+        use crate::page_processes::ProcessesChange;
+        let ctx = egui::Context::default();
+        let start = Settings::default();
+        let mut colours = start.clone();
+        colours.cpu_color = [1, 2, 3];
+        let queue = || {
+            vec![
+                Action::ChangeSettings(crate::settings::SettingsChange::new(&start, colours.clone())),
+                Action::PerfSetting(PerfSetting::Logical(false)),
+                Action::Processes(ProcessesChange::InspectorWidth(321.0)),
+                Action::ResourceValues { percents: true },
+            ]
+        };
+        for reversed in [false, true] {
+            let mut actions = queue();
+            if reversed {
+                actions.reverse();
+            }
+            let mut app = TaskApp::headless(start.clone(), Snapshot::default());
+            for a in actions {
+                app.run_action(&ctx, a);
+            }
+            let s = &app.settings;
+            assert_eq!(s.cpu_color, [1, 2, 3], "the page's own change (reversed: {reversed})");
+            assert!(!s.perf_logical, "Performance's change (reversed: {reversed})");
+            assert_eq!(s.process_table.inspector_width, 321.0, "Processes' change (reversed: {reversed})");
+            assert!(s.process_percents, "Resource values (reversed: {reversed})");
+        }
+    }
+
+    #[test]
+    fn a_settings_change_keeps_the_add_on_choices_made_in_the_same_frame() {
+        let ctx = egui::Context::default();
+        let start = Settings::default();
+        let mut colours = start.clone();
+        colours.cpu_color = [1, 2, 3];
+        let mut app = TaskApp::headless(start.clone(), Snapshot::default());
+        app.settings.addons = json!({ "tap": { "enabled": false } });
+        app.run_action(&ctx, Action::ChangeSettings(crate::settings::SettingsChange::new(&start, colours)));
+        assert_eq!(app.settings.cpu_color, [1, 2, 3]);
+        assert_eq!(app.settings.addons, json!({ "tap": { "enabled": false } }));
+    }
+
+    #[test]
+    fn processes_keeps_its_selection_and_search_while_another_page_is_shown() {
+        let (mut app, _tx) = TaskApp::fed(Settings::default(), Snapshot { procs: vec![crate::sampler::ProcRow { pid: A, name: "alpha.exe".into(), ..Default::default() }, crate::sampler::ProcRow { pid: B, name: "beta.exe".into(), ..Default::default() }], ..Default::default() });
+        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        let frame = |app: &mut TaskApp| crate::test_ui::texts(&crate::test_ui::run(&ctx, (1400.0, 900.0), vec![], |ui| app.draw_page(ui, &mut Vec::new())));
+        app.page = Page::Core(Core::Processes);
+        app.pages.processes.go_to(B);
+        app.pages.processes.search = "bet".into();
+        frame(&mut app);
+        app.page = Page::Core(Core::Settings);
+        frame(&mut app);
+        frame(&mut app);
+        app.page = Page::Core(Core::Processes);
+        let shown = frame(&mut app);
+        assert_eq!(app.pages.processes.selected.single(), Some(B), "the selection survives the other page");
+        assert_eq!(app.pages.processes.search, "bet", "so does the search");
+        assert!(shown.iter().any(|t| t == "beta.exe") && !shown.iter().any(|t| t == "alpha.exe"), "and the page shows them again: {shown:?}");
+    }
+
+    #[test]
     fn inspect_opens_one_inspector_window_per_process() {
         let me = crate::sampler::ProcRow { pid: std::process::id(), name: "tests.exe".into(), ..Default::default() };
         let mut app = TaskApp::headless(Settings::default(), Snapshot { procs: vec![me], ..Default::default() });
         let ctx = egui::Context::default();
         app.run_action(&ctx, Action::Inspect(std::process::id()));
         app.run_action(&ctx, Action::Inspect(std::process::id()));
-        assert_eq!(app.inspectors.iter().map(|i| i.pid).collect::<Vec<_>>(), [std::process::id()], "inspecting it again opens no second window");
+        assert_eq!(app.pages.processes.inspectors.iter().map(|i| i.pid).collect::<Vec<_>>(), [std::process::id()], "inspecting it again opens no second window");
     }
 
     #[test]
@@ -1643,7 +1600,7 @@ mod tests {
         let ctx = egui::Context::default();
         app.run_action(&ctx, Action::AnalyzeWaitChain(std::process::id()));
         app.run_action(&ctx, Action::AnalyzeWaitChain(std::process::id()));
-        assert_eq!(app.wait_chains.iter().map(|w| w.pid).collect::<Vec<_>>(), [std::process::id()], "analysing it again opens no second window");
+        assert_eq!(app.pages.processes.wait_chains.iter().map(|w| w.pid).collect::<Vec<_>>(), [std::process::id()], "analysing it again opens no second window");
     }
 
     #[test]
@@ -1651,15 +1608,309 @@ mod tests {
         let me = crate::sampler::ProcRow { pid: std::process::id(), name: "tests.exe".into(), ..Default::default() };
         let mut app = TaskApp::headless(Settings::default(), Snapshot { procs: vec![me], ..Default::default() });
         let ctx = egui::Context::default();
+        app.recording().set_admin(false);
         app.run_action(&ctx, Action::FileActivity(std::process::id()));
         app.run_action(&ctx, Action::FileActivity(std::process::id()));
-        assert_eq!(app.file_activity.iter().map(|w| w.pid).collect::<Vec<_>>(), [std::process::id()], "asking again opens no second window");
-        if !crate::platform::is_admin() {
-            assert!(!app.file_activity[0].tracing(), "the admin check runs on click; not elevated, no trace");
-        }
+        assert_eq!(app.pages.processes.file_activity.iter().map(|w| w.pid).collect::<Vec<_>>(), [std::process::id()], "asking again opens no second window");
+        assert!(!app.pages.processes.file_activity[0].tracing(), "the admin check runs on click; the seam says not elevated, no trace");
         // Closing the app stops every trace with its window.
         app.close_file_activity();
-        assert!(app.file_activity.is_empty());
+        assert!(app.pages.processes.file_activity.is_empty());
+    }
+
+    // ---- Process actions through the system-actions seam ----
+
+    const A: u32 = 4_000_000_001;
+    const B: u32 = 4_000_000_002;
+    const C: u32 = 4_000_000_003;
+
+    /// A headless app listing alpha.exe, beta.exe and gamma.exe (made-up
+    /// PIDs no real process has), nothing said and no refresh asked yet.
+    fn app_with_three_processes() -> TaskApp {
+        use crate::sampler::ProcRow;
+        let row = |pid, name: &str| ProcRow { pid, name: name.into(), ..Default::default() };
+        let procs = vec![row(A, "alpha.exe"), row(B, "beta.exe"), row(C, "gamma.exe")];
+        let app = TaskApp::headless(Settings::default(), Snapshot { procs, ..Default::default() });
+        app.sampler.refresh_requested.store(false, Ordering::Relaxed);
+        app
+    }
+
+    fn said(app: &TaskApp) -> Option<String> {
+        app.message.as_ref().map(|(m, _)| m.clone())
+    }
+
+    fn refreshed(app: &TaskApp) -> bool {
+        app.sampler.refresh_requested.load(Ordering::Relaxed)
+    }
+
+    fn end(pid: u32, force: bool, tree: bool, name: &str) -> Action {
+        Action::End { pid, force, tree, name: name.into() }
+    }
+
+    #[test]
+    fn ending_a_process_says_ended_with_its_name_and_refreshes() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, end(A, false, false, "alpha.exe"));
+        assert_eq!(said(&app).as_deref(), Some("Ended alpha.exe"));
+        assert!(refreshed(&app));
+        assert_eq!(app.recording().requests(), [Request::End { pid: A, force: false, tree: false }]);
+    }
+
+    #[test]
+    fn force_quit_and_end_tree_ask_the_system_for_exactly_that() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, end(A, true, false, "alpha.exe"));
+        app.run_action(&ctx, end(B, false, true, "beta.exe"));
+        assert_eq!(
+            app.recording().requests(),
+            [Request::End { pid: A, force: true, tree: false }, Request::End { pid: B, force: false, tree: true }]
+        );
+    }
+
+    #[test]
+    fn a_process_that_cannot_be_ended_says_why_and_does_not_refresh() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.recording().fail(Request::End { pid: A, force: false, tree: false }, "Access is denied.");
+        app.run_action(&ctx, end(A, false, false, "alpha.exe"));
+        assert_eq!(said(&app).as_deref(), Some("Access is denied."));
+        assert!(!refreshed(&app));
+    }
+
+    #[test]
+    fn ending_many_processes_says_how_many_were_ended_and_refreshes() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, Action::EndMany { pids: vec![A, B, C], force: true, tree: true });
+        assert_eq!(said(&app).as_deref(), Some("Ended 3 processes"));
+        assert!(refreshed(&app));
+        let ended = |pid| Request::End { pid, force: true, tree: true };
+        assert_eq!(app.recording().requests(), [ended(A), ended(B), ended(C)]);
+    }
+
+    #[test]
+    fn ending_many_tries_every_process_and_reports_the_first_failure() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        let ended = |pid| Request::End { pid, force: false, tree: false };
+        app.recording().fail(ended(A), "Access is denied.");
+        app.recording().fail(ended(B), "The process was not found.");
+        app.run_action(&ctx, Action::EndMany { pids: vec![A, B, C], force: false, tree: false });
+        assert_eq!(said(&app).as_deref(), Some("Access is denied."), "the first failure, in the order of the pids");
+        assert!(refreshed(&app));
+        assert_eq!(app.recording().requests(), [ended(A), ended(B), ended(C)], "a failure does not stop the rest");
+    }
+
+    /// What every "each process" action says: "<done> <name>" for one
+    /// process, "<done> N processes" for several, the first failure when any
+    /// failed (every process is tried); the table is refreshed each time.
+    fn each_process_action_reports(action: fn(Vec<u32>) -> Action, request: fn(u32) -> crate::system_actions::Request, done: &str) {
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, action(vec![B]));
+        assert_eq!(said(&app), Some(format!("{done} beta.exe")), "one process");
+        assert!(refreshed(&app));
+        app.sampler.refresh_requested.store(false, Ordering::Relaxed);
+        app.run_action(&ctx, action(vec![A, B, C]));
+        assert_eq!(said(&app), Some(format!("{done} 3 processes")), "several processes");
+        assert!(refreshed(&app));
+        app.recording().fail(request(A), "Access denied: first.");
+        app.recording().fail(request(B), "Access denied: second.");
+        let before = app.recording().requests().len();
+        app.run_action(&ctx, action(vec![A, B, C]));
+        assert_eq!(said(&app).as_deref(), Some("Access denied: first."), "the first failure");
+        assert_eq!(app.recording().requests()[before..], [request(A), request(B), request(C)], "every process is tried");
+    }
+
+    #[test]
+    fn set_priority_says_it_and_asks_the_seam() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, Action::Priority(B, "High"));
+        assert_eq!(said(&app).as_deref(), Some("Priority set to High"));
+        assert_eq!(app.recording().requests(), [crate::system_actions::Request::Priority(B, "High".into())]);
+    }
+
+    #[test]
+    fn set_priority_says_the_failure_and_does_not_refresh() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.recording().fail(crate::system_actions::Request::Priority(B, "Low".into()), "Access denied: this process can't be changed.");
+        app.run_action(&ctx, Action::Priority(B, "Low"));
+        assert_eq!(said(&app).as_deref(), Some("Access denied: this process can't be changed."));
+        assert!(!refreshed(&app), "Priority does not refresh the table");
+        assert_eq!(app.recording().requests(), [crate::system_actions::Request::Priority(B, "Low".into())]);
+    }
+
+    #[test]
+    fn suspend_reports_for_one_process_for_several_or_the_first_failure() {
+        each_process_action_reports(Action::Suspend, crate::system_actions::Request::Suspend, "Suspended");
+    }
+
+    #[test]
+    fn resume_reports_for_one_process_for_several_or_the_first_failure() {
+        each_process_action_reports(Action::Resume, crate::system_actions::Request::Resume, "Resumed");
+    }
+
+    #[test]
+    fn efficiency_mode_reports_for_one_process_for_several_or_the_first_failure() {
+        each_process_action_reports(Action::Efficiency, crate::system_actions::Request::Efficiency, "Efficiency mode on for");
+    }
+
+    #[test]
+    fn set_affinity_reports_for_one_process_for_several_or_the_first_failure() {
+        fn affinity(pids: Vec<u32>) -> Action {
+            Action::Affinity(pids, 0b101)
+        }
+        fn request(pid: u32) -> crate::system_actions::Request {
+            crate::system_actions::Request::Affinity(pid, 0b101)
+        }
+        each_process_action_reports(affinity, request, "Processor affinity set for");
+    }
+
+
+    // ---- Elevation, administrator check and the remaining actions ----
+
+    #[test]
+    fn restart_as_administrator_closes_the_app_when_the_elevated_copy_takes_over() {
+        use crate::system_actions::Request;
+        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, Action::RestartAsAdministrator);
+        assert_eq!(app.recording().requests(), [Request::RestartElevated(Core::Processes.id().into())], "asks to reopen on Processes");
+        assert!(closes(&ctx), "the elevated copy takes over: this one closes");
+        assert_eq!(said(&app), None, "nothing to say when it goes through");
+    }
+
+    #[test]
+    fn restart_as_administrator_that_is_cancelled_says_why_and_keeps_the_app_open() {
+        use crate::system_actions::Request;
+        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        let mut app = app_with_three_processes();
+        app.recording().fail(Request::RestartElevated(Core::Processes.id().into()), "Administrator rights were not granted.");
+        app.run_action(&ctx, Action::RestartAsAdministrator);
+        assert_eq!(said(&app).as_deref(), Some("Administrator rights were not granted."));
+        assert!(!closes(&ctx), "cancelled: the app stays open");
+    }
+
+    /// Whether the app asked its window to close since the last frame.
+    fn closes(ctx: &egui::Context) -> bool {
+        let out = crate::test_ui::run(ctx, (400.0, 300.0), vec![], |_| {});
+        out.viewport_output.values().any(|v| v.commands.iter().any(|c| matches!(c, egui::ViewportCommand::Close)))
+    }
+
+    #[test]
+    fn file_activity_follows_the_administrator_answer_of_the_seam() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.recording().set_admin(false);
+        app.run_action(&ctx, Action::FileActivity(A));
+        assert!(!app.pages.processes.file_activity[0].tracing(), "the seam says not administrator: no trace, whatever the test run is");
+        app.close_file_activity();
+    }
+
+    #[test]
+    fn uac_virtualization_tries_every_process_and_reports_only_the_first_refusal() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, Action::UacVirtualization(vec![A, B]));
+        assert_eq!(said(&app), None, "nothing to say when all go through");
+        assert_eq!(app.recording().requests(), [Request::UacVirtualization(A), Request::UacVirtualization(B)]);
+        app.recording().fail(Request::UacVirtualization(A), "Access is denied.");
+        app.recording().fail(Request::UacVirtualization(B), "Not supported.");
+        app.run_action(&ctx, Action::UacVirtualization(vec![A, B, C]));
+        assert_eq!(said(&app).as_deref(), Some("Access is denied."), "the first refusal only");
+        assert_eq!(app.recording().requests()[2..], [Request::UacVirtualization(A)], "the search stops at the first refusal");
+    }
+
+    /// The actions that say nothing unless they fail: asks the seam for
+    /// exactly `request`, says nothing when it goes through and its error
+    /// when it does not.
+    fn error_only_action(action: Action, request: crate::system_actions::Request) {
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        app.run_action(&ctx, action.clone());
+        assert_eq!(said(&app), None, "nothing to say when it goes through");
+        assert_eq!(app.recording().requests(), [request.clone()]);
+        app.recording().fail(request, "It failed: reason.");
+        app.run_action(&ctx, action);
+        assert_eq!(said(&app).as_deref(), Some("It failed: reason."));
+    }
+
+    #[test]
+    fn bring_to_front_says_only_its_error() {
+        error_only_action(Action::BringToFront(A), crate::system_actions::Request::BringToFront(A));
+    }
+
+    #[test]
+    fn open_file_location_says_only_its_error() {
+        error_only_action(Action::OpenLocation(r"C:\Tools\tool.exe".into()), crate::system_actions::Request::OpenFileLocation(r"C:\Tools\tool.exe".into()));
+    }
+
+    #[test]
+    fn open_power_options_says_only_its_error() {
+        error_only_action(Action::OpenPowerOptions, crate::system_actions::Request::OpenPowerOptions);
+    }
+
+    #[test]
+    fn show_in_file_explorer_says_that_it_could_not_when_it_fails_and_nothing_otherwise() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        let path = std::path::PathBuf::from(r"C:\Tools\tool.dmp");
+        app.run_action(&ctx, Action::ShowInExplorer(path.clone()));
+        assert_eq!(said(&app), None);
+        assert_eq!(app.recording().requests(), [Request::RevealInExplorer(path.clone())]);
+        app.recording().fail(Request::RevealInExplorer(path.clone()), "any");
+        app.run_action(&ctx, Action::ShowInExplorer(path));
+        assert_eq!(said(&app).as_deref(), Some(crate::platform::REVEAL_FAILED));
+    }
+
+    #[test]
+    fn run_new_task_starts_the_trimmed_text_and_says_so_or_says_its_error() {
+        use crate::system_actions::Request;
+        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        let mut app = app_with_three_processes();
+        app.run_dialog = Some("  notepad ".into());
+        let enter = egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        // One frame to take focus, one with Enter.
+        for events in [vec![], vec![enter]] {
+            crate::test_ui::run(&ctx, (800.0, 600.0), events, |ui| app.dialogs(ui.ctx(), &mut Vec::new()));
+        }
+        assert_eq!(app.recording().requests(), [Request::RunNewTask("  notepad ".into())]);
+        assert_eq!(said(&app).as_deref(), Some("Started \"notepad\""));
+        app.recording().fail(Request::RunNewTask("nope".into()), "Windows cannot find 'nope'.");
+        app.run_dialog = Some("nope".into());
+        for events in [vec![], vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]] {
+            crate::test_ui::run(&ctx, (800.0, 600.0), events, |ui| app.dialogs(ui.ctx(), &mut Vec::new()));
+        }
+        assert_eq!(said(&app).as_deref(), Some("Windows cannot find 'nope'."));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_headless_app_never_acts_on_a_real_process() {
+        // A real process that would live for half a minute.
+        let mut child = std::process::Command::new("ping").args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = app_with_three_processes();
+        let pid = child.id();
+        for action in [end(pid, true, true, "ping.exe"), Action::EndMany { pids: vec![pid], force: true, tree: true }, Action::Suspend(vec![pid])] {
+            app.run_action(&ctx, action);
+        }
+        let alive = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(alive, "the headless app ended or acted on a real process");
+        assert_eq!(app.recording().requests().len(), 3, "the requests were recorded instead");
     }
 
     /// An app with svchost.exe (Windows's, PID 900) and tool.exe (PID 901),
@@ -1682,7 +1933,7 @@ mod tests {
         let mut app = with_windows_process(true);
         app.run_action(&ctx, Action::GoToProcess(900));
         assert_eq!(app.page, Page::Core(Core::Summary), "it does not open a table without the process");
-        assert_eq!(app.ask_show_microsoft, Some(900));
+        assert_eq!(app.pages.processes.ask_show_microsoft, Some(900));
         // A modal sizes itself on its first frame and shows on the next.
         let mut draw = || crate::test_ui::texts(&crate::test_ui::run(&ctx, (1200.0, 800.0), vec![], |ui| app.dialogs(ui.ctx(), &mut Vec::new())));
         draw();
@@ -1692,7 +1943,7 @@ mod tests {
         // "Turn it off": the option goes off and Processes shows the process.
         app.show_microsoft_and_go();
         assert!(!app.settings.hide_microsoft);
-        assert_eq!((app.page, app.selected.single(), app.ask_show_microsoft), (Page::Core(Core::Processes), Some(900), None));
+        assert_eq!((app.page, app.pages.processes.selected.single(), app.pages.processes.ask_show_microsoft), (Page::Core(Core::Processes), Some(900), None));
     }
 
     #[test]
@@ -1700,44 +1951,96 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = with_windows_process(true);
         app.run_action(&ctx, Action::GoToProcess(901));
-        assert_eq!((app.page, app.selected.single(), app.ask_show_microsoft), (Page::Core(Core::Processes), Some(901), None), "not Microsoft's");
+        assert_eq!((app.page, app.pages.processes.selected.single(), app.pages.processes.ask_show_microsoft), (Page::Core(Core::Processes), Some(901), None), "not Microsoft's");
         let mut app = with_windows_process(false);
         app.run_action(&ctx, Action::GoToProcess(900));
-        assert_eq!((app.page, app.selected.single(), app.ask_show_microsoft), (Page::Core(Core::Processes), Some(900), None), "the option is off");
+        assert_eq!((app.page, app.pages.processes.selected.single(), app.pages.processes.ask_show_microsoft), (Page::Core(Core::Processes), Some(900), None), "the option is off");
+    }
+
+    /// One frame of the dialogs and what they queue, run as the app does:
+    /// the Processes page takes the finished background jobs here.
+    fn pump_jobs(app: &mut TaskApp) {
+        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        let mut actions = Vec::new();
+        crate::test_ui::run(&ctx, (800.0, 600.0), vec![], |ui| app.dialogs(ui.ctx(), &mut actions));
+        for a in actions {
+            app.run_action(&ctx, a);
+        }
+    }
+
+    /// Frames until the status bar says something (or 10 s pass): the
+    /// finished background jobs are taken on each.
+    fn frames_until_said(app: &mut TaskApp) -> Option<String> {
+        use std::time::{Duration, Instant};
+        let until = Instant::now() + Duration::from_secs(10);
+        while app.message.is_none() && app.pages.processes.dump_question.is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+            pump_jobs(app);
+        }
+        said(app)
     }
 
     #[test]
     fn restarting_explorer_runs_off_the_ui_thread_and_says_how_it_went_on_a_later_frame() {
+        use crate::system_actions::Request;
         use std::time::{Duration, Instant};
-        fn slow(pid: u32) -> Result<(), String> {
-            assert_eq!(pid, 4242);
-            std::thread::sleep(Duration::from_millis(500));
-            Ok(())
-        }
-        fn refused(_: u32) -> Result<(), String> {
-            Err(crate::platform::EXPLORER_NOT_RESTARTED.to_string())
-        }
-        let said = |app: &TaskApp| app.message.as_ref().map(|(m, _)| m.clone());
-        let wait = |app: &mut TaskApp| {
-            let until = Instant::now() + Duration::from_secs(10);
-            while said(app).is_none() && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(20));
-                app.finished_restarts();
-            }
-        };
         let ctx = egui::Context::default();
         let mut app = with_windows_process(false);
         app.message = None;
+        app.recording().delay(Request::RestartExplorer(4242), Duration::from_millis(500));
         let started = Instant::now();
-        app.restart_explorer_with(&ctx, 4242, slow);
+        app.run_action(&ctx, Action::RestartExplorer(4242));
         assert!(started.elapsed() < Duration::from_millis(250), "the UI thread does not wait: {:?}", started.elapsed());
-        assert_eq!(said(&app), None, "nothing to say yet");
-        wait(&mut app);
-        assert_eq!(said(&app).as_deref(), Some("Restarted Windows Explorer"));
+        assert_eq!(app.message, None, "nothing to say yet");
+        assert_eq!(frames_until_said(&mut app).as_deref(), Some("Restarted Windows Explorer"));
+        assert_eq!(app.recording().requests(), [Request::RestartExplorer(4242)]);
+    }
+
+    #[test]
+    fn a_restart_of_explorer_that_could_not_end_or_restart_it_says_why() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        for said in [crate::platform::EXPLORER_NOT_ENDED, crate::platform::EXPLORER_NOT_RESTARTED] {
+            let mut app = with_windows_process(false);
+            app.message = None;
+            app.recording().fail(Request::RestartExplorer(4242), said);
+            app.run_action(&ctx, Action::RestartExplorer(4242));
+            assert_eq!(frames_until_said(&mut app).as_deref(), Some(said));
+        }
+    }
+
+    #[test]
+    fn a_dump_is_written_off_the_ui_thread_then_asks_to_show_the_file() {
+        use crate::system_actions::Request;
+        use std::time::{Duration, Instant};
+        let ctx = egui::Context::default();
+        let mut app = with_windows_process(false);
         app.message = None;
-        app.restart_explorer_with(&ctx, 4242, refused);
-        wait(&mut app);
-        assert_eq!(said(&app).as_deref(), Some(crate::platform::EXPLORER_NOT_RESTARTED));
+        let dir = std::env::temp_dir();
+        let asked = Request::Dump { pid: 4242, name: "Code.exe".into(), dir: dir.clone() };
+        app.recording().delay(asked.clone(), Duration::from_millis(500));
+        let started = Instant::now();
+        app.run_action(&ctx, Action::Dump { pid: 4242, name: "Code.exe".into() });
+        assert!(started.elapsed() < Duration::from_millis(250), "the UI thread does not wait: {:?}", started.elapsed());
+        assert_eq!(app.pages.processes.dump_question, None, "not written yet");
+        frames_until_said(&mut app);
+        assert_eq!(app.pages.processes.dump_question, Some(dir.join("Code.exe-4242.dmp")));
+        assert_eq!(app.message, None);
+        assert_eq!(app.recording().requests(), [asked]);
+    }
+
+    #[test]
+    fn a_dump_that_fails_says_the_dump_failure_text_and_asks_nothing() {
+        use crate::system_actions::Request;
+        let ctx = egui::Context::default();
+        let mut app = with_windows_process(false);
+        app.message = None;
+        let asked = Request::Dump { pid: 4242, name: "Code.exe".into(), dir: std::env::temp_dir() };
+        app.recording().fail(asked.clone(), winsys::DUMP_FAILED);
+        app.run_action(&ctx, Action::Dump { pid: 4242, name: "Code.exe".into() });
+        assert_eq!(frames_until_said(&mut app).as_deref(), Some(winsys::DUMP_FAILED));
+        assert_eq!(app.pages.processes.dump_question, None);
+        assert_eq!(app.recording().requests(), [asked]);
     }
 
     #[test]
@@ -1745,8 +2048,8 @@ mod tests {
         let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
         let mut app = with_windows_process(false);
         let path = std::path::PathBuf::from(r"C:\Temp\TaskManager-tool-901.dmp");
-        app.dump_done(Ok(path.clone()));
-        assert_eq!(app.dump_question, Some(path.clone()));
+        app.pages.processes.dump_done(Ok(path.clone()), &mut Vec::new());
+        assert_eq!(app.pages.processes.dump_question, Some(path.clone()));
         // A modal sizes itself on its first frame and shows on the next.
         let mut draw = || crate::test_ui::texts(&crate::test_ui::run(&ctx, (1200.0, 800.0), vec![], |ui| app.dialogs(ui.ctx(), &mut Vec::new())));
         draw();
@@ -1755,16 +2058,20 @@ mod tests {
         assert_eq!(DUMP_QUESTION, "Show it in File Explorer?");
         // Yes: File Explorer shows the file; No: nothing.
         let mut actions = Vec::new();
-        app.answer_dump(true, &mut actions);
-        assert_eq!((actions, app.dump_question.clone()), (vec![Action::ShowInExplorer(path.clone())], None));
-        app.dump_done(Ok(path));
+        app.pages.processes.answer_dump(true, &mut actions);
+        assert_eq!((actions, app.pages.processes.dump_question.clone()), (vec![Action::ShowInExplorer(path.clone())], None));
+        app.pages.processes.dump_done(Ok(path), &mut Vec::new());
         let mut actions = Vec::new();
-        app.answer_dump(false, &mut actions);
-        assert_eq!((actions, app.dump_question.clone()), (vec![], None));
+        app.pages.processes.answer_dump(false, &mut actions);
+        assert_eq!((actions, app.pages.processes.dump_question.clone()), (vec![], None));
         // A dump Windows refused: the status bar says why, nothing is asked.
-        app.dump_done(Err("Windows could not write the memory dump file.".into()));
+        let mut said = Vec::new();
+        app.pages.processes.dump_done(Err("Windows could not write the memory dump file.".into()), &mut said);
+        for a in said {
+            app.run_action(&ctx, a);
+        }
         assert_eq!(app.message.as_ref().map(|(m, _)| m.as_str()), Some("Windows could not write the memory dump file."));
-        assert_eq!(app.dump_question, None);
+        assert_eq!(app.pages.processes.dump_question, None);
     }
 
     #[test]
@@ -1812,23 +2119,159 @@ mod tests {
         let ctx = egui::Context::default();
         let info = |name: &str| crate::sampler::ServiceInfo { name: name.into(), ..Default::default() };
         let snap = crate::sampler::Snapshot { services: std::sync::Arc::new([(200, vec![info("Winmgmt"), info("Schedule")])].into_iter().collect()), ..Default::default() };
-        let mut app = TaskApp::headless(Settings::default(), snap);
+        let row = |name: &str, pid| crate::system_lists::ServiceRow { name: name.into(), pid, status: "Running".into(), ..Default::default() };
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.script_services(vec![row("Winmgmt", 200), row("Schedule", 200), row("Spooler", 300)]);
+        let mut app = TaskApp::headless(Settings::default(), snap).on_system(fake);
         app.page = Page::Core(Core::Processes);
-        app.search = "chrome".into();
         app.run_action(&ctx, Action::GoToServices { pid: 200, service: None });
         assert_eq!(app.page, Page::Core(Core::Services));
-        assert_eq!(app.svc_selected.as_deref(), Some("Winmgmt"), "its first service selected");
-        assert_eq!(app.search, "200", "filtered to the services of its host");
+        let shown = page_texts(&mut app);
+        assert_eq!(shown.iter().filter(|w| *w == "Winmgmt").count(), 2, "its first service selected: in the list and its panel: {shown:?}");
+        assert!(!shown.iter().any(|w| w == "Spooler"), "filtered to the services of its host: {shown:?}");
         app.run_action(&ctx, Action::GoToServices { pid: 200, service: Some("Schedule".into()) });
-        assert_eq!(app.svc_selected.as_deref(), Some("Schedule"), "a service row's own service");
+        let shown = page_texts(&mut app);
+        assert_eq!(shown.iter().filter(|w| *w == "Schedule").count(), 2, "a service row's own service: {shown:?}");
+        assert_eq!(shown.iter().filter(|w| *w == "Winmgmt").count(), 1, "no longer selected: {shown:?}");
+    }
+
+    #[test]
+    fn services_and_startup_keep_their_selection_while_another_page_is_shown() {
+        let ctx = egui::Context::default();
+        let row = |name: &str, pid| crate::system_lists::ServiceRow { name: name.into(), pid, status: "Running".into(), ..Default::default() };
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.script_services(vec![row("Winmgmt", 200), row("Spooler", 300)]);
+        let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake);
+        app.run_action(&ctx, Action::GoToServices { pid: 200, service: Some("Winmgmt".into()) });
+        app.page = Page::Core(Core::Processes);
+        page_texts(&mut app);
+        app.page = Page::Core(Core::Services);
+        let shown = page_texts(&mut app);
+        assert_eq!(shown.iter().filter(|w| *w == "Winmgmt").count(), 2, "still selected: {shown:?}");
+        assert!(!shown.iter().any(|w| w == "Spooler"), "still filtered: {shown:?}");
+    }
+
+    #[test]
+    fn go_to_services_reads_the_list_through_the_seam() {
+        let row = |name: &str, pid| crate::system_lists::ServiceRow { name: name.into(), pid, status: "Running".into(), ..Default::default() };
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.script_services(vec![row("Winmgmt", 200), row("Spooler", 0)]);
+        let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
+        app.run_action(&egui::Context::default(), Action::GoToServices { pid: 200, service: None });
+        assert_eq!(app.page, Page::Core(Core::Services));
+        assert_eq!(fake.service_reads(), 1);
+        let shown = page_texts(&mut app);
+        assert_eq!(fake.service_reads(), 1, "the page does not read it again");
+        assert!(shown.iter().any(|w| w == "Winmgmt") && !shown.iter().any(|w| w == "Spooler"), "the host's services only: {shown:?}");
+    }
+
+    fn entry(id: &str, name: &str, enabled: bool) -> crate::system_lists::StartupRow {
+        crate::system_lists::StartupRow { id: id.into(), name: name.into(), enabled, ..Default::default() }
+    }
+
+    /// An app on the Startup apps page, over a fake holding `rows`.
+    fn startup_app(rows: Vec<crate::system_lists::StartupRow>) -> (TaskApp, std::sync::Arc<crate::system_lists::fake::FakeSystem>) {
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.script_startup(rows);
+        let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
+        app.page = Page::Core(Core::Startup);
+        app.refresh_now();
+        (app, fake)
+    }
+
+    #[test]
+    fn a_startup_toggle_reports_and_rereads() {
+        let (mut app, fake) = startup_app(vec![entry("run|Steam", "Steam", true)]);
+        let ctx = egui::Context::default();
+        let reads = fake.startup_reads();
+        fake.script_startup(vec![entry("run|Steam", "Steam", false)]);
+        app.run_action(&ctx, Action::Startup("run|Steam".into(), false));
+        assert_eq!(fake.startup_requests(), vec![("run|Steam".to_string(), false)]);
+        assert_eq!(said(&app).as_deref(), Some("Steam disabled"));
+        assert_eq!(fake.startup_reads(), reads + 1, "the list is read again");
+        assert!(page_texts(&mut app).iter().any(|w| w == "0 of 1 startup apps are enabled"), "the reread state is kept");
+        app.run_action(&ctx, Action::Startup("run|Steam".into(), true));
+        assert_eq!(said(&app).as_deref(), Some("Steam enabled"));
+    }
+
+    #[test]
+    fn a_refused_startup_toggle_says_the_error_and_rereads() {
+        let (mut app, fake) = startup_app(vec![entry("run|Steam", "Steam", true)]);
+        fake.fail_startup_toggle("Access denied. Run the app as administrator to change this entry.");
+        let reads = fake.startup_reads();
+        app.run_action(&egui::Context::default(), Action::Startup("run|Steam".into(), false));
+        assert_eq!(said(&app).as_deref(), Some("Access denied. Run the app as administrator to change this entry."));
+        assert_eq!(fake.startup_reads(), reads + 1);
+    }
+
+    #[test]
+    fn a_startup_toggle_targets_the_chosen_entry_after_the_list_changed() {
+        let (mut app, fake) = startup_app(vec![entry("run|Alpha", "Alpha", true), entry("run|Beta", "Beta", true)]);
+        // Between the click and the action the list is read again and a new
+        // entry sorts in front: Beta moves from index 1 to index 2.
+        fake.script_startup(vec![entry("run|Aardvark", "Aardvark", true), entry("run|Alpha", "Alpha", true), entry("run|Beta", "Beta", true)]);
+        app.refresh_now();
+        app.run_action(&egui::Context::default(), Action::Startup("run|Beta".into(), false));
+        assert_eq!(fake.startup_requests(), vec![("run|Beta".to_string(), false)]);
+        assert_eq!(said(&app).as_deref(), Some("Beta disabled"));
+    }
+
+    #[test]
+    fn a_startup_toggle_of_an_entry_that_left_the_list_changes_nothing() {
+        let (mut app, fake) = startup_app(vec![entry("run|Steam", "Steam", true)]);
+        fake.script_startup(vec![]);
+        app.refresh_now();
+        let reads = fake.startup_reads();
+        app.run_action(&egui::Context::default(), Action::Startup("run|Steam".into(), false));
+        assert!(fake.startup_requests().is_empty(), "no entry is toggled");
+        assert_eq!(said(&app).as_deref(), Some("That startup app is no longer in the list"));
+        assert_eq!(fake.startup_reads(), reads + 1, "the list is read again");
+    }
+
+    #[test]
+    fn the_sidebar_reads_the_startup_list_through_the_seam() {
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.script_startup(vec![entry("run|Steam", "Steam", true)]);
+        let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
+        app.refresh_now();
+        assert_eq!(fake.startup_reads(), 0, "refresh on another page reads no startup list");
+        app.page = Page::Core(Core::Startup);
+        app.refresh_now();
+        assert_eq!(fake.startup_reads(), 1);
+        assert!(page_texts(&mut app).iter().any(|w| w == "1 of 1 startup apps is enabled"), "the list is the one read");
+    }
+
+    #[test]
+    fn a_service_control_reports_and_rereads_through_the_seam() {
+        let ctx = egui::Context::default();
+        for (what, said_text) in [("start", "Started Spooler"), ("stop", "Stopped Spooler"), ("restart", "Restarted Spooler")] {
+            let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+            let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
+            app.run_action(&ctx, Action::Service("Spooler".into(), what));
+            assert_eq!(fake.service_requests(), vec![("Spooler".to_string(), what.to_string())]);
+            assert_eq!(said(&app).as_deref(), Some(said_text));
+            assert_eq!(fake.service_reads(), 1, "{what} rereads the list");
+        }
+    }
+
+    #[test]
+    fn a_failed_service_control_says_the_error_and_still_rereads() {
+        let reason = "Access denied for \"Spooler\". Run the app as administrator to change services.";
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        fake.fail_service_control(reason);
+        let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
+        app.run_action(&egui::Context::default(), Action::Service("Spooler".into(), "stop"));
+        assert_eq!(fake.service_requests().len(), 1);
+        assert_eq!(said(&app).as_deref(), Some(reason));
+        assert_eq!(fake.service_reads(), 1);
     }
 
     #[test]
     fn the_app_names_no_addon() {
         let sources = [
             ("app.rs", include_str!("app.rs")),
-            ("pages.rs", include_str!("pages.rs")),
-            ("pages2.rs", include_str!("pages2.rs")),
+            ("page_colors.rs", include_str!("page_colors.rs")),
+            ("page_settings.rs", include_str!("page_settings.rs")),
             ("platform.rs", include_str!("platform.rs")),
             ("widgets.rs", include_str!("widgets.rs")),
             ("settings.rs", include_str!("settings.rs")),
@@ -1875,7 +2318,8 @@ mod tests {
     /// The process names the Processes table draws.
     fn table_names(app: &mut TaskApp) -> Vec<String> {
         let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
-        let out = crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new()));
+        app.page = Page::Core(Core::Processes);
+        let out = crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| app.draw_page(ui, &mut Vec::new()));
         crate::test_ui::texts(&out).into_iter().filter(|t| t.ends_with(".exe")).collect()
     }
 
@@ -1897,5 +2341,165 @@ mod tests {
         feed.send(one(4, "running.exe")).expect("sent");
         app.pull_samples();
         assert_eq!(table_names(&mut app), ["running.exe"], "running again, samples reach the table");
+    }
+
+    /// The texts the page shown draws, through the app's dispatch.
+    fn page_texts(app: &mut TaskApp) -> Vec<String> {
+        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        crate::test_ui::texts(&crate::test_ui::run(&ctx, (1400.0, 900.0), vec![], |ui| app.draw_page(ui, &mut Vec::new())))
+    }
+
+    #[test]
+    fn settings_and_colors_are_drawn_for_their_pages() {
+        let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
+        app.page = Page::Core(Core::Settings);
+        let words = page_texts(&mut app);
+        for w in ["Settings", "Real-time update speed", "Add-ons"] {
+            assert!(words.iter().any(|x| x == w), "{w:?} in {words:?}");
+        }
+        app.page = Page::Core(Core::Colors);
+        let words = page_texts(&mut app);
+        assert!(words.iter().any(|x| x == "The default palette"), "{words:?}");
+    }
+
+    #[test]
+    fn settings_changed_by_a_page_reach_the_sampler() {
+        let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
+        let paused = SPEEDS.len() - 1;
+        let mut new = Settings::default();
+        new.speed = paused;
+        app.adopt_settings(new);
+        assert_eq!(app.settings.speed, paused);
+        assert_eq!(app.sampler.interval_ms.load(Ordering::Relaxed), 0, "Paused stops the sampler");
+        let mut normal = Settings::default();
+        normal.speed = 1;
+        app.adopt_settings(normal);
+        assert_eq!(app.sampler.interval_ms.load(Ordering::Relaxed), SPEEDS[1].1 as u64);
+    }
+
+    #[test]
+    fn system_info_is_drawn_for_its_page_under_the_standard_header() {
+        let snap = Snapshot { cpu_per_core: vec![0.0; 4], ..Default::default() };
+        let mut app = TaskApp::headless(Settings::default(), snap);
+        app.page = Page::Core(Core::SystemInfo);
+        let texts = page_texts(&mut app);
+        assert!(texts.iter().any(|t| t == "System Info"), "its title: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Logical processors"), "its cards: {texts:?}");
+        assert!(texts.iter().any(|t| t.trim() == "Refresh"), "the header's Refresh: {texts:?}");
+    }
+
+    #[test]
+    fn summary_is_drawn_for_its_page_under_the_standard_header_and_follows_each_new_sample() {
+        let (mut app, feed) = TaskApp::fed(Settings::default(), Snapshot::default());
+        app.page = Page::Core(Core::Summary);
+        feed.send(Snapshot { seq: 1, cpu_total: 42.0, ..Default::default() }).expect("sent");
+        app.pull_samples();
+        let texts = page_texts(&mut app);
+        assert!(texts.iter().any(|t| t == "Summary"), "its title: {texts:?}");
+        assert!(texts.iter().any(|t| t == "42%"), "the new sample is on its cards: {texts:?}");
+        assert!(texts.iter().any(|t| t.trim() == "Refresh"), "the header's Refresh: {texts:?}");
+    }
+
+    #[test]
+    fn users_is_drawn_for_its_page_from_the_latest_snapshot() {
+        let mut app = app_with_three_processes();
+        app.page = Page::Core(Core::Users);
+        let texts = page_texts(&mut app);
+        assert!(texts.iter().any(|t| t == "Users"), "its title: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Only System is running processes"), "its band: {texts:?}");
+    }
+
+    #[test]
+    fn refresh_on_a_moved_page_still_asks_the_sampler_for_a_sample() {
+        for core in [Core::SystemInfo, Core::Users, Core::Performance, Core::Services, Core::Startup, Core::AppHistory] {
+            let mut app = app_with_three_processes();
+            app.page = Page::Core(core);
+            app.refresh_now();
+            assert!(refreshed(&app), "{core:?}");
+        }
+    }
+
+    #[test]
+    fn f5_on_services_rereads_the_list() {
+        let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+        let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
+        app.page = Page::Core(Core::Services);
+        page_texts(&mut app);
+        app.refresh_now();
+        assert_eq!(fake.service_reads(), 2);
+    }
+
+    #[test]
+    fn f5_on_startup_rereads_the_list() {
+        let (mut app, fake) = startup_app(vec![entry("a", "Steam", true)]);
+        page_texts(&mut app);
+        fake.script_startup(vec![entry("a", "Steam", true), entry("b", "Discord", true)]);
+        app.refresh_now();
+        assert_eq!(fake.startup_reads(), 2);
+        let shown = page_texts(&mut app);
+        assert!(shown.iter().any(|w| w == "2 of 2 startup apps are enabled"), "{shown:?}");
+    }
+
+    #[test]
+    fn app_history_counts_from_the_second_sample_and_not_while_paused() {
+        let busy = |name: &str, forced| {
+            let p = crate::sampler::ProcRow { name: name.into(), cpu: 100.0, disk_read: 50e6, ..Default::default() };
+            Snapshot { procs: vec![p], cpu_per_core: vec![0.0; 2], forced, ..Default::default() }
+        };
+        let (mut app, feed) = TaskApp::fed(Settings::default(), Snapshot::default());
+        app.page = Page::Core(Core::AppHistory);
+        feed.send(busy("first.exe", false)).expect("sent");
+        app.pull_samples();
+        assert!(!page_texts(&mut app).iter().any(|w| w == "first.exe"), "the first sample counts nothing");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        feed.send(busy("first.exe", false)).expect("sent");
+        app.pull_samples();
+        assert!(page_texts(&mut app).iter().any(|w| w == "first.exe"), "the next one counts the time since it");
+        app.settings.speed = SPEEDS.iter().position(|s| s.1 == 0).expect("a Paused speed");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        feed.send(busy("late.exe", false)).expect("sent");
+        app.pull_samples();
+        assert!(!page_texts(&mut app).iter().any(|w| w == "late.exe"), "paused, nothing is counted");
+    }
+
+    #[test]
+    fn performance_is_drawn_for_its_page_with_its_own_header() {
+        let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
+        app.page = Page::Core(Core::Performance);
+        let texts = page_texts(&mut app);
+        assert!(texts.iter().any(|t| t == "Performance"), "its title: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Memory"), "its device list: {texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("Run new task")), "no standard header: {texts:?}");
+    }
+
+    #[test]
+    fn the_device_chosen_on_performance_is_saved_in_the_settings() {
+        let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
+        app.run_action(&egui::Context::default(), Action::PerfSetting(crate::page_perf::PerfSetting::Device("memory".into())));
+        assert_eq!(app.settings.perf_device, "memory");
+    }
+
+    #[test]
+    fn the_refresh_button_of_performance_asks_the_sampler_for_a_sample() {
+        let mut app = TaskApp::headless(Settings::default(), Snapshot::default());
+        app.run_action(&egui::Context::default(), Action::Refresh);
+        assert!(refreshed(&app));
+    }
+
+    #[test]
+    fn pausing_freezes_the_performance_history_and_refresh_still_adds_a_point() {
+        let (mut app, feed) = TaskApp::fed(Settings::default(), Snapshot::default());
+        let points = |app: &TaskApp| app.ph.get("cpu").map_or(0, |h| h.len());
+        feed.send(Snapshot::default()).expect("sent");
+        app.pull_samples();
+        let running = points(&app);
+        assert!(running > 0, "a running sample adds a point");
+        app.settings.speed = SPEEDS.iter().position(|s| s.1 == 0).expect("a Paused speed");
+        feed.send(Snapshot::default()).expect("sent");
+        app.pull_samples();
+        assert_eq!(points(&app), running, "paused, the history stays");
+        feed.send(Snapshot { forced: true, ..Default::default() }).expect("sent");
+        app.pull_samples();
+        assert_eq!(points(&app), running + 1, "Refresh still adds a point");
     }
 }

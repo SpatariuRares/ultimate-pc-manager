@@ -43,7 +43,8 @@ pub enum Action {
     SearchOnline(String),
     Copy(String),
     Service(String, &'static str),
-    Startup(usize, bool),
+    /// Enable or disable a startup entry, named by its stable id.
+    Startup(String, bool),
     /// A short message in the status bar.
     Say(String),
     /// Opens Windows' Power Options (the app never changes the plan).
@@ -86,7 +87,7 @@ pub enum Action {
     Efficiency(Vec<u32>),
     /// An item of the Processes page's Process View, also the View
     /// submenu of a process's menu.
-    ProcessView(crate::pages::ProcView),
+    ProcessView(crate::page_processes::ProcView),
     /// Restart on the shell's Windows Explorer (the process of this PID):
     /// ends it and starts explorer.exe again.
     RestartExplorer(u32),
@@ -104,6 +105,8 @@ pub enum Action {
     /// "Restart as Administrator": starts this app again elevated (UAC
     /// asks) on Processes and closes this window; a refusal is said.
     RestartAsAdministrator,
+    /// A change of the settings the Processes page asks for.
+    Processes(crate::page_processes::ProcessesChange),
     /// Create memory dump file: a full dump of the process `pid` (named
     /// `name`) goes to the temp folder, off the UI thread; once written the
     /// app asks "Show it in File Explorer?".
@@ -117,6 +120,16 @@ pub enum Action {
     /// that records sensors for other pages (see
     /// [`crate::addons::AddonHost::record_sensors`]); nothing when it is off.
     RecordSensors(bool),
+    /// Settings or Colors changed settings: the app keeps these, saves
+    /// them and acts on what changed (the sampler's interval, the
+    /// signatures Hide Microsoft Services and Processes needs).
+    ChangeSettings(crate::settings::SettingsChange),
+    /// Settings › Add-ons: turns the add-on on or off and saves the choice.
+    SetAddon(&'static str, bool),
+    /// Refresh now (the Refresh button of a page that draws its own header).
+    Refresh,
+    /// A choice Performance saves (see [`crate::page_perf::PerfSetting`]).
+    PerfSetting(crate::page_perf::PerfSetting),
 }
 
 /// Said when Restart ends Windows Explorer but explorer.exe does not start

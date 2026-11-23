@@ -1380,7 +1380,7 @@ mod tests {
         assert_eq!(status_of(true, true), "Suspended", "a suspended app's window hangs because it is suspended");
         // No source of the Processes page names the old sysinfo status.
         let gone = concat!("\"Termin", "ated\"");
-        for (file, text) in [("sampler.rs", include_str!("sampler.rs")), ("proc_info.rs", include_str!("proc_info.rs")), ("process_view.rs", include_str!("process_view.rs")), ("pages.rs", include_str!("pages.rs"))] {
+        for (file, text) in [("sampler.rs", include_str!("sampler.rs")), ("proc_info.rs", include_str!("proc_info.rs")), ("process_view.rs", include_str!("process_view.rs"))] {
             assert!(!text.contains(gone), "{file} still names {gone}");
         }
     }

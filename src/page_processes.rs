@@ -1,98 +1,201 @@
-//! Summary, Processes, System Info and Users pages.
+//! The Processes page as a module (see [`crate::core_page`]): the table, its
+//! selection, search and view, the questions it asks before ending or
+//! lowering a process, the memory dumps and Explorer restarts it waits for,
+//! and the Inspector, Analyze wait chain and File activity windows. What
+//! changes the app (a status message, a setting, another page) is queued as
+//! an [`Action`]; the app's handler runs it and calls back the methods of
+//! [`ProcessesPage`] that open a window or move the selection.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
-use egui::{vec2, Align, Color32, Layout, RichText, Sense, Ui};
+use egui::{vec2, Align, Layout, RichText, Sense, Ui};
 use egui_extras::Column;
 
-use crate::app::{status_parts, Action, ProcCol, TaskApp};
-use crate::settings::SPEEDS;
+use crate::addons::{AddonHost, Core, ProcessColumn};
+use crate::app::{Action, ProcCol};
+use crate::core_page::{CorePage, PageCtx, SampleSlot};
 use crate::page_perf::fmt_bytes_rate;
-use crate::platform::PageContext;
-use crate::process_view::{self, figure_of, percent, Chevron, FileTexts, Figures, Line, Pick, ProcessLine, Selection, Totals, ViewOptions};
+use crate::process_view::{self, figure_of, percent, Chevron, FileTexts, Figures, Follow, Line, Pick, ProcessLine, Selection, Totals, ViewOptions, ViewState};
 use crate::sampler::ProcRow;
-use crate::summary_view::Metric;
+use crate::settings::{Settings, SPEEDS};
+use crate::signature::Signatures;
+use crate::system_actions::SystemActions;
 use crate::theme::{self, Theme};
 use crate::widgets::parts::{self, cell_text, BandArea, CellInk, Mark, SidePanel, StatusBand, TABLE_ROW_HEIGHT};
 use crate::widgets::*;
 
-impl TaskApp {
-    pub fn page_summary(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        self.header(ui, "Summary");
-        let t = self.settings.theme();
-        // Drawn from the view built once per sample (see `summary_view`),
-        // taken out while drawing (not copied) and put back after.
-        self.read_summary_sensors();
-        self.summary_view();
-        let view = std::mem::take(&mut self.summary);
-        let colour = |m: Metric| match m {
-            Metric::Cpu => rgb(self.settings.cpu_color),
-            Metric::Memory => rgb(self.settings.mem_color),
-            Metric::Disk => rgb(self.settings.disk_color),
-            Metric::Network => rgb(self.settings.net_color),
-        };
-        let cards = view.cards().map(|c| (c, colour(c.metric)));
-        let band = &view.band;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            StatusBand::new(Mark::Dot(health_colour(&t, band.paused, band.providers)), &band.headline).sub(&band.sub).actions_width(0.0).show(ui, |_, _| {});
-            ui.add_space(14.0);
-            // The graphs on the left, the busiest processes beside them (under
-            // them in a narrow window), as on board P01.
-            let gap = 16.0;
-            let wide = ui.available_width() >= 900.0;
-            let aside = if wide { SUMMARY_ASIDE } else { ui.available_width() };
-            let main = if wide { ui.available_width() - aside - gap } else { ui.available_width() };
-            let graphs = |ui: &mut Ui| {
-                ui.set_width(main);
-                let w = ((main - 14.0) / 2.0).max(200.0);
-                for pair in cards.chunks(2) {
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = 14.0;
-                        for (c, color) in pair {
-                            card(ui, c.metric.title(), c.value_text(), *color, w, |ui| {
-                                ui.label(RichText::new(c.sub_text()).font(t.fonts.label.clone()).color(t.label));
-                                if c.metric == Metric::Cpu {
-                                    cpu_overview(ui, &t, &view, *color);
-                                } else {
-                                    graph(ui, vec2(ui.available_width(), 96.0), &c.history, c.max, *color);
-                                }
-                                if c.metric == Metric::Memory {
-                                    // "Available X · Cached Y · Swap Z".
-                                    ui.label(RichText::new(&view.memory_footer).font(t.fonts.label.clone()).color(t.label));
-                                }
-                            });
-                        }
-                    });
-                    ui.add_space(14.0);
-                }
-            };
-            if wide {
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = gap;
-                    ui.vertical(graphs);
-                    ui.vertical(|ui| top_processes(ui, &t, aside, &view.top));
-                });
-            } else {
-                ui.vertical(graphs);
-                top_processes(ui, &t, aside, &view.top);
-            }
-            // Summary's tiles, then the add-ons' after them.
-            crate::summary_tiles::tile_row(ui, &view.tiles);
-            let mut page = PageContext::new(&self.settings, &self.snap);
-            self.addons.summary_tiles(ui, &mut page);
-            actions.append(&mut page.actions);
-        });
-        self.summary = view;
+/// Shown when "Go to the process" targets one that Hide Microsoft Services
+/// and Processes keeps out of the table.
+pub const SHOW_MICROSOFT_QUESTION: &str = "Processes does not list this process while Hide Microsoft Services and Processes is on. Turn it off?";
+
+/// Asked once a memory dump is written.
+pub const DUMP_QUESTION: &str = "Show it in File Explorer?";
+
+/// What Processes reads that the app owns: the program signatures, the
+/// Processes columns of the add-ons that are on, and what the app asks of
+/// the system (the menu reads priority and affinity through it).
+#[derive(Clone, Copy)]
+pub struct ProcessInputs<'a> {
+    pub signatures: &'a Signatures,
+    pub columns: &'a dyn ProcessColumns,
+    pub system: &'a dyn SystemActions,
+}
+
+impl<'a> ProcessInputs<'a> {
+    /// Inputs without add-on columns (a new sample, a refresh, the windows).
+    pub fn new(signatures: &'a Signatures, system: &'a dyn SystemActions) -> Self {
+        ProcessInputs { signatures, columns: &NoColumns, system }
     }
 
-    pub fn page_processes(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+    /// The same with the add-ons' columns (the page being drawn).
+    pub fn with_columns(self, columns: &'a dyn ProcessColumns) -> Self {
+        ProcessInputs { columns, ..self }
+    }
+}
+
+/// The Processes columns the add-ons that are on add, and their figures.
+pub trait ProcessColumns {
+    /// The columns, by add-on id, in registry order.
+    fn columns(&self) -> Vec<(&'static str, ProcessColumn)>;
+    /// The figures of the column of add-on `id`, which is drawn in this frame.
+    fn figures(&self, id: &str, settings: &Settings) -> Option<HashMap<u32, usize>>;
+}
+
+/// No add-on adds a column.
+pub struct NoColumns;
+
+impl ProcessColumns for NoColumns {
+    fn columns(&self) -> Vec<(&'static str, ProcessColumn)> {
+        Vec::new()
+    }
+    fn figures(&self, _: &str, _: &Settings) -> Option<HashMap<u32, usize>> {
+        None
+    }
+}
+
+/// The add-on host, behind a cell because reading a column marks it as drawn.
+impl<H: std::ops::DerefMut<Target = AddonHost>> ProcessColumns for std::cell::RefCell<H> {
+    fn columns(&self) -> Vec<(&'static str, ProcessColumn)> {
+        self.borrow_mut().process_columns()
+    }
+    fn figures(&self, id: &str, settings: &Settings) -> Option<HashMap<u32, usize>> {
+        self.borrow_mut().process_figures(id, settings)
+    }
+}
+
+/// A host a test owns.
+#[cfg(test)]
+impl ProcessColumns for std::cell::RefCell<AddonHost> {
+    fn columns(&self) -> Vec<(&'static str, ProcessColumn)> {
+        self.borrow_mut().process_columns()
+    }
+    fn figures(&self, id: &str, settings: &Settings) -> Option<HashMap<u32, usize>> {
+        self.borrow_mut().process_figures(id, settings)
+    }
+}
+
+/// A change of the settings the Processes page asks for; the app saves it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProcessesChange {
+    /// The table's layout as the user left it (columns, widths, sort).
+    Table(crate::settings::ProcessTable),
+    /// The Process Inspector window's width as resized.
+    InspectorWidth(f32),
+    /// The File activity window's width as resized.
+    FileActivityWidth(f32),
+    /// "Don't ask again" on the Efficiency mode question.
+    EfficiencyAskOff,
+    /// "Turn off" on the question asked for a hidden process: the option
+    /// goes off and Processes shows the process asked for.
+    ShowMicrosoft,
+}
+
+/// The Processes page: the fields that were the app's.
+#[derive(Default)]
+pub struct ProcessesPage {
+    /// What the filter box holds.
+    pub search: String,
+    /// The process rows selected (Ctrl and Shift add rows).
+    pub selected: Selection,
+    /// The page scrolls to the selected process once (after "Go to the
+    /// process" or type-ahead).
+    pub reveal_selected: bool,
+    /// Follow process: the process kept selected and in view.
+    pub following: Option<Follow>,
+    /// Which tree rows are open and which groups are folded.
+    pub view: ViewState,
+    pub confirm_end: Option<EndAsk>,
+    /// Efficiency mode's question, open while it waits for an answer.
+    pub confirm_efficiency: Option<EfficiencyAsk>,
+    /// The processes Set priority > Realtime waits to change while its
+    /// question is open.
+    pub confirm_realtime: Option<Vec<u32>>,
+    /// The process another page went to while "Hide Microsoft Services and
+    /// Processes" hides it: asks whether to turn the option off.
+    pub ask_show_microsoft: Option<u32>,
+    /// The memory dump file just written, while [`DUMP_QUESTION`] waits.
+    pub dump_question: Option<std::path::PathBuf>,
+    /// The memory dumps being written off the UI thread, each sending the
+    /// file written or why Windows refused.
+    dumps: Vec<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
+    /// Restarts of Windows Explorer running off the UI thread.
+    explorer_restarts: Vec<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// Each program file's description, read off the UI thread.
+    descriptions: crate::version_info::Descriptions,
+    /// The open Process Inspector windows, one per process.
+    pub inspectors: Vec<crate::inspector::Inspector>,
+    /// The open Analyze wait chain windows, one per process.
+    pub wait_chains: Vec<crate::wait_chain::WaitChain>,
+    /// The open File activity windows, one per process; each holds its
+    /// trace, stopped when the window goes.
+    pub file_activity: Vec<crate::file_activity::FileActivity>,
+}
+
+/// The processes Settings keeps out of the table now.
+fn hide_of(ctx: &PageCtx) -> process_view::Hide {
+    process_view::Hide::new(ctx.settings, std::process::id(), ctx.processes.signatures.microsoft())
+}
+
+/// What the "Process View" menu lists now, top to bottom.
+pub fn process_view_items(settings: &Settings) -> Vec<parts::DropItem<ProcView>> {
+    let tree = settings.process_tree;
+    let item = |id, label, checked, enabled| parts::DropItem::Item { id, label, checked, enabled };
+    vec![
+        item(ProcView::Tree, "Process tree", Some(tree), true),
+        item(ProcView::Smooth, "Smooth CPU readings", Some(settings.smooth_cpu), true),
+        item(ProcView::ShowExited, "Show exited processes", Some(settings.show_exited), true),
+        parts::DropItem::Separator,
+        item(ProcView::ExpandAll, "Expand all", None, tree),
+        item(ProcView::CollapseAll, "Collapse all", None, tree),
+    ]
+}
+
+impl CorePage for ProcessesPage {
+    fn sample_slot(&self) -> SampleSlot {
+        SampleSlot::ProcessTracking
+    }
+
+    /// The view notices the processes that ended (it keeps them a moment;
+    /// the sampler does not).
+    fn on_sample(&mut self, ctx: &PageCtx) {
+        self.view.track(&ctx.snapshot.procs, std::time::Instant::now(), ctx.settings.show_exited);
+    }
+
+    /// Draws with the add-ons' Processes columns, read through the host.
+    fn draw_with_addons(&mut self, ui: &mut Ui, ctx: &PageCtx, host: &mut AddonHost, actions: &mut Vec<Action>) {
+        let columns = std::cell::RefCell::new(host);
+        let ctx = PageCtx { processes: ctx.processes.with_columns(&columns), ..*ctx };
+        self.draw(ui, &ctx, actions);
+    }
+
+    fn draw(&mut self, ui: &mut Ui, ctx: &PageCtx, actions: &mut Vec<Action>) {
         let t = theme::of_ui(ui);
         // The header: Process View ⌄, the filter, Refresh. Run new task
         // sits under File (Ctrl+N).
         let (mut refresh, mut view) = (false, None);
-        let view_items = self.process_view_items();
+        let view_items = process_view_items(ctx.settings);
         ui.horizontal(|ui| {
-            self.page_title(ui, "Processes");
+            crate::core_page::page_title(ui, Core::Processes.id(), "Processes");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 refresh = refresh_button(ui).clicked();
                 crate::widgets::search_field(ui, &mut self.search, "Filter by name, user, or PID", 300.0);
@@ -100,66 +203,66 @@ impl TaskApp {
             });
         });
         if refresh {
-            self.refresh_now();
+            actions.push(Action::Refresh);
         }
         if let Some(item) = view {
-            self.apply_process_view(item);
+            actions.push(Action::ProcessView(item));
         }
         ui.add_space(10.0);
 
         // Follow process: the followed row stays the one selected, its tree
         // open; following ends with the process.
         if let Some(pid) = self.following.as_ref().map(|f| f.pid) {
-            if self.snap.procs.iter().any(|p| p.pid == pid) {
+            if ctx.snapshot.procs.iter().any(|p| p.pid == pid) {
                 self.selected = Selection::only(pid);
-                self.proc_view.reveal(&self.snap.procs, pid);
+                self.view.reveal(&ctx.snapshot.procs, pid);
             } else {
                 self.following = None;
             }
         }
         // "Go to the process": open the rows above it first.
         if let (true, Some(pid)) = (self.reveal_selected, self.selected.single()) {
-            self.proc_view.reveal(&self.snap.procs, pid);
+            self.view.reveal(&ctx.snapshot.procs, pid);
         }
         let q = self.search.trim().to_lowercase();
         // The standard columns, then those of the add-ons that are on;
         // the ones shown, in the user's order. An add-on's column is read
         // only while it shows.
-        let extra = self.addons.process_columns();
+        let extra = ctx.processes.columns.columns();
         let cols = columns_with(&extra);
-        let shown: Vec<Placed> = layout_of(&cols, &self.settings.process_table).into_iter().filter(|p| p.shown).collect();
+        let shown: Vec<Placed> = layout_of(&cols, &ctx.settings.process_table).into_iter().filter(|p| p.shown).collect();
         let mut figures = Figures::new();
         for p in &shown {
             if let ProcCol::Addon(id) = p.col {
-                if let Some(by_pid) = self.addons.process_figures(id, &self.settings) {
+                if let Some(by_pid) = ctx.processes.columns.figures(id, ctx.settings) {
                     figures.insert(id, by_pid);
                 }
             }
         }
-        let files = self.file_texts(&shown);
-        let sort = proc_sort_in(&cols, &self.settings.process_table);
+        let files = self.file_texts(ctx, &shown);
+        let sort = proc_sort_in(&cols, &ctx.settings.process_table);
         let opts = ViewOptions {
-            tree: self.settings.process_tree,
+            tree: ctx.settings.process_tree,
             filter: self.search.clone(),
             sort,
             figures,
             files,
-            show_exited: self.settings.show_exited,
-            hide: self.hide(),
-            smooth: self.settings.smooth_cpu,
-            highlight: self.settings.highlight_updates,
+            show_exited: ctx.settings.show_exited,
+            hide: hide_of(ctx),
+            smooth: ctx.settings.smooth_cpu,
+            highlight: ctx.settings.highlight_updates,
             now: std::time::Instant::now(),
-            services: self.snap.services.clone(),
+            services: ctx.snapshot.services.clone(),
         };
-        let mut view = process_view::view(&self.snap.procs, &opts, &self.proc_view);
+        let mut view = process_view::view(&ctx.snapshot.procs, &opts, &self.view);
         // Right and Left open and close the selected tree row (not while
         // the filter box has the keys).
         let keys_free = !ui.memory(|m| m.focused().is_some());
         if let (Some(pid), true) = (self.selected.single(), keys_free) {
             let (left, right) = ui.input(|i| (i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight)));
             if left || right {
-                self.proc_view.open(&view, pid, right);
-                view = process_view::view(&self.snap.procs, &opts, &self.proc_view);
+                self.view.open(&view, pid, right);
+                view = process_view::view(&ctx.snapshot.procs, &opts, &self.view);
             }
         }
         if keys_free {
@@ -170,14 +273,14 @@ impl TaskApp {
                 (typed, i.time)
             });
             if !typed.is_empty() {
-                if let Some(pid) = self.proc_view.type_ahead.key(&view, &typed, now) {
+                if let Some(pid) = self.view.type_ahead.key(&view, &typed, now) {
                     self.selected = Selection::only(pid);
                     self.reveal_selected = true;
                 }
             }
             // Delete = End task, after asking.
             if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
-                let ask = EndAsk::task(&rows_of(&self.snap.procs, &self.selected));
+                let ask = EndAsk::task(&rows_of(&ctx.snapshot.procs, &self.selected));
                 if ask.is_some() {
                     self.confirm_end = ask;
                 }
@@ -191,7 +294,7 @@ impl TaskApp {
         let figures = &opts.figures;
         let files = &opts.files;
 
-        let s = &self.snap;
+        let s = ctx.snapshot;
         let band = ProcessesBand::of(&s.procs, view.shown, &q);
         let load = format!(
             "CPU {:.0}% \u{b7} Memory {:.0}% \u{b7} Disk {:.1} MB/s",
@@ -239,7 +342,7 @@ impl TaskApp {
             })
             .collect();
         // Resource values ▸ Percents: figures as a share of the machine's.
-        let percents = self.settings.process_percents;
+        let percents = ctx.settings.process_percents;
         let totals = Totals { mem: s.mem_total, disk_read: s.disk_read_bps, disk_write: s.disk_write_bps };
         // The items the add-ons' columns add to a process's menu.
         let links: Vec<(&'static str, &'static str)> = extra.iter().map(|(id, c)| (*id, c.menu_item)).collect();
@@ -251,7 +354,8 @@ impl TaskApp {
             }
         }
         let following = self.following.as_ref().map(|f| f.pid);
-        let services = self.snap.services.clone();
+        let services = ctx.snapshot.services.clone();
+        let system = ctx.processes.system;
         let mut new_sort = None;
         let mut new_sel = None;
         let mut service_sel = None;
@@ -265,13 +369,13 @@ impl TaskApp {
         // selected processes that still run.
         let chosen = match selected.service_line(&view) {
             Some(l) => vec![&l.row],
-            None => rows_of(&self.snap.procs, &selected),
+            None => rows_of(&ctx.snapshot.procs, &selected),
         };
         // Each header cell's width as drawn (the table keeps the widths
         // to itself), its span, and a header dragged onto another.
         let mut drawn: Vec<(ProcCol, f32, egui::Rangef)> = Vec::new();
         let mut dropped: Option<(ProcCol, f32)> = None;
-        let mut table_layout = self.settings.process_table.clone();
+        let mut table_layout = ctx.settings.process_table.clone();
         // A changed set of columns starts from the saved widths.
         let keys: Vec<ProcCol> = shown.iter().map(|p| p.col).collect();
         let keys_id = egui::Id::new("processes-columns-drawn");
@@ -279,7 +383,7 @@ impl TaskApp {
         ui.data_mut(|d| d.insert_temp(keys_id, keys));
         // The table's toolbar: the column chooser, then (marked additions)
         // Pause, the app's update speed and Export to CSV.
-        let paused = self.settings.interval_ms() == 0;
+        let paused = ctx.settings.interval_ms() == 0;
         let mut speed = None;
         let mut export = false;
         ui.horizontal(|ui| {
@@ -287,10 +391,10 @@ impl TaskApp {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 export = parts::link_button(ui, "Export to CSV").clicked();
                 ui.add_space(12.0);
-                let now = SPEEDS.get(self.settings.speed).map_or("", |s| s.0);
+                let now = SPEEDS.get(ctx.settings.speed).map_or("", |s| s.0);
                 egui::ComboBox::from_id_salt("processes-speed").selected_text(now).width(150.0).show_ui(ui, |ui| {
                     for (i, (label, ms)) in SPEEDS.iter().enumerate() {
-                        if *ms != 0 && ui.selectable_label(self.settings.speed == i, *label).clicked() {
+                        if *ms != 0 && ui.selectable_label(ctx.settings.speed == i, *label).clicked() {
                             speed = Some(i);
                         }
                     }
@@ -444,11 +548,12 @@ impl TaskApp {
                                     view: &view_items,
                                     priority: None,
                                     affinity: None,
-                                    shell: crate::winsys::shell_pid(),
+                                    shell: None,
                                     following,
                                     services: Some(&*services),
                                     windowed: None,
                                 };
+                                let state = crate::widgets::read_menu_state(system, p, &rows, &state);
                                 process_menu(ui, p, &rows, &state, actions);
                             });
                         });
@@ -463,7 +568,7 @@ impl TaskApp {
         ui.add_space(12.0);
         let mut end = None;
         ui.allocate_ui(vec2(width, detail_h), |ui| {
-            if process_details(ui, &t, &chosen, &self.snap.procs) {
+            if process_details(ui, &t, &chosen, &ctx.snapshot.procs) {
                 end = EndAsk::task(&chosen);
             }
         });
@@ -484,7 +589,9 @@ impl TaskApp {
             let now = if sort.0 == c { (c, !sort.1) } else { (c, starts_descending(c)) };
             set_proc_sort_in(&cols, &mut table_layout, now);
         }
-        self.settings.process_table = table_layout;
+        if table_layout != ctx.settings.process_table {
+            actions.push(Action::Processes(ProcessesChange::Table(table_layout)));
+        }
         if let Some((pid, pick)) = new_sel {
             self.selected.click(&view, pid, pick);
             // Picking another row stops following.
@@ -498,13 +605,13 @@ impl TaskApp {
         }
         if let Some((pid, open)) = toggle_row {
             if open {
-                self.proc_view.expanded.insert(pid);
+                self.view.expanded.insert(pid);
             } else {
-                self.proc_view.expanded.remove(&pid);
+                self.view.expanded.remove(&pid);
             }
         }
         if let Some(g) = toggle_group {
-            self.proc_view.toggle_group(g);
+            self.view.toggle_group(g);
         }
         // "Force quit" and "End process tree" ask first: move them into the
         // confirmation dialog.
@@ -533,7 +640,7 @@ impl TaskApp {
         }
         // Efficiency mode asks first while "Ask before applying Efficiency
         // mode" is on.
-        if self.settings.ask_efficiency {
+        if ctx.settings.ask_efficiency {
             actions.retain(|a| match a {
                 Action::Efficiency(pids) => {
                     self.confirm_efficiency = Some(EfficiencyAsk { pids: pids.clone(), dont_ask: false });
@@ -544,87 +651,300 @@ impl TaskApp {
         }
     }
 
-    pub fn page_system(&mut self, ui: &mut Ui) {
-        self.header(ui, "System Info");
-        let t = theme::of_ui(ui);
-        let s = &self.snap;
-        let computer = sysinfo::System::host_name().unwrap_or_default();
-        let os = sysinfo::System::long_os_version().unwrap_or_default();
-        let fields = vec![
-            ("Computer name", computer.clone()),
-            ("Operating system", os.clone()),
-            ("Version", sysinfo::System::os_version().unwrap_or_default()),
-            ("Kernel", sysinfo::System::kernel_version().unwrap_or_default()),
-            ("Architecture", sysinfo::System::cpu_arch()),
-            ("Processor", cpu_brand()),
-            ("Cores", sysinfo::System::physical_core_count().map(|c| c.to_string()).unwrap_or_default()),
-            ("Logical processors", s.cpu_per_core.len().to_string()),
-            ("Speed", format!("{:.2} GHz", s.cpu_freq_mhz as f64 / 1000.0)),
-            ("Installed memory", fmt_bytes(s.mem_total)),
-            ("Page file", fmt_bytes(s.swap_total)),
-            ("Drives", s.disks.len().to_string()),
-            ("Network adapters", s.net.len().to_string()),
-            ("Up time", fmt_uptime(s.uptime)),
-        ];
-        let paused = self.settings.interval_ms() == 0;
-        let providers = crate::app::ProviderState::of(s);
-        let [state, procs, ip, generation] = status_parts(paused, providers, s.procs.len(), &local_ip(), s.seq);
-        let sub = [procs, ip, generation, computer, os].into_iter().filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" \u{b7} ");
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            StatusBand::new(Mark::Dot(health_colour(&t, paused, providers)), &state).sub(&sub).show(ui, |_, _| {});
-            for section in system_sections(&fields) {
-                ui.add_space(14.0);
-                parts::field_card(ui, section.group, section.title, &section.fields);
+    /// What the page keeps open whichever page is shown: the questions and
+    /// the Inspector, wait chain and File activity windows.
+    fn windows(&mut self, egui_ctx: &egui::Context, ctx: &PageCtx, actions: &mut Vec<Action>) {
+        self.finished_dumps(actions);
+        self.finished_restarts(actions);
+        if self.dump_question.is_some() {
+            let (mut yes, mut no) = (false, false);
+            egui::Modal::new(egui::Id::new("dump-question")).show(egui_ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(DUMP_QUESTION);
+                ui.add_space(10.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    use crate::widgets::parts::{outline_button, primary_button};
+                    yes = primary_button(ui, "Yes", true).clicked();
+                    no = outline_button(ui, "No", true).clicked();
+                });
+            });
+            if yes || no {
+                self.answer_dump(yes, actions);
             }
-        });
+        }
+        if self.ask_show_microsoft.is_some() {
+            let (mut turn_off, mut cancel) = (false, false);
+            egui::Modal::new(egui::Id::new("show-microsoft-question")).show(egui_ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(SHOW_MICROSOFT_QUESTION);
+                ui.add_space(10.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    use crate::widgets::parts::{outline_button, primary_button};
+                    turn_off = primary_button(ui, "Turn off", true).clicked();
+                    cancel = outline_button(ui, "Cancel", true).clicked();
+                });
+            });
+            if turn_off {
+                actions.push(Action::Processes(ProcessesChange::ShowMicrosoft));
+            } else if cancel {
+                self.ask_show_microsoft = None;
+            }
+        }
+        if let Some(ask) = self.confirm_end.clone() {
+            let mut close = false;
+            let sub = crate::widgets::sub_text(&Theme::of(theme::Mode::from_dark(ctx.settings.dark)));
+            egui::Window::new(ask.title())
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+                .show(egui_ctx, |ui| {
+                    ui.label(ask.question());
+                    if !ask.note().is_empty() {
+                        ui.label(RichText::new(ask.note()).color(sub));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button(ask.title()).clicked() {
+                            actions.push(ask.action());
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if close {
+                self.confirm_end = None;
+            }
+        }
+        if let Some(mut ask) = self.confirm_efficiency.clone() {
+            let (mut go, mut cancel) = (false, false);
+            egui::Modal::new(egui::Id::new("efficiency-question")).show(egui_ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(EFFICIENCY_QUESTION);
+                ui.add_space(6.0);
+                ui.checkbox(&mut ask.dont_ask, "Don't ask again");
+                ui.add_space(10.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    use crate::widgets::parts::{outline_button, primary_button};
+                    go = primary_button(ui, ask.title(), true).clicked();
+                    cancel = outline_button(ui, "Cancel", true).clicked();
+                });
+            });
+            self.confirm_efficiency = if go || cancel { None } else { Some(ask.clone()) };
+            if go {
+                Self::answer_efficiency(&ask, actions);
+            }
+        }
+        if let Some(pids) = self.confirm_realtime.clone() {
+            let (mut go, mut cancel) = (false, false);
+            egui::Modal::new(egui::Id::new("realtime-question")).show(egui_ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(REALTIME_QUESTION);
+                ui.add_space(10.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    use crate::widgets::parts::{outline_button, primary_button};
+                    go = primary_button(ui, "Continue", true).clicked();
+                    cancel = outline_button(ui, "Cancel", true).clicked();
+                });
+            });
+            if go || cancel {
+                self.confirm_realtime = None;
+            }
+            if go {
+                Self::answer_realtime(&pids, actions);
+            }
+        }
+        // The Process Inspectors; a resize is saved with the table's layout.
+        let procs = &ctx.snapshot.procs;
+        let mut width = ctx.settings.process_table.inspector_width;
+        self.inspectors.retain_mut(|inspector| inspector.show(egui_ctx, procs, &mut width, actions));
+        if width != ctx.settings.process_table.inspector_width {
+            actions.push(Action::Processes(ProcessesChange::InspectorWidth(width)));
+        }
+        self.wait_chains.retain_mut(|w| w.show(egui_ctx));
+        // The File activity windows; closing one stops its trace.
+        let mut width = ctx.settings.process_table.file_activity_width;
+        self.file_activity.retain_mut(|window| window.show(egui_ctx, procs, &mut width, actions));
+        if width != ctx.settings.process_table.file_activity_width {
+            actions.push(Action::Processes(ProcessesChange::FileActivityWidth(width)));
+        }
+    }
+}
+
+impl ProcessesPage {
+    /// What the Publisher and Description columns show, for the program
+    /// files of the live and exited processes, while each column is among
+    /// the `shown`. Asks the caches for the files not read yet (off the UI
+    /// thread); those show nothing until read.
+    fn file_texts(&self, ctx: &PageCtx, shown: &[Placed]) -> FileTexts {
+        let mut files = FileTexts::default();
+        let on = |col| shown.iter().any(|p| p.col == col);
+        let exes = || ctx.snapshot.procs.iter().chain(self.view.exited_rows()).map(|p| p.exe.as_str());
+        let signatures = ctx.processes.signatures;
+        if on(ProcCol::Publisher) {
+            signatures.ask(exes());
+            files.publisher = exes().filter_map(|e| Some((e.to_string(), crate::signature::publisher(signatures.of(e)?)))).collect();
+        }
+        if on(ProcCol::Description) {
+            self.descriptions.ask(exes());
+            files.description = exes().filter_map(|e| Some((e.to_string(), self.descriptions.of(e).flatten()?))).collect();
+        }
+        files
     }
 
-    pub fn page_users(&mut self, ui: &mut Ui) {
-        self.header(ui, "Users");
-        let t = self.settings.theme();
-        let accounts = accounts(&self.snap.procs);
-        let n: usize = accounts.iter().map(|a| a.procs.len()).sum();
-        let cpu: f32 = accounts.iter().map(|a| a.cpu).sum();
-        let mem: u64 = accounts.iter().map(|a| a.mem).sum();
-        let sub = format!("{n} processes \u{b7} CPU {cpu:.1}% \u{b7} {} memory", fmt_bytes(mem));
-        StatusBand::new(Mark::None, &users_headline(&accounts)).sub(&sub).show(ui, |_, _| {});
-        ui.add_space(14.0);
+    /// Efficiency mode agreed to: it runs, and "Don't ask again" turns
+    /// "Ask before applying Efficiency mode" off.
+    pub fn answer_efficiency(ask: &EfficiencyAsk, actions: &mut Vec<Action>) {
+        if ask.dont_ask {
+            actions.push(Action::Processes(ProcessesChange::EfficiencyAskOff));
+        }
+        actions.push(Action::Efficiency(ask.pids.clone()));
+    }
 
-        // The chosen account (its details beside the list) and the expanded
-        // ones are kept in egui's memory.
-        let chosen_id = egui::Id::new("users-chosen");
-        let before: Option<String> = ui.data_mut(|d| d.get_persisted(chosen_id)).flatten();
-        let chosen = parts::list_with_panel(
-            ui,
-            |ui, list_w| {
-                let mut chosen = before;
-                user_head(ui, &t, list_w);
-                egui::ScrollArea::vertical().id_salt("users-list").auto_shrink([false, false]).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    for a in &accounts {
-                        let open_id = egui::Id::new(("users-open", &a.name));
-                        let mut open: bool = ui.data_mut(|d| d.get_persisted(open_id)).unwrap_or(false);
-                        let on = chosen.as_deref() == Some(a.name.as_str());
-                        if account_row(ui, &t, list_w - 12.0, a, on, open).clicked() {
-                            open = !open || !on;
-                            chosen = Some(a.name.clone());
-                            ui.data_mut(|d| d.insert_persisted(open_id, open));
-                        }
-                        if open {
-                            for p in a.procs.iter().take(200) {
-                                member_row(ui, &t, list_w - 12.0, p);
-                            }
-                        }
-                    }
-                });
-                chosen
-            },
-            |ui, chosen| {
-                let item = chosen.as_ref().and_then(|c| accounts.iter().find(|a| &a.name == c));
-                SidePanel::new("user-detail").show(ui, item, |ui, a| account_detail(ui, &t, a));
-            },
-        );
-        ui.data_mut(|d| d.insert_persisted(chosen_id, chosen));
+    /// Realtime priority agreed to: it is set on each of `pids`.
+    pub fn answer_realtime(pids: &[u32], actions: &mut Vec<Action>) {
+        actions.extend(pids.iter().map(|&pid| Action::Priority(pid, "Realtime")));
+    }
+
+    /// A memory dump is done: once written, [`DUMP_QUESTION`] is asked; a
+    /// refusal is said in the status bar.
+    pub fn dump_done(&mut self, result: Result<std::path::PathBuf, String>, actions: &mut Vec<Action>) {
+        match result {
+            Ok(path) => self.dump_question = Some(path),
+            Err(e) => actions.push(Action::Say(e)),
+        }
+    }
+
+    /// The answer to [`DUMP_QUESTION`]: Yes shows the file in File Explorer.
+    pub fn answer_dump(&mut self, show: bool, actions: &mut Vec<Action>) {
+        if let Some(path) = self.dump_question.take() {
+            if show {
+                actions.push(Action::ShowInExplorer(path));
+            }
+        }
+    }
+
+    /// Waits for a memory dump being written off the UI thread.
+    pub fn watch_dump(&mut self, written: std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>) {
+        self.dumps.push(written);
+    }
+
+    /// Waits for a restart of Windows Explorer running off the UI thread.
+    pub fn watch_restart(&mut self, restarted: std::sync::mpsc::Receiver<Result<(), String>>) {
+        self.explorer_restarts.push(restarted);
+    }
+
+    /// Takes the memory dumps whose writing has ended.
+    fn finished_dumps(&mut self, actions: &mut Vec<Action>) {
+        let mut done = Vec::new();
+        self.dumps.retain(|rx| match rx.try_recv() {
+            Ok(result) => {
+                done.push(result);
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                done.push(Err(crate::winsys::DUMP_FAILED.to_string()));
+                false
+            }
+        });
+        for result in done {
+            self.dump_done(result, actions);
+        }
+    }
+
+    /// Takes the restarts of Windows Explorer that have ended and says how
+    /// each went.
+    fn finished_restarts(&mut self, actions: &mut Vec<Action>) {
+        let mut done = Vec::new();
+        self.explorer_restarts.retain(|rx| match rx.try_recv() {
+            Ok(result) => {
+                done.push(result);
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                done.push(Err(crate::platform::EXPLORER_NOT_RESTARTED.to_string()));
+                false
+            }
+        });
+        for result in done {
+            match result {
+                Ok(()) => {
+                    actions.push(Action::Say("Restarted Windows Explorer".to_string()));
+                    actions.push(Action::Refresh);
+                }
+                Err(e) => actions.push(Action::Say(e)),
+            }
+        }
+    }
+
+    /// Follow process on `pid`, or Stop following (`None`).
+    pub fn follow(&mut self, pid: Option<u32>) {
+        self.following = pid.map(Follow::new);
+        if let Some(pid) = pid {
+            self.selected = Selection::only(pid);
+        }
+    }
+
+    /// Opens on `pid`: clears the search so the process is listed, selects
+    /// it and scrolls to it.
+    pub fn go_to(&mut self, pid: u32) {
+        self.search.clear();
+        self.selected = Selection::only(pid);
+        self.reveal_selected = true;
+    }
+
+    /// One Inspector window per process: inspecting it again brings its
+    /// window up.
+    pub fn inspect(&mut self, egui_ctx: &egui::Context, pid: u32, procs: &[ProcRow]) {
+        if self.inspectors.iter().any(|i| i.pid == pid) {
+            egui_ctx.move_to_top(egui::LayerId::new(egui::Order::Middle, crate::inspector::window_id(pid)));
+        } else {
+            self.inspectors.push(crate::inspector::Inspector::open(pid, procs));
+        }
+    }
+
+    /// One wait chain window per process: analysing it again runs it again
+    /// and brings its window up.
+    pub fn analyze_wait_chain(&mut self, egui_ctx: &egui::Context, pid: u32, procs: &[ProcRow]) {
+        if let Some(w) = self.wait_chains.iter_mut().find(|w| w.pid == pid) {
+            w.rerun(procs);
+            egui_ctx.move_to_top(egui::LayerId::new(egui::Order::Middle, crate::wait_chain::window_id(pid)));
+        } else {
+            self.wait_chains.push(crate::wait_chain::WaitChain::open(pid, procs));
+        }
+    }
+
+    /// One File activity window per process; the trace starts only when
+    /// `admin` (the check runs on the click).
+    pub fn open_file_activity(&mut self, egui_ctx: &egui::Context, pid: u32, procs: &[ProcRow], admin: bool) {
+        if self.file_activity.iter().any(|w| w.pid == pid) {
+            egui_ctx.move_to_top(egui::LayerId::new(egui::Order::Middle, crate::file_activity::window_id(pid)));
+        } else {
+            self.file_activity.push(crate::file_activity::FileActivity::open(pid, procs, admin));
+        }
+    }
+
+    /// Closes every File activity window, stopping their traces (on exit).
+    pub fn close_file_activity(&mut self) {
+        self.file_activity.clear();
+    }
+
+    /// "Show exited processes" went off: the ones kept are dropped.
+    pub fn drop_exited(&mut self) {
+        self.view.drop_exited();
+    }
+
+    /// Expand all: every tree row opens, and so does each host of services.
+    pub fn expand_all(&mut self, procs: &[ProcRow], hosts: impl Iterator<Item = u32>) {
+        self.view.expand_all(procs);
+        self.view.expanded.extend(hosts);
+    }
+
+    /// Collapse all.
+    pub fn collapse_all(&mut self) {
+        self.view.collapse_all();
     }
 }
 
@@ -982,8 +1302,8 @@ pub fn process_csv<'a>(lines: impl Iterator<Item = &'a ProcessLine>, columns: &[
 /// processes, a separator, Expand all, Collapse all.
 /// Each arrives with its ticket (#165 tree and Expand / Collapse all, #166
 /// exited processes, #167 smoothing) as a variant here, a line in
-/// [`TaskApp::process_view_items`] and an arm in
-/// [`TaskApp::apply_process_view`].
+/// [`process_view_items`] and an arm in
+/// `TaskApp::apply_process_view`.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ProcView {
     /// Children under their parent, or a flat list (saved).
@@ -998,67 +1318,6 @@ pub enum ProcView {
     CollapseAll,
 }
 
-impl TaskApp {
-    /// What the Publisher and Description columns show, for the program
-    /// files of the live and exited processes, while each column is among
-    /// the `shown`. Asks the caches for the files not read yet (off the UI
-    /// thread); those show nothing until read.
-    fn file_texts(&self, shown: &[Placed]) -> FileTexts {
-        let mut files = FileTexts::default();
-        let on = |col| shown.iter().any(|p| p.col == col);
-        let exes = || self.snap.procs.iter().chain(self.proc_view.exited_rows()).map(|p| p.exe.as_str());
-        if on(ProcCol::Publisher) {
-            self.signatures.ask(exes());
-            files.publisher = exes().filter_map(|e| Some((e.to_string(), crate::signature::publisher(self.signatures.of(e)?)))).collect();
-        }
-        if on(ProcCol::Description) {
-            self.descriptions.ask(exes());
-            files.description = exes().filter_map(|e| Some((e.to_string(), self.descriptions.of(e).flatten()?))).collect();
-        }
-        files
-    }
-
-    /// What the "Process View ⌄" menu lists now, top to bottom.
-    fn process_view_items(&self) -> Vec<parts::DropItem<ProcView>> {
-        let tree = self.settings.process_tree;
-        let item = |id, label, checked, enabled| parts::DropItem::Item { id, label, checked, enabled };
-        vec![
-            item(ProcView::Tree, "Process tree", Some(tree), true),
-            item(ProcView::Smooth, "Smooth CPU readings", Some(self.settings.smooth_cpu), true),
-            item(ProcView::ShowExited, "Show exited processes", Some(self.settings.show_exited), true),
-            parts::DropItem::Separator,
-            item(ProcView::ExpandAll, "Expand all", None, tree),
-            item(ProcView::CollapseAll, "Collapse all", None, tree),
-        ]
-    }
-
-    /// Does what the Process View item clicked asks.
-    pub(crate) fn apply_process_view(&mut self, item: ProcView) {
-        match item {
-            ProcView::Tree => {
-                self.settings.process_tree = !self.settings.process_tree;
-                self.settings.save();
-            }
-            ProcView::Smooth => {
-                self.settings.smooth_cpu = !self.settings.smooth_cpu;
-                self.settings.save();
-            }
-            ProcView::ShowExited => {
-                self.settings.show_exited = !self.settings.show_exited;
-                if !self.settings.show_exited {
-                    self.proc_view.drop_exited();
-                }
-                self.settings.save();
-            }
-            ProcView::ExpandAll => {
-                self.proc_view.expand_all(&self.snap.procs);
-                // A host of services opens too.
-                self.proc_view.expanded.extend(self.snap.services.keys());
-            }
-            ProcView::CollapseAll => self.proc_view.collapse_all(),
-        }
-    }
-}
 
 /// Whether a first click on the column sorts the largest first: the
 /// columns of amounts do, the columns of words do not.
@@ -1093,88 +1352,6 @@ impl ProcessesBand {
         let shown = (!query.is_empty()).then(|| format!("{shown} shown for \u{201c}{query}\u{201d}"));
         ProcessesBand { headline, shown, most_cpu, most_memory }
     }
-}
-
-/// How many of the busiest processes Summary lists.
-pub(crate) const SUMMARY_TOP: usize = 25;
-/// The width of Summary's process list beside the graphs.
-const SUMMARY_ASIDE: f32 = 340.0;
-
-/// The CPU Overview card's body: utilization with the kernel time under it
-/// (in Performance's kernel colour), their legend, the per-core squares
-/// and the "N logical processors · Speed X GHz" footer.
-fn cpu_overview(ui: &mut Ui, t: &Theme, view: &crate::summary_view::SummaryView, color: Color32) {
-    let kernel = t.graphs.kernel;
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 96.0), Sense::hover());
-    paint_graph(ui.painter(), rect, &[], view.cpu.max, color, true);
-    paint_series(ui.painter(), rect, &view.cpu_kernel, view.cpu.max, kernel);
-    paint_series(ui.painter(), rect, &view.cpu.history, view.cpu.max, color);
-    ui.horizontal(|ui| {
-        parts::legend_item(ui, "Utilization", color);
-        ui.add_space(8.0);
-        parts::legend_item(ui, "Kernel", kernel);
-    });
-    core_squares(ui, &view.per_core, color);
-    ui.label(RichText::new(&view.cpu_footer).font(t.fonts.label.clone()).color(t.label));
-}
-
-/// Summary's band line: "CPU 15.4% at 4.90 GHz · memory 40.5% · 389
-/// processes" (no speed without a reading).
-pub(crate) fn summary_sub(cpu: f32, freq_mhz: u64, memory: f64, procs: usize) -> String {
-    let speed = if freq_mhz > 0 { format!(" at {}", crate::metrics::fmt_ghz(freq_mhz as f32)) } else { String::new() };
-    let procs = if procs == 1 { "1 process".to_string() } else { format!("{procs} processes") };
-    format!("CPU {cpu:.1}%{speed} \u{b7} memory {memory:.1}% \u{b7} {procs}")
-}
-
-/// The `n` busiest processes by CPU (more memory first on a tie), without
-/// the idle process (pid 0).
-pub(crate) fn top_by_cpu(procs: &[ProcRow], n: usize) -> Vec<ProcRow> {
-    let mut top: Vec<&ProcRow> = procs.iter().filter(|p| p.pid != 0).collect();
-    top.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal).then(b.mem.cmp(&a.mem)));
-    top.into_iter().take(n).cloned().collect()
-}
-
-/// Summary's aside: the busiest processes in a panel, PID, name, CPU and
-/// memory, under a display-face heading in the CPU colour (the link blue in the light
-/// theme), as on board P01.
-fn top_processes(ui: &mut Ui, t: &Theme, width: f32, top: &[ProcRow]) {
-    egui::Frame::new()
-        .fill(t.panel)
-        .stroke(egui::Stroke::new(1.0, t.line))
-        .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin::same(16))
-        .show(ui, |ui| {
-            ui.set_width(width - 32.0);
-            // The CPU colour is made for dark surfaces; the link blue reads on the light panel.
-            let heading_ink = if t.mode == theme::Mode::Dark { t.graphs.cpu } else { t.link };
-            let heading = egui::text::LayoutJob::single_section(
-                "TOP CPU PROCESSES".into(),
-                egui::TextFormat { font_id: display_font(ui, 15.0), color: heading_ink, extra_letter_spacing: 2.0, ..Default::default() },
-            );
-            ui.label(heading);
-            ui.add_space(4.0);
-            let columns = [50.0, 0.0, 46.0, 66.0];
-            let row = |ui: &mut Ui, cells: [(&str, Color32); 4], size: f32| {
-                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), size + 10.0), Sense::hover());
-                let name_w = rect.width() - columns[0] - columns[2] - columns[3] - 18.0;
-                let mut x = rect.left();
-                for (i, (text, ink)) in cells.into_iter().enumerate() {
-                    let w = if i == 1 { name_w } else { columns[i] };
-                    let galley = fitted(ui, text, size, ink, false, w);
-                    let right = i != 1;
-                    let at = if right { x + w - galley.size().x } else { x };
-                    ui.painter().galley(egui::pos2(at, rect.center().y - galley.size().y / 2.0), galley, ink);
-                    x += w + 6.0;
-                }
-                rect
-            };
-            let head = row(ui, [("PID", t.label), ("Name", t.label), ("CPU", t.label), ("Memory", t.label)], 11.5);
-            ui.painter().hline(head.x_range(), head.bottom(), egui::Stroke::new(1.0, t.line));
-            for p in top {
-                let (pid, cpu, mem) = (p.pid.to_string(), format!("{:.1}%", p.cpu), fmt_mb(p.mem));
-                row(ui, [(&pid, t.label), (&p.name, t.text), (&cpu, t.soft), (&mem, t.soft)], 12.0);
-            }
-        });
 }
 
 /// The rows of the selected processes that still run, in the snapshot's
@@ -1403,143 +1580,6 @@ fn process_details(ui: &mut Ui, t: &Theme, chosen: &[&ProcRow], procs: &[ProcRow
     end
 }
 
-/// A System Info card: its group, its title and its fields.
-struct Section<'a> {
-    group: &'a str,
-    title: &'a str,
-    fields: Vec<(&'a str, String)>,
-}
-
-/// Which card each System Info field sits in, as Design A groups them.
-const SECTIONS: &[(&str, &str, &[&str])] = &[
-    ("Software", "Operating System", &["Computer name", "Operating system", "Version", "Kernel", "Up time"]),
-    ("Hardware", "Processor", &["Processor", "Architecture", "Cores", "Logical processors", "Speed"]),
-    ("Hardware", "Memory", &["Installed memory", "Page file"]),
-    ("Hardware", "Storage", &["Drives"]),
-    ("Network", "Network", &["Network adapters"]),
-];
-
-/// The page's fields in their cards; a card with no field is left out.
-fn system_sections<'a>(fields: &[(&'a str, String)]) -> Vec<Section<'a>> {
-    SECTIONS
-        .iter()
-        .map(|(group, title, keys)| Section {
-            group,
-            title,
-            fields: keys.iter().filter_map(|k| fields.iter().find(|(f, _)| f == k).cloned()).collect(),
-        })
-        .filter(|s| !s.fields.is_empty())
-        .collect()
-}
-
-/// An account running processes, with its processes by memory.
-#[derive(Debug)]
-struct Account {
-    name: String,
-    cpu: f32,
-    mem: u64,
-    procs: Vec<ProcRow>,
-}
-
-/// The accounts that run processes, by name; processes without a user
-/// are "System".
-fn accounts(procs: &[ProcRow]) -> Vec<Account> {
-    let mut by: BTreeMap<String, Account> = BTreeMap::new();
-    for p in procs {
-        let name = if p.user.is_empty() { "System".to_string() } else { p.user.clone() };
-        let a = by.entry(name.clone()).or_insert_with(|| Account { name, cpu: 0.0, mem: 0, procs: Vec::new() });
-        a.cpu += p.cpu;
-        a.mem += p.mem;
-        a.procs.push(p.clone());
-    }
-    let mut all: Vec<Account> = by.into_values().collect();
-    for a in &mut all {
-        a.procs.sort_by(|x, y| y.mem.cmp(&x.mem));
-    }
-    all
-}
-
-/// The Users band's headline.
-fn users_headline(accounts: &[Account]) -> String {
-    match accounts {
-        [] => "No user sessions were reported".to_string(),
-        [one] => format!("Only {} is running processes", one.name),
-        many => format!("{} accounts are running processes", many.len()),
-    }
-}
-
-/// x of each Users column from the right edge: CPU, Memory, Processes.
-const USER_COLUMNS: [f32; 3] = [200.0, 110.0, 12.0];
-
-fn user_head(ui: &mut Ui, t: &Theme, width: f32) {
-    let (rect, _) = ui.allocate_exact_size(vec2(width - 12.0, 24.0), Sense::hover());
-    let p = ui.painter();
-    let y = rect.center().y;
-    p.text(egui::pos2(rect.left() + 12.0, y), egui::Align2::LEFT_CENTER, "User", t.fonts.label.clone(), t.label);
-    for (label, x) in ["CPU", "Memory", "Processes"].iter().zip(USER_COLUMNS) {
-        p.text(egui::pos2(rect.right() - x, y), egui::Align2::RIGHT_CENTER, *label, t.fonts.label.clone(), t.label);
-    }
-    p.hline(rect.x_range(), rect.bottom(), egui::Stroke::new(1.0, t.line));
-    ui.add_space(4.0);
-}
-
-/// An account's row: chevron, name and how many processes, its figures.
-fn account_row(ui: &mut Ui, t: &Theme, width: f32, a: &Account, selected: bool, open: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, 42.0), Sense::click());
-    let p = ui.painter();
-    parts::row_fill(p, rect, selected, resp.hovered());
-    let ink = if selected { t.on_selected } else { t.text };
-    let sub = parts::sub_colour(t, selected);
-    let y = rect.center().y;
-    // The chevron: down while the account's processes show, right otherwise.
-    let c = egui::pos2(rect.left() + 17.0, y);
-    crate::widgets::disclosure(p, c, open);
-    p.text(egui::pos2(rect.left() + 30.0, rect.top() + 13.0), egui::Align2::LEFT_CENTER, &a.name, egui::FontId::new(13.0, theme::semibold()), ink);
-    let count = match a.procs.len() {
-        1 => "1 process".to_string(),
-        n => format!("{n} processes"),
-    };
-    p.text(egui::pos2(rect.left() + 30.0, rect.top() + 30.0), egui::Align2::LEFT_CENTER, &count, egui::FontId::proportional(11.5), sub);
-    let figures = [format!("{:.1}%", a.cpu), fmt_bytes(a.mem), a.procs.len().to_string()];
-    for (f, x) in figures.iter().zip(USER_COLUMNS) {
-        p.text(egui::pos2(rect.right() - x, y), egui::Align2::RIGHT_CENTER, f, t.fonts.row.clone(), ink);
-    }
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &a.name));
-    resp
-}
-
-/// One process under an open account: name and PID, CPU and memory.
-fn member_row(ui: &mut Ui, t: &Theme, width: f32, proc: &ProcRow) {
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, 26.0), Sense::hover());
-    let p = ui.painter();
-    parts::row_fill(p, rect, false, resp.hovered());
-    let y = rect.center().y;
-    let name = p.text(egui::pos2(rect.left() + 40.0, y), egui::Align2::LEFT_CENTER, &proc.name, t.fonts.row.clone(), t.text);
-    p.text(egui::pos2(name.right() + 8.0, y), egui::Align2::LEFT_CENTER, format!("PID {}", proc.pid), egui::FontId::proportional(11.5), t.faint);
-    let figures = [format!("{:.1}%", proc.cpu), fmt_mb(proc.mem)];
-    for (f, x) in figures.iter().zip(USER_COLUMNS) {
-        p.text(egui::pos2(rect.right() - x, y), egui::Align2::RIGHT_CENTER, f, t.fonts.row.clone(), t.soft);
-    }
-}
-
-/// The chosen account beside the Users list: its name and its figures.
-fn account_detail(ui: &mut Ui, t: &Theme, a: &Account) {
-    ui.label(RichText::new(&a.name).font(t.fonts.figure.clone()).color(t.text));
-    ui.add_space(8.0);
-    ui.columns(3, |cols| {
-        let figures = [
-            ("CPU", format!("{:.1}%", a.cpu), t.graphs.cpu),
-            ("Memory", fmt_bytes(a.mem), t.graphs.memory),
-            ("Processes", a.procs.len().to_string(), t.text),
-        ];
-        for (ui, (label, value, ink)) in cols.iter_mut().zip(figures) {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            ui.label(RichText::new(label).font(t.fonts.label.clone()).color(t.label));
-            ui.label(RichText::new(value).font(t.fonts.figure_small.clone()).color(ink));
-        }
-    });
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1548,20 +1588,84 @@ pub(crate) mod tests {
         ProcRow { pid, name: name.into(), user: user.into(), cpu, mem, ..Default::default() }
     }
 
-    /// Settings whose CPU colour is the user's own.
-    pub(crate) fn custom_cpu() -> (crate::settings::Settings, Color32) {
-        let mut settings = crate::settings::Settings::default();
-        settings.cpu_color = [0x12, 0x34, 0x56];
-        (settings, Color32::from_rgb(0x12, 0x34, 0x56))
+    fn sample() -> Vec<ProcRow> {
+        vec![
+            proc(0, "System Idle Process", "", 90.0, 0),
+            proc(4, "System", "", 0.4, 0),
+            proc(35308, "chrome.exe", "spata", 0.2, 6_000_000_000),
+            proc(16244, "Code.exe", "spata", 8.0, 4_300_000_000),
+            proc(8944, "explorer.exe", "spata", 0.0, 470_000_000),
+        ]
     }
 
-    #[test]
-    fn a_custom_cpu_colour_reaches_summary() {
-        let (settings, cpu) = custom_cpu();
-        let mut app = TaskApp::headless(settings, crate::sampler::Snapshot::default());
-        let ctx = crate::test_ui::context(theme::Mode::Dark);
-        let out = crate::test_ui::run(&ctx, (1200.0, 800.0), vec![], |ui| app.page_summary(ui, &mut Vec::new()));
-        assert!(crate::test_ui::colours(&out).contains(&cpu));
+
+    /// A page with what the app gives it: settings, the latest snapshot, a
+    /// recording system and the add-ons' columns. Drawing it applies the
+    /// settings the page asks for, as the app's handler does.
+    pub struct Shown {
+        pub page: ProcessesPage,
+        pub settings: Settings,
+        pub snap: crate::sampler::Snapshot,
+        signatures: Signatures,
+        pub system: std::sync::Arc<crate::system_actions::RecordingActions>,
+        pub addons: std::cell::RefCell<AddonHost>,
+    }
+
+    impl Shown {
+        pub fn headless(settings: Settings, snap: crate::sampler::Snapshot) -> Self {
+            Shown {
+                page: ProcessesPage::default(),
+                settings,
+                snap,
+                signatures: Signatures::default(),
+                system: Default::default(),
+                addons: std::cell::RefCell::new(AddonHost::from_section(&serde_json::json!({}))),
+            }
+        }
+
+        /// One frame of the page through the interface.
+        pub fn page_processes(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+            let (cpu, mem) = (Default::default(), Default::default());
+            let perf = &self.signatures;
+            let inputs = ProcessInputs::new(perf, &*self.system).with_columns(&self.addons);
+            let ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories: crate::core_page::Histories { cpu: &cpu, mem: &mem, perf: &Default::default() }, system: &crate::system_lists::fake::FakeSystem::default(), processes: inputs };
+            self.page.draw(ui, &ctx, actions);
+            self.apply(actions);
+        }
+
+        /// A new sample, as the app delivers it: the page sees it, then it
+        /// becomes the latest.
+        pub fn sample(&mut self, snap: crate::sampler::Snapshot) {
+            let (cpu, mem) = (Default::default(), Default::default());
+            let ctx = PageCtx { settings: &self.settings, snapshot: &snap, histories: crate::core_page::Histories { cpu: &cpu, mem: &mem, perf: &Default::default() }, system: &crate::system_lists::fake::FakeSystem::default(), processes: ProcessInputs::new(&self.signatures, &*self.system) };
+            self.page.on_sample(&ctx);
+            self.snap = snap;
+        }
+
+        /// One frame of what the page keeps open, with the texts it drew and
+        /// the actions it queued.
+        pub fn windows_frame(&mut self, ctx: &egui::Context) -> (Vec<String>, Vec<Action>) {
+            let (cpu, mem) = (Default::default(), Default::default());
+            let page_ctx = PageCtx { settings: &self.settings, snapshot: &self.snap, histories: crate::core_page::Histories { cpu: &cpu, mem: &mem, perf: &Default::default() }, system: &crate::system_lists::fake::FakeSystem::default(), processes: ProcessInputs::new(&self.signatures, &*self.system) };
+            let mut actions = Vec::new();
+            let out = crate::test_ui::run(ctx, (1400.0, 900.0), vec![], |ui| self.page.windows(ui.ctx(), &page_ctx, &mut actions));
+            (crate::test_ui::texts(&out), actions)
+        }
+
+        /// What the app's handler does with the settings the page asks for.
+        pub fn apply(&mut self, actions: &mut Vec<Action>) {
+            actions.retain(|a| match a {
+                Action::Processes(ProcessesChange::Table(t)) => {
+                    self.settings.process_table = t.clone();
+                    false
+                }
+                Action::Processes(ProcessesChange::EfficiencyAskOff) => {
+                    self.settings.ask_efficiency = false;
+                    false
+                }
+                _ => true,
+            });
+        }
     }
 
     #[test]
@@ -1628,8 +1732,8 @@ pub(crate) mod tests {
     fn the_details_pane_draws_its_22_fields_for_a_selected_process() {
         let mut snap = crate::sampler::Snapshot { procs: vec![nordvpn()], mem_total: 16_000_000_000, ..Default::default() };
         snap.procs.push(proc(4, "System", "SYSTEM", 0.0, 0));
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), snap);
-        app.selected = Selection::only(26920);
+        let mut app = Shown::headless(crate::settings::Settings::default(), snap);
+        app.page.selected = Selection::only(26920);
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let out = crate::test_ui::run(&ctx, (1800.0, 1000.0), vec![], |ui| app.page_processes(ui, &mut Vec::new()));
         let texts = crate::test_ui::texts(&out);
@@ -1666,7 +1770,7 @@ pub(crate) mod tests {
             assert!(!texts.iter().any(|t| t == "Kernel time"), "no fields with {} selected", chosen.len());
         }
         // The page with nothing selected says the same.
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), crate::sampler::Snapshot { procs: vec![a], ..Default::default() });
+        let mut app = Shown::headless(crate::settings::Settings::default(), crate::sampler::Snapshot { procs: vec![a], ..Default::default() });
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let out = crate::test_ui::run(&ctx, (1800.0, 1000.0), vec![], |ui| app.page_processes(ui, &mut Vec::new()));
         assert!(crate::test_ui::texts(&out).iter().any(|t| t == parts::EMPTY_DETAIL));
@@ -1719,7 +1823,7 @@ pub(crate) mod tests {
 
     /// One frame of the Processes page with `events`, keys `held` and the
     /// clock at `time` seconds.
-    fn processes_frame(ctx: &egui::Context, app: &mut TaskApp, events: Vec<egui::Event>, held: egui::Modifiers, time: f64) -> egui::FullOutput {
+    fn processes_frame(ctx: &egui::Context, app: &mut Shown, events: Vec<egui::Event>, held: egui::Modifiers, time: f64) -> egui::FullOutput {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1800.0, 900.0))),
             events,
@@ -1733,7 +1837,7 @@ pub(crate) mod tests {
     }
 
     /// A click on the row named `name`, with `held` keys down.
-    fn click_row(ctx: &egui::Context, app: &mut TaskApp, name: &str, held: egui::Modifiers, time: f64) {
+    fn click_row(ctx: &egui::Context, app: &mut Shown, name: &str, held: egui::Modifiers, time: f64) {
         let out = processes_frame(ctx, app, vec![], held, time);
         let at = text_spots(&out).into_iter().find(|(t, _)| t == name).expect("the row").1.center();
         let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: held };
@@ -1741,22 +1845,22 @@ pub(crate) mod tests {
         processes_frame(ctx, app, vec![press(false)], held, time);
     }
 
-    fn sorted_pids(app: &TaskApp) -> Vec<u32> {
-        app.selected.pids().collect()
+    fn sorted_pids(app: &Shown) -> Vec<u32> {
+        app.page.selected.pids().collect()
     }
 
     #[test]
     fn three_selected_rows_take_the_plural_labels_and_ask_end_3_selected_processes() {
         let mut snap = disk_sample();
         snap.procs.push(proc(14, "writes-most.exe", "spata", 1.0, 1_000_000));
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), snap);
+        let mut app = Shown::headless(crate::settings::Settings::default(), snap);
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let ctrl = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
         click_row(&ctx, &mut app, "reads-most.exe", egui::Modifiers::NONE, 1.0);
         click_row(&ctx, &mut app, "reads-least.exe", ctrl, 3.0);
         click_row(&ctx, &mut app, "writes-most.exe", ctrl, 5.0);
         assert_eq!(sorted_pids(&app), [11, 12, 14], "Ctrl adds rows");
-        let rows = rows_of(&app.snap.procs, &app.selected);
+        let rows = rows_of(&app.snap.procs, &app.page.selected);
         let entries = crate::widgets::end_entries(&rows);
         let labels: Vec<&str> = entries.iter().map(|(l, _)| *l).collect();
         assert_eq!(labels, ["End selected tasks", "Force quit selected tasks", "End selected process trees", "Force quit selected process trees"]);
@@ -1785,28 +1889,28 @@ pub(crate) mod tests {
 
     #[test]
     fn delete_asks_before_ending_the_selected_task() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), disk_sample());
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         processes_frame(&ctx, &mut app, vec![key(egui::Key::Delete)], egui::Modifiers::NONE, 1.0);
-        assert_eq!(app.confirm_end, None, "nothing selected, nothing asked");
-        app.selected = Selection::only(12);
+        assert_eq!(app.page.confirm_end, None, "nothing selected, nothing asked");
+        app.page.selected = Selection::only(12);
         processes_frame(&ctx, &mut app, vec![key(egui::Key::Delete)], egui::Modifiers::NONE, 2.0);
-        let ask = app.confirm_end.clone().expect("Delete asks first");
+        let ask = app.page.confirm_end.clone().expect("Delete asks first");
         assert_eq!((ask.question(), ask.note()), ("End reads-most.exe?".to_string(), "Unsaved data in this process may be lost."));
         assert_eq!(ask.action(), Action::End { pid: 12, force: false, tree: false, name: "reads-most.exe".into() });
     }
 
     #[test]
     fn type_ahead_selects_the_row_whose_name_starts_with_the_letters_typed() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), disk_sample());
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let text = |s: &str| egui::Event::Text(s.into());
         processes_frame(&ctx, &mut app, vec![text("r")], egui::Modifiers::NONE, 1.0);
         processes_frame(&ctx, &mut app, vec![text("eads-s")], egui::Modifiers::NONE, 1.5);
-        assert_eq!(app.selected, Selection::only(13), "reads-some.exe");
+        assert_eq!(app.page.selected, Selection::only(13), "reads-some.exe");
         // Two seconds later the letters start a new name.
         processes_frame(&ctx, &mut app, vec![text("reads-m")], egui::Modifiers::NONE, 4.0);
-        assert_eq!(app.selected, Selection::only(12), "reads-most.exe");
+        assert_eq!(app.page.selected, Selection::only(12), "reads-most.exe");
     }
 
     #[test]
@@ -1862,46 +1966,20 @@ pub(crate) mod tests {
 
     #[test]
     fn a_double_click_on_a_process_row_inspects_it_and_a_click_only_selects_it() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), disk_sample());
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let mut actions = Vec::new();
-        let draw = |events, actions: &mut Vec<Action>, app: &mut TaskApp| crate::test_ui::run(&ctx, (1800.0, 900.0), events, |ui| app.page_processes(ui, actions));
+        let draw = |events, actions: &mut Vec<Action>, app: &mut Shown| crate::test_ui::run(&ctx, (1800.0, 900.0), events, |ui| app.page_processes(ui, actions));
         let out = draw(vec![], &mut actions, &mut app);
         let at = text_spots(&out).into_iter().find(|(t, _)| t == "reads-most.exe").expect("the row").1.center();
         let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
         draw(vec![egui::Event::PointerMoved(at), press(true)], &mut actions, &mut app);
         draw(vec![press(false)], &mut actions, &mut app);
-        assert_eq!(app.selected, Selection::only(12), "a click selects the row");
+        assert_eq!(app.page.selected, Selection::only(12), "a click selects the row");
         assert!(actions.is_empty(), "a click inspects nothing: {actions:?}");
         draw(vec![press(true)], &mut actions, &mut app);
         draw(vec![press(false)], &mut actions, &mut app);
         assert_eq!(actions, [Action::Inspect(12)], "the second click of a double-click inspects the row");
-    }
-
-    fn sample() -> Vec<ProcRow> {
-        vec![
-            proc(0, "System Idle Process", "", 90.0, 0),
-            proc(4, "System", "", 0.4, 0),
-            proc(35308, "chrome.exe", "spata", 0.2, 6_000_000_000),
-            proc(16244, "Code.exe", "spata", 8.0, 4_300_000_000),
-            proc(8944, "explorer.exe", "spata", 0.0, 470_000_000),
-        ]
-    }
-
-    #[test]
-    fn the_summary_band_sums_up_cpu_speed_memory_and_processes() {
-        assert_eq!(summary_sub(15.42, 4900, 40.5, 389), "CPU 15.4% at 4.90 GHz \u{b7} memory 40.5% \u{b7} 389 processes");
-        assert_eq!(summary_sub(0.0, 0, 0.0, 1), "CPU 0.0% \u{b7} memory 0.0% \u{b7} 1 process", "no speed reading: no speed");
-    }
-
-    #[test]
-    fn summary_lists_the_busiest_processes_without_the_idle_one() {
-        let top: Vec<u32> = top_by_cpu(&sample(), 3).iter().map(|p| p.pid).collect();
-        assert_eq!(top, vec![16244, 4, 35308], "by CPU, the idle process (pid 0) left out");
-        let mut tied = sample();
-        tied.push(proc(77, "tied.exe", "spata", 0.2, 9_000_000_000));
-        let top: Vec<u32> = top_by_cpu(&tied, 4).iter().map(|p| p.pid).collect();
-        assert_eq!(top, vec![16244, 4, 77, 35308], "equal CPU: more memory first");
     }
 
     #[test]
@@ -1946,7 +2024,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_processes_page_draws_the_standard_columns_in_order() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), disk_sample());
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let out = crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new()));
         let spots = text_spots(&out);
@@ -1964,7 +2042,7 @@ pub(crate) mod tests {
 
     #[test]
     fn disk_read_and_disk_write_are_separate_sortable_columns() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), disk_sample());
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let mut draw = |events| crate::test_ui::run(&ctx, (1800.0, 900.0), events, |ui| app.page_processes(ui, &mut Vec::new()));
         let order = |out: &egui::FullOutput| {
@@ -2003,7 +2081,7 @@ pub(crate) mod tests {
             cpu_time: std::time::Duration::from_secs(3),
             ..proc(22, "quiet.exe", "spata", 0.0, 1_000_000)
         }];
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), snap);
+        let mut app = Shown::headless(crate::settings::Settings::default(), snap);
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let out = crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new()));
         let texts = crate::test_ui::texts(&out);
@@ -2013,7 +2091,7 @@ pub(crate) mod tests {
     }
 
     /// The words drawn by one frame of the Processes page of `app`.
-    fn processes_texts(app: &mut TaskApp) -> Vec<String> {
+    fn processes_texts(app: &mut Shown) -> Vec<String> {
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let out = crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new()));
         crate::test_ui::texts(&out).into_iter().map(|t| t.trim().to_string()).collect()
@@ -2021,7 +2099,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_processes_header_shows_process_view_the_filter_hint_and_refresh() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), disk_sample());
         let texts = processes_texts(&mut app);
         for shown in ["Processes", "Process View", "Filter by name, user, or PID", "Refresh"] {
             assert!(texts.iter().any(|t| t == shown), "{shown} in {texts:?}");
@@ -2032,14 +2110,14 @@ pub(crate) mod tests {
     #[test]
     fn a_filter_that_hides_every_row_asks_to_clear_the_search_box() {
         const CLEAR: &str = "Clear the search box to restore all process rows.";
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
-        app.search = "no-such-process".into();
+        let mut app = Shown::headless(crate::settings::Settings::default(), disk_sample());
+        app.page.search = "no-such-process".into();
         assert!(processes_texts(&mut app).iter().any(|t| t == CLEAR));
-        app.search = "reads-most".into();
+        app.page.search = "reads-most".into();
         let texts = processes_texts(&mut app);
         assert!(texts.iter().any(|t| t == "reads-most.exe"), "the filter keeps its match");
         assert!(!texts.iter().any(|t| t == CLEAR), "a row is shown: no message");
-        app.search.clear();
+        app.page.search.clear();
         app.snap.procs.clear();
         assert!(!processes_texts(&mut app).iter().any(|t| t == CLEAR), "no filter, no rows: nothing to clear");
     }
@@ -2047,45 +2125,12 @@ pub(crate) mod tests {
     #[test]
     fn the_band_still_names_the_busiest_processes() {
         let snap = crate::sampler::Snapshot { procs: sample(), mem_total: 16_000_000_000, ..Default::default() };
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), snap);
+        let mut app = Shown::headless(crate::settings::Settings::default(), snap);
         let texts = processes_texts(&mut app);
         for shown in ["Most memory", "Most CPU now", "Code.exe, 8.0%"] {
             assert!(texts.iter().any(|t| t == shown), "{shown} in {texts:?}");
         }
         assert!(texts.iter().any(|t| t.starts_with("chrome.exe, ")), "{texts:?}");
-    }
-
-    #[test]
-    fn services_keep_their_own_filter_on_the_shared_search_text() {
-        let svc = |name: &str| crate::winsys::ServiceRow { name: name.into(), display: String::new(), pid: 0, status: "Running".into(), start_type: "Manual".into() };
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
-        app.services = Some(Ok(vec![svc("WSearch"), svc("Spooler")]));
-        let ctx = crate::test_ui::context(theme::Mode::Dark);
-        let draw = |app: &mut TaskApp| {
-            let out = crate::test_ui::run(&ctx, (1400.0, 900.0), vec![], |ui| app.page_services(ui, &mut Vec::new()));
-            crate::test_ui::texts(&out).into_iter().map(|t| t.trim().to_string()).collect::<Vec<_>>()
-        };
-        let texts = draw(&mut app);
-        assert!(texts.iter().any(|t| t == "Filter services"), "{texts:?}");
-        assert!(!texts.iter().any(|t| t == "Filter by name, user, or PID"));
-        app.search = "wsearch".into();
-        let texts = draw(&mut app);
-        assert!(texts.iter().any(|t| t == "WSearch"), "{texts:?}");
-        assert!(!texts.iter().any(|t| t == "Spooler"));
-        assert!(!texts.iter().any(|t| t.starts_with("Clear the search box")), "the processes message stays on Processes");
-    }
-
-    #[test]
-    fn the_services_filter_also_matches_the_pid_of_their_host() {
-        let svc = |name: &str, pid| crate::winsys::ServiceRow { name: name.into(), display: String::new(), pid, status: "Running".into(), start_type: "Manual".into() };
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
-        app.services = Some(Ok(vec![svc("WSearch", 300), svc("Winmgmt", 200), svc("Schedule", 200)]));
-        app.search = "200".into();
-        let ctx = crate::test_ui::context(theme::Mode::Dark);
-        let out = crate::test_ui::run(&ctx, (1400.0, 900.0), vec![], |ui| app.page_services(ui, &mut Vec::new()));
-        let texts: Vec<String> = crate::test_ui::texts(&out).into_iter().map(|t| t.trim().to_string()).collect();
-        assert!(texts.iter().any(|t| t == "Winmgmt") && texts.iter().any(|t| t == "Schedule"), "{texts:?}");
-        assert!(!texts.iter().any(|t| t == "WSearch"), "another host's service");
     }
 
     /// A process busy on the GPU, one less so and one without GPU engines.
@@ -2100,7 +2145,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_gpu_column_shows_each_processs_engine_percent() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), gpu_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), gpu_sample());
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let out = crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new()));
         let spots = text_spots(&out);
@@ -2113,7 +2158,7 @@ pub(crate) mod tests {
 
     #[test]
     fn sorting_by_gpu_puts_the_busiest_first_then_turns_round() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), gpu_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), gpu_sample());
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let mut draw = |events| crate::test_ui::run(&ctx, (1800.0, 900.0), events, |ui| app.page_processes(ui, &mut Vec::new()));
         let order = |out: &egui::FullOutput| {
@@ -2136,7 +2181,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_processes_table_scrolls_sideways_when_the_columns_do_not_fit() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), disk_sample());
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let mut draw = |events| crate::test_ui::run(&ctx, (800.0, 900.0), events, |ui| app.page_processes(ui, &mut Vec::new()));
         let command = |out: &egui::FullOutput| text_spots(out).into_iter().find(|(text, _)| text == "Command").map(|(_, r)| r);
@@ -2154,11 +2199,10 @@ pub(crate) mod tests {
 
     #[test]
     fn expand_all_and_collapse_all_are_greyed_while_the_tree_is_off() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), tree_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), tree_sample());
         for tree in [true, false] {
             app.settings.process_tree = tree;
-            let items: Vec<(&str, Option<bool>, bool)> = app
-                .process_view_items()
+            let items: Vec<(&str, Option<bool>, bool)> = process_view_items(&app.settings)
                 .into_iter()
                 .filter_map(|i| match i {
                     parts::DropItem::Item { label, checked, enabled, .. } => Some((label, checked, enabled)),
@@ -2182,9 +2226,9 @@ pub(crate) mod tests {
     fn process_view_lists_show_exited_processes_ticked_as_saved() {
         let mut settings = crate::settings::Settings::default();
         settings.show_exited = false;
-        let mut app = TaskApp::headless(settings, tree_sample());
-        let ticked = |app: &TaskApp| {
-            app.process_view_items().into_iter().find_map(|i| match i {
+        let mut app = Shown::headless(settings, tree_sample());
+        let ticked = |app: &Shown| {
+            process_view_items(&app.settings).into_iter().find_map(|i| match i {
                 parts::DropItem::Item { id: ProcView::ShowExited, label, checked, .. } => Some((label, checked)),
                 _ => None,
             })
@@ -2196,11 +2240,11 @@ pub(crate) mod tests {
 
     #[test]
     fn an_exited_process_reads_exited_tinted_red_with_its_gpu_unavailable() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), tree_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), tree_sample());
         let t0 = std::time::Instant::now();
-        app.proc_view.track(&app.snap.procs, t0, true);
+        app.page.view.track(&app.snap.procs, t0, true);
         app.snap.procs.retain(|p| p.pid != 200);
-        app.proc_view.track(&app.snap.procs, t0 + std::time::Duration::from_secs(1), true);
+        app.page.view.track(&app.snap.procs, t0 + std::time::Duration::from_secs(1), true);
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let out = crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new()));
         let texts = crate::test_ui::texts(&out);
@@ -2216,12 +2260,12 @@ pub(crate) mod tests {
     /// The Processes page drawn once, after svchost.exe's CPU changed
     /// between two samples a moment ago.
     fn page_after_a_change(settings: crate::settings::Settings) -> egui::FullOutput {
-        let mut app = TaskApp::headless(settings, tree_sample());
+        let mut app = Shown::headless(settings, tree_sample());
         let now = std::time::Instant::now();
         let before = now.checked_sub(std::time::Duration::from_secs(1)).unwrap_or(now);
-        app.proc_view.track(&app.snap.procs, before, true);
+        app.page.view.track(&app.snap.procs, before, true);
         app.snap.procs[2].cpu = 40.0;
-        app.proc_view.track(&app.snap.procs, now, true);
+        app.page.view.track(&app.snap.procs, now, true);
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new()))
     }
@@ -2253,7 +2297,7 @@ pub(crate) mod tests {
             let mut settings = crate::settings::Settings::default();
             settings.process_percents = percents;
             set_column_shown_in(&columns_with(&[]), &mut settings.process_table, ProcCol::PeakMem, true);
-            let mut app = TaskApp::headless(settings, sample.clone());
+            let mut app = Shown::headless(settings, sample.clone());
             let ctx = crate::test_ui::context(theme::Mode::Dark);
             crate::test_ui::texts(&crate::test_ui::run(&ctx, (2400.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new())))
         };
@@ -2304,8 +2348,8 @@ pub(crate) mod tests {
     fn resource_values_follows_view_with_values_and_percents() {
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let p = proc(7, "Code.exe", "spata", 0.0, 0);
-        let app = TaskApp::headless(crate::settings::Settings::default(), tree_sample());
-        let view = app.process_view_items();
+        let app = Shown::headless(crate::settings::Settings::default(), tree_sample());
+        let view = process_view_items(&app.settings);
         let out = crate::test_ui::run(&ctx, (400.0, 800.0), vec![], |ui| crate::widgets::process_menu(ui, &p, &[&p], &no_view_state(&view), &mut Vec::new()));
         let texts = crate::test_ui::texts(&out);
         let at = |w: &str| texts.iter().position(|t| t == w).unwrap_or_else(|| panic!("{w} in {texts:?}"));
@@ -2332,8 +2376,8 @@ pub(crate) mod tests {
                 Item(CreateDump), Item(GoToServices), Item(BringToFront), Item(OpenFileLocation), Item(SearchOnline), Item(CopyName),
             ]
         );
-        let app = TaskApp::headless(crate::settings::Settings::default(), tree_sample());
-        let view = app.process_view_items();
+        let app = Shown::headless(crate::settings::Settings::default(), tree_sample());
+        let view = process_view_items(&app.settings);
         let mut p = proc(7, "Code.exe", "spata", 0.0, 0);
         p.exe = "C:/Code/Code.exe".into();
         let one = menu_entries(&p, &[&p], &no_view_state(&view));
@@ -2372,8 +2416,8 @@ pub(crate) mod tests {
 
     #[test]
     fn analyze_wait_chain_analyses_the_right_clicked_process_with_one_or_several_rows() {
-        let app = TaskApp::headless(crate::settings::Settings::default(), tree_sample());
-        let view = app.process_view_items();
+        let app = Shown::headless(crate::settings::Settings::default(), tree_sample());
+        let view = process_view_items(&app.settings);
         let p = proc(7, "Code.exe", "spata", 0.0, 0);
         let q = proc(8, "node.exe", "spata", 0.0, 0);
         for rows in [vec![&p], vec![&p, &q]] {
@@ -2388,8 +2432,8 @@ pub(crate) mod tests {
 
     #[test]
     fn file_activity_is_never_greyed_and_opens_the_window_of_the_row() {
-        let app = TaskApp::headless(crate::settings::Settings::default(), tree_sample());
-        let view = app.process_view_items();
+        let app = Shown::headless(crate::settings::Settings::default(), tree_sample());
+        let view = process_view_items(&app.settings);
         let p = proc(7, "Code.exe", "spata", 0.0, 0);
         let one = menu_entries(&p, &[&p], &no_view_state(&view));
         assert_eq!(menu_item(&one, "File activity"), (true, vec![Action::FileActivity(7)]), "the administrator check runs on the click");
@@ -2399,11 +2443,11 @@ pub(crate) mod tests {
 
     #[test]
     fn the_view_submenu_sends_the_process_view_items_and_greys_expand_all_with_the_tree_off() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), tree_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), tree_sample());
         let p = proc(7, "Code.exe", "spata", 0.0, 0);
         for tree in [true, false] {
             app.settings.process_tree = tree;
-            let view = app.process_view_items();
+            let view = process_view_items(&app.settings);
             let entries = menu_entries(&p, &[&p], &no_view_state(&view));
             let sub = submenu(&entries, "View");
             assert_eq!(menu_item(sub, "Process tree"), (true, vec![Action::ProcessView(ProcView::Tree)]));
@@ -2535,65 +2579,66 @@ pub(crate) mod tests {
     #[test]
     fn a_followed_row_stays_selected_and_in_view_after_the_order_changes() {
         let ctx = crate::test_ui::context(theme::Mode::Dark);
-        let draw = |app: &mut TaskApp| crate::test_ui::texts(&crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new())));
-        let mut followed = TaskApp::headless(crate::settings::Settings::default(), many_sample(9_000_000));
-        followed.follow(Some(1000));
+        let draw = |app: &mut Shown| crate::test_ui::texts(&crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new())));
+        let mut followed = Shown::headless(crate::settings::Settings::default(), many_sample(9_000_000));
+        followed.page.follow(Some(1000));
         assert!(draw(&mut followed).iter().any(|t| t == "p0.exe"), "on top by memory");
-        assert_eq!(followed.selected, Selection::only(1000), "following selects the row");
+        assert_eq!(followed.page.selected, Selection::only(1000), "following selects the row");
         // The next snapshot puts it last (Memory, largest first).
-        let mut plain = TaskApp::headless(crate::settings::Settings::default(), many_sample(1));
+        let mut plain = Shown::headless(crate::settings::Settings::default(), many_sample(1));
         assert!(!draw(&mut plain).iter().any(|t| t == "p0.exe"), "last is out of view unfollowed");
         followed.snap = many_sample(1);
-        followed.selected = Selection::only(1001);
+        followed.page.selected = Selection::only(1001);
         draw(&mut followed);
         let texts = draw(&mut followed);
-        assert_eq!(followed.selected, Selection::only(1000), "still selected");
+        assert_eq!(followed.page.selected, Selection::only(1000), "still selected");
         assert!(texts.iter().any(|t| t == "p0.exe"), "scrolled into view: {texts:?}");
         // Stop following: the selection is the user's again.
-        followed.follow(None);
-        followed.selected = Selection::only(1001);
+        followed.page.follow(None);
+        followed.page.selected = Selection::only(1001);
         draw(&mut followed);
-        assert_eq!(followed.selected, Selection::only(1001));
+        assert_eq!(followed.page.selected, Selection::only(1001));
     }
 
     #[test]
     fn efficiency_mode_asks_once_then_not_again_after_dont_ask_again() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), disk_sample());
         let ctx = crate::test_ui::context(theme::Mode::Dark);
-        let frame = |app: &mut TaskApp, actions: &mut Vec<Action>| crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| app.page_processes(ui, actions));
+        let frame = |app: &mut Shown, actions: &mut Vec<Action>| crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| app.page_processes(ui, actions));
         let mut actions = vec![Action::Efficiency(vec![12])];
         frame(&mut app, &mut actions);
         assert!(actions.is_empty(), "held for the question: {actions:?}");
-        let ask = app.confirm_efficiency.clone().expect("Efficiency mode asks first");
+        let ask = app.page.confirm_efficiency.clone().expect("Efficiency mode asks first");
         assert_eq!(ask, EfficiencyAsk { pids: vec![12], dont_ask: false });
         assert_eq!(EFFICIENCY_QUESTION, "Efficiency mode lowers this process's priority and power consumption. Continue?");
         assert_eq!(ask.title(), "Efficiency mode");
         // Agreed with Don't ask again ticked.
         let mut sent = Vec::new();
-        app.confirm_efficiency = None;
-        app.answer_efficiency(&EfficiencyAsk { dont_ask: true, ..ask }, &mut sent);
+        app.page.confirm_efficiency = None;
+        ProcessesPage::answer_efficiency(&EfficiencyAsk { dont_ask: true, ..ask }, &mut sent);
+        app.apply(&mut sent);
         assert_eq!(sent, [Action::Efficiency(vec![12])]);
         assert!(!app.settings.ask_efficiency, "Ask before applying Efficiency mode is off");
         // The next time it runs as it is.
         let mut actions = vec![Action::Efficiency(vec![13])];
         frame(&mut app, &mut actions);
         assert_eq!(actions, [Action::Efficiency(vec![13])]);
-        assert_eq!(app.confirm_efficiency, None);
+        assert_eq!(app.page.confirm_efficiency, None);
     }
 
     #[test]
     fn realtime_priority_asks_before_it_is_applied() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), disk_sample());
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         // Set priority ▸ Realtime on two selected rows, and High as it is.
         let mut actions = vec![Action::Priority(12, "Realtime"), Action::Priority(13, "Realtime"), Action::Priority(14, "High")];
         crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| app.page_processes(ui, &mut actions));
         assert_eq!(actions, [Action::Priority(14, "High")], "Realtime held for the question");
-        assert_eq!(app.confirm_realtime, Some(vec![12, 13]));
+        assert_eq!(app.page.confirm_realtime, Some(vec![12, 13]));
         assert_eq!(REALTIME_QUESTION, "Realtime priority can make the system unresponsive. Continue?");
         // Agreed: Realtime is set on both.
         let mut sent = Vec::new();
-        TaskApp::answer_realtime(&[12, 13], &mut sent);
+        ProcessesPage::answer_realtime(&[12, 13], &mut sent);
         assert_eq!(sent, [Action::Priority(12, "Realtime"), Action::Priority(13, "Realtime")]);
     }
 
@@ -2608,6 +2653,39 @@ pub(crate) mod tests {
             Some(MenuEntry::Sub { items, .. }) => items.clone(),
             other => vec![other.unwrap_or_else(|| panic!("Set affinity in {:?}", labels(&entries))).clone()],
         }
+    }
+
+    #[test]
+    fn the_process_menu_reads_priority_affinity_and_window_through_the_seam() {
+        use crate::winsys::Affinity;
+        let app = Shown::headless(crate::settings::Settings::default(), tree_sample());
+        let seam = app.system.clone();
+        let (p, q) = (proc(4_000_000_001, "a.exe", "spata", 0.0, 0), proc(4_000_000_002, "b.exe", "spata", 0.0, 0));
+        let mask = Affinity::Mask { process: 0b01, system: 0b11 };
+        seam.script_priority(p.pid, "High");
+        seam.script_affinity(p.pid, mask);
+        seam.script_window(p.pid);
+        let blank = MenuState { priority: None, ..no_view_state(&[]) };
+        let one = crate::widgets::read_menu_state(&*seam, &p, &[&p], &blank);
+        assert_eq!((one.priority, one.affinity, one.windowed), (Some("High"), Some(mask), Some(true)));
+        let ticked = menu_entries(&p, &[&p], &one);
+        let sub = ticked.iter().find_map(|e| match e { MenuEntry::Sub { label: "Set priority", items } => Some(items.clone()), _ => None }).expect("Set priority");
+        assert!(sub.iter().any(|e| matches!(e, MenuEntry::Item { label, checked: Some(true), .. } if label == "High")), "High is ticked");
+        // Several rows: no priority; the affinity is still the row's own.
+        let many = crate::widgets::read_menu_state(&*seam, &p, &[&p, &q], &blank);
+        assert_eq!((many.priority, many.affinity, many.windowed), (None, Some(mask), None));
+        // The shell's Explorer is read through the seam too.
+        seam.script_shell(p.pid);
+        assert_eq!(crate::widgets::read_menu_state(&*seam, &p, &[&p], &blank).shell, Some(p.pid));
+        let explorer = proc(4_000_000_003, "explorer.exe", "spata", 0.0, 0);
+        seam.script_shell(explorer.pid);
+        let state = crate::widgets::read_menu_state(&*seam, &explorer, &[&explorer], &blank);
+        assert_eq!(menu_item(&menu_entries(&explorer, &[&explorer], &state), "Restart"), (true, vec![Action::RestartExplorer(explorer.pid)]), "Restart follows the shell the seam reports");
+        let other = menu_entries(&p, &[&p], &crate::widgets::read_menu_state(&*seam, &p, &[&p], &blank));
+        assert!(!labels(&other).contains(&"Restart"), "not for a process that is not the shell");
+        // A process the adapter knows nothing about: nothing ticked, no window.
+        let none = crate::widgets::read_menu_state(&*seam, &q, &[&q], &blank);
+        assert_eq!((none.priority, none.affinity, none.windowed), (None, None, Some(false)));
     }
 
     #[test]
@@ -2671,14 +2749,14 @@ pub(crate) mod tests {
 
     #[test]
     fn right_and_left_open_and_close_the_selected_tree_row() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), tree_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), tree_sample());
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         // Nothing selected yet: the details pane would show the handles.
         let texts = crate::test_ui::texts(&crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new())));
         assert!(texts.iter().any(|t| t == "Apps (2)") && texts.iter().any(|t| t == "Background processes (1)"), "{texts:?}");
         assert!(!texts.iter().any(|t| t == "steamwebhelper.exe"), "the child starts closed");
         assert!(!texts.iter().any(|t| t == "4321"), "a parent leaves Handles empty");
-        app.selected = Selection::only(100);
+        app.page.selected = Selection::only(100);
         let mut draw = |events| crate::test_ui::texts(&crate::test_ui::run(&ctx, (1800.0, 900.0), events, |ui| app.page_processes(ui, &mut Vec::new())));
         draw(vec![key(egui::Key::ArrowRight)]);
         assert!(draw(vec![]).iter().any(|t| t == "steamwebhelper.exe"), "Right opens the row");
@@ -2688,7 +2766,7 @@ pub(crate) mod tests {
 
     #[test]
     fn double_clicking_a_group_header_folds_and_unfolds_it() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), tree_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), tree_sample());
         // What the page asked for: a header's double-click inspects nothing.
         let mut actions = Vec::new();
         // A fresh context for each double-click: egui's clicks share one
@@ -2712,7 +2790,7 @@ pub(crate) mod tests {
     }
 
     /// The headings of the Processes table, left to right.
-    fn headings_drawn(app: &mut TaskApp) -> Vec<String> {
+    fn headings_drawn(app: &mut Shown) -> Vec<String> {
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let out = crate::test_ui::run(&ctx, (3000.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new()));
         let mut found: Vec<(f32, String)> = text_spots(&out)
@@ -2731,7 +2809,7 @@ pub(crate) mod tests {
 
     #[test]
     fn hiding_a_column_removes_it_and_showing_it_again_restores_its_old_slot() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), disk_sample());
         set_column_shown(&mut app.settings.process_table, ProcCol::Threads, false);
         let hidden = headings_drawn(&mut app);
         assert!(!hidden.iter().any(|t| t == "Threads"), "{hidden:?}");
@@ -2777,7 +2855,7 @@ pub(crate) mod tests {
         assert_eq!(saved["process_table"]["sort_direction"], "ascending");
         assert_eq!(saved["process_table"]["column_widths"]["command"], 300.0);
 
-        let mut app = TaskApp::headless(restarted, disk_sample());
+        let mut app = Shown::headless(restarted, disk_sample());
         let drawn = headings_drawn(&mut app);
         let mut expected: Vec<&str> = ALL_TITLES.iter().copied().filter(|t| *t != "Handles" && *t != "PID").collect();
         expected.insert(expected.iter().position(|t| *t == "Memory").unwrap() + 1, "PID");
@@ -2798,7 +2876,7 @@ pub(crate) mod tests {
             assert_eq!(widths, PROC_COLUMNS.iter().map(|c| c.width).collect::<Vec<_>>(), "the default widths");
             let mut snap = disk_sample();
             snap.procs = vec![proc(1, "small.exe", "spata", 50.0, 1_000), proc(2, "big.exe", "spata", 1.0, 9_000), proc(3, "mid.exe", "spata", 9.0, 5_000)];
-            let mut app = TaskApp::headless(settings, snap);
+            let mut app = Shown::headless(settings, snap);
             assert_eq!(headings_drawn(&mut app), ALL_TITLES);
             let ctx = crate::test_ui::context(theme::Mode::Dark);
             let out = crate::test_ui::run(&ctx, (3000.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new()));
@@ -2829,7 +2907,7 @@ pub(crate) mod tests {
 
     #[test]
     fn dragging_a_header_moves_its_column_and_a_divider_saves_the_width() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), disk_sample());
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let mut draw = |events| crate::test_ui::run(&ctx, (3000.0, 900.0), events, |ui| app.page_processes(ui, &mut Vec::new()));
         let spot = |out: &egui::FullOutput, title: &str| text_spots(out).into_iter().find(|(t, _)| is_heading(t, title)).unwrap().1;
@@ -2862,16 +2940,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn column_changes_on_the_processes_page_are_saved_once_the_mouse_is_up() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
-        assert!(!app.process_table_unsaved(false), "nothing changed");
-        set_column_shown(&mut app.settings.process_table, ProcCol::Pid, false);
-        assert!(!app.process_table_unsaved(true), "not while a divider is dragged");
-        assert!(app.process_table_unsaved(false));
-        assert!(!app.process_table_unsaved(false), "saved once");
-    }
-
-    #[test]
     fn the_connections_column_counts_each_processs_connections_once_shown() {
         use crate::addons::connections::inventory::{assemble, Proto, Row, TcpState};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2885,14 +2953,14 @@ pub(crate) mod tests {
         });
         let mut snap = disk_sample();
         snap.procs = vec![proc(41, "many.exe", "spata", 1.0, 3_000), proc(42, "one.exe", "spata", 1.0, 2_000), proc(43, "none.exe", "spata", 1.0, 1_000)];
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), snap);
-        app.addons = crate::addons::AddonHost::for_tests_with(vec![crate::addons::Entry::Addon(Box::new(fake))], &serde_json::json!({})).0;
+        let mut app = Shown::headless(crate::settings::Settings::default(), snap);
+        app.addons = std::cell::RefCell::new(crate::addons::AddonHost::for_tests_with(vec![crate::addons::Entry::Addon(Box::new(fake))], &serde_json::json!({})).0);
         let ctx = crate::test_ui::context(theme::Mode::Dark);
-        let draw = |app: &mut TaskApp| text_spots(&crate::test_ui::run(&ctx, (3200.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new())));
+        let draw = |app: &mut Shown| text_spots(&crate::test_ui::run(&ctx, (3200.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new())));
         // An addition: hidden until the user shows it, and nothing read meanwhile.
         let spots = draw(&mut app);
         assert!(!spots.iter().any(|(t, _)| t == "Connections"), "hidden by default");
-        let cols = columns_with(&app.addons.process_columns());
+        let cols = columns_with(&app.addons.borrow_mut().process_columns());
         let choices = column_choices_in(&cols, &app.settings.process_table);
         assert_eq!(choices.last().map(|c| (c.title, c.shown)), Some(("Connections", false)), "last in the chooser, unticked");
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -2919,13 +2987,13 @@ pub(crate) mod tests {
         let me = std::env::current_exe().expect("own path").display().to_string();
         let mut snap = disk_sample();
         snap.procs = vec![ProcRow { exe: me, ..proc(77, "tests.exe", "spata", 1.0, 1_000) }];
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), snap);
+        let mut app = Shown::headless(crate::settings::Settings::default(), snap);
         assert_eq!(headings_drawn(&mut app), ALL_TITLES, "hidden by default");
         let choices = column_choices(&app.settings.process_table);
         let of = |title| choices.iter().find(|c| c.title == title).map(|c| (c.shown, c.enabled));
         assert_eq!((of("Publisher"), of("Description")), (Some((false, true)), Some((false, true))), "unticked in the chooser");
         let ctx = crate::test_ui::context(theme::Mode::Dark);
-        let draw = |app: &mut TaskApp| crate::test_ui::texts(&crate::test_ui::run(&ctx, (3600.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new())));
+        let draw = |app: &mut Shown| crate::test_ui::texts(&crate::test_ui::run(&ctx, (3600.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new())));
         assert!(!draw(&mut app).iter().any(|t| t == "Ultimate PC Manager"), "nothing read while hidden");
 
         set_column_shown(&mut app.settings.process_table, ProcCol::Publisher, true);
@@ -2941,19 +3009,19 @@ pub(crate) mod tests {
     #[test]
     fn with_connections_off_neither_its_column_nor_its_menu_item_shows() {
         let p = proc(42, "one.exe", "spata", 1.0, 2_000);
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
-        let links = |app: &mut TaskApp| {
-            let extra = app.addons.process_columns();
+        let mut app = Shown::headless(crate::settings::Settings::default(), disk_sample());
+        let links = |app: &mut Shown| {
+            let extra = app.addons.borrow_mut().process_columns();
             let links: Vec<(&'static str, &'static str)> = extra.iter().map(|(id, c)| (*id, c.menu_item)).collect();
             crate::widgets::process_links(&links, &p)
         };
         assert_eq!(links(&mut app), [("Go to connections", Action::ShowProcessIn { addon: "connections", pid: 42 })], "on: the item");
         // The user showed the column while it was on, then turned it off.
-        let cols = columns_with(&app.addons.process_columns());
+        let cols = columns_with(&app.addons.borrow_mut().process_columns());
         set_column_shown_in(&cols, &mut app.settings.process_table, ProcCol::Addon("connections"), true);
-        app.addons.set_enabled("connections", false);
+        app.addons.borrow_mut().set_enabled("connections", false);
         assert!(links(&mut app).is_empty(), "off: no item");
-        let cols = columns_with(&app.addons.process_columns());
+        let cols = columns_with(&app.addons.borrow_mut().process_columns());
         assert!(!column_choices_in(&cols, &app.settings.process_table).iter().any(|c| c.title == "Connections"), "nor a line in the chooser");
         let drawn = headings_drawn(&mut app);
         assert_eq!(drawn, ALL_TITLES, "nor a column");
@@ -2961,58 +3029,6 @@ pub(crate) mod tests {
         let out = crate::test_ui::run(&ctx, (3200.0, 900.0), vec![], |ui| app.page_processes(ui, &mut Vec::new()));
         assert!(!crate::test_ui::texts(&out).iter().any(|t| t == "Connections"));
         assert!(app.settings.process_table.column_order.iter().any(|k| k == "connections"), "its saved slot is kept for when it is on again");
-    }
-
-    #[test]
-    fn system_info_keeps_every_field_in_one_card() {
-        let keys = [
-            "Computer name", "Operating system", "Version", "Kernel", "Architecture", "Processor", "Cores",
-            "Logical processors", "Speed", "Installed memory", "Page file", "Drives", "Network adapters", "Up time",
-        ];
-        let fields: Vec<(&str, String)> = keys.iter().map(|k| (*k, format!("value of {k}"))).collect();
-        let sections = system_sections(&fields);
-        let shown: Vec<(&str, String)> = sections.iter().flat_map(|s| s.fields.clone()).collect();
-        assert_eq!(shown.len(), keys.len());
-        for k in keys {
-            assert_eq!(shown.iter().filter(|(f, v)| *f == k && *v == format!("value of {k}")).count(), 1, "{k}");
-        }
-        let titles: Vec<&str> = sections.iter().map(|s| s.title).collect();
-        assert_eq!(titles, ["Operating System", "Processor", "Memory", "Storage", "Network"]);
-    }
-
-    #[test]
-    fn users_are_the_accounts_running_processes() {
-        let accounts = accounts(&sample());
-        let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, ["System", "spata"]);
-        let spata = &accounts[1];
-        assert_eq!(spata.procs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["chrome.exe", "Code.exe", "explorer.exe"], "by memory");
-        assert!((spata.cpu - 8.2).abs() < 1e-4);
-        assert_eq!(spata.mem, 10_770_000_000);
-        assert_eq!(users_headline(&accounts), "2 accounts are running processes");
-        assert_eq!(users_headline(&accounts[1..]), "Only spata is running processes");
-        assert_eq!(users_headline(&[]), "No user sessions were reported");
-    }
-
-    #[test]
-    fn both_hiding_settings_are_on_the_settings_page_not_in_process_view() {
-        const LABELS: [&str; 2] = ["Show Task Manager in Reports", "Hide Microsoft Services and Processes"];
-        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), crate::sampler::Snapshot::default());
-        let texts = crate::test_ui::texts(&crate::test_ui::run(&ctx, (1400.0, 2400.0), vec![], |ui| app.page_settings(ui, &mut Vec::new())));
-        for label in LABELS {
-            assert!(texts.iter().any(|t| t == label), "Settings shows {label}: {texts:?}");
-        }
-        assert!(texts.iter().any(|t| t.starts_with("Hides services and processes whose program file carries a verified Microsoft Windows signature")));
-        let menu: Vec<&str> = app
-            .process_view_items()
-            .iter()
-            .filter_map(|i| match i {
-                parts::DropItem::Item { label, .. } => Some(*label),
-                parts::DropItem::Separator => None,
-            })
-            .collect();
-        assert!(LABELS.iter().all(|l| !menu.contains(l)), "Process View lists {menu:?}");
     }
 
     #[test]
@@ -3031,7 +3047,7 @@ pub(crate) mod tests {
     }
 
     /// One frame of the Processes page with `events`, its actions kept.
-    fn processes_frame_into(ctx: &egui::Context, app: &mut TaskApp, events: Vec<egui::Event>, actions: &mut Vec<Action>) -> egui::FullOutput {
+    fn processes_frame_into(ctx: &egui::Context, app: &mut Shown, events: Vec<egui::Event>, actions: &mut Vec<Action>) -> egui::FullOutput {
         let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1800.0, 900.0))), events, ..Default::default() };
         ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| app.page_processes(ui, actions));
@@ -3039,7 +3055,7 @@ pub(crate) mod tests {
     }
 
     /// The actions a click on the text `label` of the Processes page queues.
-    fn click_text(app: &mut TaskApp, label: &str) -> Vec<Action> {
+    fn click_text(app: &mut Shown, label: &str) -> Vec<Action> {
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let out = processes_frame_into(&ctx, app, vec![], &mut Vec::new());
         let at = text_spots(&out).into_iter().find(|(t, _)| t == label).unwrap_or_else(|| panic!("{label} is drawn")).1.center();
@@ -3053,7 +3069,7 @@ pub(crate) mod tests {
     #[test]
     fn pause_and_resume_in_the_table_toolbar_set_the_apps_update_speed() {
         let paused = crate::settings::SPEEDS.iter().position(|s| s.1 == 0).expect("a Paused speed");
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), disk_sample());
         assert!(processes_texts(&mut app).iter().any(|t| t == "Update speed"), "the speed sits by Pause");
         assert_eq!(click_text(&mut app, "Pause"), [Action::UpdateSpeed(paused)]);
         app.settings.speed = paused;
@@ -3062,7 +3078,7 @@ pub(crate) mod tests {
 
     #[test]
     fn export_to_csv_sends_the_shown_rows_and_columns() {
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), disk_sample());
+        let mut app = Shown::headless(crate::settings::Settings::default(), disk_sample());
         set_column_shown(&mut app.settings.process_table, ProcCol::Status, false);
         let actions = click_text(&mut app, "Export to CSV");
         let [Action::ExportCsv { file_name, text }] = actions.as_slice() else { panic!("one export: {actions:?}") };
@@ -3077,13 +3093,78 @@ pub(crate) mod tests {
         let mut snap = disk_sample();
         let info = crate::sampler::ServiceInfo { name: "Winmgmt".into(), display_name: "Windows Management Instrumentation".into(), host: "reads-most.exe (12)".into(), ..Default::default() };
         snap.services = std::sync::Arc::new([(12, vec![info])].into_iter().collect());
-        let mut app = TaskApp::headless(crate::settings::Settings::default(), snap);
-        app.proc_view.expanded.insert(12);
+        let mut app = Shown::headless(crate::settings::Settings::default(), snap);
+        app.page.view.expanded.insert(12);
         click_text(&mut app, "Service: Winmgmt (Windows Management Instrumentation)");
         let texts = processes_texts(&mut app);
         assert!(texts.iter().any(|t| t == "Service name") && texts.iter().any(|t| t == "Winmgmt"), "{texts:?}");
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         processes_frame_into(&ctx, &mut app, vec![key(egui::Key::Delete)], &mut Vec::new());
-        assert_eq!(app.confirm_end, None, "Delete on a service does not end its host");
+        assert_eq!(app.page.confirm_end, None, "Delete on a service does not end its host");
+    }
+
+    // ---- The page through the interface: samples, windows, jobs ----
+
+    #[test]
+    fn a_process_that_ended_between_two_samples_is_kept_in_the_table_as_exited() {
+        let ctx = crate::test_ui::context(theme::Mode::Dark);
+        let mut shown = Shown::headless(Settings::default(), crate::sampler::Snapshot::default());
+        shown.sample(crate::sampler::Snapshot { procs: vec![proc(21, "gone.exe", "spata", 0.0, 1), proc(22, "stays.exe", "spata", 0.0, 1)], ..Default::default() });
+        shown.sample(crate::sampler::Snapshot { procs: vec![proc(22, "stays.exe", "spata", 0.0, 1)], ..Default::default() });
+        let texts = crate::test_ui::texts(&crate::test_ui::run(&ctx, (1800.0, 900.0), vec![], |ui| shown.page_processes(ui, &mut Vec::new())));
+        assert!(texts.iter().any(|t| t == "gone.exe"), "kept a moment, tinted: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Exited"), "{texts:?}");
+    }
+
+    #[test]
+    fn the_page_asks_before_ending_after_it_was_hidden_and_shown_again() {
+        let ctx = crate::test_ui::context(theme::Mode::Dark);
+        let mut shown = Shown::headless(Settings::default(), disk_sample());
+        click_row(&ctx, &mut shown, "reads-most.exe", egui::Modifiers::NONE, 1.0);
+        // Hidden: no frame of the page is drawn, samples keep arriving.
+        shown.sample(disk_sample());
+        shown.sample(disk_sample());
+        processes_frame(&ctx, &mut shown, vec![key(egui::Key::Delete)], egui::Modifiers::NONE, 5.0);
+        let (texts, _) = shown.windows_frame(&ctx);
+        let (texts_next, _) = shown.windows_frame(&ctx);
+        assert!(texts.iter().chain(&texts_next).any(|t| t == "End reads-most.exe?"), "the selection is kept: {texts:?}");
+    }
+
+    #[test]
+    fn a_dump_that_is_written_asks_to_show_it_and_one_that_fails_queues_its_message() {
+        let ctx = crate::test_ui::context(theme::Mode::Dark);
+        let mut shown = Shown::headless(Settings::default(), disk_sample());
+        let path = std::path::PathBuf::from(r"C:\Temp\Code-4242.dmp");
+        let (tx, rx) = std::sync::mpsc::channel();
+        shown.page.watch_dump(rx);
+        let (texts, actions) = shown.windows_frame(&ctx);
+        assert!(!texts.iter().any(|t| t == DUMP_QUESTION) && actions.is_empty(), "nothing yet: {texts:?}");
+        tx.send(Ok(path)).unwrap();
+        shown.windows_frame(&ctx);
+        let (texts, _) = shown.windows_frame(&ctx);
+        assert!(texts.iter().any(|t| t == DUMP_QUESTION), "{texts:?}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        shown.page.watch_dump(rx);
+        tx.send(Err("Windows could not write the memory dump file.".into())).unwrap();
+        let (_, actions) = shown.windows_frame(&ctx);
+        assert_eq!(actions, [Action::Say("Windows could not write the memory dump file.".into())]);
+    }
+
+    #[test]
+    fn a_restart_of_explorer_that_ends_says_so_and_asks_for_a_refresh() {
+        let ctx = crate::test_ui::context(theme::Mode::Dark);
+        let mut shown = Shown::headless(Settings::default(), disk_sample());
+        let (tx, rx) = std::sync::mpsc::channel();
+        shown.page.watch_restart(rx);
+        tx.send(Ok(())).unwrap();
+        let (_, actions) = shown.windows_frame(&ctx);
+        assert_eq!(actions, [Action::Say("Restarted Windows Explorer".into()), Action::Refresh]);
+    }
+
+    #[test]
+    fn the_refresh_button_of_the_header_queues_a_refresh() {
+        let mut shown = Shown::headless(Settings::default(), disk_sample());
+        let actions = click_text(&mut shown, "      Refresh");
+        assert!(actions.contains(&Action::Refresh), "{actions:?}");
     }
 }
