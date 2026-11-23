@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use egui::{vec2, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, Ui};
 
+use super::filters::{self, FilterDriver, FilterRead};
 use super::engine::{self as drivers, DeviceDriver, DriverUpdate, Hub, KernelDriver, KernelFigures, KernelScope};
 use super::signature::{signature_text, Signature, SignatureBook};
 use super::store::{Flags, StoreFigures, StoreList, StorePackage};
@@ -32,6 +33,8 @@ pub enum Scope {
     Kernel,
     /// The driver packages Windows keeps.
     Store,
+    /// The loaded file-system minifilters (read-only).
+    Filters,
 }
 
 /// What the page remembers between frames.
@@ -223,6 +226,35 @@ fn list_note(listing: bool, error: Option<&str>, total: usize, shown: usize, sea
 const DEVICE_FILTER_HINT: &str = "Find a driver or maker";
 const KERNEL_FILTER_HINT: &str = "Driver name, service or vendor";
 
+/// The filter hint of the Filter drivers tab.
+const FILTER_NAME_HINT: &str = "Filter name";
+
+/// How many filters a read found (the tab's count).
+fn filters_count(read: &FilterRead) -> usize {
+    match read {
+        FilterRead::Filters(list) => list.len(),
+        _ => 0,
+    }
+}
+
+/// The filters whose name contains the lowercase text `q` (empty: all).
+fn filter_rows<'a>(list: &'a [FilterDriver], q: &str) -> Vec<&'a FilterDriver> {
+    list.iter().filter(|f| q.is_empty() || f.name.to_lowercase().contains(q)).collect()
+}
+
+/// What the Filter drivers tab says in place of its rows: the title and the
+/// detail line; None when there are rows to show.
+fn filter_note(read: Option<&FilterRead>, shown: usize, searching: bool) -> Option<(String, Option<String>)> {
+    match read {
+        None => Some(("Reading the filters\u{2026}".into(), None)),
+        Some(FilterRead::NeedsAdmin) => Some((filters::NEEDS_ADMIN.into(), None)),
+        Some(FilterRead::Failed(why)) => Some(("Filters could not be listed".into(), Some(why.clone()))),
+        Some(FilterRead::Filters(_)) if shown > 0 => None,
+        Some(FilterRead::Filters(_)) if searching => Some(("No filter matches what you typed.".into(), None)),
+        Some(FilterRead::Filters(_)) => Some(("No filters are loaded.".into(), None)),
+    }
+}
+
 /// What the side panel says while nothing is selected.
 const DEVICE_EMPTY: &str = "Select a driver to see its details and what Windows Update offers for it.";
 const KERNEL_EMPTY: &str = "Select a kernel module to see where it lives, how much memory it holds and whether it can be unloaded.";
@@ -386,7 +418,7 @@ impl Derived {
 
         let mut items = Vec::new();
         let mut matching = 0;
-        if !matches!(inputs.scope, Scope::Kernel | Scope::Store) {
+        if matches!(inputs.scope, Scope::Hardware | Scope::Builtin) {
             let matches: Vec<usize> = scoped(inputs.scope == Scope::Hardware)
                 .into_iter()
                 .filter(|&i| {
@@ -626,6 +658,7 @@ impl DriversPage {
         let store = st.store.clone();
         let store_error = st.store_error.clone();
         let store_reading = st.store_reading;
+        let filter_read = st.filters.clone();
         let signatures = st.signatures.clone();
         drop(st);
         let admin = self.context.is_admin();
@@ -676,18 +709,20 @@ impl DriversPage {
                 (Scope::Builtin, "Windows built-in", view.builtin_count),
                 (Scope::Kernel, "Kernel modules", kernel.len()),
                 (Scope::Store, "Driver store", store.len()),
+                (Scope::Filters, "Filter drivers", filter_read.as_deref().map_or(0, filters_count)),
             ];
             if let Some(scope) = parts::scope_group(ui, self.drv_ui.scope, &scopes).clicked {
                 self.drv_ui.scope = scope;
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if !matches!(self.drv_ui.scope, Scope::Kernel | Scope::Store) {
+                if matches!(self.drv_ui.scope, Scope::Hardware | Scope::Builtin) {
                     ui.checkbox(&mut self.drv_ui.show_disconnected, "Show disconnected");
                     ui.add_space(8.0);
                 }
                 let hint = match self.drv_ui.scope {
                     Scope::Kernel => KERNEL_FILTER_HINT,
                     Scope::Store => STORE_FILTER_HINT,
+                    Scope::Filters => FILTER_NAME_HINT,
                     _ => DEVICE_FILTER_HINT,
                 };
                 crate::widgets::search_field(ui, &mut self.drv_ui.search, hint, 240.0);
@@ -705,6 +740,16 @@ impl DriversPage {
                 if !listed_at.is_empty() {
                     ui.label(RichText::new(format!("Updated {listed_at}")).color(th.faint).size(12.0));
                 }
+            });
+        }
+        if self.drv_ui.scope == Scope::Filters {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Filter drivers").strong().color(th.soft));
+                ui.label(RichText::new(filters::FILTERS_INTRO).size(12.0).color(th.label));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(filters::FILTERS_READ_ONLY).size(12.0).color(th.faint));
+                });
             });
         }
         ui.add_space(10.0);
@@ -728,6 +773,10 @@ impl DriversPage {
                 let list = self.store_view(&store);
                 self.store_list(&mut list_ui, actions, &list, store_reading, store_error.as_deref());
                 self.store_side(&mut side_ui, actions, &list);
+            }
+            Scope::Filters => {
+                self.filter_list(&mut list_ui, filter_read.as_deref());
+                empty_panel(&mut side_ui, filters::FILTERS_SIDE);
             }
             scope => {
                 let searching = !self.drv_ui.search.trim().is_empty();
@@ -1269,6 +1318,48 @@ impl DriversPage {
         if unload.is_some() {
             self.drv_ui.confirm_unload = unload;
         }
+    }
+
+    /// The Filter drivers tab: name, altitude, instances and frame, or why
+    /// there is no list. Read-only: rows have no actions.
+    fn filter_list(&mut self, ui: &mut Ui, read: Option<&FilterRead>) {
+        let th = theme::of_ui(ui);
+        let q = self.drv_ui.search.trim().to_lowercase();
+        let rows = match read {
+            Some(FilterRead::Filters(list)) => filter_rows(list, &q),
+            _ => Vec::new(),
+        };
+        if let Some((title, detail)) = filter_note(read, rows.len(), !q.is_empty()) {
+            ui.label(RichText::new(title).color(if matches!(read, Some(FilterRead::Failed(_))) { th.red } else { th.label }));
+            if let Some(detail) = detail {
+                ui.label(RichText::new(detail).size(12.0).color(th.faint));
+            }
+            return;
+        }
+        let w = ui.available_width();
+        let fixed = [110.0, 90.0, 70.0];
+        let gap = 12.0;
+        let name_w = (w - fixed.iter().sum::<f32>() - gap * 3.0 - 20.0).max(160.0);
+        let right = [10.0 + name_w + gap + fixed[0], 10.0 + name_w + gap * 2.0 + fixed[0] + fixed[1], 10.0 + name_w + gap * 3.0 + fixed[0] + fixed[1] + fixed[2]];
+        let (hr, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
+        let p = ui.painter();
+        p.text(Pos2::new(hr.left() + 10.0, hr.center().y), Align2::LEFT_CENTER, "Filter", text(12.0), th.label);
+        for (x, h) in right.iter().zip(["Altitude", "Instances", "Frame"]) {
+            p.text(Pos2::new(hr.left() + x, hr.center().y), Align2::RIGHT_CENTER, h, text(12.0), th.label);
+        }
+        p.rect_filled(Rect::from_min_size(Pos2::new(hr.left(), hr.bottom() - 1.0), vec2(w, 1.0)), CornerRadius::ZERO, th.line);
+        egui::ScrollArea::vertical().id_salt("drv-filter-list").auto_shrink([false, false]).show_rows(ui, 28.0, rows.len(), |ui, range| {
+            for f in &rows[range] {
+                let (r, resp) = ui.allocate_exact_size(vec2(w, 28.0), Sense::hover());
+                let p = ui.painter();
+                parts::row_fill(p, r, false, resp.hovered());
+                p.text(Pos2::new(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, fit(p, &f.name, &text(13.0), name_w), text(13.0), th.text);
+                let nums = [f.altitude.clone(), f.instances.to_string(), f.frame.to_string()];
+                for (x, v) in right.iter().zip(nums) {
+                    p.text(Pos2::new(r.left() + x, r.center().y), Align2::RIGHT_CENTER, v, text(13.0), th.soft);
+                }
+            }
+        });
     }
 
     fn kernel_side(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, kernel: &[KernelDriver], signatures: &SignatureBook, admin: bool, idle: bool) {
@@ -1993,6 +2084,34 @@ mod tests {
         let rows = shown.iter().filter(|t| t.starts_with("Driver 0") || t.starts_with("Driver 1") || t.starts_with("Driver 2")).count();
         assert!(rows < 100, "{rows} rows built for a screen of rows");
         assert!(shown.iter().any(|t| t == "Open in Device Manager"), "the side panel shows the selected driver");
+    }
+
+    #[test]
+    fn the_filter_tab_says_why_it_has_no_rows() {
+        let list = |names: &[&str]| FilterRead::Filters(names.iter().map(|n| FilterDriver { name: n.to_string(), altitude: "1".into(), instances: 1, frame: 0 }).collect());
+        assert_eq!(filter_note(None, 0, false).unwrap().0, "Reading the filters\u{2026}");
+        assert_eq!(filter_note(Some(&FilterRead::NeedsAdmin), 0, false), Some(("Needs administrator rights to list filters.".to_string(), None)));
+        assert_eq!(filter_note(Some(&FilterRead::Failed("boom".into())), 0, false), Some(("Filters could not be listed".to_string(), Some("boom".to_string()))));
+        assert_eq!(filter_note(Some(&list(&[])), 0, false).unwrap().0, "No filters are loaded.");
+        assert_eq!(filter_note(Some(&list(&["a"])), 0, true).unwrap().0, "No filter matches what you typed.");
+        assert_eq!(filter_note(Some(&list(&["a"])), 1, true), None);
+    }
+
+    #[test]
+    fn the_filter_search_matches_names_in_any_case() {
+        let f = |n: &str| FilterDriver { name: n.into(), altitude: "1".into(), instances: 1, frame: 0 };
+        let all = [f("WdFilter"), f("bindflt"), f("FileCrypt")];
+        assert_eq!(filter_rows(&all, "").len(), 3);
+        assert_eq!(filter_rows(&all, "wdf").iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["WdFilter"]);
+        assert_eq!(filters_count(&FilterRead::NeedsAdmin), 0);
+    }
+
+    #[test]
+    fn the_other_tabs_still_draw_without_the_filter_tab_in_the_way() {
+        let mut page = page_with(vec![gpu("Alpha GPU")], vec![loaded("disk", "Microsoft", "disk.sys", Some(1024))]);
+        assert!(frame(&mut page).iter().any(|t| t == "Alpha GPU"));
+        page.drv_ui.scope = Scope::Kernel;
+        assert!(frame(&mut page).iter().any(|t| t == "disk"));
     }
 
     #[test]

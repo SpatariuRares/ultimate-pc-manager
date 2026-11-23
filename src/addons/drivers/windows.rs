@@ -3,6 +3,7 @@
 
 use super::engine::{DeviceDriver, KernelDriver, SecurityReading};
 use super::store::StorePackage;
+use super::filters::FilterRead;
 use super::ListingReader;
 
 /// The Drivers add-on's reader on a real PC.
@@ -21,6 +22,9 @@ impl ListingReader for WindowsListing {
     }
     fn store(&self) -> Result<Vec<StorePackage>, String> {
         imp::read_store()
+    }
+    fn filters(&self) -> FilterRead {
+        imp::list_filters()
     }
     fn signature(&self, path: &str) -> super::signature::Signature {
         super::signature::check(path)
@@ -42,6 +46,9 @@ mod imp {
     }
     pub fn read_store() -> Result<Vec<super::StorePackage>, String> {
         Err(unavailable_error(Feature::DeviceSetupApi))
+    }
+    pub fn list_filters() -> super::super::filters::FilterRead {
+        super::super::filters::FilterRead::Failed(unavailable_error(Feature::DeviceSetupApi))
     }
 }
 
@@ -146,6 +153,37 @@ mod imp {
             p.size = store_folder(&p.published, &p.original, &folders, std::path::Path::new(&root), &repository).map(|f| folder_size(&repository.join(f)));
         }
         Ok(packages)
+    }
+
+    /// The loaded minifilters, read with `FilterFindFirst`/`FilterFindNext`
+    /// (read-only). Without administrator rights Windows refuses: that is
+    /// told as such and nothing asks for rights.
+    pub fn list_filters() -> super::super::filters::FilterRead {
+        use super::super::filters::{failure, parse_entry, sorted, FilterRead, AGGREGATE_STANDARD_INFORMATION, NO_MORE_ITEMS};
+        use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::InstallableFileSystems::{FilterFindClose, FilterFindFirst, FilterFindNext};
+        let mut buf = vec![0u8; 64 * 1024];
+        let (mut got, mut find): (u32, HANDLE) = (0, INVALID_HANDLE_VALUE);
+        let mut hr = unsafe { FilterFindFirst(AGGREGATE_STANDARD_INFORMATION, buf.as_mut_ptr().cast(), buf.len() as u32, &mut got, &mut find) };
+        if hr == NO_MORE_ITEMS {
+            return FilterRead::Filters(Vec::new());
+        }
+        if hr != 0 {
+            return failure(hr);
+        }
+        let mut list = Vec::new();
+        let outcome = loop {
+            list.extend(parse_entry(&buf[..(got as usize).min(buf.len())]));
+            hr = unsafe { FilterFindNext(find, AGGREGATE_STANDARD_INFORMATION, buf.as_mut_ptr().cast(), buf.len() as u32, &mut got) };
+            if hr == NO_MORE_ITEMS {
+                break FilterRead::Filters(sorted(std::mem::take(&mut list)));
+            }
+            if hr != 0 {
+                break failure(hr);
+            }
+        };
+        unsafe { FilterFindClose(find) };
+        outcome
     }
 
     fn wide(s: &str) -> Vec<u16> {

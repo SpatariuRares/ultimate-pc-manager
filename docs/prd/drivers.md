@@ -124,7 +124,9 @@ A "Driver store" tab after Kernel modules lists the driver packages Windows keep
 
 ### Security band (spec #11, #32)
 A compact read-only "Security" strip under the status band shows Memory integrity (`HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled`) and the vulnerable driver blocklist (`HKLM\SYSTEM\CurrentControlSet\Control\CI\Config\VulnerableDriverBlocklistEnable`).
-- Each value shows as "On" (1), "Off" (0), "Not set" (no key or value: the page does not guess) or "could not be read" (access denied, another type, any other number), each with its own explaining line; an unreadable value is never shown as off.
+- Each value shows as "On" (1), "Off" (0), "Not set" or "could not be read" (access denied, another type, any other number), each with its own explaining line; an unreadable value is never shown as off.
+- **Memory integrity with no value or no key shows "Off"** (owner decision on #32), as Windows Security does when the setting was never turned on; "could not be read" is kept for a real read failure or an unknown value. The vulnerable driver blocklist is unchanged: with no value it still shows "Not set".
+- Possible later improvement: read the running state from WMI `Win32_DeviceGuard.SecurityServicesRunning`.
 - The values are read with normal rights, in process, in the same read as the driver listing; nothing is written and no elevated job is added. When the add-on is turned off the read is dropped and nothing new starts.
 - "Open Windows Security" opens `windowsdefender://coreisolation`; the strip says "Read-only: change them in Windows Security."
 
@@ -134,6 +136,12 @@ Windows Update installs and INF installs offer "Create a restore point first" in
 - The step uses `Checkpoint-Computer` with the `DEVICE_DRIVER_INSTALL` type and reports "Restore point created.", "System Restore is off on drive C:." or "Windows already created a restore point in the last 24 hours." (any other failure: "The restore point could not be created: <reason>").
 - When it is not created, the job stops before the change (nothing was changed) and the page asks "Continue without a new restore point?" with Continue and Cancel. Continue runs the change again without a restore point (a second UAC prompt, only on this path); Cancel says "Cancelled: nothing was changed.". When it is created its message leads the outcome message.
 - Unload and Scan make no restore point. The job is an uninterruptible elevated job like the others: turning the add-on off waits for it.
+
+### Filter drivers (spec #11, #33)
+A "Filter drivers" tab lists the loaded file-system minifilters read-only: name, altitude, instances and frame, highest altitude first like `fltmc filters`, with a "Filter name" search.
+- They are read in process with `FilterFindFirst`/`FilterFindNext` (Filter Manager user API), in the same read as the driver listing, with normal rights.
+- When Windows refuses without administrator rights the tab says "Needs administrator rights to list filters."; the page never asks for rights on its own.
+- There is no unload or other action. When the add-on is turned off the read is dropped and nothing new starts; no elevated job is added.
 
 ### Behavior as an add-on
 54. As a user, I want to turn Drivers on or off from the Add-ons page in Settings, so that I keep the app light if I do not need it. *(our addition)*

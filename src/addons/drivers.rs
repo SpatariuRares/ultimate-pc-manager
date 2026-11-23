@@ -9,6 +9,8 @@
 pub mod cli;
 /// Reading drivers and Windows Update, and installing.
 pub mod engine;
+/// The read-only list of loaded file-system minifilters.
+pub mod filters;
 /// The Drivers page.
 pub mod page;
 /// Driver signatures: WinVerifyTrust, catalogs and WHQL.
@@ -52,6 +54,11 @@ pub trait ListingReader: Send + Sync {
     /// they could not be read.
     fn store(&self) -> Result<Vec<store::StorePackage>, String> {
         Err("this reader does not read the driver store".into())
+    }
+    /// The loaded file-system minifilters, read-only and with normal
+    /// rights; Windows may refuse without administrator rights.
+    fn filters(&self) -> filters::FilterRead {
+        filters::FilterRead::Failed("this reader does not list filters".into())
     }
     /// The signature of the driver file at `path`, read with normal rights.
     /// Called on a background thread, one file at a time.
@@ -969,7 +976,63 @@ mod reader_tests {
         assert!(!page.contains("Memory integrity is off") && !page.contains("The blocklist is off"), "an unreadable value is never shown as off: {page}");
 
         let mut host = secure_host(NotSet, Value(1));
-        until("the not-set strip is shown", || shown(&mut host).contains("Not set"));
+        until("the missing memory integrity value is shown as off", || shown(&mut host).contains("Memory integrity is off"));
+        let page = shown(&mut host);
+        assert!(!page.contains("Not set") && !page.contains("could not be read"), "a missing value is off, as Windows Security shows it: {page}");
+
+        let mut host = secure_host(Value(1), NotSet);
+        until("the not-set blocklist is shown", || shown(&mut host).contains("Not set"));
+    }
+
+    /// A reader whose Filter Manager read answers `filters`.
+    struct Filtered(filters::FilterRead);
+
+    impl ListingReader for Filtered {
+        fn devices(&self) -> Result<Vec<DeviceDriver>, String> {
+            Ok(vec![device("Alpha GPU")])
+        }
+        fn kernel(&self) -> Result<Vec<KernelDriver>, String> {
+            Ok(Vec::new())
+        }
+        fn filters(&self) -> filters::FilterRead {
+            self.0.clone()
+        }
+    }
+
+    fn filters_host(read: filters::FilterRead) -> AddonHost {
+        let reader: Arc<dyn ListingReader> = Arc::new(Filtered(read));
+        let entries = vec![Entry::Addon(Box::new(Drivers::with_reader(reader)))];
+        AddonHost::for_tests_with(entries, &json!({ "drivers": { "enabled": true, "settings": { "scope": "filters" } } })).0
+    }
+
+    #[test]
+    fn the_filter_drivers_tab_lists_name_altitude_instances_and_frame_and_has_no_action() {
+        let list = vec![
+            filters::FilterDriver { name: "WdFilter".into(), altitude: "328010".into(), instances: 5, frame: 0 },
+            filters::FilterDriver { name: "bindflt".into(), altitude: "409800".into(), instances: 1, frame: 0 },
+        ];
+        let mut host = filters_host(filters::FilterRead::Filters(list));
+        until("the filters are shown", || shown(&mut host).contains("WdFilter"));
+        let page = shown(&mut host);
+        for want in ["Filter drivers", "Filter\n", "Altitude", "Instances", "Frame", "bindflt", "409800", "328010", filters::FILTERS_INTRO, filters::FILTERS_READ_ONLY, filters::FILTERS_SIDE] {
+            assert!(page.contains(want), "{want:?} in {page}");
+        }
+        assert!(!page.contains("Unload") && !page.contains("Alpha GPU"), "no action, and no device rows here: {page}");
+    }
+
+    #[test]
+    fn filters_that_need_administrator_rights_show_the_message_and_no_list() {
+        let mut host = filters_host(filters::FilterRead::NeedsAdmin);
+        until("the message is shown", || shown(&mut host).contains("Needs administrator rights to list filters."));
+        assert!(!shown(&mut host).contains("Altitude"), "no table without a list");
+    }
+
+    #[test]
+    fn a_reader_without_a_filter_read_says_the_filters_could_not_be_listed() {
+        let reader = Fake::devices(vec![Ok(vec![device("Alpha GPU")])]);
+        let (mut host, _) = host_with(&reader, json!({ "enabled": true, "settings": { "scope": "filters" } }));
+        until("the failure is shown", || shown(&mut host).contains("Filters could not be listed"));
+        assert!(shown(&mut host).contains("this reader does not list filters"));
     }
 
     #[test]

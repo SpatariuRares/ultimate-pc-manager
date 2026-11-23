@@ -468,6 +468,9 @@ pub struct State {
     /// The last read of the security settings; `None` until the first
     /// listing has read them.
     pub security: Option<SecurityReading>,
+    /// The last read of the loaded filters; `None` until the first listing
+    /// has read them.
+    pub filters: Option<Arc<super::filters::FilterRead>>,
     /// What the signature checks found so far, by file path. A snapshot
     /// replaced as results arrive, so the page can tell when it changed.
     pub signatures: Arc<SignatureBook>,
@@ -616,6 +619,7 @@ impl Hub {
             // list. Each tab shows its own list's error, so both get it.
             if let Some(why) = unavailable_text(Feature::DeviceSetupApi) {
                 publish_store(&mut st, Err(why.clone()));
+                st.filters = Some(Arc::new(super::filters::FilterRead::Failed(why.clone())));
                 publish_listing(&mut st, Err(why.clone()), Err(why));
                 st.listed_at = crate::platform::clock_now();
                 return;
@@ -637,9 +641,14 @@ impl Hub {
             return;
         }
         let security = self.reader.security();
+        if self.live().is_none() {
+            return;
+        }
+        let filters = self.reader.filters();
         let Some(mut st) = self.live() else { return };
         publish_listing(&mut st, devices, kernel);
         st.security = Some(security);
+        st.filters = Some(Arc::new(filters));
         st.listed_at = crate::platform::clock_now();
         drop(st);
         // The signature check runs on its own thread.
@@ -1312,6 +1321,16 @@ pub fn setting_of(reading: &Reading) -> Setting {
     }
 }
 
+/// Memory integrity: as Windows Security shows it, a missing value (or key)
+/// means it was never turned on, so it is off. A failed read or any number
+/// other than 0 and 1 stays unreadable.
+pub fn memory_integrity_of(reading: &Reading) -> Setting {
+    match reading {
+        Reading::NotSet => Setting::Off,
+        other => setting_of(other),
+    }
+}
+
 /// The name of the first setting.
 pub const MEMORY_INTEGRITY: &str = "Memory integrity";
 /// The name of the second setting.
@@ -1335,7 +1354,7 @@ pub fn security_view(reading: Option<&SecurityReading>) -> SecurityView {
     let Some(r) = reading else {
         return SecurityView { items: [(MEMORY_INTEGRITY, None), (BLOCKLIST, None)], note: "Reading the security settings\u{2026}".into() };
     };
-    let (memory, blocklist) = (setting_of(&r.memory_integrity), setting_of(&r.blocklist));
+    let (memory, blocklist) = (memory_integrity_of(&r.memory_integrity), setting_of(&r.blocklist));
     let mut notes: Vec<String> = Vec::new();
     match (memory, blocklist) {
         (Setting::Unreadable, Setting::Unreadable) => notes.push("Windows did not let us read these settings, so we do not guess.".into()),
@@ -1345,7 +1364,6 @@ pub fn security_view(reading: Option<&SecurityReading>) -> SecurityView {
     }
     match memory {
         Setting::Off => notes.push("Memory integrity is off: Windows does not isolate the kernel from unsafe code.".into()),
-        Setting::NotSet => notes.push("Memory integrity has no value in Windows, so we do not say whether it is on.".into()),
         _ => {}
     }
     match blocklist {
@@ -2363,6 +2381,7 @@ mod outcome_tests {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+    use crate::addons::drivers::filters::{FilterDriver, FilterRead, NEEDS_ADMIN};
     use crate::addons::drivers::windows::WindowsListing;
     use crate::addons::until;
     use std::sync::atomic::AtomicUsize;
@@ -2419,10 +2438,21 @@ mod security_tests {
     }
 
     #[test]
-    fn a_missing_value_is_not_set_and_is_not_guessed() {
-        let v = security_view(Some(&reading(Reading::NotSet, Reading::NotSet)));
-        assert_eq!(v.items, [(MEMORY_INTEGRITY, Some(Setting::NotSet)), (BLOCKLIST, Some(Setting::NotSet))]);
-        assert!(v.note.contains("Memory integrity has no value") && v.note.contains("The blocklist has no value"), "{}", v.note);
+    fn a_missing_memory_integrity_value_is_off_as_windows_security_shows_it() {
+        let v = security_view(Some(&reading(Reading::NotSet, Reading::Value(1))));
+        assert_eq!(v.items, [(MEMORY_INTEGRITY, Some(Setting::Off)), (BLOCKLIST, Some(Setting::On))]);
+        assert_eq!(v.note, "Memory integrity is off: Windows does not isolate the kernel from unsafe code.");
+        assert_eq!(memory_integrity_of(&Reading::Value(1)), Setting::On);
+        assert_eq!(memory_integrity_of(&Reading::Value(0)), Setting::Off);
+        assert_eq!(memory_integrity_of(&Reading::Value(7)), Setting::Unreadable, "an unknown value is not guessed");
+        assert_eq!(memory_integrity_of(&Reading::Failed("access is denied".into())), Setting::Unreadable, "a failed read is not off");
+    }
+
+    #[test]
+    fn a_missing_blocklist_value_stays_not_set_and_is_not_guessed() {
+        let v = security_view(Some(&reading(Reading::Value(1), Reading::NotSet)));
+        assert_eq!(v.items, [(MEMORY_INTEGRITY, Some(Setting::On)), (BLOCKLIST, Some(Setting::NotSet))]);
+        assert_eq!(v.note, "The blocklist has no value in Windows, so we do not say whether it is on.");
     }
 
     #[test]
@@ -2440,11 +2470,24 @@ mod security_tests {
         in_kernel: AtomicBool,
         release: AtomicBool,
         hold: bool,
+        filters: FilterRead,
+        filters_asked: AtomicUsize,
     }
 
     impl Fake {
         fn new(security: SecurityReading, hold: bool) -> Arc<Fake> {
-            Arc::new(Fake { security, asked: AtomicUsize::new(0), in_kernel: AtomicBool::new(false), release: AtomicBool::new(!hold), hold })
+            Fake::with_filters(security, hold, FilterRead::Filters(Vec::new()))
+        }
+        fn with_filters(security: SecurityReading, hold: bool, filters: FilterRead) -> Arc<Fake> {
+            Arc::new(Fake {
+                security,
+                asked: AtomicUsize::new(0),
+                in_kernel: AtomicBool::new(false),
+                release: AtomicBool::new(!hold),
+                hold,
+                filters,
+                filters_asked: AtomicUsize::new(0),
+            })
         }
     }
 
@@ -2462,6 +2505,78 @@ mod security_tests {
         fn security(&self) -> SecurityReading {
             self.asked.fetch_add(1, Ordering::SeqCst);
             self.security.clone()
+        }
+        fn filters(&self) -> FilterRead {
+            self.filters_asked.fetch_add(1, Ordering::SeqCst);
+            self.filters.clone()
+        }
+    }
+
+    fn minifilter(name: &str) -> FilterDriver {
+        FilterDriver { name: name.into(), altitude: "328010".into(), instances: 3, frame: 0 }
+    }
+
+    #[test]
+    fn a_listing_reads_the_loaded_filters_with_normal_rights_and_starts_nothing_elevated() {
+        let (ctx, runner) = AddonContext::recording();
+        let list = FilterRead::Filters(vec![minifilter("WdFilter")]);
+        let fake = Fake::with_filters(reading(Reading::Value(1), Reading::Value(1)), false, list.clone());
+        let hub = Hub::new(ctx, fake.clone());
+        assert!(hub.lock().filters.is_none(), "nothing is read before the page asks");
+        hub.refresh();
+        until("the filters are read", || hub.lock().filters.is_some());
+        assert_eq!(hub.lock().filters.as_deref(), Some(&list));
+        assert_eq!(fake.filters_asked.load(Ordering::SeqCst), 1);
+        assert!(runner.launches().is_empty(), "no PowerShell, no elevation prompt");
+    }
+
+    #[test]
+    fn filters_that_need_administrator_rights_say_so_and_nothing_is_started() {
+        let (ctx, runner) = AddonContext::recording();
+        let fake = Fake::with_filters(reading(Reading::Value(1), Reading::Value(1)), false, FilterRead::NeedsAdmin);
+        let hub = Hub::new(ctx, fake);
+        hub.refresh();
+        until("the outcome is published", || hub.lock().filters.is_some());
+        assert_eq!(hub.lock().filters.as_deref(), Some(&FilterRead::NeedsAdmin));
+        assert!(runner.launches().is_empty(), "the page never asks for rights on its own");
+    }
+
+    #[test]
+    fn turning_off_while_the_listing_runs_drops_the_filter_read() {
+        let (ctx, _) = AddonContext::recording();
+        let fake = Fake::with_filters(reading(Reading::Value(1), Reading::Value(1)), true, FilterRead::Filters(vec![minifilter("WdFilter")]));
+        let hub = Hub::new(ctx, fake.clone());
+        hub.refresh();
+        until("the listing is running", || fake.in_kernel.load(Ordering::SeqCst));
+        hub.stop();
+        fake.release.store(true, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(fake.filters_asked.load(Ordering::SeqCst), 0, "the filters are not read once the add-on is off");
+        assert!(hub.lock().filters.is_none(), "and nothing is published");
+    }
+
+    #[test]
+    fn a_hub_that_was_stopped_starts_no_filter_read() {
+        let (ctx, _) = AddonContext::recording();
+        let fake = Fake::new(reading(Reading::Value(1), Reading::Value(1)), false);
+        let hub = Hub::new(ctx, fake.clone());
+        hub.stop();
+        hub.refresh();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(fake.filters_asked.load(Ordering::SeqCst), 0);
+    }
+
+    /// Reads this PC's loaded filters (run with `--ignored --nocapture`, and
+    /// again as administrator: without rights it says so).
+    #[test]
+    #[ignore]
+    fn reads_the_loaded_filters_of_this_pc() {
+        let read = WindowsListing.filters();
+        println!("{read:?}");
+        match read {
+            FilterRead::Filters(list) => assert!(list.iter().any(|f| !f.name.is_empty() && f.altitude.parse::<f64>().is_ok()), "{list:?}"),
+            FilterRead::NeedsAdmin => println!("{NEEDS_ADMIN}"),
+            FilterRead::Failed(why) => panic!("the read failed: {why}"),
         }
     }
 
