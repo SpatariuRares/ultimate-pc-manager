@@ -22,6 +22,7 @@ use crate::signature::Signatures;
 use crate::system_actions::SystemActions;
 use crate::theme::{self, Theme};
 use crate::widgets::parts::{self, cell_text, BandArea, CellInk, Mark, SidePanel, StatusBand, TABLE_ROW_HEIGHT};
+use crate::process_menu::*;
 use crate::widgets::*;
 
 /// Shown when "Go to the process" targets one that Hide Microsoft Services
@@ -553,7 +554,7 @@ impl CorePage for ProcessesPage {
                                     services: Some(&*services),
                                     windowed: None,
                                 };
-                                let state = crate::widgets::read_menu_state(system, p, &rows, &state);
+                                let state = crate::process_menu::read_menu_state(system, p, &rows, &state);
                                 process_menu(ui, p, &rows, &state, actions);
                             });
                         });
@@ -1424,7 +1425,7 @@ impl EndAsk {
             EndKind::ForceQuit => "Force quit",
             EndKind::Tree => "End process tree",
         };
-        crate::widgets::menu_label(one, self.many())
+        crate::process_menu::menu_label(one, self.many())
     }
 
     pub fn question(&self) -> String {
@@ -1474,7 +1475,7 @@ pub const REALTIME_QUESTION: &str = "Realtime priority can make the system unres
 impl EfficiencyAsk {
     /// The dialog's title and its button: the menu item's label.
     pub fn title(&self) -> &'static str {
-        crate::widgets::menu_label("Efficiency mode", self.pids.len() > 1)
+        crate::process_menu::menu_label("Efficiency mode", self.pids.len() > 1)
     }
 }
 
@@ -1802,7 +1803,7 @@ pub(crate) mod tests {
     /// What the menu's end item sends, and the question asked first, if any.
     fn menu_end(label: &str) -> (Action, Option<EndAsk>) {
         let p = proc(7, "Code.exe", "spata", 0.0, 0);
-        let item = crate::widgets::END_ITEMS.iter().find(|(_, l)| *l == label).expect("a menu item").0;
+        let item = crate::process_menu::END_ITEMS.iter().find(|(_, l)| *l == label).expect("a menu item").0;
         let sent = item.action(&[&p]);
         let ask = EndAsk::before(&sent);
         (sent, ask)
@@ -1861,7 +1862,7 @@ pub(crate) mod tests {
         click_row(&ctx, &mut app, "writes-most.exe", ctrl, 5.0);
         assert_eq!(sorted_pids(&app), [11, 12, 14], "Ctrl adds rows");
         let rows = rows_of(&app.snap.procs, &app.page.selected);
-        let entries = crate::widgets::end_entries(&rows);
+        let entries = crate::process_menu::end_entries(&rows);
         let labels: Vec<&str> = entries.iter().map(|(l, _)| *l).collect();
         assert_eq!(labels, ["End selected tasks", "Force quit selected tasks", "End selected process trees", "Force quit selected process trees"]);
         let ask = EndAsk::before(&entries[0].1).expect("ending several asks first");
@@ -1923,7 +1924,7 @@ pub(crate) mod tests {
 
     #[test]
     fn force_quit_process_tree_sends_a_forced_tree_end() {
-        let labels: Vec<&str> = crate::widgets::END_ITEMS.iter().map(|(_, l)| *l).collect();
+        let labels: Vec<&str> = crate::process_menu::END_ITEMS.iter().map(|(_, l)| *l).collect();
         assert_eq!(labels, ["End task", "Force quit", "End process tree", "Force quit process tree"]);
         let (sent, ask) = menu_end("Force quit process tree");
         assert_eq!(sent, Action::End { pid: 7, force: true, tree: true, name: "Code.exe".into() });
@@ -1945,7 +1946,7 @@ pub(crate) mod tests {
         let ctx = crate::test_ui::context(theme::Mode::Dark);
         let p = proc(7, "Code.exe", "spata", 0.0, 0);
         let mut actions = Vec::new();
-        let draw = |events, actions: &mut Vec<Action>| crate::test_ui::run(&ctx, (400.0, 600.0), events, |ui| crate::widgets::process_menu(ui, &p, &[&p], &no_view_state(&[]), actions));
+        let draw = |events, actions: &mut Vec<Action>| crate::test_ui::run(&ctx, (400.0, 600.0), events, |ui| crate::process_menu::process_menu(ui, &p, &[&p], &no_view_state(&[]), actions));
         let out = draw(vec![], &mut actions);
         let texts: Vec<(String, egui::FontFamily, egui::Rect)> = crate::test_ui::flat_shapes(&out)
             .iter()
@@ -2350,22 +2351,22 @@ pub(crate) mod tests {
         let p = proc(7, "Code.exe", "spata", 0.0, 0);
         let app = Shown::headless(crate::settings::Settings::default(), tree_sample());
         let view = process_view_items(&app.settings);
-        let out = crate::test_ui::run(&ctx, (400.0, 800.0), vec![], |ui| crate::widgets::process_menu(ui, &p, &[&p], &no_view_state(&view), &mut Vec::new()));
+        let out = crate::test_ui::run(&ctx, (400.0, 800.0), vec![], |ui| crate::process_menu::process_menu(ui, &p, &[&p], &no_view_state(&view), &mut Vec::new()));
         let texts = crate::test_ui::texts(&out);
         let at = |w: &str| texts.iter().position(|t| t == w).unwrap_or_else(|| panic!("{w} in {texts:?}"));
         assert_eq!(at("Follow process"), at("View") + 1, "{texts:?}");
         assert_eq!(at("Resource values"), at("Follow process") + 1, "{texts:?}");
         assert_eq!(at("Efficiency mode"), at("Resource values") + 1, "{texts:?}");
         assert_eq!(at("Set priority"), at("Efficiency mode") + 1, "{texts:?}");
-        assert_eq!(crate::widgets::RESOURCE_VALUES.map(|(_, label)| label), ["Values", "Percents"]);
+        assert_eq!(crate::process_menu::RESOURCE_VALUES.map(|(_, label)| label), ["Values", "Percents"]);
     }
 
     #[test]
     fn the_process_menu_holds_its_items_and_separators_in_order() {
-        use crate::widgets::{MenuLine::*, MenuSlot::*};
+        use crate::process_menu::{MenuLine::*, MenuSlot::*};
         // Every item, the later tickets' included.
         assert_eq!(
-            crate::widgets::PROCESS_MENU,
+            crate::process_menu::PROCESS_MENU,
             [
                 Item(Inspect), Separator,
                 Item(End(EndItem::Task)), Item(Restart), Item(End(EndItem::ForceQuit)), Item(End(EndItem::Tree)), Item(End(EndItem::ForceQuitTree)), Separator,
@@ -2423,7 +2424,7 @@ pub(crate) mod tests {
         for rows in [vec![&p], vec![&p, &q]] {
             let entries = menu_entries(&p, &rows, &no_view_state(&view));
             let found = entries.iter().find_map(|e| match e {
-                crate::widgets::MenuEntry::Item { label, enabled, actions, .. } if label == "Analyze wait chain" => Some((*enabled, actions.clone())),
+                crate::process_menu::MenuEntry::Item { label, enabled, actions, .. } if label == "Analyze wait chain" => Some((*enabled, actions.clone())),
                 _ => None,
             });
             assert_eq!(found, Some((true, vec![Action::AnalyzeWaitChain(7)])), "{} rows", rows.len());
@@ -2666,25 +2667,25 @@ pub(crate) mod tests {
         seam.script_affinity(p.pid, mask);
         seam.script_window(p.pid);
         let blank = MenuState { priority: None, ..no_view_state(&[]) };
-        let one = crate::widgets::read_menu_state(&*seam, &p, &[&p], &blank);
+        let one = crate::process_menu::read_menu_state(&*seam, &p, &[&p], &blank);
         assert_eq!((one.priority, one.affinity, one.windowed), (Some("High"), Some(mask), Some(true)));
         let ticked = menu_entries(&p, &[&p], &one);
         let sub = ticked.iter().find_map(|e| match e { MenuEntry::Sub { label: "Set priority", items } => Some(items.clone()), _ => None }).expect("Set priority");
         assert!(sub.iter().any(|e| matches!(e, MenuEntry::Item { label, checked: Some(true), .. } if label == "High")), "High is ticked");
         // Several rows: no priority; the affinity is still the row's own.
-        let many = crate::widgets::read_menu_state(&*seam, &p, &[&p, &q], &blank);
+        let many = crate::process_menu::read_menu_state(&*seam, &p, &[&p, &q], &blank);
         assert_eq!((many.priority, many.affinity, many.windowed), (None, Some(mask), None));
         // The shell's Explorer is read through the seam too.
         seam.script_shell(p.pid);
-        assert_eq!(crate::widgets::read_menu_state(&*seam, &p, &[&p], &blank).shell, Some(p.pid));
+        assert_eq!(crate::process_menu::read_menu_state(&*seam, &p, &[&p], &blank).shell, Some(p.pid));
         let explorer = proc(4_000_000_003, "explorer.exe", "spata", 0.0, 0);
         seam.script_shell(explorer.pid);
-        let state = crate::widgets::read_menu_state(&*seam, &explorer, &[&explorer], &blank);
+        let state = crate::process_menu::read_menu_state(&*seam, &explorer, &[&explorer], &blank);
         assert_eq!(menu_item(&menu_entries(&explorer, &[&explorer], &state), "Restart"), (true, vec![Action::RestartExplorer(explorer.pid)]), "Restart follows the shell the seam reports");
-        let other = menu_entries(&p, &[&p], &crate::widgets::read_menu_state(&*seam, &p, &[&p], &blank));
+        let other = menu_entries(&p, &[&p], &crate::process_menu::read_menu_state(&*seam, &p, &[&p], &blank));
         assert!(!labels(&other).contains(&"Restart"), "not for a process that is not the shell");
         // A process the adapter knows nothing about: nothing ticked, no window.
-        let none = crate::widgets::read_menu_state(&*seam, &q, &[&q], &blank);
+        let none = crate::process_menu::read_menu_state(&*seam, &q, &[&q], &blank);
         assert_eq!((none.priority, none.affinity, none.windowed), (None, None, Some(false)));
     }
 
@@ -3013,7 +3014,7 @@ pub(crate) mod tests {
         let links = |app: &mut Shown| {
             let extra = app.addons.borrow_mut().process_columns();
             let links: Vec<(&'static str, &'static str)> = extra.iter().map(|(id, c)| (*id, c.menu_item)).collect();
-            crate::widgets::process_links(&links, &p)
+            crate::process_menu::process_links(&links, &p)
         };
         assert_eq!(links(&mut app), [("Go to connections", Action::ShowProcessIn { addon: "connections", pid: 42 })], "on: the item");
         // The user showed the column while it was on, then turned it off.
