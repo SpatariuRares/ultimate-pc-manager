@@ -89,11 +89,52 @@ pub struct KernelDriver {
     pub group: String,
     pub image_size: Option<u64>,
     pub load_index: Option<u32>,
+    /// The list of loaded kernel images could not be read, so `image_size`
+    /// and `load_index` are unknown for this row (not absent).
+    pub modules_unread: bool,
     /// Services this driver depends on (the configuration's dependency list).
     pub depends_services: Vec<String>,
     /// Load order groups this driver depends on.
     pub depends_groups: Vec<String>,
 }
+
+/// One image of the loaded-module list: its full path, size and load order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedModule {
+    pub path: String,
+    pub size: u64,
+    pub index: u32,
+}
+
+/// A path as compared: lowercase, without the `\??\` prefix, `\SystemRoot`
+/// spelled out as the Windows folder.
+pub fn normal_path(path: &str, windir: &str) -> String {
+    let p = path.trim().to_lowercase().replace('/', "\\");
+    let p = p.strip_prefix(r"\??\").unwrap_or(&p);
+    match p.strip_prefix(r"\systemroot") {
+        Some(rest) => format!("{}{rest}", windir.to_lowercase()),
+        None => p.to_string(),
+    }
+}
+
+/// The loaded module of a driver image: matched by full path; by file name
+/// only when the image path has no folder and one module has that name, so
+/// two files with one name in different folders never share a size.
+pub fn find_module<'a>(modules: &'a [LoadedModule], image_path: &str, windir: &str) -> Option<&'a LoadedModule> {
+    let want = normal_path(image_path, windir);
+    if let Some(m) = modules.iter().find(|m| normal_path(&m.path, windir) == want) {
+        return Some(m);
+    }
+    if want.contains('\\') {
+        return None;
+    }
+    let mut same = modules.iter().filter(|m| normal_path(&m.path, windir).rsplit('\\').next() == Some(want.as_str()));
+    match (same.next(), same.next()) {
+        (Some(m), None) => Some(m),
+        _ => None,
+    }
+}
+
 
 /// The SCM state shown for a state code; `None` when the state was not read.
 pub fn service_state_name(code: Option<u32>) -> Option<&'static str> {
@@ -159,6 +200,14 @@ impl KernelDriver {
     pub fn depends_on_text(&self) -> String {
         let groups = self.depends_groups.iter().map(|g| format!("{g} (group)"));
         self.depends_services.iter().cloned().chain(groups).collect::<Vec<_>>().join(", ")
+    }
+    /// Loaded: the service is not Stopped, so the pending states count.
+    /// Without a read state, only a running service is loaded.
+    pub fn is_loaded(&self) -> bool {
+        match self.state_code {
+            Some(code) => code != 1,
+            None => self.running,
+        }
     }
     pub fn third_party(&self) -> bool {
         !self.vendor.is_empty() && !self.vendor.to_lowercase().starts_with("microsoft")
@@ -229,8 +278,8 @@ impl KernelScope {
     pub fn matches(self, d: &KernelDriver) -> bool {
         match self {
             Self::All => true,
-            Self::Loaded => d.running,
-            Self::NotLoaded => !d.running,
+            Self::Loaded => d.is_loaded(),
+            Self::NotLoaded => !d.is_loaded(),
             Self::ThirdParty => d.third_party(),
             Self::FileSystem => d.kind == KernelKind::FileSystem,
         }
@@ -295,18 +344,33 @@ pub struct KernelFigures {
     pub loaded: usize,
     /// Not shipped by Microsoft.
     pub third_party: usize,
-    /// Bytes held by loaded driver images.
-    pub memory: u64,
+    /// Bytes held by the loaded driver images, each file once; None
+    /// ("an unknown amount") when the loaded-module list could not be read.
+    pub memory: Option<u64>,
 }
 
 impl KernelFigures {
-    pub fn of(list: &[KernelDriver]) -> Self {
-        Self {
-            drivers: list.len(),
-            loaded: KernelScope::Loaded.count(list),
-            third_party: KernelScope::ThirdParty.count(list),
-            memory: list.iter().filter(|d| d.running).filter_map(|d| d.image_size).sum(),
+    /// The figures of these rows (the ones matching the text filter,
+    /// whatever the scope).
+    pub fn of<'a>(rows: impl IntoIterator<Item = &'a KernelDriver>) -> Self {
+        let mut f = Self { memory: Some(0), ..Self::default() };
+        let mut images = std::collections::HashSet::new();
+        for d in rows {
+            f.drivers += 1;
+            if KernelScope::Loaded.matches(d) {
+                f.loaded += 1;
+                if d.modules_unread {
+                    f.memory = None;
+                } else if let (Some(size), Some(total)) = (d.image_size, f.memory.as_mut()) {
+                    let file = if d.path.is_empty() { d.service.to_lowercase() } else { d.path.to_lowercase() };
+                    if images.insert(file) {
+                        *total += size;
+                    }
+                }
+            }
+            f.third_party += KernelScope::ThirdParty.matches(d) as usize;
         }
+        f
     }
 }
 
@@ -1226,19 +1290,75 @@ mod kernel_scope_tests {
     #[test]
     fn four_figures_of_the_sample() {
         let f = KernelFigures::of(&sample());
-        assert_eq!(f, KernelFigures { drivers: 6, loaded: 3, third_party: 2, memory: 43_100_000 });
+        assert_eq!(f, KernelFigures { drivers: 6, loaded: 3, third_party: 2, memory: Some(43_100_000) });
     }
 
     #[test]
     fn kernel_memory_counts_only_loaded_images() {
         let mut list = sample();
         list[3].image_size = Some(9_999);
-        assert_eq!(KernelFigures::of(&list).memory, 43_100_000);
+        assert_eq!(KernelFigures::of(&list).memory, Some(43_100_000));
+    }
+
+    fn on_disk(service: &str, path: &str, size: u64) -> KernelDriver {
+        KernelDriver { service: service.into(), running: true, path: path.into(), image_size: Some(size), ..Default::default() }
+    }
+
+    #[test]
+    fn an_empty_vendor_is_not_third_party_and_microsoft_is_case_insensitive() {
+        let v = |vendor: &str| KernelDriver { vendor: vendor.into(), ..Default::default() }.third_party();
+        assert!(!v(""));
+        assert!(!v("MICROSOFT WINDOWS"));
+        assert!(!v("microsoft corporation"));
+        assert!(v("Oracle Corporation"));
+    }
+
+    #[test]
+    fn a_service_in_a_pending_state_counts_as_loaded() {
+        for code in [2, 3, 4, 5, 6, 7] {
+            let d = KernelDriver { running: code == 4, state_code: Some(code), ..Default::default() };
+            assert!(KernelScope::Loaded.matches(&d), "state {code}");
+            assert!(!KernelScope::NotLoaded.matches(&d), "state {code}");
+        }
+        let stopped = KernelDriver { state_code: Some(1), ..Default::default() };
+        assert!(KernelScope::NotLoaded.matches(&stopped) && !KernelScope::Loaded.matches(&stopped));
+    }
+
+    #[test]
+    fn two_services_on_one_file_add_its_size_once() {
+        let rows = [on_disk("a", r"C:\Windows\System32\drivers\x.sys", 500), on_disk("b", r"c:\windows\system32\DRIVERS\X.SYS", 500), on_disk("c", r"C:\y.sys", 7)];
+        assert_eq!(KernelFigures::of(&rows).memory, Some(507));
+    }
+
+    #[test]
+    fn an_unreadable_module_list_makes_memory_unknown_not_zero() {
+        let mut rows = [on_disk("a", r"C:\x.sys", 0)];
+        rows[0].image_size = None;
+        rows[0].modules_unread = true;
+        let f = KernelFigures::of(&rows);
+        assert_eq!(f.memory, None);
+        assert_eq!(f.loaded, 1);
+    }
+
+    #[test]
+    fn same_file_name_in_two_folders_gets_its_own_module() {
+        let m = |path: &str, size, index| LoadedModule { path: path.into(), size, index };
+        let mods = [m(r"\SystemRoot\system32\drivers\a.sys", 10, 1), m(r"\??\D:\other\a.sys", 20, 2)];
+        let win = r"C:\Windows";
+        assert_eq!(find_module(&mods, r"C:\Windows\System32\drivers\a.sys", win).map(|m| (m.size, m.index)), Some((10, 1)));
+        assert_eq!(find_module(&mods, r"D:\Other\a.sys", win).map(|m| (m.size, m.index)), Some((20, 2)));
+        assert_eq!(find_module(&mods, r"E:\x\a.sys", win), None, "no guess by name when the folder differs");
+    }
+
+    #[test]
+    fn a_lone_module_is_found_by_name_when_the_path_has_no_folder() {
+        let mods = [LoadedModule { path: r"\SystemRoot\system32\ntoskrnl.exe".into(), size: 9, index: 0 }];
+        assert_eq!(find_module(&mods, "ntoskrnl.exe", r"C:\Windows").map(|m| m.size), Some(9));
     }
 
     #[test]
     fn four_figures_of_an_empty_list() {
-        assert_eq!(KernelFigures::of(&[]), KernelFigures::default());
+        assert_eq!(KernelFigures::of(&[]), KernelFigures { memory: Some(0), ..Default::default() });
     }
 
     #[test]

@@ -271,6 +271,19 @@ struct Inputs {
     today: (i64, u32, u32),
 }
 
+/// A kernel module matches the lowercase text filter `q` (empty: all).
+fn kernel_text_matches(d: &KernelDriver, q: &str) -> bool {
+    q.is_empty() || [&d.display, &d.service, &d.vendor].iter().any(|s| s.to_lowercase().contains(q))
+}
+
+/// Kernel memory as a tile shows it.
+fn kernel_memory_text(memory: Option<u64>) -> String {
+    memory.map(fmt_size).unwrap_or_else(|| "an unknown amount".into())
+}
+
+/// Said under the tiles when kernel memory could not be worked out.
+const KERNEL_MEMORY_NOTE: &str = "The list of loaded kernel modules could not be read, so kernel memory is not known.";
+
 /// Everything the page works out from the lists and the filter: scope
 /// counts, the device list's kinds and folded rows, the kernel rows and
 /// their figures. It is built once and reused every frame until the data
@@ -378,7 +391,7 @@ impl Derived {
                 .iter()
                 .enumerate()
                 .filter(|(_, d)| inputs.kernel_filter.matches(d))
-                .filter(|(_, d)| q.is_empty() || [&d.display, &d.service, &d.vendor].iter().any(|s| s.to_lowercase().contains(&q)))
+                .filter(|(_, d)| kernel_text_matches(d, &q))
                 .map(|(i, _)| i)
                 .collect()
         } else {
@@ -396,7 +409,8 @@ impl Derived {
             tops,
             kernel_rows,
             kernel_counts,
-            figures: KernelFigures::of(kernel),
+            // The text filter decides the figures, never the scope.
+            figures: KernelFigures::of(kernel.iter().filter(|d| kernel_text_matches(d, &q))),
             inputs,
         }
     }
@@ -1040,6 +1054,10 @@ impl DriversPage {
             return;
         }
         kernel_tiles(ui, view.figures);
+        if view.figures.memory.is_none() {
+            ui.add_space(4.0);
+            ui.label(RichText::new(KERNEL_MEMORY_NOTE).size(12.0).color(th.faint));
+        }
         ui.add_space(10.0);
         let rows = &view.kernel_rows;
         if let Some(note) = list_note(listing, error, kernel.len(), rows.len(), !self.drv_ui.search.trim().is_empty()) {
@@ -1312,7 +1330,7 @@ fn kernel_tiles(ui: &mut Ui, f: KernelFigures) {
         ("Drivers", f.drivers.to_string(), "Registered with Windows"),
         ("Loaded", f.loaded.to_string(), "Linked into the kernel now"),
         ("Third-party", f.third_party.to_string(), "Not shipped by Microsoft"),
-        ("Kernel memory", fmt_size(f.memory), "Held by loaded driver images"),
+        ("Kernel memory", kernel_memory_text(f.memory), "Held by loaded driver images"),
     ];
     let gap = 10.0;
     let w = ((ui.available_width() - gap * 3.0) / 4.0).max(120.0);
@@ -1473,6 +1491,45 @@ mod tests {
         frame(&mut page);
         frame(&mut page);
         assert_eq!(page.derived_builds(), 5, "the kernel scope changed");
+    }
+
+    fn loaded(service: &str, vendor: &str, path: &str, size: Option<u64>) -> KernelDriver {
+        KernelDriver { service: service.into(), display: service.into(), vendor: vendor.into(), running: true, path: path.into(), image_size: size, ..Default::default() }
+    }
+
+    fn tile_values(page: &mut DriversPage) -> Vec<String> {
+        let t = frame(page);
+        let at = t.iter().position(|x| x == "Drivers").expect("the tiles are shown");
+        // Each tile draws its label, value and subtitle in turn.
+        (0..4).map(|i| t[at + i * 3 + 1].clone()).collect()
+    }
+
+    #[test]
+    fn figures_follow_the_text_filter_and_not_the_scope() {
+        let kernel = vec![
+            loaded("nvlddmkm", "NVIDIA", "nv.sys", Some(2048)),
+            loaded("disk", "Microsoft", "disk.sys", Some(1024)),
+            KernelDriver { service: "vbox".into(), display: "vbox".into(), vendor: "Oracle".into(), ..Default::default() },
+        ];
+        let mut page = page_with(Vec::new(), kernel);
+        page.drv_ui.scope = Scope::Kernel;
+        assert_eq!(tile_values(&mut page), ["3", "2", "2", "3.0 KB"]);
+        page.drv_ui.search = "nvlddmkm".into();
+        assert_eq!(tile_values(&mut page), ["1", "1", "1", "2.0 KB"]);
+        // Another scope changes the rows, not the figures.
+        page.drv_ui.kernel_filter = KernelScope::NotLoaded;
+        assert_eq!(tile_values(&mut page), ["1", "1", "1", "2.0 KB"]);
+    }
+
+    #[test]
+    fn an_unreadable_module_list_says_an_unknown_amount_and_a_note() {
+        let mut row = loaded("disk", "Microsoft", "disk.sys", None);
+        row.modules_unread = true;
+        let mut page = page_with(Vec::new(), vec![row]);
+        page.drv_ui.scope = Scope::Kernel;
+        let t = frame(&mut page);
+        assert!(t.iter().any(|x| x == "an unknown amount"), "{t:?}");
+        assert!(t.iter().any(|x| x == KERNEL_MEMORY_NOTE));
     }
 
     #[test]
