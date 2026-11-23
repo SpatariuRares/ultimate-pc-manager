@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod availability;
 mod core_page;
 mod page_summary;
 mod page_colors;

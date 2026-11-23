@@ -289,7 +289,7 @@ impl Provider for PowerStatusProvider {
         #[cfg(windows)]
         return Ok(());
         #[cfg(not(windows))]
-        Err("Windows only".into())
+        Err(crate::availability::unavailable_error(crate::availability::Feature::SensorProviders))
     }
 
     fn read(&mut self, at: Instant) -> Vec<Reading> {

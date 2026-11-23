@@ -314,7 +314,7 @@ pub fn open_power_options() -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        Err("Power options are a Windows panel.".into())
+        Err(crate::availability::unavailable_error(crate::availability::Feature::PowerOptions))
     }
 }
 
@@ -963,10 +963,9 @@ mod imp {
 #[cfg(not(windows))]
 mod imp {
     use super::*;
-    /// The error every call that would change the system returns.
-    const NOT: &str = "Only available on Windows.";
+    use crate::availability::{unavailable_error, Feature};
     /// No Service Control Manager: an error.
-    pub fn list_services() -> Result<Vec<ServiceRow>, String> { Err(NOT.into()) }
+    pub fn list_services() -> Result<Vec<ServiceRow>, String> { Err(unavailable_error(Feature::Services)) }
     /// No running services: no (PID, service) pair.
     pub fn running_service_pids() -> Vec<(u32, String)> { Vec::new() }
     /// No running services.
@@ -976,28 +975,28 @@ mod imp {
     /// No version resources: no file description.
     pub fn file_description(_: &str) -> Option<String> { None }
     /// Services cannot be started or stopped: an error.
-    pub fn control_service(_: &str, _: &str) -> Result<(), String> { Err(NOT.into()) }
+    pub fn control_service(_: &str, _: &str) -> Result<(), String> { Err(unavailable_error(Feature::Services)) }
     /// Priorities cannot be set: an error.
-    pub fn set_priority(_: u32, _: &str) -> Result<(), String> { Err(NOT.into()) }
+    pub fn set_priority(_: u32, _: &str) -> Result<(), String> { Err(unavailable_error(Feature::ProcessControl)) }
     /// No priority is known.
     pub fn get_priority(_: u32) -> Option<&'static str> { None }
     /// No affinity is known.
     pub fn get_affinity(_: u32) -> Option<Affinity> { None }
     /// Affinities cannot be set: an error.
-    pub fn set_affinity(_: u32, _: u64) -> Result<(), String> { Err(NOT.into()) }
+    pub fn set_affinity(_: u32, _: u64) -> Result<(), String> { Err(unavailable_error(Feature::ProcessControl)) }
     /// Processes cannot be suspended: an error.
-    pub fn suspend_process(_: u32) -> Result<(), String> { Err(NOT.into()) }
+    pub fn suspend_process(_: u32) -> Result<(), String> { Err(unavailable_error(Feature::ProcessControl)) }
     /// Processes cannot be resumed: an error.
-    pub fn resume_process(_: u32) -> Result<(), String> { Err(NOT.into()) }
+    pub fn resume_process(_: u32) -> Result<(), String> { Err(unavailable_error(Feature::ProcessControl)) }
     /// Efficiency mode cannot be set: an error.
-    pub fn set_efficiency(_: u32) -> Result<(), String> { Err(NOT.into()) }
+    pub fn set_efficiency(_: u32) -> Result<(), String> { Err(unavailable_error(Feature::ProcessControl)) }
     /// Efficiency mode is not known.
     #[cfg(test)]
     pub fn efficiency_on(_: u32) -> Option<bool> { None }
     /// No startup entries.
     pub fn list_startup() -> Vec<StartupEntry> { Vec::new() }
     /// Startup entries cannot be changed: an error.
-    pub fn set_startup_enabled(_: &StartupEntry, _: bool) -> Result<(), String> { Err(NOT.into()) }
+    pub fn set_startup_enabled(_: &StartupEntry, _: bool) -> Result<(), String> { Err(unavailable_error(Feature::StartupEntries)) }
 }
 
 pub use imp::*;

@@ -170,7 +170,7 @@ impl Toasts {
 mod imp {
     /// Notifications are Windows only.
     pub fn show(_: &str, _: &str) -> Result<(), String> {
-        Err("Notifications are only available on Windows.".into())
+        Err(crate::availability::unavailable_error(crate::availability::Feature::Notifications))
     }
 
     pub fn shutdown() {}
