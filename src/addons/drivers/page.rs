@@ -191,7 +191,20 @@ fn list_note(listing: bool, error: Option<&str>, total: usize, shown: usize, sea
 }
 
 /// Draws the note in place of a list's rows.
+/// The filter hints of the two lists.
 const DEVICE_FILTER_HINT: &str = "Find a driver or maker";
+const KERNEL_FILTER_HINT: &str = "Driver name, service or vendor";
+
+/// What the side panel says while nothing is selected.
+const DEVICE_EMPTY: &str = "Select a driver to see its details and what Windows Update offers for it.";
+const KERNEL_EMPTY: &str = "Select a kernel module to see where it lives, how much memory it holds and whether it can be unloaded.";
+
+fn empty_panel(ui: &mut Ui, text: &str) {
+    let th = theme::of_ui(ui);
+    parts::SidePanel::new("drv-side").show(ui, Some(()), |ui, ()| {
+        ui.add(egui::Label::new(RichText::new(text).color(th.label)).wrap());
+    });
+}
 
 /// What "Open file location" does for `path`: File Explorer selects the
 /// file, or the status bar says why it cannot.
@@ -606,7 +619,8 @@ impl DriversPage {
                     ui.checkbox(&mut self.drv_ui.show_disconnected, "Show disconnected");
                     ui.add_space(8.0);
                 }
-                crate::widgets::search_field(ui, &mut self.drv_ui.search, DEVICE_FILTER_HINT, 240.0);
+                let hint = if self.drv_ui.scope == Scope::Kernel { KERNEL_FILTER_HINT } else { DEVICE_FILTER_HINT };
+                crate::widgets::search_field(ui, &mut self.drv_ui.search, hint, 240.0);
             });
         });
         if self.drv_ui.scope == Scope::Kernel {
@@ -971,6 +985,10 @@ impl DriversPage {
 
     fn device_side(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, devices: &[DeviceDriver], updates: Option<&[DriverUpdate]>, idle: bool) {
         let chosen = self.drv_ui.selected_device.clone().and_then(|id| devices.iter().find(|d| d.instance_id == id));
+        if chosen.is_none() {
+            empty_panel(ui, DEVICE_EMPTY);
+            return;
+        }
         parts::SidePanel::new("drv-side").show(ui, chosen, |ui, d| {
             let th = theme::of_ui(ui);
             let upd = updates.and_then(|u| u.iter().find(|x| x.device.as_deref() == Some(d.instance_id.as_str())));
@@ -1166,6 +1184,10 @@ impl DriversPage {
 
     fn kernel_side(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, kernel: &[KernelDriver], admin: bool, idle: bool) {
         let chosen = self.drv_ui.selected_kernel.clone().and_then(|s| kernel.iter().find(|d| d.service == s));
+        if chosen.is_none() {
+            empty_panel(ui, KERNEL_EMPTY);
+            return;
+        }
         parts::SidePanel::new("drv-side").show(ui, chosen, |ui, d| {
             let th = theme::of_ui(ui);
             let (offered, _) = d.unload_note(admin);
@@ -1699,7 +1721,7 @@ Unload: Not offered: Windows loaded it at boot, and the kernel refuses to stop a
 #[cfg(test)]
 mod list_note_tests {
 use super::*;
-use super::tests::{page_and_runner, page_with};
+use super::tests::{gpu, page_and_runner, page_with};
 
     /// The note for an empty list (`shown` 0) with these inputs.
     fn note(listing: bool, error: Option<&str>, total: usize, searching: bool) -> Option<ListNote> {
@@ -1908,6 +1930,31 @@ use super::tests::{page_and_runner, page_with};
         assert_eq!(screen.actions, vec![Action::Say(r"The file C:\no\such\acme.sys was not found.".into())]);
     }
 
+    #[test]
+    fn each_tab_shows_its_own_filter_hint() {
+        let (mut page, mut screen) = (page_with(vec![gpu("Alpha GPU")], vec![module(r"C:\x\acme.sys")]), Screen::new());
+        let shown = |t: &[(Pos2, String)], s: &str| t.iter().any(|(_, x)| x == s);
+        let devices = screen.settle(&mut page);
+        assert!(shown(&devices, "Find a driver or maker"), "Device drivers hint unchanged");
+        assert!(!shown(&devices, "Driver name, service or vendor"));
+        page.drv_ui.scope = Scope::Kernel;
+        let kernel = screen.settle(&mut page);
+        assert!(shown(&kernel, "Driver name, service or vendor"));
+        assert!(!shown(&kernel, "Find a driver or maker"));
+    }
+
+    #[test]
+    fn each_tab_shows_its_own_empty_panel_text() {
+        let (mut page, mut screen) = (page_with(vec![gpu("Alpha GPU")], vec![module(r"C:\x\acme.sys")]), Screen::new());
+        let shown = |t: &[(Pos2, String)], s: &str| t.iter().any(|(_, x)| x == s);
+        let drivers = "Select a driver to see its details and what Windows Update offers for it.";
+        let kernel_text = "Select a kernel module to see where it lives, how much memory it holds and whether it can be unloaded.";
+        let devices = screen.settle(&mut page);
+        assert!(shown(&devices, drivers) && !shown(&devices, kernel_text));
+        page.drv_ui.scope = Scope::Kernel;
+        let kernel = screen.settle(&mut page);
+        assert!(shown(&kernel, kernel_text) && !shown(&kernel, drivers));
+    }
 }
 
 /// "With Windows" and "check the maker" (#71).
