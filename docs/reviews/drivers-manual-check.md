@@ -45,7 +45,8 @@ The automatic tests run the bootstrap with a real, non-elevated PowerShell. Thes
     - Expected: it works as before (result shown, no error).
     - While the UAC prompt is open, look at `%LOCALAPPDATA%\UltimatePCManager\jobs`: only `job-<random>.ps1` is there, no `.json` result.
 12. Script swap: while the UAC prompt is open, open that `job-*.ps1` in Notepad and append a line such as `New-Item C:\Users\Public\swapped.txt`, save, then answer **Yes**.
-    - Expected: the action fails with "PowerShell finished without a result."; `C:\Users\Public\swapped.txt` does not exist.
+    - Expected: the action fails with "The administrator script was changed before it ran, so it was not run."; `C:\Users\Public\swapped.txt` does not exist.
+    - Folder race (optional): while the prompt is open, run in a normal PowerShell a loop that keeps creating `%windir%\Temp\upcm-*` folders. The job must either run normally or fail with "The protected result folder could not be trusted, so the script was not run."; it must never show a result from a folder you created.
 13. Result protection: during a long elevated action (for example Install from an INF file), from a normal (non-elevated) PowerShell run `Get-ChildItem $env:windir\Temp\upcm-*` and try `New-Item $env:windir\Temp\upcm-*\envelope.json`.
     - Expected: the folder can be listed or read, but creating or changing a file in it is denied (Access denied).
 14. Result forgery: a normal process cannot create `envelope.json` there (denied); a result with a wrong or missing token is shown as "The elevated result was rejected: it does not carry this job's token." (covered by an automatic test).

@@ -1055,13 +1055,20 @@ mod imp {
 
     /// Runs Windows PowerShell with `params` as administrator (UAC asks)
     /// and waits.
-    fn run_elevated(params: &str) -> Result<(), String> {
+    fn run_elevated(params: &str) -> Result<i32, String> {
+        use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
         unsafe {
             let verb = wide("runas");
-            // The full path, so a program planted earlier on the search path
+            // The full path from the system call (not an environment
+            // variable), so a program planted earlier on the search path
             // is never the one that gets administrator rights.
-            let system = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
-            let file = wide(&format!("{system}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
+            let mut dir = [0u16; 260];
+            let n = GetSystemDirectoryW(dir.as_mut_ptr(), dir.len() as u32) as usize;
+            if n == 0 || n >= dir.len() {
+                return Err("Could not find the Windows system folder.".into());
+            }
+            let system = String::from_utf16_lossy(&dir[..n]);
+            let file = wide(&format!("{system}\\WindowsPowerShell\\v1.0\\powershell.exe"));
             let p = wide(params);
             let mut info: SHELLEXECUTEINFOW = zeroed();
             info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
@@ -1077,11 +1084,13 @@ mod imp {
                     format!("Could not start an elevated PowerShell (error {}).", GetLastError())
                 });
             }
+            let mut code = 0u32;
             if !info.hProcess.is_null() {
                 WaitForSingleObject(info.hProcess, INFINITE);
+                GetExitCodeProcess(info.hProcess, &mut code);
                 CloseHandle(info.hProcess);
             }
-            Ok(())
+            Ok(code as i32)
         }
     }
 

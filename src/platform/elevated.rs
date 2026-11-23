@@ -19,6 +19,21 @@
 
 use std::path::Path;
 
+/// Exit codes of the bootstrap that name a refusal (0 is a finished job).
+const EXIT_SCRIPT_CHANGED: i32 = 3;
+const EXIT_NO_RESULT: i32 = 5;
+const EXIT_FOLDER_UNTRUSTED: i32 = 6;
+
+/// The error for a bootstrap that ended with `code`, when it names a refusal.
+pub fn refusal(code: i32) -> Option<&'static str> {
+    match code {
+        EXIT_SCRIPT_CHANGED => Some("The administrator script was changed before it ran, so it was not run."),
+        EXIT_FOLDER_UNTRUSTED => Some("The protected result folder could not be trusted, so the script was not run."),
+        EXIT_NO_RESULT => Some("PowerShell finished without a result."),
+        _ => None,
+    }
+}
+
 /// What one elevated job needs to know.
 pub struct Job<'a> {
     /// The script file (in the user-writable jobs folder).
@@ -65,14 +80,15 @@ pub fn bootstrap(job: &Job) -> Result<String, String> {
     Ok(format!(
         r#"$ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
+$env:PSModulePath=(Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'WindowsPowerShell\Modules')+';'+(Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\Modules')
 try {{
 $bytes=[IO.File]::ReadAllBytes({script})
 $sha=[Security.Cryptography.SHA256]::Create()
 $h=([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-','').ToLowerInvariant()
-if($h -ne {hash}){{ exit 3 }}
+if($h -ne {hash}){{ exit {EXIT_SCRIPT_CHANGED} }}
 $text=[Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xFEFF)
 $dir={dir}
-if(Test-Path -LiteralPath $dir){{ exit 4 }}
+if(Test-Path -LiteralPath $dir){{ exit {EXIT_FOLDER_UNTRUSTED} }}
 $sec=New-Object Security.AccessControl.DirectorySecurity
 $sec.SetAccessRuleProtection($true,$false)
 foreach($sid in 'S-1-5-18','S-1-5-32-544'){{
@@ -82,6 +98,21 @@ foreach($sid in 'S-1-5-18','S-1-5-32-544'){{
 $me=New-Object Security.Principal.NTAccount({domain},{user})
 $sec.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($me,'{rights}','ContainerInherit,ObjectInherit','None','Allow')))
 [void][IO.Directory]::CreateDirectory($dir,$sec)
+# CreateDirectory succeeds silently on a folder somebody else made first (and
+# then applies no ACL), so the folder is trusted only after its owner, ACL,
+# type and emptiness are checked.
+$sidT=[Security.Principal.SecurityIdentifier]
+$meSid=$me.Translate($sidT).Value
+$owners=@('S-1-5-32-544','S-1-5-18'){test_owner}
+$d=New-Object IO.DirectoryInfo($dir)
+$acl=$d.GetAccessControl()
+$ok=($owners -contains $acl.GetOwner($sidT).Value) -and $acl.AreAccessRulesProtected -and (-not ($d.Attributes -band [IO.FileAttributes]::ReparsePoint)) -and (@(Get-ChildItem -LiteralPath $dir -Force).Count -eq 0)
+foreach($r in $acl.GetAccessRules($true,$true,$sidT)){{
+  $who=$r.IdentityReference.Value
+  if($r.AccessControlType -ne 'Allow' -or @('S-1-5-18','S-1-5-32-544',$meSid) -notcontains $who){{ $ok=$false }}
+  if($who -eq $meSid -and -not {full} -and ([int]$r.FileSystemRights -band 0xC0116) -ne 0){{ $ok=$false }}
+}}
+if(-not $ok){{ exit {EXIT_FOLDER_UNTRUSTED} }}
 $out=Join-Path $dir 'result.json'
 $a=@{{Out=$out{named}}}
 $sb=[scriptblock]::Create($text)
@@ -100,6 +131,8 @@ $envl='{{"token":"'+{token}+'","result":'+$raw+'}}'
         domain = ps_quote(job.caller.0),
         user = ps_quote(job.caller.1),
         rights = caller_rights,
+        test_owner = if job.caller_full_control { "+@($meSid)" } else { "" },
+        full = if job.caller_full_control { "$true" } else { "$false" },
         named = named,
         token = ps_quote(job.token),
     ))
@@ -188,11 +221,14 @@ pub fn random_hex() -> Result<String, String> {
 /// Runs one elevated job through `launch` (which starts PowerShell with the
 /// parameters it gets and waits). `jobs` holds the script file, `result_base`
 /// is where the elevated side creates its protected result folder.
-pub fn run(jobs: &Path, result_base: &Path, script: &str, args: &[(&str, &str)], caller_full_control: bool, launch: impl FnOnce(&str) -> Result<(), String>) -> Result<serde_json::Value, String> {
+pub fn run(jobs: &Path, result_base: &Path, script: &str, args: &[(&str, &str)], caller_full_control: bool, launch: impl FnOnce(&str) -> Result<i32, String>) -> Result<serde_json::Value, String> {
     let id = random_hex()?;
     let token = random_hex()?;
+    // Not derived from the job id: the script file's name is visible to
+    // normal processes, the result folder's name must not be.
+    let folder = random_hex()?;
     let script_file = jobs.join(format!("job-{id}.ps1"));
-    let result_dir = result_base.join(format!("upcm-{id}"));
+    let result_dir = result_base.join(format!("upcm-{folder}"));
     // A BOM so Windows PowerShell reads a file as UTF-8 (the hash covers it).
     let bytes = format!("\u{feff}{script}").into_bytes();
     let user = std::env::var("USERNAME").map_err(|_| "Could not tell which account to give the result to.".to_string())?;
@@ -204,7 +240,10 @@ pub fn run(jobs: &Path, result_base: &Path, script: &str, args: &[(&str, &str)],
         return Err("The elevated script's arguments are too long.".into());
     }
     std::fs::write(&script_file, &bytes).map_err(|e| e.to_string())?;
-    let result = launch(&params).and_then(|_| {
+    let result = launch(&params).and_then(|code| {
+        if let Some(why) = refusal(code) {
+            return Err(why.to_string());
+        }
         let text = std::fs::read_to_string(result_dir.join("envelope.json")).map_err(|_| "PowerShell finished without a result.".to_string())?;
         open_envelope(&text, &token)
     });
@@ -268,8 +307,36 @@ mod tests {
         d
     }
 
-    fn start(params: &str) -> Result<(), String> {
-        super::super::imp::run_hidden(params, &std::sync::atomic::AtomicBool::new(false))
+
+    fn start_with(params: &str, env: Option<(&str, &str)>) -> Result<i32, String> {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.raw_arg(params).creation_flags(0x0800_0000);
+        if let Some((k, v)) = env {
+            cmd.env(k, v);
+        }
+        let status = cmd.status().map_err(|e| e.to_string())?;
+        Ok(status.code().unwrap_or(-1))
+    }
+
+    fn start(params: &str) -> Result<i32, String> {
+        start_with(params, None)
+    }
+
+    fn first_with_extension(d: &Path, ext: &str) -> std::path::PathBuf {
+        std::fs::read_dir(d).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == ext)).unwrap()
+    }
+
+    /// Runs the bootstrap of a script file written in `d` against `dir`.
+    fn direct(d: &Path, dir: &Path, full: bool) -> i32 {
+        let ps1 = d.join("direct.ps1");
+        let bytes = "\u{feff}param([string]$Out)\n'{}' | Out-File $Out".as_bytes().to_vec();
+        std::fs::write(&ps1, &bytes).unwrap();
+        let hash = sha256_hex(&bytes);
+        let user = std::env::var("USERNAME").unwrap();
+        let domain = std::env::var("USERDOMAIN").unwrap_or_else(|_| ".".into());
+        let text = bootstrap(&Job { script_file: &ps1, script_sha256: &hash, result_dir: dir, token: "t", args: &[], caller: (&domain, &user), caller_full_control: full }).unwrap();
+        start(&format!("-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {}", encode_command(&text))).unwrap()
     }
 
     #[test]
@@ -282,16 +349,15 @@ mod tests {
     }
 
     #[test]
-    fn a_script_swapped_before_it_runs_is_not_executed() {
+    fn a_script_swapped_before_it_runs_is_not_executed_and_says_so() {
         let d = scratch("swap");
         let marker = d.join("evil-ran");
         let evil = format!("param([string]$Out)\n'x' | Out-File '{}'\n'{{}}' | Out-File $Out", marker.display());
         let result = run(&d, &d, "param([string]$Out)\n'{}' | Out-File $Out", &[], true, |params| {
-            let ps1 = std::fs::read_dir(&d).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "ps1")).unwrap();
-            std::fs::write(&ps1, evil).unwrap();
+            std::fs::write(first_with_extension(&d, "ps1"), evil).unwrap();
             start(params)
         });
-        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("was changed before it ran"));
         assert!(!marker.exists(), "the swapped script never ran");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -300,10 +366,10 @@ mod tests {
     fn a_result_forged_with_the_wrong_token_is_rejected() {
         let d = scratch("forge");
         let result = run(&d, &d, "param([string]$Out)\n'{\"ok\":true}' | Out-File $Out", &[], true, |params| {
-            start(params)?;
+            let code = start(params)?;
             let env = std::fs::read_dir(&d).unwrap().filter_map(|e| e.ok()).map(|e| e.path().join("envelope.json")).find(|p| p.exists()).unwrap();
             std::fs::write(env, "{\"token\":\"guess\",\"result\":{\"ok\":true}}").unwrap();
-            Ok(())
+            Ok(code)
         });
         assert!(result.unwrap_err().contains("rejected"));
         let _ = std::fs::remove_dir_all(&d);
@@ -312,14 +378,40 @@ mod tests {
     #[test]
     fn an_existing_result_folder_is_never_reused() {
         let d = scratch("exists");
-        let result = run(&d, &d, "param([string]$Out)\n'{}' | Out-File $Out", &[], true, |params| {
-            // Someone pre-created the folder the elevated side is about to make.
-            let ps1 = std::fs::read_dir(&d).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "ps1")).unwrap();
-            let id = ps1.file_stem().unwrap().to_string_lossy().trim_start_matches("job-").to_string();
-            std::fs::create_dir_all(d.join(format!("upcm-{id}"))).unwrap();
-            start(params)
-        });
-        assert!(result.is_err());
+        let dir = d.join("upcm-taken");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("result.json"), "{\"forged\":true}").unwrap();
+        assert_eq!(direct(&d, &dir, true), EXIT_FOLDER_UNTRUSTED, "refused before running anything");
+        assert_eq!(std::fs::read_to_string(dir.join("result.json")).unwrap(), "{\"forged\":true}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_folder_that_is_not_owned_by_administrators_is_not_trusted() {
+        // Not elevated, the new folder's owner is the user, not
+        // Administrators: the job is refused, as it is for a folder an
+        // attacker made first. (From an elevated shell the folder is
+        // trusted and the job runs, which is the other accepted outcome.)
+        let d = scratch("owner");
+        let code = direct(&d, &d.join("upcm-fresh"), false);
+        assert!(code == EXIT_FOLDER_UNTRUSTED || code == 0, "got {code}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_elevated_session_does_not_load_modules_from_user_folders() {
+        let d = scratch("modules");
+        let v = run(&d, &d, "param([string]$Out)\n(@{ path = $env:PSModulePath } | ConvertTo-Json) | Out-File $Out", &[], true, |params| start_with(params, Some(("PSModulePath", "C:\\poisoned\\modules")))).unwrap();
+        let path = v["path"].as_str().unwrap().to_lowercase();
+        assert!(!path.contains("poisoned"));
+        assert!(path.contains("windowspowershell"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn each_refusal_code_has_its_own_message_and_success_has_none() {
+        assert!(refusal(EXIT_SCRIPT_CHANGED).unwrap().contains("changed"));
+        assert!(refusal(EXIT_FOLDER_UNTRUSTED).unwrap().contains("could not be trusted"));
+        assert_eq!(refusal(0), None);
     }
 }

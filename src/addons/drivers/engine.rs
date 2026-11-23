@@ -753,18 +753,20 @@ ConvertTo-Json -InputObject $res -Depth 5 | Out-File -FilePath $Out -Encoding ut
 "#;
 
 const TOOL_SCRIPT: &str = r#"param([string]$Out, [string]$Mode, [string]$Arg)
+$pnputil = Join-Path ([Environment]::SystemDirectory) 'pnputil.exe'
+$sc = Join-Path ([Environment]::SystemDirectory) 'sc.exe'
 $res = [ordered]@{ ok = $false; error = ''; code = 0; output = '' }
 try {
   switch ($Mode) {
     'inf' {
       if (Test-Path -LiteralPath $Arg -PathType Container) {
-        $o = & pnputil.exe /add-driver (Join-Path $Arg '*.inf') /subdirs /install 2>&1
+        $o = & $pnputil /add-driver (Join-Path $Arg '*.inf') /subdirs /install 2>&1
       } else {
-        $o = & pnputil.exe /add-driver $Arg /install 2>&1
+        $o = & $pnputil /add-driver $Arg /install 2>&1
       }
     }
-    'scan' { $o = & pnputil.exe /scan-devices 2>&1 }
-    'stop' { $o = & sc.exe stop $Arg 2>&1 }
+    'scan' { $o = & $pnputil /scan-devices 2>&1 }
+    'stop' { $o = & $sc stop $Arg 2>&1 }
     default { throw "Unknown mode $Mode" }
   }
   $res.code = $LASTEXITCODE
@@ -1250,6 +1252,14 @@ mod outcome_tests {
 
     fn tool(mode: &str, code: i64) -> ToolOutcome {
         tool_outcome(mode, Ok(json!({ "ok": true, "code": code, "output": "out" })))
+    }
+
+    #[test]
+    fn the_elevated_tool_script_calls_system_tools_by_their_system32_path() {
+        for line in TOOL_SCRIPT.lines() {
+            assert!(!line.contains("& pnputil") && !line.contains("& sc.exe"), "found a PATH lookup: {line}");
+        }
+        assert!(TOOL_SCRIPT.contains("[Environment]::SystemDirectory"));
     }
 
     #[test]
