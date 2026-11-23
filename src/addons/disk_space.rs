@@ -525,7 +525,7 @@ impl DiskSpace {
         let mut v = cache.view.clone();
         let bytes = v.bytes;
         v.finished = s.done.as_ref().map(|d| {
-            let today = crate::pro::local_secs().div_euclid(86_400);
+            let today = crate::platform::local_secs().div_euclid(86_400);
             text::finished(&text::day_word(d.day, today), &d.at, d.secs, bytes, v.files)
         });
         let root_text = v.root.as_deref().unwrap_or_default();
@@ -544,7 +544,7 @@ impl DiskSpace {
         v.running = s.running.clone();
         v.progress = s.running.as_ref().and(s.expected).filter(|e| *e > 0).map(|e| (bytes as f32 / e as f32).min(0.99));
         v.phase = s.phase;
-        v.last_scan = s.done.as_ref().or(s.stopped.as_ref()).map(|d| format!("{} at {}", text::day_word(d.day, crate::pro::local_secs().div_euclid(86_400)), d.at));
+        v.last_scan = s.done.as_ref().or(s.stopped.as_ref()).map(|d| format!("{} at {}", text::day_word(d.day, crate::platform::local_secs().div_euclid(86_400)), d.at));
         v.chip = Self::chip(t, &s.nav, &v.pieces);
         v
     }
@@ -671,7 +671,7 @@ impl DiskSpace {
         std::thread::spawn(move || {
             let _alive = alive;
             work(&job);
-            let now = crate::pro::local_secs();
+            let now = crate::platform::local_secs();
             // The scan ends under one lock: a Start comes either before
             // (a new serial, so this thread says nothing more) or after
             // (this scan is no longer running), never in between.
@@ -1013,7 +1013,7 @@ impl DiskSpace {
             s.running = None;
             s.phase = s.phase.after(Step::Stop);
             let secs = s.started.map_or(0, |t| self.now().saturating_duration_since(t).as_secs());
-            s.stopped = Some(Done::at(crate::pro::local_secs(), secs));
+            s.stopped = Some(Done::at(crate::platform::local_secs(), secs));
         }
     }
 
@@ -1271,7 +1271,7 @@ impl Addon for DiskSpace {
             return;
         }
         let sub = page.sub_text();
-        let today = crate::pro::local_secs().div_euclid(86_400);
+        let today = crate::platform::local_secs().div_euclid(86_400);
         let history = self.history();
         ui.add_space(10.0);
         ui.label(RichText::new("Disk Space").strong());

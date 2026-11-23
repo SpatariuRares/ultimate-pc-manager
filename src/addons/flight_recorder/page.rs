@@ -256,7 +256,7 @@ impl FlightRecorder {
             };
             let values = [
                 (format_line(), t.text),
-                (default_file_name(crate::pro::local_secs()), t.text),
+                (default_file_name(crate::platform::local_secs()), t.text),
                 (folder, t.text),
                 (layout::limit_line(SAFE_CAPTURE_LIMIT), t.soft),
             ];

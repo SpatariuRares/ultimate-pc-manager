@@ -828,6 +828,47 @@ pub fn local_secs() -> i64 {
     secs as i64 + local_offset_secs()
 }
 
+/// The local clock's text ("21:12:05"), as the add-on pages show it.
+pub fn clock_now() -> String {
+    let d = local_secs().rem_euclid(86_400);
+    format!("{:02}:{:02}:{:02}", d / 3600, (d % 3600) / 60, d % 60)
+}
+
+/// Local seconds as ISO-8601 local time ("2026-11-17T21:12:05").
+pub fn iso_text(secs: i64) -> String {
+    let (days, s) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+}
+
+/// The local seconds of an ISO-8601 time (a zone suffix is ignored).
+pub fn iso_secs(t: &str) -> Option<i64> {
+    let b = t.as_bytes();
+    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b' ') || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| t.get(r).and_then(|s| s.parse::<i64>().ok());
+    let (y, m, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let (hh, mm, ss) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    let y = y - i64::from(m <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era * 146_097 + doe - 719_468) * 86_400 + hh * 3600 + mm * 60 + ss)
+}
+
 fn local_offset_secs() -> i64 {
     #[cfg(windows)]
     unsafe {
@@ -1363,6 +1404,36 @@ mod imp {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn iso_text_and_iso_secs_round_trip() {
+        for secs in [0, 86_399, 951_782_400 + 3600, 1_795_000_000, -86_400] {
+            assert_eq!(iso_secs(&iso_text(secs)), Some(secs), "{secs}");
+        }
+    }
+
+    #[test]
+    fn a_known_date_has_its_iso_text() {
+        // 2026-11-17T21:12:05 is 20_774 days and 76_325 seconds after 1970-01-01.
+        assert_eq!(iso_text(20_774 * 86_400 + 76_325), "2026-11-17T21:12:05");
+        assert_eq!(iso_secs("2026-11-17T21:12:05"), Some(20_774 * 86_400 + 76_325));
+        assert_eq!(iso_text(951_782_400), "2000-02-29T00:00:00");
+    }
+
+    #[test]
+    fn iso_secs_ignores_a_zone_suffix_and_refuses_malformed_text() {
+        assert_eq!(iso_secs("2026-11-17T21:12:05+01:00"), iso_secs("2026-11-17 21:12:05"));
+        assert_eq!(iso_secs("2026-13-17T21:12:05"), None);
+        assert_eq!(iso_secs("not a date"), None);
+    }
+
+    #[test]
+    fn the_clock_text_is_hours_minutes_seconds() {
+        let t = clock_now();
+        let parts: Vec<&str> = t.split(':').collect();
+        assert_eq!(parts.len(), 3, "{t}");
+        assert!(parts.iter().all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_digit())), "{t}");
+    }
 
     #[test]
     fn the_test_executor_records_requests_and_launches_nothing() {

@@ -395,11 +395,11 @@ impl Store {
 /// `started` / `finished` as ISO-8601 text.
 mod iso {
     pub fn serialize<S: serde::Serializer>(secs: &i64, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&crate::pro::iso_text(*secs))
+        s.serialize_str(&crate::platform::iso_text(*secs))
     }
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
         let t: String = serde::Deserialize::deserialize(d)?;
-        crate::pro::iso_secs(&t).ok_or_else(|| serde::de::Error::custom(format!("\"{t}\" is not an ISO-8601 date")))
+        crate::platform::iso_secs(&t).ok_or_else(|| serde::de::Error::custom(format!("\"{t}\" is not an ISO-8601 date")))
     }
 }
 
@@ -603,7 +603,7 @@ pub(crate) mod tests {
         let project = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut t = SpaceTree::new(project, super::super::LARGEST);
         super::super::scan::walk(project, &|| true, &mut |events| t.apply(events));
-        let now = crate::pro::local_secs();
+        let now = crate::platform::local_secs();
         let s = Snapshot::of(&t, &new_id(), now - 5, now, LIMIT);
         let store = Store::app().unwrap();
         store.save(&s).unwrap();
