@@ -80,6 +80,8 @@ pub struct KernelDriver {
     pub start_type: &'static str,
     /// 0 boot, 1 system, 2 automatic, 3 manual, 4 disabled; `None` when Windows did not return the configuration.
     pub start_code: Option<u32>,
+    /// The SCM state code (1 stopped ... 7 paused); `None` when it was not read.
+    pub state_code: Option<u32>,
     pub kind: KernelKind,
     pub path: String,
     pub version: String,
@@ -90,6 +92,10 @@ pub struct KernelDriver {
     /// The list of loaded kernel images could not be read, so `image_size`
     /// and `load_index` are unknown for this row (not absent).
     pub modules_unread: bool,
+    /// Services this driver depends on (the configuration's dependency list).
+    pub depends_services: Vec<String>,
+    /// Load order groups this driver depends on.
+    pub depends_groups: Vec<String>,
 }
 
 /// One image of the loaded-module list: its full path, size and load order.
@@ -129,6 +135,50 @@ pub fn find_module<'a>(modules: &'a [LoadedModule], image_path: &str, windir: &s
     }
 }
 
+
+/// The SCM state shown for a state code; `None` when the state was not read.
+pub fn service_state_name(code: Option<u32>) -> Option<&'static str> {
+    match code? {
+        1 => Some("Stopped"),
+        2 => Some("Start pending"),
+        3 => Some("Stop pending"),
+        4 => Some("Running"),
+        5 => Some("Continue pending"),
+        6 => Some("Pause pending"),
+        7 => Some("Paused"),
+        _ => None,
+    }
+}
+
+/// The kind of a driver service from its service type bits.
+pub fn kernel_kind_from_type(service_type: u32) -> KernelKind {
+    match service_type {
+        t if t & 2 != 0 => KernelKind::FileSystem,
+        t if t & 1 != 0 => KernelKind::Kernel,
+        t if t & 8 != 0 => KernelKind::Recognizer,
+        t if t & 4 != 0 => KernelKind::Adapter,
+        _ => KernelKind::Kernel,
+    }
+}
+
+/// Splits a service's dependency list (UTF-16 strings, each ended by a nul, the list
+/// ended by an empty string) into (services, load order groups). A group
+/// is written with the prefix '+' (SC_GROUP_IDENTIFIER).
+pub fn parse_dependencies(units: &[u16]) -> (Vec<String>, Vec<String>) {
+    let (mut services, mut groups) = (Vec::new(), Vec::new());
+    for entry in units.split(|&u| u == 0) {
+        if entry.is_empty() {
+            break;
+        }
+        let text = String::from_utf16_lossy(entry);
+        match text.strip_prefix('+') {
+            Some(group) => groups.push(group.to_string()),
+            None => services.push(text),
+        }
+    }
+    (services, groups)
+}
+
 /// The start type shown for a service start code; "Unknown" when the configuration was not read.
 pub fn start_type_name(code: Option<u32>) -> &'static str {
     match code {
@@ -142,6 +192,23 @@ pub fn start_type_name(code: Option<u32>) -> &'static str {
 }
 
 impl KernelDriver {
+    /// The state label: the SCM state when read (pending states included), else Running/Stopped.
+    pub fn state_label(&self) -> &'static str {
+        service_state_name(self.state_code).unwrap_or(if self.running { "Running" } else { "Stopped" })
+    }
+    /// The services then the groups this driver depends on, comma-separated; empty when none.
+    pub fn depends_on_text(&self) -> String {
+        let groups = self.depends_groups.iter().map(|g| format!("{g} (group)"));
+        self.depends_services.iter().cloned().chain(groups).collect::<Vec<_>>().join(", ")
+    }
+    /// Loaded: the service is not Stopped, so the pending states count.
+    /// Without a read state, only a running service is loaded.
+    pub fn is_loaded(&self) -> bool {
+        match self.state_code {
+            Some(code) => code != 1,
+            None => self.running,
+        }
+    }
     pub fn third_party(&self) -> bool {
         !self.vendor.is_empty() && !self.vendor.to_lowercase().starts_with("microsoft")
     }
@@ -211,9 +278,8 @@ impl KernelScope {
     pub fn matches(self, d: &KernelDriver) -> bool {
         match self {
             Self::All => true,
-            // Not Stopped: the pending states count as loaded.
-            Self::Loaded => d.running,
-            Self::NotLoaded => !d.running,
+            Self::Loaded => d.is_loaded(),
+            Self::NotLoaded => !d.is_loaded(),
             Self::ThirdParty => d.third_party(),
             Self::FileSystem => d.kind == KernelKind::FileSystem,
         }
@@ -1135,10 +1201,13 @@ mod kernel_scope_tests {
 
     #[test]
     fn a_service_in_a_pending_state_counts_as_loaded() {
-        // `running` means "not Stopped": the reader sets it for pending states.
-        let pending = KernelDriver { running: true, ..Default::default() };
-        assert!(KernelScope::Loaded.matches(&pending));
-        assert!(!KernelScope::NotLoaded.matches(&pending));
+        for code in [2, 3, 4, 5, 6, 7] {
+            let d = KernelDriver { running: code == 4, state_code: Some(code), ..Default::default() };
+            assert!(KernelScope::Loaded.matches(&d), "state {code}");
+            assert!(!KernelScope::NotLoaded.matches(&d), "state {code}");
+        }
+        let stopped = KernelDriver { state_code: Some(1), ..Default::default() };
+        assert!(KernelScope::NotLoaded.matches(&stopped) && !KernelScope::Loaded.matches(&stopped));
     }
 
     #[test]
@@ -1472,6 +1541,44 @@ mod outcome_tests {
         assert_eq!(unread.unload_note(true), note);
         assert_eq!(unread.unload_note(false), note);
         assert_eq!(KernelDriver::default().unload_note(true), (false, "Not loaded."));
+    }
+
+    #[test]
+    fn every_service_state_has_its_own_label() {
+        let names: Vec<_> = (1..=7).map(|c| service_state_name(Some(c)).unwrap()).collect();
+        assert_eq!(names, ["Stopped", "Start pending", "Stop pending", "Running", "Continue pending", "Pause pending", "Paused"]);
+        assert_eq!(service_state_name(None), None);
+        assert_eq!(service_state_name(Some(0)), None);
+        assert_eq!(KernelDriver { running: true, ..Default::default() }.state_label(), "Running");
+        assert_eq!(KernelDriver { running: false, ..Default::default() }.state_label(), "Stopped");
+        assert_eq!(KernelDriver { running: false, state_code: Some(3), ..Default::default() }.state_label(), "Stop pending");
+    }
+
+    #[test]
+    fn every_service_type_has_its_own_kind() {
+        assert_eq!(kernel_kind_from_type(1).label(), "Kernel");
+        assert_eq!(kernel_kind_from_type(2).label(), "File system");
+        assert_eq!(kernel_kind_from_type(8).label(), "Recognizer");
+        assert_eq!(kernel_kind_from_type(4).label(), "Adapter");
+        assert_eq!(kernel_kind_from_type(2 | 8).label(), "File system");
+    }
+
+    #[test]
+    fn dependencies_split_into_services_and_groups() {
+        // '#' stands for the nul that ends each string; the list ends with an empty string.
+        let units: Vec<u16> = "+Base#Tcpip#Ndis##".encode_utf16().map(|u| if u == 0x23 { 0 } else { u }).collect();
+        let (s, g) = parse_dependencies(&units);
+        assert_eq!(s, ["Tcpip", "Ndis"]);
+        assert_eq!(g, ["Base"]);
+        assert_eq!(parse_dependencies(&[0, 0]), (vec![], vec![]));
+        assert_eq!(parse_dependencies(&[]), (vec![], vec![]));
+    }
+
+    #[test]
+    fn depends_on_text_lists_services_then_groups() {
+        let d = KernelDriver { depends_services: vec!["Tcpip".into(), "Ndis".into()], depends_groups: vec!["Base".into()], ..Default::default() };
+        assert_eq!(d.depends_on_text(), "Tcpip, Ndis, Base (group)");
+        assert_eq!(KernelDriver::default().depends_on_text(), "");
     }
 
     #[test]
