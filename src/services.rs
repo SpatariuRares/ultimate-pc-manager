@@ -15,9 +15,9 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos as system;
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
 mod linux;
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
 use linux as system;
 
 /// The Services page's row (the page owns it; this adapter fills it).

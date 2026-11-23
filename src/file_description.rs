@@ -13,9 +13,9 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos as system;
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
 mod linux;
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
 use linux as system;
 
 pub use system::file_description;

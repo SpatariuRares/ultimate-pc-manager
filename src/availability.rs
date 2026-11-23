@@ -93,7 +93,11 @@ fn reason(feature: Feature) -> Option<&'static str> {
 
 /// Whether this system has the feature at all.
 pub(crate) fn system_has(_feature: Feature) -> bool {
-    cfg!(windows)
+    #[cfg(windows)]
+    return true;
+    // No current feature has a Linux or macOS implementation yet.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    return false;
 }
 
 /// Is the feature available on this system.
@@ -178,7 +182,7 @@ mod tests {
         assert_eq!(unavailable_features(), Vec::<Feature>::new());
     }
 
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn no_current_feature_is_in_the_system_off_windows() {
         for &feature in Feature::ALL {
