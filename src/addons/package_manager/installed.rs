@@ -25,7 +25,7 @@ use egui::{RichText, Ui};
 
 use crate::platform::install_queue::{Request, Work};
 use crate::platform::uninstaller::{self, Uninstaller};
-use crate::platform::winget::{classify, describe, ExitClass, UNINSTALL_COMMAND_FAILED};
+use super::catalog::ExitClass;
 use crate::platform::{lock_state, AddonContext, Job, Ran};
 
 use super::batch::{Kind, Status};
@@ -190,7 +190,7 @@ pub(super) fn update_package(context: &AddonContext, source: &dyn PackageSource,
         Ran::NotStarted(why) => Outcome::NotStarted(why),
         Ran::Stopped => Outcome::NotStarted("it was stopped.".into()),
         Ran::Exited(code) => {
-            let updated = matches!(classify(code), ExitClass::Installed | ExitClass::InstalledRestart);
+            let updated = source.classify(code).is_success();
             let found = if updated { source.installed_version(context, &package.catalog, &package.id, accept, &never) } else { None };
             let found = found.map(|version| version.is_some_and(|v| !known_version(&package.version) || v == package.version));
             Outcome::Exited { code, found }
@@ -206,13 +206,13 @@ fn known_version(version: &str) -> bool {
 /// The status an update's `outcome` gives its package, which goes to
 /// `version`: an update winget reports done but not found at that version
 /// is told apart.
-pub fn update_status(outcome: &Outcome, version: &str) -> Status {
+pub fn update_status(source: &dyn PackageSource, outcome: &Outcome, version: &str) -> Status {
     match outcome {
-        Outcome::Exited { code, found: Some(false) } if matches!(classify(*code), ExitClass::Installed | ExitClass::InstalledRestart) => {
+        Outcome::Exited { code, found: Some(false) } if source.classify(*code).is_success() => {
             let what = if known_version(version) { format!("version {version} is") } else { "it is".to_string() };
-            Status::Failed(format!("updated according to winget ({}), but {what} not found among the installed packages", code_text(*code)))
+            Status::Failed(format!("updated according to winget ({}), but {what} not found among the installed packages", code_text(source, *code)))
         }
-        _ => outcome.status(),
+        _ => outcome.status(source),
     }
 }
 
@@ -242,11 +242,11 @@ fn uninstall_with(context: &AddonContext, source: &dyn PackageSource, package: &
         Ran::Stopped => return Err(format!("{name} was not started: it was stopped.")),
         Ran::Exited(code) => code,
     };
-    if let (UNINSTALL_COMMAND_FAILED, Some(elevating)) = (code, elevating) {
+    if let (true, Some(elevating)) = (source.uninstall_needs_admin(code), elevating) {
         let local = source.local_id(context, &package.catalog, &package.id, accept, &never);
         let entry = local.filter(|l| l.starts_with("ARP\\Machine\\")).and_then(|l| registry_key(&l)).and_then(|key| (elevating.entry_of)(&key));
         let Some(entry) = entry else {
-            return Err(format!("{name} could not be uninstalled: {}. {ADMIN_HINT}", describe(code)));
+            return Err(format!("{name} could not be uninstalled: {}. {ADMIN_HINT}", source.describe(code)));
         };
         (elevating.uninstall)(&entry)?;
         return match source.is_installed(context, &package.catalog, &package.id, accept, &never) {
@@ -254,14 +254,15 @@ fn uninstall_with(context: &AddonContext, source: &dyn PackageSource, package: &
             _ => Ok(format!("{name} was uninstalled.")),
         };
     }
-    match classify(code) {
-        ExitClass::Installed | ExitClass::InstalledRestart if source.is_installed(context, &package.catalog, &package.id, accept, &never) == Some(true) => {
-            Err(format!("{name} is still installed after winget uninstalled it ({}).", code_text(code)))
+    let class = source.classify(code);
+    match class {
+        _ if class.is_success() && source.is_installed(context, &package.catalog, &package.id, accept, &never) == Some(true) => {
+            Err(format!("{name} is still installed after winget uninstalled it ({}).", code_text(source, code)))
         }
         ExitClass::Installed => Ok(format!("{name} was uninstalled.")),
-        ExitClass::InstalledRestart => Ok(format!("{name} was uninstalled; {}.", describe(code))),
-        ExitClass::Cancelled => Err(format!("{name} was not uninstalled: {}.", describe(code))),
-        ExitClass::Skipped(_) | ExitClass::Failed => Err(format!("{name} could not be uninstalled: {}.", describe(code))),
+        ExitClass::InstalledRestart => Ok(format!("{name} was uninstalled; {}.", source.describe(code))),
+        ExitClass::Cancelled => Err(format!("{name} was not uninstalled: {}.", source.describe(code))),
+        ExitClass::Skipped | ExitClass::Failed => Err(format!("{name} could not be uninstalled: {}.", source.describe(code))),
     }
 }
 
@@ -482,7 +483,7 @@ mod tests {
     use crate::settings::Settings;
     use serde_json::json;
 
-    use crate::platform::winget::{NO_PACKAGE_FOUND, UNINSTALL_COMMAND_FAILED};
+    use crate::platform::winget::{describe, NO_PACKAGE_FOUND, UNINSTALL_COMMAND_FAILED};
 
     /// A `winget list` table with these rows (name, id, version, available,
     /// source), padded the way winget pads it.
@@ -717,6 +718,37 @@ mod tests {
         assert_eq!(page.removed(), Some(Ok("VLC media player was uninstalled.".into())));
         assert!(page.fallback().is_empty(), "the shared uninstaller is not used");
         assert_eq!(page.finished_jobs(), [ID]);
+    }
+
+    #[test]
+    fn a_failed_uninstall_says_so_in_words_and_a_refused_one_names_administrator_rights() {
+        let mut page = Page::new("failed-text", no_entry);
+        page.runner.prepare(When::Arg("uninstall".into()), 1603, "");
+        page.act(Command::Uninstall(vlc()));
+        until("the uninstall ends", || page.removed().is_some());
+        assert_eq!(page.removed(), Some(Err("VLC media player could not be uninstalled: exit code 1603.".into())));
+
+        let mut page = Page::new("restart-text", no_entry);
+        page.runner.prepare(When::Arg("uninstall".into()), 3010, "");
+        page.runner.prepare(When::Arg("--exact".into()), NO_PACKAGE_FOUND, "");
+        page.act(Command::Uninstall(vlc()));
+        until("the uninstall ends", || page.removed().is_some());
+        assert_eq!(page.removed(), Some(Ok("VLC media player was uninstalled; restart Windows to finish (3010).".into())));
+
+        let mut page = Page::new("cancel-text", no_entry);
+        page.runner.prepare(When::Arg("uninstall".into()), 1602, "");
+        page.act(Command::Uninstall(vlc()));
+        until("the uninstall ends", || page.removed().is_some());
+        assert_eq!(page.removed(), Some(Err("VLC media player was not uninstalled: the installation was cancelled (1602).".into())));
+
+        let mut page = Page::new("admin-text", no_entry);
+        page.runner.prepare(When::Arg("uninstall".into()), UNINSTALL_COMMAND_FAILED, "");
+        page.act(Command::Uninstall(vlc()));
+        until("the uninstall ends", || page.removed().is_some());
+        let removed = page.removed();
+        let Some(Err(text)) = removed else { panic!("{removed:?}") };
+        assert!(text.starts_with("VLC media player could not be uninstalled: "), "{text}");
+        assert!(text.ends_with("Uninstalling it needs administrator rights: restart the app as administrator and try again."), "{text}");
     }
 
     #[test]

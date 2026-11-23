@@ -85,25 +85,51 @@ pub struct Target<'a> {
     pub pin: &'a Pin,
 }
 
+/// What an exit code means for the package, whatever the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitClass {
+    Installed,
+    /// Installed; Windows must restart to finish.
+    InstalledRestart,
+    /// Nothing was done.
+    Skipped,
+    Cancelled,
+    Failed,
+}
+
+impl ExitClass {
+    /// The package is installed (updated, uninstalled) whatever the restart.
+    pub fn is_success(self) -> bool {
+        matches!(self, ExitClass::Installed | ExitClass::InstalledRestart)
+    }
+}
+
 /// A catalog source (see the module docs). `None` from a method that takes
 /// `stop`: it was set, and the work was ended.
 pub trait PackageSource: Send + Sync {
-    /// The source's id ("winget").
-    #[cfg_attr(not(test), allow(dead_code))] // in the catalog interface #113 defines; v1 has one source and nothing asks it yet
-    fn id(&self) -> &'static str;
     /// The catalogs it serves, by the name packages carry.
     fn catalogs(&self) -> &'static [&'static str];
     /// Whether installing `id` needs administrator rights, when known.
     fn needs_admin(&self, id: &str) -> Option<bool>;
-    /// It can install for the current user only.
-    #[cfg_attr(not(test), allow(dead_code))] // in the catalog interface #113 defines; v1 has one source and nothing asks it yet
-    fn supports_user_scope(&self) -> bool;
-    /// It can uninstall programs it did not install.
-    #[cfg_attr(not(test), allow(dead_code))] // in the catalog interface #113 defines; v1 has one source and nothing asks it yet
-    fn can_uninstall_foreign(&self) -> bool;
     /// Whether it can be used, and how to repair it.
-    #[cfg_attr(not(test), allow(dead_code))] // in the catalog interface #113 defines; v1 has one source and nothing asks it yet
     fn availability(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Readiness>;
+    /// Repairs a source that is installed but not registered; `Err` says why
+    /// it failed. `None`: stopped.
+    fn register(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Result<(), String>>;
+    /// What an exit code of an install, update or uninstall means.
+    fn classify(&self, code: i32) -> ExitClass;
+    /// An exit code in words for a message, with the raw code beside them.
+    fn describe(&self, code: i32) -> String;
+    /// Whether this uninstall exit code means the uninstaller needs
+    /// administrator rights.
+    fn uninstall_needs_admin(&self, code: i32) -> bool;
+    /// Names joined for a message ("A, B and C").
+    fn join_names(&self, names: &[String]) -> String;
+    /// The last `n` lines of its output worth showing (no progress bars).
+    fn last_lines(&self, output: &str, n: usize) -> String;
+    /// Lets it bring its catalogs up to date (slow the first time); `Err`
+    /// says why it could not.
+    fn refresh_catalogs(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Result<(), String>>;
     /// The catalogs it serves that are not active on this PC (removed or
     /// disabled there); empty when it could not tell.
     fn inactive_catalogs(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Vec<String>>;
@@ -208,9 +234,6 @@ impl Winget {
 }
 
 impl PackageSource for Winget {
-    fn id(&self) -> &'static str {
-        "winget"
-    }
     fn catalogs(&self) -> &'static [&'static str] {
         WINGET_CATALOGS
     }
@@ -218,14 +241,37 @@ impl PackageSource for Winget {
         // winget's search does not say; the installer asks through UAC.
         None
     }
-    fn supports_user_scope(&self) -> bool {
-        true
-    }
-    fn can_uninstall_foreign(&self) -> bool {
-        true
-    }
     fn availability(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Readiness> {
         readiness::check(ctx, stop)
+    }
+    fn register(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Result<(), String>> {
+        let args = readiness::powershell_args(readiness::REGISTER_APP_INSTALLER);
+        run_to_end(ctx, "powershell.exe", &args, stop, "PowerShell did not start.", |code, out| format!("Registering App Installer failed (exit code {code}). {}", out.trim()))
+    }
+    fn classify(&self, code: i32) -> ExitClass {
+        use crate::platform::winget::ExitClass as W;
+        match crate::platform::winget::classify(code) {
+            W::Installed => ExitClass::Installed,
+            W::InstalledRestart => ExitClass::InstalledRestart,
+            W::Skipped(_) => ExitClass::Skipped,
+            W::Cancelled => ExitClass::Cancelled,
+            W::Failed => ExitClass::Failed,
+        }
+    }
+    fn describe(&self, code: i32) -> String {
+        crate::platform::winget::describe(code)
+    }
+    fn uninstall_needs_admin(&self, code: i32) -> bool {
+        code == crate::platform::winget::UNINSTALL_COMMAND_FAILED
+    }
+    fn join_names(&self, names: &[String]) -> String {
+        crate::platform::winget::join_names(names)
+    }
+    fn last_lines(&self, output: &str, n: usize) -> String {
+        crate::platform::winget::last_lines(output, n)
+    }
+    fn refresh_catalogs(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Result<(), String>> {
+        run_to_end(ctx, "winget", &["source", "update"], stop, "winget did not start.", |code, _| crate::platform::winget::describe(code))
     }
     fn inactive_catalogs(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Vec<String>> {
         Some(match Self::ask(ctx, &["source", "list", "--disable-interactivity"], stop)? {
@@ -318,6 +364,17 @@ impl PackageSource for Winget {
         let args = ["uninstall", "--id", target.id, "--exact", "--source", target.catalog, "--silent", "--disable-interactivity", "--log", &log];
         Self::run_package(ctx, &args, stop, on_line)
     }
+}
+
+/// Runs `program` and tells whether it ended well (exit code 0): `Err` is
+/// `not_started` when it did not start, and `failed(code, output)` when it
+/// exited otherwise. `None`: stopped.
+fn run_to_end(ctx: &AddonContext, program: &str, args: &[&str], stop: &AtomicBool, not_started: &str, failed: impl FnOnce(i32, &str) -> String) -> Option<Result<(), String>> {
+    Some(match readiness::ask(ctx, program, args, stop)? {
+        readiness::Answer::Exited(0, _) => Ok(()),
+        readiness::Answer::Exited(code, out) => Err(failed(code, &out)),
+        readiness::Answer::NotStarted => Err(not_started.into()),
+    })
 }
 
 /// `args` with `--accept-source-agreements` when the catalogs' agreements
@@ -493,12 +550,60 @@ mod tests {
     }
 
     #[test]
+    fn refreshing_the_catalogs_is_winget_source_update() {
+        let stop = AtomicBool::new(false);
+        let (ctx, runner) = AddonContext::recording();
+        runner.prepare(crate::platform::When::Arg("source".into()), 0, "Done");
+        assert_eq!(Winget.refresh_catalogs(&ctx, &stop), Some(Ok(())));
+        assert_eq!(runner.launches().len(), 1);
+        let (ctx, runner) = AddonContext::recording();
+        runner.prepare(crate::platform::When::Arg("source".into()), 1, "boom");
+        let Some(Err(why)) = Winget.refresh_catalogs(&ctx, &stop) else { panic!("a failed update is an error") };
+        assert_eq!(why, crate::platform::winget::describe(1));
+    }
+
+    #[test]
     fn the_registry_has_winget_serving_its_catalog_and_the_store() {
-        assert_eq!(SOURCES.iter().map(|s| s.id()).collect::<Vec<_>>(), ["winget"]);
-        assert_eq!(source_of("winget").map(|s| s.id()), Some("winget"));
-        assert_eq!(source_of("msstore").map(|s| s.id()), Some("winget"));
+        assert_eq!(SOURCES.len(), 1);
+        assert!(source_of("winget").is_some());
+        assert!(source_of("msstore").is_some());
         assert!(source_of("scoop").is_none());
-        let w = source_of("winget").unwrap();
-        assert_eq!((w.needs_admin("Git.Git"), w.supports_user_scope(), w.can_uninstall_foreign()), (None, true, true));
+        assert_eq!(source_of("winget").unwrap().needs_admin("Git.Git"), None);
+    }
+
+    #[test]
+    fn the_source_classifies_exit_codes_and_says_which_are_successes() {
+        let w = &Winget as &dyn PackageSource;
+        assert_eq!(w.classify(0), ExitClass::Installed);
+        assert_eq!(w.classify(3010), ExitClass::InstalledRestart);
+        assert_eq!(w.classify(1602), ExitClass::Cancelled);
+        assert_eq!(w.classify(0x8A15_002B_u32 as i32), ExitClass::Skipped);
+        assert_eq!(w.classify(1603), ExitClass::Failed);
+        assert!(w.classify(0).is_success() && w.classify(3010).is_success());
+        assert!(!w.classify(1602).is_success() && !w.classify(1603).is_success());
+    }
+
+    #[test]
+    fn the_source_describes_exits_and_formats_messages() {
+        let w = &Winget as &dyn PackageSource;
+        assert_eq!(w.describe(1603), "exit code 1603");
+        assert!(w.uninstall_needs_admin(crate::platform::winget::UNINSTALL_COMMAND_FAILED));
+        assert!(!w.uninstall_needs_admin(1603));
+        assert_eq!(w.join_names(&["A".to_string(), "B".to_string()]), "A and B");
+        assert_eq!(w.last_lines("one
+two
+three", 2), "two
+three");
+    }
+
+    #[test]
+    fn registering_the_source_runs_powershell_and_reports_why_it_failed() {
+        let stop = AtomicBool::new(false);
+        let (ctx, runner) = AddonContext::recording();
+        runner.prepare(crate::platform::When::Arg("-NoProfile".into()), 0, "");
+        assert_eq!(Winget.register(&ctx, &stop), Some(Ok(())));
+        let (ctx, runner) = AddonContext::recording();
+        runner.prepare(crate::platform::When::Arg("-NoProfile".into()), 5, " denied ");
+        assert_eq!(Winget.register(&ctx, &stop), Some(Err("Registering App Installer failed (exit code 5). denied".into())));
     }
 }

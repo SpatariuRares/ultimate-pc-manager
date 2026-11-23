@@ -54,13 +54,12 @@ use egui::{RichText, Ui};
 use crate::addons::{is_default, read_settings, write_settings, Addon, Consumption, Requirements, CloseWait, Asked, Capability};
 use crate::platform::install_queue::{Request, Work};
 use crate::platform::series::{Run, Series};
-use crate::platform::winget::{classify, describe, last_lines, ExitClass};
 use crate::platform::{lock_state, AddonContext, Generation, Job, PageContext, Ran};
 
 use batch::{Item, Kind, Status};
 use bundle::BundleView;
-use catalog::{Found, PackageSource, Pin, Target};
-use readiness::{Answer, Readiness, Repair};
+use catalog::{ExitClass, Found, PackageSource, Pin, Target};
+use readiness::{Readiness, Repair};
 
 /// The add-on's id, and its page's.
 pub const ID: &str = "package-manager";
@@ -179,7 +178,7 @@ pub struct Install {
 impl Install {
     /// The last lines of its output worth showing (no progress bars).
     pub fn last_lines(&self) -> String {
-        last_lines(&self.lines.join("\n"), 5)
+        source_for(&self.package.catalog).last_lines(&self.lines.join("\n"), 5)
     }
 }
 
@@ -196,50 +195,52 @@ pub enum Outcome {
 
 impl Outcome {
     /// The outcome in words, with the raw code.
-    pub fn text(&self, name: &str) -> String {
+    pub fn text(&self, source: &dyn PackageSource, name: &str) -> String {
         let (code, found) = match self {
             Outcome::NotStarted(why) => return format!("{name} was not started: {}", why.trim()),
             Outcome::Exited { code, found } => (*code, *found),
         };
-        let words = describe(code);
-        match classify(code) {
-            ExitClass::Installed | ExitClass::InstalledRestart if found == Some(false) => {
-                format!("{name} was installed according to winget ({}), but it is not found among the installed packages.", code_text(code))
+        let words = source.describe(code);
+        let class = source.classify(code);
+        match class {
+            _ if class.is_success() && found == Some(false) => {
+                format!("{name} was installed according to winget ({}), but it is not found among the installed packages.", code_text(source, code))
             }
-            ExitClass::Installed => format!("{name} was installed ({}).", code_text(code)),
+            ExitClass::Installed => format!("{name} was installed ({}).", code_text(source, code)),
             ExitClass::InstalledRestart => format!("{name} was installed; {words}."),
-            ExitClass::Skipped(_) => format!("{name} was skipped: {words}."),
+            ExitClass::Skipped => format!("{name} was skipped: {words}."),
             ExitClass::Cancelled => format!("{name} was cancelled: {words}."),
             ExitClass::Failed => format!("{name} started installing but failed: {words}."),
         }
     }
 
     /// The status it gives a package of a series.
-    pub fn status(&self) -> Status {
+    pub fn status(&self, source: &dyn PackageSource) -> Status {
         let (code, found) = match self {
             Outcome::NotStarted(why) => return Status::NotStarted(why.trim().trim_end_matches('.').to_string()),
             Outcome::Exited { code, found } => (*code, *found),
         };
-        match classify(code) {
-            ExitClass::Installed | ExitClass::InstalledRestart if found == Some(false) => {
-                Status::Failed(format!("installed according to winget ({}), but not found among the installed packages", code_text(code)))
+        let class = source.classify(code);
+        match class {
+            _ if class.is_success() && found == Some(false) => {
+                Status::Failed(format!("installed according to winget ({}), but not found among the installed packages", code_text(source, code)))
             }
             ExitClass::Installed => Status::Ok,
             ExitClass::InstalledRestart => Status::OkRestart,
-            ExitClass::Skipped(_) => Status::Skipped(describe(code)),
+            ExitClass::Skipped => Status::Skipped(source.describe(code)),
             ExitClass::Cancelled => Status::Cancelled,
-            ExitClass::Failed => Status::Failed(describe(code)),
+            ExitClass::Failed => Status::Failed(source.describe(code)),
         }
     }
 }
 
 /// An exit code as a raw code ("exit code 0"), or in words with the raw
 /// code when it has some.
-fn code_text(code: i32) -> String {
+fn code_text(source: &dyn PackageSource, code: i32) -> String {
     if code == 0 {
         "exit code 0".into()
     } else {
-        describe(code)
+        source.describe(code)
     }
 }
 
@@ -452,6 +453,19 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 
+/// The source whose availability the page shows and whose catalogs it
+/// refreshes: v1 has one source, so the first registered.
+fn primary_source() -> &'static dyn PackageSource {
+    catalog::SOURCES[0]
+}
+
+/// The source a package of `catalog` comes from. Every catalog a package
+/// carries is served by a registered source; the primary one stands in for
+/// a catalog nobody serves.
+fn source_for(catalog: &str) -> &'static dyn PackageSource {
+    catalog::source_of(catalog).unwrap_or_else(primary_source)
+}
+
 /// Installs `package` with `source`, its log in `log` (inside the folder
 /// `logs`, made first), then checks that it shows as installed when the
 /// exit code says it was. `on_line` gets each line of winget's output. An
@@ -468,7 +482,7 @@ fn install_package(context: &AddonContext, source: &dyn PackageSource, package: 
         Ran::NotStarted(why) => Outcome::NotStarted(why),
         Ran::Stopped => Outcome::NotStarted("it was stopped.".into()),
         Ran::Exited(code) => {
-            let installed = matches!(classify(code), ExitClass::Installed | ExitClass::InstalledRestart);
+            let installed = source.classify(code).is_success();
             let found = if installed { source.is_installed(context, &package.catalog, &package.id, accept, &never) } else { None };
             Outcome::Exited { code, found }
         }
@@ -794,12 +808,12 @@ impl PackageManager {
                                 Kind::Install => {
                                     let outcome = install_package(&context, source, package, &items[i].pin, &log, &logs, accept, &mut on_line);
                                     mark_installed(&mut run.follow(), package, &outcome);
-                                    let status = outcome.status();
+                                    let status = outcome.status(source);
                                     (outcome, status)
                                 }
                                 Kind::Update => {
                                     let outcome = installed::update_package(&context, source, package, &log, &logs, accept, &mut on_line);
-                                    let status = installed::update_status(&outcome, &package.version);
+                                    let status = installed::update_status(source, &outcome, &package.version);
                                     (outcome, status)
                                 }
                             };
@@ -897,7 +911,7 @@ impl PackageManager {
     /// Checks winget again in the background.
     fn begin_check(&mut self) {
         self.spawn(Check::Checking, |context, stop, job| {
-            if let Some(r) = readiness::check(context, stop) {
+            if let Some(r) = primary_source().availability(context, stop) {
                 job.publish(|s| s.check = Check::Known(r));
             }
         });
@@ -922,11 +936,10 @@ impl PackageManager {
         lock_state(&self.state).catalogs = Catalogs::Updating;
         let (job, stop) = (Job::new(&self.state, &self.generation), self.stop.clone());
         std::thread::spawn(move || {
-            let outcome = match readiness::ask(&context, "winget", &["source", "update"], &stop) {
+            let outcome = match primary_source().refresh_catalogs(&context, &stop) {
                 None => return,
-                Some(Answer::Exited(0, _)) => Catalogs::Updated,
-                Some(Answer::Exited(code, _)) => Catalogs::Failed(crate::platform::winget::describe(code)),
-                Some(Answer::NotStarted) => Catalogs::Failed("winget did not start.".into()),
+                Some(Ok(())) => Catalogs::Updated,
+                Some(Err(why)) => Catalogs::Failed(why),
             };
             // The catalogs removed or disabled on this PC: their bundle
             // entries cannot be installed.
@@ -955,14 +968,12 @@ impl PackageManager {
                 lock_state(&self.state).repair_error = error;
             }
             Some((Repair::Register, _)) => self.spawn(Check::Repairing, |context, stop, job| {
-                let args = readiness::powershell_args(readiness::REGISTER_APP_INSTALLER);
-                let error = match readiness::ask(context, "powershell.exe", &args, stop) {
+                let error = match primary_source().register(context, stop) {
                     None => return,
-                    Some(Answer::Exited(0, _)) => None,
-                    Some(Answer::Exited(code, out)) => Some(format!("Registering App Installer failed (exit code {code}). {}", out.trim())),
-                    Some(Answer::NotStarted) => Some("PowerShell did not start.".into()),
+                    Some(Ok(())) => None,
+                    Some(Err(why)) => Some(why),
                 };
-                if let Some(r) = readiness::check(context, stop) {
+                if let Some(r) = primary_source().availability(context, stop) {
                     job.publish(|s| {
                         s.check = Check::Known(r);
                         s.repair_error = error.map(|e| e.trim().to_string());
@@ -1533,7 +1544,7 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
         );
         assert_eq!(winget_runs(&runner, "list"), [strings(&["list", "--id", "VideoLAN.VLC", "--exact", "--disable-interactivity", "--accept-source-agreements"])]);
         assert_eq!(install.outcome, Some(Outcome::Exited { code: 0, found: Some(true) }));
-        assert_eq!(install.outcome.as_ref().unwrap().text("VLC media player"), "VLC media player was installed (exit code 0).");
+        assert_eq!(install.outcome.as_ref().unwrap().text(primary_source(), "VLC media player"), "VLC media player was installed (exit code 0).");
         assert_eq!(install.last_lines(), "Found VLC media player [VideoLAN.VLC]\nStarting package install...\nSuccessfully installed", "no progress bar");
     }
 
@@ -1545,7 +1556,7 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
         });
         let outcome = install.outcome.unwrap();
         assert_eq!(outcome, Outcome::Exited { code: 0, found: Some(false) });
-        assert_eq!(outcome.text("VLC"), "VLC was installed according to winget (exit code 0), but it is not found among the installed packages.");
+        assert_eq!(outcome.text(primary_source(), "VLC"), "VLC was installed according to winget (exit code 0), but it is not found among the installed packages.");
     }
 
     #[test]
@@ -1560,9 +1571,25 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
                 runner.prepare(When::Arg("install".into()), code, "");
                 runner.prepare(When::Arg("list".into()), 0, LISTED);
             });
-            assert_eq!(install.outcome.as_ref().unwrap().text("VLC"), words);
+            assert_eq!(install.outcome.as_ref().unwrap().text(primary_source(), "VLC"), words);
             let checked = winget_runs(&runner, "list").len();
             assert_eq!(checked, usize::from(code == 3010), "only an install is checked ({code})");
+        }
+    }
+
+    #[test]
+    fn each_exit_class_reads_as_one_literal_sentence() {
+        let cases = [
+            (1603, "VLC started installing but failed: exit code 1603."),
+            (3010, "VLC was installed; restart Windows to finish (3010)."),
+            (1602, "VLC was cancelled: the installation was cancelled (1602)."),
+        ];
+        for (code, text) in cases {
+            let (install, _, _) = install_vlc(&format!("literal-{code}"), |runner| {
+                runner.prepare(When::Arg("install".into()), code, "");
+                runner.prepare(When::Arg("list".into()), 0, LISTED);
+            });
+            assert_eq!(install.outcome.as_ref().unwrap().text(primary_source(), "VLC"), text);
         }
     }
 
@@ -1571,7 +1598,7 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
         let (install, runner, _) = install_vlc("notstarted", |_| {});
         let outcome = install.outcome.unwrap();
         assert!(matches!(outcome, Outcome::NotStarted(_)));
-        assert!(outcome.text("VLC").starts_with("VLC was not started: "), "{}", outcome.text("VLC"));
+        assert!(outcome.text(primary_source(), "VLC").starts_with("VLC was not started: "), "{}", outcome.text(primary_source(), "VLC"));
         assert!(winget_runs(&runner, "list").is_empty());
     }
 
@@ -1711,6 +1738,47 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
             host.status_bar_areas(ui, page);
         })
         .0
+    }
+
+    #[test]
+    fn the_page_says_winget_is_ready_or_why_it_is_not_in_words() {
+        let logs = scratch("readiness-text");
+        let (mut host, runner, view, _) = host_with_logs(&logs);
+        runner.prepare(When::Arg("--version".into()), 0, "v1.9.25200");
+        open_page(&mut host);
+        until("ready", || matches!(check_of(&view), Check::Known(Readiness::Ready(_))));
+        let text = page_text(&mut host);
+        assert!(text.contains("winget 1.9.25200 is ready"), "{text}");
+        assert!(text.contains("You can search and install programs from the winget catalogs."), "{text}");
+
+        let (mut host, runner, view, _) = host_with_logs(&logs);
+        runner.prepare(When::Arg("--version".into()), 0, "v1.2.10271");
+        open_page(&mut host);
+        until("too old", || matches!(check_of(&view), Check::Known(Readiness::TooOld(_))));
+        let text = page_text(&mut host);
+        assert!(text.contains("winget 1.2.10271 is too old"), "{text}");
+        assert!(text.contains("Update in the Microsoft Store"), "{text}");
+    }
+
+    #[test]
+    fn the_catalogs_are_updated_before_a_search_and_a_failed_update_says_why() {
+        let logs = scratch("source-update");
+        let (mut host, runner, view, commands) = host_with_logs(&logs);
+        runner.prepare(When::Arg("--version".into()), 0, "v1.9.25200");
+        runner.prepare(When::Arg("source".into()), 1, "");
+        open_page(&mut host);
+        until("ready", || matches!(check_of(&view), Check::Known(Readiness::Ready(_))));
+        open_page(&mut host);
+        until("update failed", || matches!(lock_state(&view).catalogs, Catalogs::Failed(_)));
+        assert_eq!(lock_state(&view).catalogs, Catalogs::Failed("exit code 1".into()));
+        assert!(page_text(&mut host).contains("Could not update the catalogs: exit code 1"), "{}", page_text(&mut host));
+
+        runner.prepare(When::Arg("--query".into()), 0, SEARCH);
+        act(&mut host, &commands, Command::Search("vlc".into()));
+        until("searched", || found_of(&view).is_some());
+        let launches = runner.launches();
+        let position = |verb: &str| launches.iter().position(|l| matches!(l, Launch::Run { program, args, .. } if program == "winget" && args.first().map(String::as_str) == Some(verb)));
+        assert!(position("source") < position("search"), "the catalogs come first: {launches:?}");
     }
 
     #[test]
