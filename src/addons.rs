@@ -214,24 +214,6 @@ pub trait Addon {
     /// Shows the row that owns `path` on its page (after
     /// [`Addon::owner_of`] named it); the app then opens the page.
     fn reveal(&mut self, _path: &std::path::Path) {}
-    /// Its column in the Processes table and its item in a process's menu
-    /// (optional; none by default). Asked only while it is on; keep it cheap.
-    fn process_column(&self) -> Option<ProcessColumn> {
-        None
-    }
-    /// The figure of each process (by PID) in that column, asked once per
-    /// frame while the column shows: it may start reading then (see
-    /// [`Addon::process_column_hidden`]). None until it has a reading.
-    fn process_figures(&mut self, _settings: &crate::settings::Settings) -> Option<HashMap<u32, usize>> {
-        None
-    }
-    /// Called once when its column, drawn in the last frame, is not drawn
-    /// any more (hidden, or another page opened). Drop here what only the
-    /// column needs.
-    fn process_column_hidden(&mut self) {}
-    /// Opens its page on the process `pid` (its menu item was chosen); the
-    /// app then opens the page.
-    fn reveal_process(&mut self, _pid: u32) {}
     /// "Packages changed": a job of the install queue (see
     /// [`AddonContext::install_queue`]) ended; `by` is the id of the add-on
     /// that ran it (it may be this one). Told only while it is on, once per
@@ -264,6 +246,28 @@ pub trait Addon {
 pub struct Offers<'a> {
     /// It records sensors for other add-ons' pages (Flight Recorder).
     pub sensor_recorder: Option<&'a mut dyn SensorRecorder>,
+    /// It adds a column to the Processes table and an item to a process's
+    /// menu (Connections).
+    pub process_column: Option<&'a mut dyn ProcessColumnProvider>,
+}
+
+/// The Processes column capability: a column in the Processes table and an
+/// item in a process's menu, only while the add-on that offers it is on.
+pub trait ProcessColumnProvider {
+    /// Its column and menu item; keep it cheap.
+    fn process_column(&self) -> ProcessColumn;
+    /// The figure of each process (by PID) in that column, asked once per
+    /// frame while the column shows: it may start reading then (see
+    /// [`ProcessColumnProvider::process_column_hidden`]). None until it has
+    /// a reading.
+    fn process_figures(&mut self, settings: &crate::settings::Settings) -> Option<HashMap<u32, usize>>;
+    /// Called once when its column, drawn in the last frame, is not drawn
+    /// any more (hidden, or another page opened). Drop here what only the
+    /// column needs.
+    fn process_column_hidden(&mut self);
+    /// Opens its page on the process `pid` (its menu item was chosen); the
+    /// app then opens the page.
+    fn reveal_process(&mut self, pid: u32);
 }
 
 /// The sensor recorder capability: what Power & Freq's "Record" talks to.
@@ -527,8 +531,16 @@ struct Slot {
 /// stopping offers (picked from its [`Offers`] by `pick`); None when none
 /// does. A disabled or stopping add-on offers nothing.
 fn provider<'s, T: ?Sized + 's>(slots: impl IntoIterator<Item = &'s mut Slot>, pick: impl Fn(Offers<'s>) -> Option<&'s mut T>) -> Option<&'s mut T> {
+    provider_with_id(slots, pick).map(|(_, c)| c)
+}
+
+/// [`provider`], with the id of the add-on that offers the capability.
+fn provider_with_id<'s, T: ?Sized + 's>(slots: impl IntoIterator<Item = &'s mut Slot>, pick: impl Fn(Offers<'s>) -> Option<&'s mut T>) -> Option<(&'static str, &'s mut T)> {
     slots.into_iter().filter(|s| s.enabled && !s.stopping).find_map(|s| match &mut s.entry {
-        Entry::Addon(a) => pick(a.offers()),
+        Entry::Addon(a) => {
+            let id = a.id();
+            pick(a.offers()).map(|c| (id, c))
+        }
         Entry::Core(_) => None,
     })
 }
@@ -1146,29 +1158,29 @@ impl AddonHost {
         }
     }
 
-    /// The Processes columns of the add-ons that are on, by add-on id, in
-    /// registry order (see [`Addon::process_column`]).
+    /// The Processes column offered by the add-on that is on, by add-on id
+    /// (see [`ProcessColumnProvider`]); empty when none offers it.
     pub fn process_columns(&mut self) -> Vec<(&'static str, ProcessColumn)> {
-        self.enabled_addons().filter_map(|a| a.process_column().map(|c| (a.id(), c))).collect()
+        provider_with_id(&mut self.slots, |o| o.process_column).map(|(id, c)| (id, c.process_column())).into_iter().collect()
     }
 
     /// The figures of the add-on `id`'s Processes column, which is drawn in
-    /// this frame (see [`Addon::process_figures`]). None when it is off or
-    /// has no reading yet.
+    /// this frame (see [`ProcessColumnProvider::process_figures`]). None when
+    /// it is off, offers no column or has no reading yet.
     pub fn process_figures(&mut self, id: &str, settings: &crate::settings::Settings) -> Option<HashMap<u32, usize>> {
-        let addon = self.enabled_addon(id)?;
-        let id = addon.id();
-        let figures = addon.process_figures(settings);
+        let (id, column) = provider_with_id(&mut self.slots, |o| o.process_column).filter(|(i, _)| *i == id)?;
+        let figures = column.process_figures(settings);
         self.columns.mark(id);
         figures
     }
 
     /// Opens the page of the add-on `id` on the process `pid` (see
-    /// [`Addon::reveal_process`]). False (and nothing done) when it is off.
+    /// [`ProcessColumnProvider::reveal_process`]). False (and nothing done)
+    /// when it is off or offers no column.
     pub fn reveal_process(&mut self, id: &str, pid: u32) -> bool {
-        match self.enabled_addon(id) {
-            Some(addon) => {
-                addon.reveal_process(pid);
+        match provider_with_id(&mut self.slots, |o| o.process_column).filter(|(i, _)| *i == id) {
+            Some((_, column)) => {
+                column.reveal_process(pid);
                 true
             }
             None => false,
@@ -1210,7 +1222,9 @@ impl AddonHost {
                     a.summary_hidden();
                 }
                 if columns_hidden.contains(&a.id()) {
-                    a.process_column_hidden();
+                    if let Some(column) = a.offers().process_column {
+                        column.process_column_hidden();
+                    }
                 }
             }
         }
@@ -1759,6 +1773,73 @@ mod tests {
     fn record(host: &mut AddonHost, on: bool) -> Result<(), &'static str> {
         let (settings, sample) = (Settings::default(), Snapshot::default());
         host.record_sensors(on, &mut PageContext::new(&settings, &sample))
+    }
+
+    /// What a Processes-column test add-on was asked: `(hidden, revealed pids)`.
+    type ColumnLog = std::sync::Arc<std::sync::Mutex<(u32, Vec<u32>)>>;
+
+    /// An add-on that offers a Processes column of its own; it has no page
+    /// of the kind Connections has.
+    struct Counts(ColumnLog);
+
+    impl ProcessColumnProvider for Counts {
+        fn process_column(&self) -> ProcessColumn {
+            ProcessColumn { title: "Counts", menu_item: "Go to counts" }
+        }
+        fn process_figures(&mut self, _settings: &Settings) -> Option<HashMap<u32, usize>> {
+            Some(HashMap::from([(7, 3)]))
+        }
+        fn process_column_hidden(&mut self) {
+            self.0.lock().unwrap().0 += 1;
+        }
+        fn reveal_process(&mut self, pid: u32) {
+            self.0.lock().unwrap().1.push(pid);
+        }
+    }
+
+    impl Addon for Counts {
+        test_addon!("counts", "Counts", "Counts per process.");
+        fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
+        fn offers(&mut self) -> Offers<'_> {
+            Offers { process_column: Some(self), ..Offers::default() }
+        }
+    }
+
+    fn counts_host() -> (AddonHost, ColumnLog) {
+        let log = ColumnLog::default();
+        let entries = vec![Entry::Addon(Box::new(Records(false))), Entry::Addon(Box::new(Counts(std::sync::Arc::clone(&log))))];
+        (AddonHost::for_tests_with(entries, &json!({})).0, log)
+    }
+
+    #[test]
+    fn a_processes_column_comes_from_whichever_addon_offers_it_while_that_addon_is_on() {
+        let (mut host, _) = counts_host();
+        let column = ProcessColumn { title: "Counts", menu_item: "Go to counts" };
+        assert_eq!(host.process_columns(), [("counts", column)]);
+        assert_eq!(host.process_figures("counts", &Settings::default()), Some(HashMap::from([(7, 3)])));
+        host.set_enabled("counts", false);
+        assert!(host.process_columns().is_empty(), "no column while it is off");
+        assert_eq!(host.process_figures("counts", &Settings::default()), None);
+    }
+
+    #[test]
+    fn go_to_a_process_reaches_the_offering_addon_only_while_it_is_on() {
+        let (mut host, log) = counts_host();
+        assert!(host.reveal_process("counts", 42));
+        assert!(!host.reveal_process("records", 42), "an add-on that offers no column is not asked");
+        host.set_enabled("counts", false);
+        assert!(!host.reveal_process("counts", 42));
+        assert_eq!(log.lock().unwrap().1, [42]);
+    }
+
+    #[test]
+    fn a_column_no_longer_drawn_is_told_to_drop_what_only_it_needs() {
+        let (mut host, log) = counts_host();
+        host.process_figures("counts", &Settings::default());
+        host.end_frame();
+        assert_eq!(log.lock().unwrap().0, 0, "still drawn in the last frame");
+        host.end_frame();
+        assert_eq!(log.lock().unwrap().0, 1);
     }
 
     #[test]
