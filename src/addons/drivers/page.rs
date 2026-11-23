@@ -1468,7 +1468,7 @@ mod kernel_detail_tests {
             display: "Microsoft ACPIEx Driver".into(),
             running: true,
             start_type: "Boot",
-            start_code: 0,
+            start_code: Some(0),
             kind: drivers::KernelKind::Kernel,
             path: r"C:\Windows\System32\Drivers\acpiex.sys".into(),
             version: "10.0.26100.1".into(),
