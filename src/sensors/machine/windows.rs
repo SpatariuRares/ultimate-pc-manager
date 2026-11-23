@@ -113,71 +113,10 @@ fn cpu_info() -> CpuInfo {
 
 /// Memory modules from the SMBIOS table (type 17 entries).
 fn mem_info() -> MemInfo {
-    let mut m = MemInfo::default();
-    let Some(data) = super::smbios_table() else { return m };
-    if data.len() < 8 {
-        return m;
+    match super::smbios_table() {
+        Some(data) if data.len() >= 8 => crate::sensors::smbios::memory_facts(&data[8..]),
+        _ => MemInfo::default(),
     }
-    let t = &data[8..];
-    let u16at = |s: &[u8], o: usize| if o + 1 < s.len() { u16::from_le_bytes([s[o], s[o + 1]]) } else { 0 };
-    let u32at = |s: &[u8], o: usize| if o + 3 < s.len() { u32::from_le_bytes([s[o], s[o + 1], s[o + 2], s[o + 3]]) } else { 0 };
-    let mut off = 0usize;
-    while off + 4 <= t.len() {
-        let ty = t[off];
-        let len = t[off + 1] as usize;
-        if len < 4 || off + len > t.len() {
-            break;
-        }
-        let s = &t[off..off + len];
-        if ty == 17 {
-            m.slots += 1;
-            let size = u16at(s, 0x0C);
-            if size != 0 && size != 0xFFFF {
-                m.used_slots += 1;
-                m.form = m.form.or(match s.get(0x0E) {
-                    Some(0x09) => Some("DIMM"),
-                    Some(0x0D) => Some("SODIMM"),
-                    Some(0x0F) => Some("FB-DIMM"),
-                    Some(0x10) => Some("Die"),
-                    _ => None,
-                });
-                m.kind = m.kind.or(match s.get(0x12) {
-                    Some(0x18) => Some("DDR3"),
-                    Some(0x1A) => Some("DDR4"),
-                    Some(0x1B) => Some("LPDDR"),
-                    Some(0x1C) => Some("LPDDR2"),
-                    Some(0x1D) => Some("LPDDR3"),
-                    Some(0x1E) => Some("LPDDR4"),
-                    Some(0x22) => Some("DDR5"),
-                    Some(0x23) => Some("LPDDR5"),
-                    _ => None,
-                });
-                let mut speed = if len > 0x21 { u16at(s, 0x20) as u32 } else { 0 };
-                if speed == 0xFFFF && len > 0x5B {
-                    speed = u32at(s, 0x58);
-                }
-                if speed == 0 || speed == 0xFFFF {
-                    speed = u16at(s, 0x15) as u32;
-                    if speed == 0xFFFF && len > 0x57 {
-                        speed = u32at(s, 0x54);
-                    }
-                }
-                if speed != 0 && speed != 0xFFFF {
-                    m.speed_mts = Some(m.speed_mts.unwrap_or(0).max(speed));
-                }
-            }
-        }
-        if ty == 127 {
-            break;
-        }
-        // Skip the formatted area, then the strings up to a double NUL.
-        let mut p = off + len;
-        while p + 1 < t.len() && !(t[p] == 0 && t[p + 1] == 0) {
-            p += 1;
-        }
-        off = p + 2;
-    }
-    m
 }
 
 unsafe fn open_device(path: &str) -> Option<HANDLE> {
