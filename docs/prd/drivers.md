@@ -67,18 +67,28 @@ It is the last add-on in the migration order proposed by the add-ons document.
 
 ### Kernel modules
 32. As an expert user, I want a "Kernel modules" tab with the number of registered driver services, so that I reach the full list of kernel drivers with one click. *(exists)*
-33. As an expert user, I want four figures as tiles: Drivers ("Registered with Windows"), Loaded ("Linked into the kernel now"), Third-party ("Not shipped by Microsoft"), Kernel memory ("Held by loaded driver images"), so that the main numbers are visible at a glance. *(partial: today a single sentence with the same numbers)*
-34. As an expert user, I want the five scopes All, Loaded, Not loaded, Third-party, File system, each with its own count, so that I can narrow the list. *(exists without the counts on the buttons)*
+33. As an expert user, I want four figures as tiles: Drivers ("Registered with Windows"), Loaded ("Linked into the kernel now"), Third-party ("Not shipped by Microsoft"), Kernel memory ("Held by loaded driver images"), so that the main numbers are visible at a glance. The four figures count only the rows that match the text filter, whatever the scope. *(exists)*
+34. As an expert user, I want the five scopes All, Loaded, Not loaded, Third-party, File system, each with its own count, so that I can narrow the list. The counts follow the rules under "Rules for scopes and figures" below. *(exists)*
 35. As an expert user, I want "%1 shown" and "Updated %1" (time of the last reading) next to the scopes, so that I know how many rows I see and how recent they are. *(missing)*
 36. As an expert user, I want the columns Driver, Name, State, Start type, Type, Version, Vendor, so that I see the main properties of each driver. *(exists)*
 37. As an expert user, I want to filter by driver name, service name or vendor with the message "No driver name, display name or vendor matches the filter." when nothing matches, so that I know the filter found nothing. *(exists with slightly different text)*
 38. As an expert user, I want the details with the labels: Driver, Service name, State, Kind, Start type, Version, Vendor, Load index (with the load order group), Kernel memory, Location, Unload, so that I find every field. *(partial: today the labels are Service, Memory, Group, File, and State/Kind are in the subtitle)*
-39. As an expert user, I want to see real kernel memory and load index of the loaded module, read without administrator rights, so that I know how much each driver weighs. *(exists — in the canvas it was a placeholder, now the data is real)*
+39. As an expert user, I want to see real kernel memory and load index of the loaded module, read without administrator rights, so that I know how much each driver weighs; a module is matched to its driver by full path, so two files with the same name in different folders each get their own size and load index. *(exists — in the canvas it was a placeholder, now the data is real)*
 40. As an expert user, I want Unload offered only when it is possible, with the reason: "Not loaded.", "Not offered: Windows loaded it at boot, and the kernel refuses to stop a driver it started itself.", "Needs administrator rights (Windows will ask); most drivers refuse the request while the system runs.", "Not offered: its configuration could not be read." (start type "Unknown" when Windows does not return the service configuration), so that I do not try an impossible action. *(exists)*
 41. As an expert user, I want the confirmation "Unload this driver?" with "Devices that use it stop working until it loads again or Windows restarts.", so that I do not stop a driver by mistake. *(our addition; exists, to be verified end to end)*
 42. As an expert user, I want "Open file location", "Open in Device Manager", "Copy details" in the panel and "Copy service name" in the context menu and in the panel, so that I have all the actions at hand. *("Copy service name" today only in the context menu; in the canvas also in the panel)*
 43. As an expert user, I want "Select a kernel module to see where it lives, how much memory it holds and whether it can be unloaded." when nothing is selected, so that I know what I will find in the panel. *(our addition; exists)*
 44. As an expert user, I want to open the page directly on a scope from the command line (`--drivers-scope all|loaded|not-loaded|third-party|file-system`), so that I can capture or show a specific scope. An invalid value is reported in the status line as "<value> (valid scopes: all, loaded, not-loaded, third-party, file-system)" and the page opens on its saved scope; `--page drivers`, `--page kernel-modules` and `--page modules` (any case) open the page. *(exists)*
+
+#### Rules for scopes and figures
+
+- **Loaded**: the driver service is not Stopped. The pending states (starting, stopping, pausing, continuing) count as loaded.
+- **Not loaded**: the driver service is Stopped.
+- **Third-party**: the vendor (from the file's version information) is not empty and does not start with "Microsoft", whatever the case. A driver with no vendor is not third-party.
+- **File system**: the service is a file-system driver.
+- **Text filter and figures**: the four figures (Drivers, Loaded, Third-party, Kernel memory) count only the rows that match the text filter (driver name, service name or vendor), independently of the chosen scope. Changing the scope changes the rows, never the figures.
+- **Kernel memory**: the sum of the image sizes of the loaded rows, each image file counted once (two services that point to the same file add its size once). When the list of loaded modules could not be read, the tile says "an unknown amount" and a note says why; it is never shown as 0.
+- **Matching modules**: a driver's image is matched to the loaded module by full path (case-insensitive, `\SystemRoot` and `\??\` spelled out); by file name alone only when the image path has no folder and one module has that name.
 
 ### Other actions (More actions)
 45. As a user, I want "Install from an INF file…" to add a driver package and install it on compatible devices (with UAC), with the outcomes "Driver package installed.", "The package was added, but no device needed it…", "Done. Restart Windows to finish.", so that I can install a driver downloaded from the manufacturer. *(our addition; exists, to be verified end to end)*

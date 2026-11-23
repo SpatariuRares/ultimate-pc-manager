@@ -32,7 +32,6 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::super::engine::*;
-    use std::collections::HashMap;
     use std::ffi::c_void;
     use std::ptr::{null, null_mut};
 
@@ -269,26 +268,27 @@ mod imp {
         }
     }
 
-    /// Loaded kernel images by lowercase file name → (size, load order index),
-    /// from NtQuerySystemInformation(SystemModuleInformation).
-    fn kernel_modules() -> HashMap<String, (u64, u32)> {
-        let mut map = HashMap::new();
+    /// Loaded kernel images with their full paths, from
+    /// NtQuerySystemInformation(SystemModuleInformation); None when the
+    /// list could not be read.
+    fn kernel_modules() -> Option<Vec<LoadedModule>> {
+        let mut out = Vec::new();
         unsafe {
             let lib = wide("ntdll.dll");
             let h = LoadLibraryW(lib.as_ptr());
             if h.is_null() {
-                return map;
+                return None;
             }
-            let Some(f) = GetProcAddress(h, b"NtQuerySystemInformation\0".as_ptr()) else { return map };
+            let f = GetProcAddress(h, b"NtQuerySystemInformation\0".as_ptr())?;
             let query: unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32 = std::mem::transmute(f);
             let mut len = 0u32;
             query(11, null_mut(), 0, &mut len);
             if len == 0 {
-                return map;
+                return None;
             }
             let mut buf = vec![0u64; (len as usize + 65536) / 8];
             if query(11, buf.as_mut_ptr() as *mut c_void, (buf.len() * 8) as u32, &mut len) < 0 {
-                return map;
+                return None;
             }
             let base = buf.as_ptr() as *const u8;
             let count = *(base as *const u32) as usize;
@@ -300,18 +300,17 @@ mod imp {
                 }
                 let size = *(e.add(24) as *const u32) as u64;
                 let index = *(e.add(32) as *const u16) as u32;
-                let off = *(e.add(38) as *const u16) as usize;
                 let path = std::slice::from_raw_parts(e.add(40), 256);
                 let end = path.iter().position(|&b| b == 0).unwrap_or(256);
-                let name = String::from_utf8_lossy(&path[off.min(end)..end]).to_lowercase();
-                map.insert(name, (size, index));
+                out.push(LoadedModule { path: String::from_utf8_lossy(&path[..end]).into_owned(), size, index });
             }
         }
-        map
+        Some(out)
     }
 
     pub fn list_kernel() -> Result<Vec<KernelDriver>, String> {
         let modules = kernel_modules();
+        let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
         let mut out = Vec::new();
         unsafe {
             let scm = OpenSCManagerW(null(), null(), SC_MANAGER_ENUMERATE_SERVICE | SC_MANAGER_CONNECT);
@@ -334,7 +333,8 @@ mod imp {
                 let st = &it.ServiceStatusProcess;
                 let mut d = KernelDriver {
                     display: indirect(&from_wide(it.lpDisplayName), &service),
-                    running: st.dwCurrentState == SERVICE_RUNNING,
+                    // Not Stopped: the pending states count as loaded.
+                    running: st.dwCurrentState != SERVICE_STOPPED,
                     kind: match st.dwServiceType {
                         t if t & SERVICE_FILE_SYSTEM_DRIVER != 0 => KernelKind::FileSystem,
                         t if t & SERVICE_KERNEL_DRIVER != 0 => KernelKind::Kernel,
@@ -365,10 +365,14 @@ mod imp {
                     d.vendor = c;
                 }
                 if d.running {
-                    let file = d.path.rsplit('\\').next().unwrap_or("").to_lowercase();
-                    if let Some((size, index)) = modules.get(&file) {
-                        d.image_size = Some(*size);
-                        d.load_index = Some(*index);
+                    match &modules {
+                        Some(list) => {
+                            if let Some(m) = find_module(list, &d.path, &windir) {
+                                d.image_size = Some(m.size);
+                                d.load_index = Some(m.index);
+                            }
+                        }
+                        None => d.modules_unread = true,
                     }
                 }
                 d.service = service;
