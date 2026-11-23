@@ -386,6 +386,12 @@ impl Hub {
             if st.listing {
                 return;
             }
+            // A system without drivers says so; it never reads as an empty list.
+            if let Some(why) = crate::availability::availability(crate::availability::Feature::DriversListing).text() {
+                publish_listing(&mut st, Err(why.clone()), Err(why));
+                st.listed_at = crate::pro::clock_now();
+                return;
+            }
             st.listing = true;
         }
         self.spawn(None, false, |hub, _| hub.refresh_now());

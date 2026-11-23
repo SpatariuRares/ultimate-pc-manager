@@ -351,6 +351,14 @@ impl Hub {
                 return;
             }
             st.listing = true;
+            // A system without the listing says so; it never reads as "no apps".
+            if let Some(why) = crate::availability::availability(crate::availability::Feature::InstalledApps).text() {
+                st.apps.clear();
+                st.listing = false;
+                st.listed_at = crate::pro::clock_now();
+                st.message = Some((why, true));
+                return;
+            }
         }
         let hub = self.clone();
         std::thread::spawn(move || hub.refresh_now());

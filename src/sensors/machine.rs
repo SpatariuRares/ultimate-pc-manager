@@ -93,6 +93,10 @@ impl Provider for MachineFacts {
     }
 
     fn machine(&mut self) -> Option<Arc<StaticInfo>> {
+        // Blank facts would read as a machine with nothing in it.
+        if !crate::availability::is_available(crate::availability::Feature::PerformanceInfo) {
+            return None;
+        }
         Some(self.facts.get_or_insert_with(|| Arc::new(read())).clone())
     }
 }
@@ -523,6 +527,13 @@ mod tests {
     #[test]
     fn the_machine_facts_provider_is_not_a_source_of_any_figure() {
         assert!(!MachineFacts::new().listed(), "it reports no readings, so \"Sources on this PC\" does not list it");
+    }
+
+    #[test]
+    fn an_unavailable_static_information_is_not_reported_as_facts() {
+        assert!(MachineFacts::new().machine().is_some() == cfg!(windows), "the system's answer without a test one");
+        let _unavailable = crate::availability::unavailable_in_test(&[crate::availability::Feature::PerformanceInfo]);
+        assert!(MachineFacts::new().machine().is_none(), "no blank facts: the page leaves them out");
     }
 
     /// Every source file, with its path under `src/`.

@@ -791,6 +791,17 @@ mod reader_tests {
     }
 
     #[test]
+    fn an_unavailable_listing_shows_as_unavailable_and_never_as_an_empty_list() {
+        let _unavailable = crate::availability::unavailable_in_test(&[crate::availability::Feature::DriversListing]);
+        let reader = Fake::devices(vec![Ok(vec![device("Alpha GPU")])]);
+        let mut host = on(&reader);
+        until("the unavailable state is shown", || shown(&mut host).contains("Not available on this system."));
+        let page = shown(&mut host);
+        assert!(!page.contains("No drivers were reported") && !page.contains("Alpha GPU"), "not an empty list: {page}");
+        assert_eq!((reader.devices_asked(), reader.kernel_asked()), (0, 0), "nothing is read from a system without drivers");
+    }
+
+    #[test]
     fn turned_off_refresh_asks_the_reader_nothing() {
         let reader = Fake::devices(vec![Ok(vec![device("Alpha GPU")])]);
         let (mut host, _) = host_with(&reader, json!({ "enabled": false }));

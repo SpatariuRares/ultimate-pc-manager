@@ -279,6 +279,21 @@ mod tests {
     }
 
     #[test]
+    fn an_unavailable_listing_reports_it_and_reads_nothing() {
+        let _unavailable = crate::availability::unavailable_in_test(&[crate::availability::Feature::InstalledApps]);
+        let (ctx, _) = AddonContext::recording();
+        let mut addon = InstalledApps::default();
+        addon.start(&ctx);
+        let hub = addon.page().unwrap().apps.clone().with_registry(|| vec![tool("a")]);
+        addon.page().unwrap().apps = hub.clone();
+        addon.refresh();
+        until("the listing ends", || !hub.lock().listing);
+        let st = hub.lock();
+        assert_eq!(st.message, Some(("Not available on this system.".to_string(), true)), "shown as unavailable");
+        assert!(st.apps.is_empty(), "the registry is not read");
+    }
+
+    #[test]
     fn a_list_never_read_is_not_read_when_packages_change() {
         let (ctx, runner) = AddonContext::recording();
         let mut addon = InstalledApps::default();

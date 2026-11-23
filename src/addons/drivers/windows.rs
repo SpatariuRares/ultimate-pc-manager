@@ -20,11 +20,12 @@ impl ListingReader for WindowsListing {
 #[cfg(not(windows))]
 mod imp {
     use super::super::engine::*;
+    use crate::availability::{unavailable_error, Feature};
     pub fn list_devices() -> Result<Vec<DeviceDriver>, String> {
-        Ok(Vec::new())
+        Err(unavailable_error(Feature::DriversListing))
     }
     pub fn list_kernel() -> Result<Vec<KernelDriver>, String> {
-        Ok(Vec::new())
+        Err(unavailable_error(Feature::DriversListing))
     }
 }
 
