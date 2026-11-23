@@ -8,7 +8,7 @@
 //! start, stop and restart for it come with the control ticket.
 use std::collections::HashSet;
 
-use super::sources::{run_text, Output, ServiceSource, SourceError};
+use super::sources::{check_name, run_elevated, run_text, ControlHost, Output, ServiceSource, SourceError, ALL_ACTIONS};
 use crate::platform::ProcessRunner;
 use crate::system_lists::ServiceRow;
 
@@ -50,8 +50,26 @@ impl ServiceSource for OpenRc {
                 pid: 0,
                 source: SOURCE.into(),
                 scope: "System".into(),
+                actions: None,
             })
             .collect())
+    }
+
+    /// `rc-service <service> start|stop|restart`; at boot, `rc-update add` or
+    /// `del` (the default runlevel). OpenRC's services are the machine's, so
+    /// every action goes through `pkexec`.
+    fn control(&self, host: &ControlHost, _scope: &str, name: &str, action: &str) -> Result<(), String> {
+        check_name(name)?;
+        match action {
+            "start" | "stop" | "restart" => run_elevated(host, "rc-service", &[name, action]),
+            "enable" => run_elevated(host, "rc-update", &["add", name]),
+            "disable" => run_elevated(host, "rc-update", &["del", name]),
+            _ => Err(format!("\"{action}\" is not something a service can be asked to do.")),
+        }
+    }
+
+    fn actions(&self, _scope: &str) -> &'static [&'static str] {
+        ALL_ACTIONS
     }
 }
 
@@ -101,6 +119,7 @@ fn status_word(state: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action_elevation::{self, Spawned};
     use crate::platform::{Launch, RecordingRunner, When};
 
     const STATUS: &str = "Runlevel: default\n sshd                                                              [  started  ]\n cronie                                                            [  started  ]\n local                                                             [  stopped  ]\nRunlevel: boot\n hostname                                                          [  started  ]\nDynamic Runlevel: hotplugged\nDynamic Runlevel: needed/wanted\n netmount                                                          [  crashed  ]\n sshd                                                              [  started  ]\nDynamic Runlevel: manual\n cupsd                                                             [  inactive ]\n";
@@ -146,6 +165,74 @@ mod tests {
         runner.prepare(When::Nth(1), 1, "denied");
         let rows = OpenRc.list(&runner).unwrap();
         assert_eq!(by_name(&rows, "sshd").start_type, "");
+    }
+
+    fn controlled(name: &str, action: &str, answer: Spawned) -> (Result<(), String>, Vec<Vec<String>>) {
+        let launched = std::cell::RefCell::new(Vec::new());
+        let launch = |argv: &[String]| {
+            launched.borrow_mut().push(argv.to_vec());
+            answer.clone()
+        };
+        let env = |_: &str| None;
+        let result = OpenRc.control(&ControlHost { launch: &launch, env: &env }, "System", name, action);
+        (result, launched.into_inner())
+    }
+
+    fn ok() -> Spawned {
+        Spawned::Exited { code: 0, stderr: String::new() }
+    }
+
+    fn words(line: &str) -> Vec<String> {
+        line.split(' ').map(String::from).collect()
+    }
+
+    #[test]
+    fn each_action_runs_its_openrc_command_through_pkexec() {
+        for (action, line) in [
+            ("start", "pkexec rc-service sshd start"),
+            ("stop", "pkexec rc-service sshd stop"),
+            ("restart", "pkexec rc-service sshd restart"),
+            ("enable", "pkexec rc-update add sshd"),
+            ("disable", "pkexec rc-update del sshd"),
+        ] {
+            let (result, launched) = controlled("sshd", action, ok());
+            assert_eq!(result, Ok(()), "{action}");
+            assert_eq!(launched, [words(line)], "{action}");
+        }
+    }
+
+    #[test]
+    fn refusal_and_a_missing_pkexec_are_worded_plainly_and_openrc_words_are_the_error() {
+        let (refused, _) = controlled("sshd", "stop", Spawned::Exited { code: 127, stderr: String::new() });
+        assert_eq!(refused, Err(action_elevation::PERMISSION_REFUSED.to_string()));
+        let (dismissed, _) = controlled("sshd", "stop", Spawned::Exited { code: 126, stderr: String::new() });
+        assert_eq!(dismissed, Err(action_elevation::PERMISSION_DISMISSED.to_string()));
+        let (missing, _) = controlled("sshd", "stop", Spawned::NotFound);
+        assert_eq!(missing, Err(action_elevation::PKEXEC_MISSING.to_string()));
+        let (failed, _) = controlled("nope", "start", Spawned::Exited { code: 1, stderr: " * ERROR: nope does not exist\n".into() });
+        assert_eq!(failed, Err("* ERROR: nope does not exist".to_string()));
+        let (silent, _) = controlled("sshd", "start", Spawned::Exited { code: 3, stderr: String::new() });
+        assert_eq!(silent, Err("rc-service failed (exit code 3).".to_string()));
+    }
+
+    #[test]
+    fn an_unknown_action_or_a_bad_name_starts_nothing() {
+        for (name, action) in [("sshd", "mask"), ("-a", "start"), ("a b", "start"), ("", "stop")] {
+            let (result, launched) = controlled(name, action, ok());
+            assert!(result.is_err(), "{name} {action}");
+            assert!(launched.is_empty(), "{name} {action}");
+        }
+    }
+
+    #[test]
+    fn rows_of_openrc_offer_every_action() {
+        use crate::services::sources::list_all;
+        let runner = RecordingRunner::default();
+        runner.prepare(When::Nth(0), 0, STATUS);
+        runner.prepare(When::Nth(1), 0, UPDATE);
+        let sources: Vec<Box<dyn ServiceSource>> = vec![Box::new(OpenRc)];
+        let rows = list_all(&sources, &runner).unwrap();
+        assert!(rows.iter().all(|r| ["start", "stop", "restart", "enable", "disable"].into_iter().all(|a| r.can(a))));
     }
 
     #[test]

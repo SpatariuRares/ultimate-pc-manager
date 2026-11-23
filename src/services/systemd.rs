@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::sources::{run_text, ControlHost, Output, ServiceSource, SourceError};
+use super::sources::{check_name, run_text, ControlHost, ALL_ACTIONS, Output, ServiceSource, SourceError};
 use crate::action_elevation::{self, Spawned};
 use crate::platform::ProcessRunner;
 use crate::system::System;
@@ -66,6 +66,10 @@ impl ServiceSource for Systemd {
         let scope = if scope == Scope::User.label() { Scope::User } else { Scope::System };
         control(host, scope, name, action)
     }
+
+    fn actions(&self, _scope: &str) -> &'static [&'static str] {
+        ALL_ACTIONS
+    }
 }
 
 /// What `systemctl` is asked to do for each action of the page.
@@ -80,9 +84,7 @@ fn control(host: &ControlHost, scope: Scope, name: &str, action: &str) -> Result
     // The name goes to systemctl as one argument: a name that reads as an
     // option, or that holds a space, a quote or a control character, is not
     // a unit name.
-    if name.is_empty() || name.starts_with('-') || name.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\'' || c == '"') {
-        return Err(format!("\"{name}\" is not a service name."));
-    }
+    check_name(name)?;
     let argv: Vec<String> = ["systemctl"].into_iter().chain(scope.args(&[action, name])).map(String::from).collect();
     let elevate = scope == Scope::System;
     // The elevated command line is split into words again, where a backslash
@@ -271,6 +273,7 @@ fn build_rows(scope: Scope, units: Vec<Unit>, files: Vec<UnitFile>, pids: &HashM
             start_type: states.get(unit.name.as_str()).map(|s| capital(s)).unwrap_or_default(),
             source: SOURCE.into(),
             scope: scope.label().into(),
+            actions: None,
         });
     }
     // Installed but never loaded (templates are patterns, not services).

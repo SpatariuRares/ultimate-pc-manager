@@ -34,9 +34,18 @@ pub struct ServiceRow {
     /// The scope the service belongs to ("System" or "User"); empty when the
     /// manager has none.
     pub scope: String,
+    /// The actions ("start", "stop", "restart", "enable", "disable") the
+    /// row's manager can do to it; `None` where the system offers every one
+    /// (Windows).
+    pub actions: Option<&'static [&'static str]>,
 }
 
 impl ServiceRow {
+    /// Does the page offer `action` for this service?
+    pub fn can(&self, action: &str) -> bool {
+        self.actions.is_none_or(|list| list.contains(&action))
+    }
+
     /// What names this service in an action: its name, with the manager and
     /// scope it belongs to (a system and a user service can share a name).
     pub fn key(&self) -> ServiceKey {

@@ -49,6 +49,43 @@ pub trait ServiceSource {
     fn control(&self, _host: &ControlHost, _scope: &str, _name: &str, _action: &str) -> Result<(), String> {
         Err(format!("Services of {} cannot be started or stopped from here.", self.name()))
     }
+
+    /// The actions this source can do to a service of `scope`, so the page
+    /// offers only those. A source that cannot control services keeps the
+    /// default: none.
+    fn actions(&self, _scope: &str) -> &'static [&'static str] {
+        &[]
+    }
+}
+
+/// Every action the Services page knows.
+pub const ALL_ACTIONS: &[&str] = &["start", "stop", "restart", "enable", "disable"];
+
+/// Is `name` fit to go to a service manager as one argument? A name that
+/// reads as an option, or that holds a space, a quote or a control character,
+/// is not a service name.
+pub fn check_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.starts_with('-') || name.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\'' || c == '"') {
+        return Err(format!("\"{name}\" is not a service name."));
+    }
+    Ok(())
+}
+
+/// Runs `program words...` as administrator (pkexec). Every word goes in
+/// single quotes, which keep each character when the command line is split
+/// into words again; the caller has checked the names in them. What the
+/// program says is the error; pkexec's own refusals keep their plain wording.
+pub fn run_elevated(host: &ControlHost, program: &str, words: &[&str]) -> Result<(), String> {
+    use crate::system::System;
+    let line = std::iter::once(program.to_string()).chain(words.iter().map(|w| format!("'{w}'"))).collect::<Vec<_>>().join(" ");
+    let argv = crate::action_elevation::elevated_argv(System::Linux, &line, host.env)?;
+    match (host.launch)(&argv) {
+        Spawned::Exited { code, stderr } if code != 0 && code != 126 && code != 127 => {
+            let stderr = stderr.trim();
+            Err(if stderr.is_empty() { format!("{program} failed (exit code {code}).") } else { stderr.to_string() })
+        }
+        other => crate::action_elevation::interpret(System::Linux, other),
+    }
 }
 
 /// Asks the source that lists `service` to do `action` on it.
@@ -70,7 +107,11 @@ pub fn list_all(sources: &[Box<dyn ServiceSource>], runner: &dyn ProcessRunner) 
         match source.list(runner) {
             Ok(list) => {
                 present += 1;
-                rows.extend(list);
+                // Each row says which actions its source can do to it.
+                rows.extend(list.into_iter().map(|row| {
+                    let actions = source.actions(&row.scope);
+                    ServiceRow { actions: Some(actions), ..row }
+                }));
             }
             Err(SourceError::Absent) => {}
             Err(SourceError::Failed(why)) => {
@@ -192,6 +233,13 @@ mod tests {
     fn when_every_present_source_fails_the_reasons_are_the_error() {
         let sources = boxed(vec![Fixed("a", Err(SourceError::Failed("boom".into()))), Fixed("b", Err(SourceError::Absent)), Fixed("c", Err(SourceError::Failed("bang".into())))]);
         assert_eq!(list_all(&sources, &RecordingRunner::default()).unwrap_err(), "a: boom; c: bang");
+    }
+
+    #[test]
+    fn rows_of_a_source_that_cannot_control_offer_no_action() {
+        let sources = boxed(vec![Fixed("a", Ok(vec![row("x", "a")]))]);
+        let rows = list_all(&sources, &RecordingRunner::default()).unwrap();
+        assert!(ALL_ACTIONS.iter().all(|a| !rows[0].can(a)), "{rows:?}");
     }
 
     #[test]
