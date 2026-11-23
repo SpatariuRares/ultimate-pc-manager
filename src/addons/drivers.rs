@@ -918,7 +918,7 @@ mod reader_tests {
     fn the_security_strip_shows_each_state_with_its_own_text() {
         use engine::Reading::{Failed, NotSet, Value};
         let mut host = secure_host(Value(1), Value(0));
-        until("the strip is read", || shown(&mut host).contains("Vulnerable driver blocklist:"));
+        until("the strip is read", || shown(&mut host).contains("The blocklist is off"));
         let page = shown(&mut host);
         assert!(page.contains("Security") && page.contains("Memory integrity:") && page.contains("On") && page.contains("Off"), "{page}");
         assert!(page.contains("The blocklist is off: Windows does not block known vulnerable drivers."), "{page}");
