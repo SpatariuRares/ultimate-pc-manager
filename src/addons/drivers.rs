@@ -9,8 +9,16 @@
 pub mod cli;
 /// Reading drivers and Windows Update, and installing.
 pub mod engine;
+/// The read-only list of loaded file-system minifilters.
+pub mod filters;
 /// The Drivers page.
 pub mod page;
+/// Devices with a problem code, in plain words.
+pub mod problems;
+/// Driver signatures: WinVerifyTrust, catalogs and WHQL.
+pub mod signature;
+/// The driver store: reading and classifying the packages.
+pub mod store;
 /// The Windows reader of the listing.
 pub mod windows;
 
@@ -28,8 +36,11 @@ const NAME: &str = "Drivers";
 
 /// The note under its requirements in Settings › Add-ons.
 pub const NEEDS: &str = "Searching for driver updates needs the internet and the Windows Update service. \
-Administrator rights are asked through UAC only to install, scan for hardware changes and unload drivers \
-(with PowerShell, pnputil and sc): do not start this app as administrator.";
+Administrator rights are asked through UAC only to install, scan for hardware changes, unload drivers, \
+remove driver packages, back up drivers, disable, enable, restart or roll back a device, and create a restore point \
+(with PowerShell, pnputil and sc): do not start this app as administrator. \
+Reading the lists, problems, signatures, driver store, security settings and filter drivers needs normal rights only. \
+\nThe internet is also used by \"Look up on VirusTotal\", which is off by default and sends only a file's SHA-256.";
 
 /// Where the add-on reads the installed devices and kernel drivers from:
 /// the Windows reader in the app, a fake in tests. Owned by the add-on, not
@@ -39,6 +50,26 @@ pub trait ListingReader: Send + Sync {
     fn devices(&self) -> Result<Vec<DeviceDriver>, String>;
     /// The kernel driver services, or why they could not be read.
     fn kernel(&self) -> Result<Vec<KernelDriver>, String>;
+    /// Memory integrity and the vulnerable-driver blocklist, read-only and
+    /// with normal rights. A reader that cannot read them says so.
+    fn security(&self) -> engine::SecurityReading {
+        engine::SecurityReading::unreadable("this reader does not read the security settings")
+    }
+    /// The driver packages Windows keeps, read with normal rights, or why
+    /// they could not be read.
+    fn store(&self) -> Result<Vec<store::StorePackage>, String> {
+        Err("this reader does not read the driver store".into())
+    }
+    /// The loaded file-system minifilters, read-only and with normal
+    /// rights; Windows may refuse without administrator rights.
+    fn filters(&self) -> filters::FilterRead {
+        filters::FilterRead::Failed("this reader does not list filters".into())
+    }
+    /// The signature of the driver file at `path`, read with normal rights.
+    /// Called on a background thread, one file at a time.
+    fn signature(&self, _path: &str) -> signature::Signature {
+        signature::Signature::CouldNotCheck("this reader does not check signatures".into())
+    }
 }
 
 /// The add-on: its page while it is on, and while it waits to turn off.
@@ -55,6 +86,9 @@ pub struct Drivers {
     /// The tab and kernel scope `--drivers-scope` opened the page on: not
     /// saved until the user picks another one.
     from_command_line: Option<(Scope, KernelScope)>,
+    /// What an invalid `--drivers-scope` value is told as, until the host
+    /// takes it for the status line.
+    scope_error: Option<String>,
 }
 
 /// Drivers' own settings, as saved: a default value is left out, and the
@@ -80,9 +114,22 @@ struct Prefs {
     /// The Summary tile is on (off by default).
     #[serde(rename = "summaryTile", skip_serializing_if = "is_default")]
     summary_tile: bool,
+    /// "Look up on VirusTotal" is offered on kernel modules (off by default).
+    #[serde(rename = "virusTotal", skip_serializing_if = "is_default")]
+    virustotal: bool,
+    /// The user agreed to send a file's SHA-256 to VirusTotal (asked once).
+    #[serde(rename = "virusTotalConsent", skip_serializing_if = "is_default")]
+    virustotal_consent: bool,
+    /// "Create a restore point first" in the confirm dialogs (on by default).
+    #[serde(rename = "restorePoint", skip_serializing_if = "is_true")]
+    restore_point: bool,
     /// The fields of newer versions, written back untouched.
     #[serde(flatten)]
     rest: serde_json::Map<String, serde_json::Value>,
+}
+
+fn is_true(on: &bool) -> bool {
+    *on
 }
 
 fn is_default_years(years: &i64) -> bool {
@@ -98,6 +145,9 @@ impl Default for Prefs {
             check_on_open: false,
             maker_years: DEFAULT_OLD_YEARS,
             summary_tile: false,
+            virustotal: false,
+            virustotal_consent: false,
+            restore_point: true,
             rest: serde_json::Map::new(),
         }
     }
@@ -109,6 +159,8 @@ impl Prefs {
         page.drv_ui.scope = self.scope;
         page.drv_ui.kernel_filter = self.kernel_filter;
         page.drv_ui.show_disconnected = self.show_disconnected;
+        page.virustotal_consent = self.virustotal_consent;
+        page.restore_point = self.restore_point;
         self.apply_options_to(page);
     }
 
@@ -117,12 +169,13 @@ impl Prefs {
     fn apply_options_to(&self, page: &mut DriversPage) {
         page.check_on_open = self.check_on_open;
         page.old_years = self.maker_years.max(1);
+        page.virustotal = self.virustotal;
     }
 }
 
 impl Default for Drivers {
     fn default() -> Self {
-        Drivers { reader: Arc::new(windows::WindowsListing), page: None, prefs: Prefs::default(), from_command_line: None }
+        Drivers { reader: Arc::new(windows::WindowsListing), page: None, prefs: Prefs::default(), from_command_line: None, scope_error: None }
     }
 }
 
@@ -182,6 +235,9 @@ impl Drivers {
                 prefs.kernel_filter = page.drv_ui.kernel_filter;
             }
             prefs.show_disconnected = page.drv_ui.show_disconnected;
+            // The consent is given on the page; the option is the user's in Settings.
+            prefs.virustotal_consent = page.virustotal_consent;
+            prefs.restore_point = page.restore_point;
         }
         prefs
     }
@@ -239,6 +295,16 @@ impl Addon for Drivers {
         if let (true, Some(page)) = (changed, &mut self.page) {
             self.prefs.apply_options_to(page);
         }
+        group_heading(ui, "Kernel modules");
+        let looked = setting_switch(
+            ui,
+            "Offer \"Look up on VirusTotal\"",
+            Some("Sends only the file's SHA-256 to VirusTotal after you agree once; the file is not uploaded"),
+            &mut self.prefs.virustotal,
+        );
+        if let (true, Some(page)) = (looked, &mut self.page) {
+            self.prefs.apply_options_to(page);
+        }
         group_heading(ui, "Summary");
         setting_switch(ui, "Show a tile on Summary", Some("Newer drivers, after you check"), &mut self.prefs.summary_tile);
     }
@@ -280,13 +346,25 @@ impl Addon for Drivers {
 
     /// `--drivers-scope <scope>` opens the page (even without `--page`)
     /// on Kernel modules with that scope, without saving it; an invalid
-    /// value is ignored.
+    /// value opens the page on its saved scope and is told (see
+    /// [`Addon::command_line_error`]).
     fn command_line(&mut self, args: &[String]) -> bool {
-        let (Some(page), Some(scope)) = (&mut self.page, cli::kernel_scope(args)) else { return false };
+        self.scope_error = if self.page.is_some() { cli::scope_error(args) } else { None };
+        // An invalid value still asks for the page, which opens on its saved scope.
+        let invalid = self.scope_error.is_some();
+        let (Some(page), Some(scope)) = (&mut self.page, cli::kernel_scope(args)) else { return invalid };
         page.drv_ui.scope = Scope::Kernel;
         page.drv_ui.kernel_filter = scope;
         self.from_command_line = self.view();
         true
+    }
+
+    fn command_line_error(&mut self) -> Option<String> {
+        self.scope_error.take()
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &["kernel-modules", "modules"]
     }
 
     fn refresh(&mut self) {
@@ -348,6 +426,36 @@ mod tests {
         assert!(addon.uninterruptible(), "the package install goes on");
         runner.release();
         until("the install ends", || !addon.uninterruptible());
+    }
+
+    #[test]
+    fn turning_off_during_a_removal_a_backup_or_a_device_action_waits_for_it_and_starts_nothing_more() {
+        use engine::DeviceAction;
+        type Job = Box<dyn Fn(&Hub)>;
+        let jobs: Vec<(&str, Job)> = vec![
+            ("removal", Box::new(|h| h.remove_packages(vec!["oem1.inf".into()], false))),
+            ("removal with a restore point", Box::new(|h| h.remove_packages(vec!["oem1.inf".into()], true))),
+            ("backup", Box::new(|h| h.back_up(None, r"D:\B\Drivers".into()))),
+            ("disable", Box::new(|h| h.device_action_with(DeviceAction::Disable, "PCI\\X".into(), false))),
+            ("restart with a restore point", Box::new(|h| h.device_action_with(DeviceAction::Restart, "PCI\\X".into(), true))),
+            ("rollback", Box::new(|h| h.device_action_with(DeviceAction::Rollback, "PCI\\X".into(), true))),
+        ];
+        for (name, start) in jobs {
+            let (ctx, runner) = AddonContext::recording();
+            let mut addon = on(&ctx);
+            runner.hold();
+            let h = hub(&mut addon);
+            let package = |name: &str| store::StorePackage { published: name.into(), original: "a.inf".into(), provider: "Acme".into(), ..Default::default() };
+            h.lock().store = vec![package("oem1.inf"), package("oem2.inf")].into();
+            start(&h);
+            runner.wait_for(1);
+            addon.stop();
+            assert!(addon.uninterruptible(), "{name}: turning off does not cut the elevated job short");
+            h.remove_packages(vec!["oem2.inf".into()], false);
+            runner.release();
+            until("the job ends", || !addon.uninterruptible());
+            assert_eq!(runner.launches().len(), 1, "{name}: nothing else is started once off");
+        }
     }
 
     #[test]
@@ -490,6 +598,73 @@ mod settings_tests {
     }
 
     #[test]
+    fn the_requirements_list_the_new_needs_administrator_for_changes_and_the_network_for_virustotal() {
+        let (host, _) = crate::addons::AddonHost::for_tests(&serde_json::json!({ "drivers": { "enabled": false } }));
+        let note = crate::addons::overview::Overview::of(&host, Some("drivers")).detail.unwrap().note.expect("a note");
+        let (rights, internet) = note.split_once('\n').expect("the internet use of VirusTotal is on its own line");
+        for words in ["remove driver packages", "back up drivers", "disable, enable, restart or roll back a device", "restore point"] {
+            assert!(rights.contains(words), "administrator rights are asked to {words:?}: {rights}");
+        }
+        for words in ["lists", "problems", "signatures", "driver store", "security settings", "filter drivers", "normal rights only"] {
+            assert!(rights.contains(words), "reads need normal rights, {words:?}: {rights}");
+        }
+        for words in ["VirusTotal", "off by default", "only a file's SHA-256"] {
+            assert!(internet.contains(words), "the network line says {words:?}: {internet}");
+        }
+    }
+
+    #[test]
+    fn every_tab_and_kernel_scope_comes_back_after_turning_it_off_and_on() {
+        use super::page::Scope::*;
+        let (ctx, _) = AddonContext::recording();
+        for (scope, name) in [(Hardware, "hardware"), (Builtin, "builtin"), (Problems, "problems"), (Kernel, "kernel"), (Store, "store"), (Filters, "filters")] {
+            let mut addon = Drivers::default();
+            addon.start(&ctx);
+            addon.page().unwrap().drv_ui.scope = scope;
+            addon.stop();
+            let saved = addon.settings();
+            assert_eq!(saved.get("scope").and_then(|s| s.as_str()).unwrap_or("hardware"), name, "saved by name");
+            let mut next_run = Drivers::default();
+            next_run.load_settings(&saved);
+            next_run.start(&ctx);
+            assert!(next_run.page().unwrap().drv_ui.scope == scope, "{name} comes back");
+        }
+        for scope in KernelScope::SHOWN {
+            let mut addon = Drivers::default();
+            addon.start(&ctx);
+            let ui = &mut addon.page().unwrap().drv_ui;
+            ui.scope = Kernel;
+            ui.kernel_filter = scope;
+            addon.stop();
+            let saved = addon.settings();
+            let mut next_run = Drivers::default();
+            next_run.load_settings(&saved);
+            next_run.start(&ctx);
+            assert!(next_run.page().unwrap().drv_ui.kernel_filter == scope, "{} comes back: {saved}", scope.name());
+        }
+    }
+
+    #[test]
+    fn every_new_option_is_saved_together_and_restored_once_on_again() {
+        let (ctx, _) = AddonContext::recording();
+        let mut addon = Drivers::default();
+        addon.load_settings(&serde_json::json!({ "virusTotal": true }));
+        addon.start(&ctx);
+        let page = addon.page().unwrap();
+        page.drv_ui.scope = Scope::Store;
+        page.restore_point = false;
+        page.virustotal_consent = true;
+        addon.stop();
+        let saved = addon.settings();
+        assert_eq!(saved, serde_json::json!({ "scope": "store", "restorePoint": false, "virusTotal": true, "virusTotalConsent": true }));
+        let mut next_run = Drivers::default();
+        next_run.load_settings(&saved);
+        next_run.start(&ctx);
+        let page = next_run.page().unwrap();
+        assert!(page.drv_ui.scope == Scope::Store && !page.restore_point && page.virustotal && page.virustotal_consent);
+    }
+
+    #[test]
     fn the_tab_kernel_filter_and_show_disconnected_come_back_after_turning_it_off_and_on() {
         let (ctx, _) = AddonContext::recording();
         let mut addon = Drivers::default();
@@ -512,6 +687,21 @@ mod settings_tests {
         next_run.start(&ctx);
         assert!(next_run.page().unwrap().drv_ui.scope == Scope::Builtin, "read from the saved settings");
         assert_eq!(next_run.settings()["fromANewerVersion"], 1, "fields it does not know are kept");
+    }
+
+    #[test]
+    fn the_problems_scope_is_saved_and_comes_back() {
+        let (ctx, _) = AddonContext::recording();
+        let mut addon = Drivers::default();
+        addon.load_settings(&serde_json::Value::Null);
+        addon.start(&ctx);
+        addon.page().unwrap().drv_ui.scope = Scope::Problems;
+        addon.stop();
+        assert_eq!(addon.settings()["scope"], "problems");
+        let mut next_run = Drivers::default();
+        next_run.load_settings(&addon.settings());
+        next_run.start(&ctx);
+        assert!(next_run.page().unwrap().drv_ui.scope == Scope::Problems);
     }
 
     #[test]
@@ -559,6 +749,20 @@ mod settings_tests {
     }
 
     #[test]
+    fn the_restore_point_option_is_on_by_default_and_remembered_when_turned_off() {
+        let (ctx, _) = AddonContext::recording();
+        let mut addon = Drivers::default();
+        addon.start(&ctx);
+        assert!(addon.page().unwrap().restore_point, "on by default");
+        assert_eq!(addon.settings(), serde_json::Value::Null, "the default is not saved");
+        addon.page().unwrap().restore_point = false;
+        assert_eq!(addon.settings(), serde_json::json!({ "restorePoint": false }));
+        addon.stop();
+        addon.start(&ctx);
+        assert!(!addon.page().unwrap().restore_point, "the choice comes back");
+    }
+
+    #[test]
     fn the_summary_tile_shows_only_after_a_check_by_hand_and_only_when_turned_on() {
         let (ctx, runner) = AddonContext::recording();
         let mut addon = Drivers::default();
@@ -570,7 +774,7 @@ mod settings_tests {
 
         let h = addon.page().unwrap().drv.clone();
         let mut st = h.lock();
-        st.updates = Some(vec![engine::DriverUpdate::default()]);
+        st.updates = Some(vec![engine::DriverUpdate::default()].into());
         st.checked_at = "09:00".into();
         drop(st);
         assert_eq!(addon.summary_lines(), None, "a check made when the page opened does not count");
@@ -581,6 +785,127 @@ mod settings_tests {
 
         addon.load_settings(&serde_json::Value::Null);
         assert_eq!(addon.summary_lines(), None, "the tile is off by default");
+    }
+
+    fn on(ctx: &AddonContext) -> Drivers {
+        let mut addon = Drivers::with_no_drivers();
+        addon.start(ctx);
+        addon
+    }
+
+    fn hub(addon: &mut Drivers) -> Hub {
+        addon.page().unwrap().drv.clone()
+    }
+
+    /// A file holding "abc" and its SHA-256.
+    const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    fn abc_file(name: &str) -> String {
+        let path = std::env::temp_dir().join(format!("upcm-t34-{}-{name}", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    /// Hashes the file for `purpose` and lets the page act on the result.
+    fn hashed(addon: &mut Drivers, path: &str, purpose: engine::HashFor) -> Vec<Action> {
+        let page = addon.page().unwrap();
+        page.drv.hash_file(path.to_string(), purpose);
+        until("the file is hashed", || page.drv.lock().hashed.is_some());
+        let mut actions = Vec::new();
+        page.settle_hash(&mut actions);
+        actions
+    }
+
+    #[test]
+    fn virustotal_url_is_built_only_from_a_valid_hash() {
+        assert_eq!(engine::virustotal_url(ABC).as_deref(), Some(&format!("https://www.virustotal.com/gui/file/{ABC}")[..]));
+        assert_eq!(engine::virustotal_url(&ABC.to_uppercase()).as_deref(), Some(&format!("https://www.virustotal.com/gui/file/{ABC}")[..]));
+        assert_eq!(engine::virustotal_url("abc"), None);
+        assert_eq!(engine::virustotal_url(&format!("{}/x", &ABC[..60])), None);
+    }
+
+    #[test]
+    fn copy_sha256_copies_the_hash_of_the_file() {
+        let (ctx, runner) = AddonContext::recording();
+        let mut addon = on(&ctx);
+        let actions = hashed(&mut addon, &abc_file("copy"), engine::HashFor::Copy);
+        assert!(actions.contains(&Action::Copy(ABC.into())), "{actions:?}");
+        assert!(runner.launches().is_empty(), "nothing is opened or sent");
+    }
+
+    #[test]
+    fn a_lookup_with_the_option_off_opens_nothing() {
+        let (ctx, runner) = AddonContext::recording();
+        let mut addon = on(&ctx);
+        hashed(&mut addon, &abc_file("off"), engine::HashFor::VirusTotal);
+        assert!(addon.page().unwrap().drv_ui.confirm_virustotal.is_none(), "no consent is asked either");
+        assert!(runner.launches().is_empty());
+    }
+
+    #[test]
+    fn the_first_lookup_asks_and_opens_only_after_consent() {
+        let (ctx, runner) = AddonContext::recording();
+        let mut addon = on(&ctx);
+        addon.load_settings(&serde_json::json!({ "virusTotal": true }));
+        hashed(&mut addon, &abc_file("first"), engine::HashFor::VirusTotal);
+        assert_eq!(addon.page().unwrap().drv_ui.confirm_virustotal.as_deref(), Some(ABC), "asked first");
+        assert!(runner.launches().is_empty(), "nothing is opened before the user agrees");
+    }
+
+    #[test]
+    fn a_declined_consent_opens_nothing_and_is_not_remembered() {
+        let (ctx, runner) = AddonContext::recording();
+        let mut addon = on(&ctx);
+        addon.load_settings(&serde_json::json!({ "virusTotal": true }));
+        hashed(&mut addon, &abc_file("declined"), engine::HashFor::VirusTotal);
+        addon.page().unwrap().drv_ui.confirm_virustotal = None; // Cancel
+        assert!(runner.launches().is_empty());
+        assert!(addon.settings().get("virusTotalConsent").is_none());
+    }
+
+    #[test]
+    fn after_consent_the_lookup_opens_the_page_of_the_hash_and_remembers_it() {
+        let (ctx, runner) = AddonContext::recording();
+        let mut addon = on(&ctx);
+        addon.load_settings(&serde_json::json!({ "virusTotal": true }));
+        hashed(&mut addon, &abc_file("agreed"), engine::HashFor::VirusTotal);
+        let page = addon.page().unwrap();
+        let sha = page.drv_ui.confirm_virustotal.take().unwrap();
+        page.virustotal_consent = true; // Send SHA-256
+        page.look_up_on_virustotal(sha);
+        let url = format!("https://www.virustotal.com/gui/file/{ABC}");
+        assert_eq!(runner.launches(), vec![Launch::Open(url.clone())]);
+        assert_eq!(addon.settings()["virusTotalConsent"], true);
+
+        // Asked once: the next lookup opens at once.
+        hashed(&mut addon, &abc_file("again"), engine::HashFor::VirusTotal);
+        assert_eq!(runner.launches(), vec![Launch::Open(url.clone()), Launch::Open(url)]);
+    }
+
+    #[test]
+    fn the_option_and_the_consent_are_saved_and_restored() {
+        let mut addon = Drivers::with_no_drivers();
+        assert_eq!(addon.settings(), serde_json::Value::Null, "off by default, nothing saved");
+        addon.load_settings(&serde_json::json!({ "virusTotal": true, "virusTotalConsent": true }));
+        let saved = addon.settings();
+        assert_eq!((saved["virusTotal"].clone(), saved["virusTotalConsent"].clone()), (true.into(), true.into()));
+        let (ctx, _) = AddonContext::recording();
+        let mut again = Drivers::with_no_drivers();
+        again.load_settings(&saved);
+        again.start(&ctx);
+        let page = again.page().unwrap();
+        assert!(page.virustotal && page.virustotal_consent);
+    }
+
+    #[test]
+    fn hashing_after_the_add_on_was_turned_off_publishes_nothing() {
+        let (ctx, _) = AddonContext::recording();
+        let mut addon = on(&ctx);
+        let h = hub(&mut addon);
+        addon.stop();
+        h.hash_file(abc_file("stopped"), engine::HashFor::Copy);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(h.lock().hashed.is_none());
     }
 }
 
@@ -619,7 +944,6 @@ mod command_line_tests {
     fn a_drivers_scope_alone_opens_the_drivers_page() {
         let (mut host, runner) = crate::addons::AddonHost::for_tests(&serde_json::json!({ "drivers": { "enabled": true } }));
         assert_eq!(host.command_line(&args(&["--drivers-scope", "loaded"])).page, Some("drivers"));
-        assert_eq!(host.command_line(&args(&["--drivers-scope", "everything"])).page, None, "an invalid value is ignored");
         assert_eq!(host.command_line(&args(&[])).page, None);
         assert!(runner.launches().is_empty(), "nothing is launched for it");
     }
@@ -639,6 +963,35 @@ mod command_line_tests {
         addon.command_line(&args(&["--drivers-scope", "loaded"]));
         addon.page().unwrap().drv_ui.kernel_filter = KernelScope::ThirdParty;
         assert_eq!(addon.settings(), serde_json::json!({ "scope": "kernel", "kernelFilter": "third-party" }), "the user's own pick is saved");
+    }
+
+    #[test]
+    fn every_name_of_the_page_opens_it_in_any_case() {
+        let (host, _) = crate::addons::AddonHost::for_tests(&serde_json::json!({ "drivers": { "enabled": true } }));
+        for name in ["drivers", "kernel-modules", "modules", "Drivers", "DRIVERS", "Kernel-Modules", "MODULES", "Modules"] {
+            assert_eq!(host.landing(Some(name), "Summary", "Summary"), crate::addons::Landing::Page("drivers"), "{name}");
+        }
+        assert_eq!(host.landing(Some("kernel"), "Summary", "Summary"), crate::addons::Landing::Page(crate::addons::SUMMARY), "other names still fall back");
+    }
+
+    #[test]
+    fn an_invalid_drivers_scope_is_told_and_leaves_the_saved_scope() {
+        let (mut host, _) = crate::addons::AddonHost::for_tests(&serde_json::json!({ "drivers": { "enabled": true, "scope": "builtin" } }));
+        let saved = host.settings("drivers");
+        assert!(saved.is_some());
+        let line = host.command_line(&args(&["--page", "modules", "--drivers-scope", "everything"]));
+        assert_eq!(line.errors, vec!["everything (valid scopes: all, loaded, not-loaded, third-party, file-system)".to_string()]);
+        assert_eq!(line.page, Some("drivers"), "an invalid value still opens the page");
+        assert_eq!(host.settings("drivers"), saved, "the saved scope stays");
+
+        let alone = host.command_line(&args(&["--drivers-scope", "everything"]));
+        assert_eq!(alone.page, Some("drivers"), "alone it opens the page on its saved scope");
+        assert_eq!(alone.errors.len(), 1);
+        assert_eq!(host.settings("drivers"), saved, "the saved scope stays");
+
+        for ok in [&["--drivers-scope", "loaded"][..], &["--drivers-scope=third-party"], &["--page", "Drivers"], &[]] {
+            assert!(host.command_line(&args(ok)).errors.is_empty(), "{ok:?}");
+        }
     }
 
     #[test]
@@ -828,6 +1181,18 @@ mod reader_tests {
     }
 
     #[test]
+    fn opening_every_tab_reads_with_normal_rights_and_launches_nothing() {
+        let broken = DeviceDriver { problem: 28, ..device("Broken NIC") };
+        let reader = Fake::devices(vec![Ok(vec![broken, device("Alpha GPU")])]);
+        for scope in ["hardware", "builtin", "problems", "kernel", "store", "filters"] {
+            let (mut host, runner) = host_with(&reader, json!({ "enabled": true, "settings": { "scope": scope } }));
+            until("the page is drawn", || !shown(&mut host).is_empty());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(runner.launches().is_empty(), "{scope}: no PowerShell, no elevation prompt: {:?}", runner.launches());
+        }
+    }
+
+    #[test]
     fn windows_update_offers_are_matched_against_the_drivers_a_refresh_just_listed() {
         let installed = |version: &str| DeviceDriver { hardware_ids: vec![r"PCI\VEN_1".into()], version: version.into(), date: "2020-01-01".into(), ..device("Alpha GPU") };
         let reader = Fake::devices(vec![Ok(vec![installed("1.0.0.0")]), Ok(vec![installed("2.0.0.0")])]);
@@ -843,5 +1208,120 @@ mod reader_tests {
         assert!(page.contains("Up to date"), "{page}");
         assert!(page.contains("Windows Update offers the older 2.0.0.0"), "{page}");
         assert_eq!(reader.devices_asked(), 2);
+    }
+
+    /// A reader whose security band answers `security`.
+    struct Secure(engine::SecurityReading);
+
+    impl ListingReader for Secure {
+        fn devices(&self) -> Result<Vec<DeviceDriver>, String> {
+            Ok(vec![device("Alpha GPU")])
+        }
+        fn kernel(&self) -> Result<Vec<KernelDriver>, String> {
+            Ok(Vec::new())
+        }
+        fn security(&self) -> engine::SecurityReading {
+            self.0.clone()
+        }
+    }
+
+    fn secure_host(memory: engine::Reading, blocklist: engine::Reading) -> AddonHost {
+        let reader: Arc<dyn ListingReader> = Arc::new(Secure(engine::SecurityReading { memory_integrity: memory, blocklist }));
+        let entries = vec![Entry::Addon(Box::new(Drivers::with_reader(reader)))];
+        AddonHost::for_tests_with(entries, &json!({ "drivers": { "enabled": true } })).0
+    }
+
+    #[test]
+    fn the_security_strip_shows_each_state_with_its_own_text() {
+        use engine::Reading::{Failed, NotSet, Value};
+        let mut host = secure_host(Value(1), Value(0));
+        until("the strip is read", || shown(&mut host).contains("The blocklist is off"));
+        let page = shown(&mut host);
+        assert!(page.contains("Security") && page.contains("Memory integrity:") && page.contains("On") && page.contains("Off"), "{page}");
+        assert!(page.contains("The blocklist is off: Windows does not block known vulnerable drivers."), "{page}");
+        assert!(page.contains("Open Windows Security") && page.contains("Read-only: change them in Windows Security."), "{page}");
+
+        let mut host = secure_host(Failed("access is denied".into()), Failed("access is denied".into()));
+        until("the unreadable strip is shown", || shown(&mut host).contains("could not be read"));
+        let page = shown(&mut host);
+        assert!(page.contains("Windows did not let us read these settings, so we do not guess."), "{page}");
+        assert!(!page.contains("Memory integrity is off") && !page.contains("The blocklist is off"), "an unreadable value is never shown as off: {page}");
+
+        let mut host = secure_host(NotSet, Value(1));
+        until("the missing memory integrity value is shown as off", || shown(&mut host).contains("Memory integrity is off"));
+        let page = shown(&mut host);
+        assert!(!page.contains("Not set") && !page.contains("could not be read"), "a missing value is off, as Windows Security shows it: {page}");
+
+        // Nothing on the page says "Not set": a missing value is filled in by the reader.
+        let mut host = secure_host(Value(1), NotSet);
+        until("the strip is read", || shown(&mut host).contains("Memory integrity:"));
+        assert!(!shown(&mut host).contains("Not set"));
+    }
+
+    /// A reader whose Filter Manager read answers `filters`.
+    struct Filtered(filters::FilterRead);
+
+    impl ListingReader for Filtered {
+        fn devices(&self) -> Result<Vec<DeviceDriver>, String> {
+            Ok(vec![device("Alpha GPU")])
+        }
+        fn kernel(&self) -> Result<Vec<KernelDriver>, String> {
+            Ok(Vec::new())
+        }
+        fn filters(&self) -> filters::FilterRead {
+            self.0.clone()
+        }
+    }
+
+    fn filters_host(read: filters::FilterRead) -> AddonHost {
+        let reader: Arc<dyn ListingReader> = Arc::new(Filtered(read));
+        let entries = vec![Entry::Addon(Box::new(Drivers::with_reader(reader)))];
+        AddonHost::for_tests_with(entries, &json!({ "drivers": { "enabled": true, "settings": { "scope": "filters" } } })).0
+    }
+
+    #[test]
+    fn the_filter_drivers_tab_lists_name_altitude_instances_and_frame_and_has_no_action() {
+        let list = vec![
+            filters::FilterDriver { name: "WdFilter".into(), altitude: "328010".into(), instances: 5, frame: 0 },
+            filters::FilterDriver { name: "bindflt".into(), altitude: "409800".into(), instances: 1, frame: 0 },
+        ];
+        let mut host = filters_host(filters::FilterRead::Filters(list));
+        until("the filters are shown", || shown(&mut host).contains("WdFilter"));
+        let page = shown(&mut host);
+        for want in ["Filter drivers", "Filter\n", "Altitude", "Instances", "Frame", "bindflt", "409800", "328010", filters::FILTERS_INTRO, filters::FILTERS_READ_ONLY, filters::FILTERS_SIDE] {
+            assert!(page.contains(want), "{want:?} in {page}");
+        }
+        assert!(!page.contains("Unload") && !page.contains("Alpha GPU"), "no action, and no device rows here: {page}");
+    }
+
+    #[test]
+    fn filters_that_need_administrator_rights_show_the_message_and_no_list() {
+        let mut host = filters_host(filters::FilterRead::NeedsAdmin);
+        until("the message is shown", || shown(&mut host).contains("Needs administrator rights to list filters."));
+        assert!(!shown(&mut host).contains("Altitude"), "no table without a list");
+    }
+
+    #[test]
+    fn a_reader_without_a_filter_read_says_the_filters_could_not_be_listed() {
+        let reader = Fake::devices(vec![Ok(vec![device("Alpha GPU")])]);
+        let (mut host, _) = host_with(&reader, json!({ "enabled": true, "settings": { "scope": "filters" } }));
+        until("the failure is shown", || shown(&mut host).contains("Filters could not be listed"));
+        assert!(shown(&mut host).contains("this reader does not list filters"));
+    }
+
+    #[test]
+    fn a_reader_without_a_security_read_shows_it_as_unreadable() {
+        let reader = Fake::devices(vec![Ok(vec![device("Alpha GPU")])]);
+        let mut host = on(&reader);
+        until("the strip is shown", || shown(&mut host).contains("Windows did not let us read these settings"));
+    }
+
+    #[test]
+    fn open_windows_security_opens_core_isolation_and_nothing_else() {
+        let (ctx, runner) = AddonContext::recording();
+        let mut addon = Drivers::with_no_drivers();
+        addon.start(&ctx);
+        addon.page().unwrap().open_windows_security();
+        assert_eq!(runner.launches(), vec![crate::platform::Launch::Open("windowsdefender://coreisolation".into())]);
     }
 }

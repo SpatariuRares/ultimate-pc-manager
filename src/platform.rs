@@ -18,6 +18,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+#[cfg(windows)]
+mod elevated;
+pub use elevated::{sha256_hex, Sha256};
 pub mod install_queue;
 pub mod series;
 /// Windows notifications (toasts) through the notification area.
@@ -785,6 +788,17 @@ pub fn csv_field(s: &str) -> String {
     }
 }
 
+/// A CSV text field: like [`csv_field`], but a cell starting with `=`, `+`,
+/// `-` or `@` gets a leading single quote so a spreadsheet never runs it as a
+/// formula. For text only; numbers keep [`csv_field`] so they are not mangled.
+pub fn csv_text_field(s: &str) -> String {
+    if s.starts_with(['=', '+', '-', '@']) {
+        csv_field(&format!("'{s}"))
+    } else {
+        csv_field(s)
+    }
+}
+
 /// Starts this app again as administrator (UAC asks) on the page `page` (a
 /// `--page` value), without waiting: the executor [`AddonContext::restart_elevated`]
 /// uses, for core pages that have no add-on context.
@@ -972,11 +986,18 @@ mod imp {
 
     // --------------------------------------------------- PowerShell
 
-    /// Writes `script` to a file, runs it with Windows PowerShell (elevated
-    /// through UAC when asked) and reads the JSON it writes to -Out.
+    /// Runs `script` with Windows PowerShell (elevated through UAC when
+    /// asked) and reads the JSON it writes to -Out.
     pub fn run_script(script: &str, args: &[(&str, &str)], elevated: bool) -> Result<serde_json::Value, String> {
+        if elevated {
+            // The script never reaches the elevated side through a file a
+            // normal process could swap, and its result comes back through
+            // a folder only administrators can write: see `elevated`.
+            let results = std::env::var_os("windir").map(std::path::PathBuf::from).unwrap_or_else(|| "C:\\Windows".into()).join("Temp");
+            return super::elevated::run(&jobs_dir()?, &results, script, args, false, run_elevated);
+        }
         let never = AtomicBool::new(false);
-        run_in(&jobs_dir()?, script, args, |params| if elevated { run_elevated(params) } else { run_hidden(params, &never) })
+        run_in(&jobs_dir()?, script, args, |params| run_hidden(params, &never))
     }
 
     /// Like [`run_script`] without elevation; a set `stop` ends PowerShell
@@ -1046,10 +1067,20 @@ mod imp {
 
     /// Runs Windows PowerShell with `params` as administrator (UAC asks)
     /// and waits.
-    fn run_elevated(params: &str) -> Result<(), String> {
+    fn run_elevated(params: &str) -> Result<i32, String> {
+        use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
         unsafe {
             let verb = wide("runas");
-            let file = wide("powershell.exe");
+            // The full path from the system call (not an environment
+            // variable), so a program planted earlier on the search path
+            // is never the one that gets administrator rights.
+            let mut dir = [0u16; 260];
+            let n = GetSystemDirectoryW(dir.as_mut_ptr(), dir.len() as u32) as usize;
+            if n == 0 || n >= dir.len() {
+                return Err("Could not find the Windows system folder.".into());
+            }
+            let system = String::from_utf16_lossy(&dir[..n]);
+            let file = wide(&format!("{system}\\WindowsPowerShell\\v1.0\\powershell.exe"));
             let p = wide(params);
             let mut info: SHELLEXECUTEINFOW = zeroed();
             info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
@@ -1065,11 +1096,13 @@ mod imp {
                     format!("Could not start an elevated PowerShell (error {}).", GetLastError())
                 });
             }
+            let mut code = 0u32;
             if !info.hProcess.is_null() {
                 WaitForSingleObject(info.hProcess, INFINITE);
+                GetExitCodeProcess(info.hProcess, &mut code);
                 CloseHandle(info.hProcess);
             }
-            Ok(())
+            Ok(code as i32)
         }
     }
 
@@ -1557,6 +1590,21 @@ mod tests {
         assert_eq!(csv_field("plain"), "plain");
         assert_eq!(csv_field("a,b"), "\"a,b\"");
         assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        // Unchanged by the formula neutralisation: csv_field stays as it was.
+        assert_eq!(csv_field("=1+1"), "=1+1");
+        assert_eq!(csv_field("-5"), "-5");
+    }
+
+    #[test]
+    fn csv_text_field_neutralises_formulas() {
+        for s in ["=1+1", "+1", "-1", "@SUM(A1)"] {
+            assert_eq!(csv_text_field(s), format!("'{s}"));
+        }
+        assert_eq!(csv_text_field("=a,b"), "\"'=a,b\"");
+        assert_eq!(csv_text_field("plain"), "plain");
+        assert_eq!(csv_text_field("a=b"), "a=b");
+        assert_eq!(csv_text_field("a,b"), csv_field("a,b"));
+        assert_eq!(csv_text_field(""), "");
     }
 }
 

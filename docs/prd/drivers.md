@@ -4,14 +4,13 @@
 
 Those who use Ultimate PC Manager want to know whether the drivers on their PC are up to date and to install the newer ones without opening Device Manager, Windows Update and the manufacturers' websites one by one. More expert users also want to see the kernel drivers: which are loaded, how much memory they take up, who wrote them and whether they can be unloaded.
 
-The app already has almost everything: design A "update center" with the status band "are my drivers up to date?", device drivers as in Device Manager, a search on Windows Update matched by hardware ID and compared with the installed version, installation with UAC, INF package, hardware scan, a list of kernel modules with size and load index, Unload, CSV export. But today:
+Drivers is an add-on (id `drivers`): it is registered in the add-on registry, the user turns it on or off in Settings, Add-ons, its background work is stopped and its late results are discarded when it is turned off, it has its own settings, and a locked preview exists for the case it becomes paid. On top of design A (the update center with the status band "are my drivers up to date?"), spec #11 added signatures, a driver store tab with removal and backup, a security strip, restore points, device actions (disable, enable, restart, roll back), a problems view and filter drivers.
 
-- it is a fixed entry of the page enum, not an add-on that the user can turn on or off;
-- its threads (reading the list, the Windows Update search, elevated scripts) cannot be stopped and their results cannot be discarded;
-- some Kernel modules features are not complete (four figures as tiles, "%1 shown" and "Updated %1", reading, error and empty-list texts, detail row names, scope from the command line);
+What is still open:
+
 - **the installation of driver updates from Windows Update has never been tested end to end on the real system**;
-- there is no locked preview in case the add-on becomes paid;
-- the add-on contract tests are missing.
+- the real-system checks of the INF install, the scan, Unload, removal, backup and the device actions are guided manual checks, not automated tests;
+- `page.rs` and `engine.rs` have grown large and should be split into submodules (see Known limits).
 
 ## Solution
 
@@ -29,6 +28,8 @@ It is the last add-on in the migration order proposed by the add-ons document.
 
 ## User Stories
 
+This PRD has 67 numbered user stories (1-67) and two lettered ones (37a, 42a): 69 in all. The sections on the driver store, security band, restore point, device actions, roll back, problems view and filter drivers state their rules as bullet lists under spec #11 and carry no story numbers of their own.
+
 ### Status band and Windows Update updates
 
 1. As a user, I want a status band that says "Drivers have not been checked for updates yet" and explains that the check compares each driver with Windows Update, lasts up to a minute and does not ask for administrator rights, so that I know what happens before I press. *(our addition, design A; exists)*
@@ -44,10 +45,10 @@ It is the last add-on in the migration order proposed by the add-ons document.
 11. As a user, I want the confirmation "Install an older driver?" with "It is not newer than the driver you have. Install it only to go back to that version.", so that I do not downgrade by mistake. *(our addition; exists)*
 12. As a user, I want to see "All drivers are up to date on Windows Update" with the note that graphics cards and other devices may have newer drivers on the manufacturer's site, so that I do not believe Windows Update is the last word. *(our addition; exists)*
 13. As a user, I want "Checked today at HH:MM" and "Check again", so that I know how recent the answer is. *(our addition; exists)*
-14. As a user, I want the installation outcome "Installed N driver updates." or "Installed N; failed: title (0x…)", and the installed drivers to disappear from the list of offers and the list to be read again, so that the state shown is the true one. *(our addition; exists, to be verified end to end)*
+14. As a user, I want the installation outcome "Installed N driver updates." or "Installed N; failed: title (0x…)", and the installed drivers to disappear from the list of offers and the list to be read again, so that the state shown is the true one. The elevated script receives the update identity of each clicked offer and looks it up directly; it searches all driver updates again only for an identity that is no longer valid. After a dismissed UAC prompt nothing is installed and the list is not read again. *(our addition; exists, to be verified end to end)*
 15. As a user, I want "Restart Windows to finish installing drivers." when Windows requires it, so that I know a restart is needed. *(our addition; exists, to be verified end to end)*
 16. As a user, I want a "Could not check Windows Update: …" message if the search fails (service stopped, no network, company policies), so that I know why I have no answer. *(our addition; exists)*
-17. As a user, I want a clear message if I closed the UAC window without confirming, distinct from a failed installation, so that I know nothing happened. *(our addition; to be checked, today the error arrives as generic text)*
+17. As a user, I want a clear message if I closed the UAC window without confirming, distinct from a failed installation, so that I know nothing happened. *(our addition; exists: "Cancelled at the Windows prompt: nothing was changed.")*
 
 ### Device drivers (Hardware drivers / Windows built-in)
 18. As a user, I want to see a driver per device, as in Device Manager, with name, maker, version, date and a Windows Update column ("New: V" or "Up to date"), so that I understand the state of each peripheral. *(our addition; exists)*
@@ -67,18 +68,47 @@ It is the last add-on in the migration order proposed by the add-ons document.
 
 ### Kernel modules
 32. As an expert user, I want a "Kernel modules" tab with the number of registered driver services, so that I reach the full list of kernel drivers with one click. *(exists)*
-33. As an expert user, I want four figures as tiles: Drivers ("Registered with Windows"), Loaded ("Linked into the kernel now"), Third-party ("Not shipped by Microsoft"), Kernel memory ("Held by loaded driver images"), so that the main numbers are visible at a glance. *(partial: today a single sentence with the same numbers)*
-34. As an expert user, I want the five scopes All, Loaded, Not loaded, Third-party, File system, each with its own count, so that I can narrow the list. *(exists without the counts on the buttons)*
-35. As an expert user, I want "%1 shown" and "Updated %1" (time of the last reading) next to the scopes, so that I know how many rows I see and how recent they are. *(missing)*
+33. As an expert user, I want four figures as tiles: Drivers ("Registered with Windows"), Loaded ("Linked into the kernel now"), Third-party ("Not shipped by Microsoft"), Kernel memory ("Held by loaded driver images"), so that the main numbers are visible at a glance. The four figures count only the rows that match the text filter, whatever the scope. *(exists)*
+34. As an expert user, I want the five scopes All, Loaded, Not loaded, Third-party, File system, each with its own count, so that I can narrow the list. The counts follow the rules under "Rules for scopes and figures" below. *(exists)*
+35. As an expert user, I want "%1 shown" and "Updated %1" (time of the last reading) next to the scopes, so that I know how many rows I see and how recent they are. *(exists)*
 36. As an expert user, I want the columns Driver, Name, State, Start type, Type, Version, Vendor, so that I see the main properties of each driver. *(exists)*
-37. As an expert user, I want to filter by driver name, service name or vendor with the message "No driver name, display name or vendor matches the filter." when nothing matches, so that I know the filter found nothing. *(exists with slightly different text)*
-38. As an expert user, I want the details with the labels: Driver, Service name, State, Kind, Start type, Version, Vendor, Load index (with the load order group), Kernel memory, Location, Unload, so that I find every field. *(partial: today the labels are Service, Memory, Group, File, and State/Kind are in the subtitle)*
-39. As an expert user, I want to see real kernel memory and load index of the loaded module, read without administrator rights, so that I know how much each driver weighs. *(exists — in the canvas it was a placeholder, now the data is real)*
-40. As an expert user, I want Unload offered only when it is possible, with the reason: "Not loaded.", "Not offered: Windows loaded it at boot, and the kernel refuses to stop a driver it started itself.", "Needs administrator rights (Windows will ask); most drivers refuse the request while the system runs.", so that I do not try an impossible action. *(exists)*
+37. As an expert user, I want to filter by driver name, service name or vendor with the message "No driver name, display name or vendor matches the filter." when nothing matches, so that I know the filter found nothing. *(exists)*
+37a. As an expert user, I want the Kernel modules filter hint to say "Driver name, service or vendor" (Device drivers keeps "Find a driver or maker"), and each tab to say what to do with nothing selected: "Select a driver to see its details and what Windows Update offers for it." and "Select a kernel module to see where it lives, how much memory it holds and whether it can be unloaded.". *(spec #11, stories 21-22)*
+38. As an expert user, I want the details with the labels: Driver, Service name, State, Kind, Start type, Version, Vendor, Load index (with the load order group), Kernel memory, Location, Unload, so that I find every field. *(exists)*
+39. As an expert user, I want to see real kernel memory and load index of the loaded module, read without administrator rights, so that I know how much each driver weighs; a module is matched to its driver by full path, so two files with the same name in different folders each get their own size and load index. *(exists — in the canvas it was a placeholder, now the data is real)*
+40. As an expert user, I want Unload offered only when it is possible, with the reason: "Not loaded.", "Not offered: Windows loaded it at boot, and the kernel refuses to stop a driver it started itself.", "Needs administrator rights (Windows will ask); most drivers refuse the request while the system runs.", "Not offered: its configuration could not be read." (start type "Unknown" when Windows does not return the service configuration), so that I do not try an impossible action. "Not loaded." is told only for a Stopped service: a driver in a pending state (starting, stopping, pausing, continuing) or paused is loaded, so it gets the other reasons. *(exists)*
 41. As an expert user, I want the confirmation "Unload this driver?" with "Devices that use it stop working until it loads again or Windows restarts.", so that I do not stop a driver by mistake. *(our addition; exists, to be verified end to end)*
-42. As an expert user, I want "Open file location", "Open in Device Manager", "Copy details" in the panel and "Copy service name" in the context menu and in the panel, so that I have all the actions at hand. *("Copy service name" today only in the context menu; in the canvas also in the panel)*
+42. As an expert user, I want "Open file location", "Open in Device Manager", "Copy details" in the panel and "Copy service name" in the context menu and in the panel, so that I have all the actions at hand. *(exists)*
+42a. As an expert user, I want the Kernel modules context menu to offer "Open file location", "Open Device Manager", a separator, "Copy details", then the advanced actions under an "Advanced" caption ("Copy service name", "Unload…"), so that the common actions come first and Unload is visibly an advanced action. "Open file location" selects the file in File Explorer and says "The executable path is not available for this item.", "The file <path> was not found." or "File Explorer could not reveal this item." when it cannot. *(spec #11, stories 13-15)*
 43. As an expert user, I want "Select a kernel module to see where it lives, how much memory it holds and whether it can be unloaded." when nothing is selected, so that I know what I will find in the panel. *(our addition; exists)*
-44. As an expert user, I want to open the page directly on a scope from the command line (`--drivers-scope all|loaded|not-loaded|third-party|file-system`), so that I can capture or show a specific scope. *(missing)*
+44. As an expert user, I want to open the page directly on a scope from the command line (`--drivers-scope all|loaded|not-loaded|third-party|file-system`), so that I can capture or show a specific scope. An invalid value is reported in the status line as "<value> (valid scopes: all, loaded, not-loaded, third-party, file-system)" and the page opens on its saved scope; `--page drivers`, `--page kernel-modules` and `--page modules` (any case) open the page. The command line takes exactly these five scopes: `--drivers-scope unsigned` is reported like any other invalid value, although the page offers (and remembers) the Unsigned scope. *(exists)*
+
+#### Rules for scopes and figures
+
+- **Loaded**: the driver service is not Stopped. The pending states (starting, stopping, pausing, continuing) count as loaded.
+- **Not loaded**: the driver service is Stopped.
+- **Third-party**: the vendor (from the file's version information) is not empty and does not start with "Microsoft", whatever the case. A driver with no vendor is not third-party.
+- **File system**: the service is a file-system driver.
+- **Text filter and figures**: the four figures (Drivers, Loaded, Third-party, Kernel memory) count only the rows that match the text filter (driver name, service name or vendor), independently of the chosen scope. Changing the scope changes the rows, never the figures.
+- **Kernel memory**: the sum of the image sizes of the loaded rows, each image file counted once (two services that point to the same file add its size once). When the list of loaded modules could not be read, the tile says "an unknown amount" and a note says why; it is never shown as 0.
+- **Matching modules**: a driver's image is matched to the loaded module by full path (case-insensitive, `\SystemRoot` and `\??\` spelled out); by file name alone only when the image path has no folder and one module has that name.
+
+#### VirusTotal and SHA-256 (spec #11, #34)
+
+- "Copy SHA-256" on a kernel module hashes its file on this PC and copies the hash.
+- "Look up on VirusTotal" opens `https://www.virustotal.com/gui/file/<sha256>` in the browser: no API key, nothing uploaded; only the hash leaves the PC.
+- It is off by default (Settings, Add-ons, Drivers, "Offer \"Look up on VirusTotal\""). The first lookup asks "Send this file's SHA-256 to VirusTotal? The file itself is not uploaded."; the option and the consent are saved (`virusTotal`, `virusTotalConsent`), and cancelling saves nothing.
+- Both sit under "Advanced" in the kernel module menu and side panel. The file is read in pieces (it is never held in memory) on a thread of its own, not in a job, and the read stops and the result is dropped if the add-on is turned off meanwhile.
+
+#### Signatures (spec #11, #25)
+
+- **Column and rows**: Kernel modules has a Signature column, and both detail panels (devices and kernel modules) a Signature row, with a Signer row when the signer's name is known. The values are "WHQL", "Signed", "Unsigned", "Not checked" (not checked yet) and "Could not check: <reason>", which is not "Unsigned".
+- **Check**: `WinVerifyTrust` with the driver policy, first on the file's own signature, then on the catalog that lists the file's hash (`CryptCATAdmin*`), so a driver signed through its package's catalog is not called unsigned. It reads the driver image of a kernel module and the INF of a device, with normal rights (no UAC).
+- **WHQL**: the signer chain has "Microsoft Windows Hardware Compatibility Publisher". The signer shown is the first certificate of the chain.
+- **When**: on a background thread after the list is shown; results arrive while the page is open. Results are cached in memory by path, size and modification time; a file that changed is checked again, and a failed check is tried again at the next reading.
+- **Unsigned scope**: a sixth scope on Kernel modules, with its count, lists the modules whose check found no signature (not the ones not checked yet, nor the ones that could not be checked). It is worked out with the other counts in the page's derived data, once per change of data or filter. The command line does not accept it (story 44).
+- **CSV**: the columns are Kind, Name, Class/Type, Provider/Vendor, Version, Date, Status, INF/Service, Windows Update, Instance ID/Path, then the kernel-only Start type, Load index, Kernel memory (bytes), Load order group, Depends on (empty on device rows), then Signature, Problem code and Problem. The kind of a kernel module is its Class/Type cell. Status of a kernel module is the page's state label (Running, Stopped or a pending state). Signature is filled for kernel modules (their image) and for device rows with a driver INF (empty without one). Problem code and Problem are filled only for a connected device with a problem code, with the explanation of the problems table. Text cells are neutralised against spreadsheet formulas.
+- **Add-on off**: the check ends before its next file, nothing is published after that and nothing new starts while the add-on is off.
 
 ### Other actions (More actions)
 45. As a user, I want "Install from an INF file…" to add a driver package and install it on compatible devices (with UAC), with the outcomes "Driver package installed.", "The package was added, but no device needed it…", "Done. Restart Windows to finish.", so that I can install a driver downloaded from the manufacturer. *(our addition; exists, to be verified end to end)*
@@ -86,12 +116,63 @@ It is the last add-on in the migration order proposed by the add-ons document.
 47. As a user, I want "Export the list as CSV…" with device drivers, kernel modules and Windows Update offers, and the outcome "Saved …" or "Could not save: …", so that I can share the inventory. *(our addition; exists)*
 48. As a user, I want a collapsible section "Output of the last tool" with the output of pnputil / sc, and "Finished with code N. See the output below." when something goes wrong, so that I see the error detail. *(our addition; exists)*
 49. As a user, I want "Refresh list", disabled while reading, so that I can read it again after a hardware change. *(exists)*
-50. As a user, I want only one job at a time (search, installation, INF, scan, Unload) to be possible, with the buttons disabled while another is running, so that elevated operations do not overlap. *(our addition; exists)*
+50. As a user, I want only one job at a time (search, installation, INF, scan, Unload) to be possible, with the buttons disabled while another is running, so that elevated operations do not overlap. *(our addition; exists)* Every job follows it (scan, install, INF, Unload, restore-point Continue, remove, backup, device actions, rollback). The one check lives in the `Hub`: a job asked for while another runs starts nothing and leaves "Another driver job is running. Wait for it to finish." as the message; every confirm dialog shows the same text and disables its confirm button meanwhile. The page asks one question (`job_free`) and the refusal is a typed flag of the state, not a text comparison. A refusal is shown only while the other job runs; a dismissed UAC prompt re-reads nothing for any job. Hashing a file (Copy SHA-256, Look up on VirusTotal) is a read, not a change: it runs on its own thread and neither takes this slot nor waits for it.
 
 ### Reading, empty and error states
-51. As a user, I want the reading state "Asking the service control manager for every driver registered on this machine." in the Kernel modules scope and "Reading the drivers…" in the others, so that I know the list is on its way. *(partial: the first text is missing)*
-52. As a user, I want "Drivers could not be enumerated" with the reason when reading fails, instead of a silent empty list, so that I understand it is an error. *(missing: today a reading error gives an empty list)*
-53. As a user, I want "No drivers were reported" / "Windows published no driver registrations." when Windows returns nothing, distinct from "No drivers here." and from the filter states, so that I can tell a problem from a filter. *(missing)*
+51. As a user, I want the reading state "Asking the service control manager for every driver registered on this machine." in the Kernel modules scope and "Reading the drivers…" in the others, so that I know the list is on its way. *(exists)*
+52. As a user, I want "Drivers could not be enumerated" with the reason when reading fails, instead of a silent empty list, so that I understand it is an error. *(exists)*
+53. As a user, I want "No drivers were reported" / "Windows published no driver registrations." when Windows returns nothing, distinct from "No drivers here." and from the filter states, so that I can tell a problem from a filter. *(exists)*
+
+### Driver store (spec #11, #26)
+A "Driver store" tab after Kernel modules lists the driver packages Windows keeps: published name (oemNN.inf) with the original INF under it, provider, class, version, date, signer, and the devices using it. A filter ("Package, INF, provider or device") and "Copy details" (row menu and side panel) work as on the other tabs; the filter and the selection are the tab's own.
+- Read with `pnputil /enum-drivers /devices /format xml` and normal rights (no UAC), parsed from the XML, never from localised text. `/enum-drivers` lists the third-party packages (`oemNN.inf`) only. The read follows the driver listing in the same background job: the other tabs do not wait for it, a refresh re-reads it, and when the add-on is turned off its result is dropped and nothing new starts.
+- **Old**: another package with the same original INF name and provider (case does not matter) has a newer version (numbers compared part by part, missing parts count as 0), then a later date when the versions are equal. **In use**: at least one device. **Inbox**: the provider starts with "Microsoft" (case-insensitive); inbox packages are flagged and never offered for removal.
+- Figures, over the whole store (not the filter): packages, third-party (not inbox), old (old, not in use, not inbox: what "Remove old packages" will remove), disk space used and what can be freed. The size of a package is its folder in `System32\DriverStore\FileRepository`, found through `HKLM\SYSTEM\DriverDatabase\DriverInfFiles\<oemNN.inf>`; a package whose folder is not found has no size, and when none has one the figure says "unknown", never 0.
+- Selection: every non-inbox row has a tick box (the shared selection of "Remove N...", "Back up selected"); inbox rows have none. A new read forgets ticked packages that no longer exist.
+- Removal (spec #11, #28; stories 47-52): "Remove..." (ticked packages, or the one selected in the side panel), "Remove old packages" (only Old, not In use, not inbox). Each asks for a confirmation that lists the packages and offers "Create a restore point first". It runs one elevated job through `Hub::run_job` (restore point step, then `pnputil /delete-driver <oemN.inf>` by its absolute System32 path, never `/force`). Packages in use, inbox packages and unknown names are refused before the job starts ("Not removed: <name> (a device uses it)"); when nothing is left to remove no UAC prompt appears. "Remove even if in use..." exists for one package only, behind a stronger warning and "I understand, continue anyway"; it is the only path that runs `/uninstall /force`. Outcome: "Removed N packages, freed X." and one "Not removed: <name> (<reason>)" per package left (the reason is the tool's own "Failed ..." line); the store is read again only when something was removed. A dismissed UAC prompt is "Cancelled at the Windows prompt: nothing was changed." with no re-read.
+- Backup (spec #11, #29; stories 55-58): "Back up drivers..." in the page header (every third-party package) and "Back up selected" (the ticked ones) ask for a folder and export each package with `pnputil /export-driver <oemN.inf> <folder>` into the dated subfolder "Drivers yyyy-mm-dd" of that folder, in one elevated job. A backup changes nothing, so it makes no restore point (stories 59 and 62 list changes only). Outcome: "Backed up N driver packages to <folder>." and one "Not backed up: <name> (<reason>)" per failure. The dialog says the backup is restored with "Install from an INF file...", one INF per package.
+- Both jobs are uninterruptible elevated jobs: turning the add-on off waits for them, and once it is off nothing new starts.
+
+### Security band (spec #11, #32)
+A compact read-only "Security" strip under the status band shows Memory integrity (`HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled`) and the vulnerable driver blocklist (`HKLM\SYSTEM\CurrentControlSet\Control\CI\Config\VulnerableDriverBlocklistEnable`).
+- Each value shows as "On" (1), "Off" (0) or "could not be read" (access denied, another type, any other number), each with its own explaining line; an unreadable value is never shown as off. There is no "Not set".
+- **Memory integrity with no value or no key shows "Off"** (owner decision on #32), as Windows Security does when the setting was never turned on; "could not be read" is kept for a real read failure or an unknown value.
+- **The vulnerable driver blocklist with no value** shows what Microsoft's default is: "On" on Windows 11 22H2 and later (build 22621 or higher), where it is enabled by default, and "Off" on earlier builds. The build is read read-only from `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\CurrentBuildNumber`; when it cannot be read the blocklist shows "could not be read" rather than a guess. A value that exists is shown as it is.
+- Possible later improvement: read the running state from WMI `Win32_DeviceGuard.SecurityServicesRunning`.
+- The values are read with normal rights, in process, in the same read as the driver listing; nothing is written and no elevated job is added. When the add-on is turned off the read is dropped and nothing new starts.
+- "Open Windows Security" opens `windowsdefender://coreisolation`; the strip says "Read-only: change them in Windows Security."
+
+### Restore point (spec #11, #27)
+Windows Update installs and INF installs offer "Create a restore point first" in their confirm dialog: on by default, remembered (setting `restorePoint`, saved only when turned off).
+- The restore point is a **step** of the same elevated job as the change, so the user sees one UAC prompt. The job script takes an ordered `Steps` argument (`restore-point,install-updates` or `restore-point,inf`); the step's PowerShell runs before the change and stores its result under `steps` in the job result. A later change adds its step by passing one more `Step` to `Hub::run_job`. With the option off the launch has no steps and is exactly the change's own script and arguments.
+- The step uses `Checkpoint-Computer` with the `DEVICE_DRIVER_INSTALL` type and reports "Restore point created.", "System Restore is off on drive C:." or "Windows already created a restore point in the last 24 hours." (any other failure: "The restore point could not be created: <reason>").
+- When it is not created, the job stops before the change (nothing was changed) and the page asks "Continue without a new restore point?" with Continue and Cancel. Continue runs the change again without a restore point (a second UAC prompt, only on this path); Cancel says "Cancelled: nothing was changed.". When it is created its message leads the outcome message.
+- Unload and Scan make no restore point. The job is an uninterruptible elevated job like the others: turning the add-on off waits for it.
+
+### Device actions: Disable, Enable, Restart (spec #11, #30)
+The device context menu and the side panel offer "Disable device" (or "Enable device" for a device Windows reports as disabled, problem code 22) and "Restart device", with the administrator shield. They are greyed out while another driver job runs.
+- Each asks first: the dialog says what will happen ("The device stops working until you enable it again.", "Windows starts the device again.", "The device stops for a moment and starts again.") and carries the restore point option.
+- Protected classes (disk drives and storage controllers, display adapters, system devices; the boot disk and its controller are in the storage group) need a stronger warning for Disable and Restart: "This is a <kind>: you may lose your screen or your boot disk until Windows restarts." The confirm button stays off until the user ticks "I understand, continue anyway". Enable never asks for it.
+- The job is `pnputil /disable-device`, `/enable-device` or `/restart-device` with the instance ID, from the System32 folder, elevated, in the same one-UAC-prompt job as the optional restore point step (modes `disable-device`, `enable-device`, `restart-device` of the tool script). It is uninterruptible like the other elevated jobs.
+- Outcomes: "Done.", "Restart Windows to finish." (pnputil code 3010) or "Windows refused: <reason>" (the last line pnputil printed, or its exit code). The list is read again after each outcome except a dismissed UAC prompt, which changed nothing.
+
+### Roll back driver (spec #11, #31)
+"Roll back driver" sits first in the same menu group and panel section, with the shield, the same confirm dialog ("Windows goes back to the previous driver it kept for this device."), restore point option, stronger warning for protected classes, outcomes and re-read as the other device actions.
+- The route is Device Manager's own: `DiRollbackDriver` (newdev.dll) with `ROLLBACK_FLAG_NO_UI`, called by mode `rollback-device` of the tool script, in the same one-UAC-prompt job. PowerShell has no built-in rollback command (`pnputil` has none; WMI/CIM has none), so the script builds a dynamic assembly in memory (`System.Reflection.Emit`, run-only) that imports `SetupDiCreateDeviceInfoList`, `SetupDiOpenDeviceInfoW`, `DiRollbackDriver` and `SetupDiDestroyDeviceInfoList`, loaded by their System32 path. Nothing is compiled or written to disk (no `Add-Type`), the runner (#17) is unchanged, and no other elevation path exists.
+- Outcomes: "Done.", "Restart Windows to finish." (the API asked for a restart), "No previous driver is kept for this device." (Windows reported `ERROR_NO_MORE_ITEMS`: the device has no backup driver) or "Windows refused: <Windows' reason>".
+- Windows documents no read-only check for "a backup driver exists", so the entry is offered for every device and Windows answers when asked.
+
+### Problems view (spec #11, #24)
+A "Problems" scope after "Windows built-in" lists only the devices that are connected and have a Configuration Manager problem code, with their count (amber while not chosen). A disconnected device is never a problem. The scope, its count and the band line exist only while some device has a problem (the scope stays while chosen, and says "No device has a problem." when empty). The count is part of the page's derived data and is worked out once per change of data, scope or filter. The scope is saved like the others (`"problems"`).
+- The status band adds "N devices have a problem" ("1 device has a problem") with "Show them", which opens the scope.
+- Each row says "Code <n>: <explanation>" under its name, from a fixed table of the documented codes (`problems.rs`), for example 10 "The device cannot start.", 22 "The device is disabled.", 28 "No driver is installed.", 43 "Windows stopped the device because it reported problems.". An unknown code is still named and gets no suggestion.
+- The side panel shows the code and its explanation, then "Try:" with a suggestion: "Update or reinstall the driver", "Restart the device" or "Enable the device". It is a link to the page's own action when there is one (Install update when Windows Update offers a newer driver; the Restart or Enable device dialog), otherwise plain text.
+
+### Filter drivers (spec #11, #33)
+A "Filter drivers" tab lists the loaded file-system minifilters read-only: name, altitude, instances and frame, highest altitude first like `fltmc filters`, with a "Filter name" search.
+- They are read in process with `FilterFindFirst`/`FilterFindNext` (Filter Manager user API), in the same read as the driver listing, with normal rights.
+- When Windows refuses without administrator rights the tab says "Needs administrator rights to list filters."; the page never asks for rights on its own.
+- There is no unload or other action. When the add-on is turned off the read is dropped and nothing new starts; no elevated job is added.
 
 ### Behavior as an add-on
 54. As a user, I want to turn Drivers on or off from the Add-ons page in Settings, so that I keep the app light if I do not need it. *(our addition)*
@@ -100,8 +181,9 @@ It is the last add-on in the migration order proposed by the add-ons document.
 57. As a user, I want turning it off during a Windows Update search to interrupt the search and discard the result, so that nothing continues after it is turned off. *(our addition)*
 58. As a user, I want that, during an installation, a scan or an Unload (elevated scripts), the switch does not turn the add-on off until the work is finished, with a message that explains it, so that a driver installation does not end without an outcome. *(our addition)*
 59. As a user, I want that, when I turn it on again, I find my settings again (chosen tab, kernel scope, "Show disconnected", add-on options), so that turning it off does not make me lose anything. *(our addition)*
-60. As a user, I want the Add-ons page to show, before turning it on, what it asks of the system: network and Windows Update service for the search, PowerShell, administrator rights via UAC to install, scan and download drivers, so that I know what I accept. *(our addition)*
+60. As a user, I want the Add-ons page to show, before turning it on, what it asks of the system: network and Windows Update service for the search, PowerShell, administrator rights via UAC to install, scan, unload, remove, back up, device actions (disable, enable, restart, roll back) and restore points, and the network for VirusTotal (off by default); reads (lists, problems, signatures, driver store, security band, filters) need normal rights only, so that I know what I accept. *(our addition; spec #11 story 83)* The requirements are the add-on's existing `Requirements` (admin, network, programs) plus its `NEEDS` note; the tab, scopes, restore-point option, VirusTotal option and consent are saved in its settings (story 82).
 61. As a user, I want the app not to need to be started as administrator: the list and the search work with normal rights, and only the actions that change the system ask for UAC, so that the rest of the app runs with normal rights. *(decision taken; exists)*
+    - Elevated scripts reach the administrator side only as a SHA-256-checked, in-memory copy (the check and the run use the same bytes) and answer through a folder in `%windir%\Temp` that only administrators and SYSTEM can write; the result carries a random per-job token that the app checks, and a result without it is shown as a failure.
 62. As a user, I want optionally a tile in Summary with "N newer drivers" and the time of the last check, shown only after a check I made, so that I see the state without opening the page and without automatic searches. *(our addition, optional)*
 63. As a user, I want in the add-on settings section the choice to search Windows Update when the page opens (off by default) and the "check the maker" threshold (3 years by default), so that I adapt the add-on to my use. *(our addition, optional)*
 
@@ -130,6 +212,7 @@ It is the last add-on in the migration order proposed by the add-ons document.
   - four tiles Drivers / Loaded / Third-party / Kernel memory in the Kernel modules scope instead of the sentence;
   - count on each kernel scope, "%1 shown" and "Updated %1";
   - detail labels (Driver, Service name, State, Kind, Start type, Version, Vendor, Load index with load order group, Kernel memory, Location, Unload) and "Copy service name" also in the panel;
+  - two further detail rows, shown only when the service has the value: "Load order group" (after Load index) and "Depends on" (services, then groups written "Name (group)"); the State row shows the pending states (Start pending, Stop pending, Continue pending, Pause pending, Paused) besides Running and Stopped; the kinds are Kernel, File system, Recognizer and Adapter;
   - the filter text of story 37 in the kernel scope;
   - the reading, error and empty states of stories 51–53; the system part must be able to return a reading error instead of an empty list;
   - a command-line option for the kernel scope, with the values of story 44;
@@ -161,11 +244,17 @@ Modules tested: driver data module, driver page module, `DriversAddon`.
 
 - The add-on platform itself (registry, Add-ons page, licenses, sales): separate PRD.
 - Downloading drivers from manufacturers' websites (NVIDIA, AMD, Intel…): the add-on only opens their page.
-- Uninstalling a driver package from the driver store, going back to the previous driver (Device Manager rollback), disabling a device.
-- Restore points before installation.
+- Downloading or choosing a driver version for a rollback beyond what Windows keeps: roll back uses the previous driver Windows itself kept (story "Roll back driver").
 - Driver values read through manufacturers' SDKs.
 - Phase 2 of the platform (add-ons in a separate process or WASM).
 - Renaming the app ("My Task Manager").
+
+## Known limits (spec #11)
+
+- **Story 27 (Windows Update install)**: the install searches Windows Update again by UpdateID, because the Windows Update Agent cannot install from an identity alone: the script looks the identity up directly and searches all driver updates again only for an identity that is no longer valid.
+- **Story 64 (roll back)**: Roll back is offered on every device, because Windows documents no read-only check that a backup driver exists; Windows answers "No previous driver is kept for this device." when asked.
+- **Story 68 (protected classes)**: the boot device is covered through the disk, storage-controller and volume classes only (the stronger warning for Disable and Restart); no separate boot-device detection exists.
+- **Follow-up**: split `page.rs` and `engine.rs` into submodules; they hold the page, the dialogs and the jobs in one file each today.
 
 ## Further Notes
 

@@ -1,7 +1,9 @@
 //! The Windows reader: today's SetupDi, service-manager and file-version
 //! code, moved unchanged. Elsewhere it lists nothing.
 
-use super::engine::{DeviceDriver, KernelDriver};
+use super::engine::{DeviceDriver, KernelDriver, SecurityReading};
+use super::store::StorePackage;
+use super::filters::FilterRead;
 use super::ListingReader;
 
 /// The Drivers add-on's reader on a real PC.
@@ -15,6 +17,18 @@ impl ListingReader for WindowsListing {
     fn kernel(&self) -> Result<Vec<KernelDriver>, String> {
         imp::list_kernel()
     }
+    fn security(&self) -> SecurityReading {
+        imp::read_security()
+    }
+    fn store(&self) -> Result<Vec<StorePackage>, String> {
+        imp::read_store()
+    }
+    fn filters(&self) -> FilterRead {
+        imp::list_filters()
+    }
+    fn signature(&self, path: &str) -> super::signature::Signature {
+        super::signature::check(path)
+    }
 }
 
 #[cfg(not(windows))]
@@ -27,12 +41,21 @@ mod imp {
     pub fn list_kernel() -> Result<Vec<KernelDriver>, String> {
         Err(unavailable_error(Feature::DeviceSetupApi))
     }
+    pub fn read_security() -> SecurityReading {
+        SecurityReading::unreadable(&unavailable_error(Feature::DeviceSetupApi))
+    }
+    pub fn read_store() -> Result<Vec<super::StorePackage>, String> {
+        Err(unavailable_error(Feature::DeviceSetupApi))
+    }
+    pub fn list_filters() -> super::super::filters::FilterRead {
+        super::super::filters::FilterRead::Failed(unavailable_error(Feature::DeviceSetupApi))
+    }
 }
 
 #[cfg(windows)]
 mod imp {
     use super::super::engine::*;
-    use std::collections::HashMap;
+    use super::StorePackage;
     use std::ffi::c_void;
     use std::ptr::{null, null_mut};
 
@@ -42,6 +65,136 @@ mod imp {
     use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
     use windows_sys::Win32::System::Services::*;
+
+    /// One DWORD of HKLM, opened with read rights only (no write path).
+    fn read_dword(subkey: &str, name: &str) -> Reading {
+        use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+        let missing = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+        match winreg::RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(subkey, KEY_READ) {
+            Err(e) if missing(&e) => Reading::NotSet,
+            Err(e) => Reading::Failed(e.to_string()),
+            Ok(key) => match key.get_value::<u32, _>(name) {
+                Ok(v) => Reading::Value(v),
+                Err(e) if missing(&e) => Reading::NotSet,
+                Err(e) => Reading::Failed(e.to_string()),
+            },
+        }
+    }
+
+    /// Memory integrity and the vulnerable-driver blocklist.
+    pub fn read_security() -> SecurityReading {
+        SecurityReading {
+            memory_integrity: read_dword(r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity", "Enabled"),
+            // Microsoft turns the blocklist on by default from build 22621,
+            // so a missing value is read together with the build.
+            blocklist: blocklist_reading(read_dword(r"SYSTEM\CurrentControlSet\Control\CI\Config", "VulnerableDriverBlocklistEnable"), read_build),
+        }
+    }
+
+    /// The Windows build number (`CurrentBuildNumber`), read-only.
+    fn read_build() -> Result<u32, String> {
+        use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+        let key = winreg::RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", KEY_READ).map_err(|e| e.to_string())?;
+        let text: String = key.get_value("CurrentBuildNumber").map_err(|e| e.to_string())?;
+        text.trim().parse().map_err(|_| format!("unexpected build number \"{text}\""))
+    }
+
+    // ------------------------------------------------------- driver store
+
+    /// The folder of a package in the driver store, from the registry's
+    /// driver database ("oem42.inf" -> `nv_dispi.inf_amd64_0123456789abcdef`).
+    fn registered_folder(published: &str) -> Option<String> {
+        use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+        let key = winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(format!(r"SYSTEM\DriverDatabase\DriverInfFiles\{published}"), KEY_READ)
+            .ok()?;
+        key.get_value::<Vec<String>, _>("").ok().and_then(|v| v.into_iter().find(|s| !s.is_empty())).or_else(|| key.get_value::<String, _>("").ok().filter(|s| !s.is_empty()))
+    }
+
+    /// The folder of a package: the registry's answer when it has one (it
+    /// does not for every package), else the only folder of that INF, else
+    /// the one whose INF is the very file Windows keeps as `INF\oemNN.inf`.
+    fn store_folder(published: &str, original: &str, folders: &[String], windir: &std::path::Path, repository: &std::path::Path) -> Option<String> {
+        if let Some(f) = registered_folder(published) {
+            return Some(f);
+        }
+        let prefix = format!("{}_", original.to_lowercase());
+        let mut same = folders.iter().filter(|f| f.to_lowercase().starts_with(&prefix));
+        let (first, second) = (same.next()?, same.next());
+        if second.is_none() {
+            return Some(first.clone());
+        }
+        let kept = std::fs::read(windir.join("INF").join(published)).ok()?;
+        folders.iter().filter(|f| f.to_lowercase().starts_with(&prefix)).find(|f| std::fs::read(repository.join(f).join(original)).is_ok_and(|b| b == kept)).cloned()
+    }
+
+    /// The bytes of the files under `dir`.
+    fn folder_size(dir: &std::path::Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+        entries
+            .flatten()
+            .map(|e| match e.metadata() {
+                Ok(m) if m.is_dir() => folder_size(&e.path()),
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            })
+            .sum()
+    }
+
+    /// The driver packages Windows keeps: `pnputil /enum-drivers /devices
+    /// /format xml` with normal rights, then each package's folder measured.
+    pub fn read_store() -> Result<Vec<StorePackage>, String> {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let out = std::process::Command::new(format!(r"{root}\System32\pnputil.exe"))
+            .args(["/enum-drivers", "/devices", "/format", "xml"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("pnputil could not be started: {e}"))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut packages = super::super::store::parse_store(&text).map_err(|e| match out.status.code() {
+            Some(0) | None => e,
+            Some(code) => format!("{e}; pnputil exited with code {code}"),
+        })?;
+        let repository = std::path::Path::new(&root).join(r"System32\DriverStore\FileRepository");
+        let folders: Vec<String> = std::fs::read_dir(&repository).into_iter().flatten().flatten().filter(|e| e.path().is_dir()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        for p in &mut packages {
+            p.size = store_folder(&p.published, &p.original, &folders, std::path::Path::new(&root), &repository).map(|f| folder_size(&repository.join(f)));
+        }
+        Ok(packages)
+    }
+
+    /// The loaded minifilters, read with `FilterFindFirst`/`FilterFindNext`
+    /// (read-only). Without administrator rights Windows refuses: that is
+    /// told as such and nothing asks for rights.
+    pub fn list_filters() -> super::super::filters::FilterRead {
+        use super::super::filters::{failure, parse_entry, sorted, FilterRead, AGGREGATE_STANDARD_INFORMATION, NO_MORE_ITEMS};
+        use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::InstallableFileSystems::{FilterFindClose, FilterFindFirst, FilterFindNext};
+        let mut buf = vec![0u8; 64 * 1024];
+        let (mut got, mut find): (u32, HANDLE) = (0, INVALID_HANDLE_VALUE);
+        let mut hr = unsafe { FilterFindFirst(AGGREGATE_STANDARD_INFORMATION, buf.as_mut_ptr().cast(), buf.len() as u32, &mut got, &mut find) };
+        if hr == NO_MORE_ITEMS {
+            return FilterRead::Filters(Vec::new());
+        }
+        if hr != 0 {
+            return failure(hr);
+        }
+        let mut list = Vec::new();
+        let outcome = loop {
+            list.extend(parse_entry(&buf[..(got as usize).min(buf.len())]));
+            hr = unsafe { FilterFindNext(find, AGGREGATE_STANDARD_INFORMATION, buf.as_mut_ptr().cast(), buf.len() as u32, &mut got) };
+            if hr == NO_MORE_ITEMS {
+                break FilterRead::Filters(sorted(std::mem::take(&mut list)));
+            }
+            if hr != 0 {
+                break failure(hr);
+            }
+        };
+        unsafe { FilterFindClose(find) };
+        outcome
+    }
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(Some(0)).collect()
@@ -269,26 +422,27 @@ mod imp {
         }
     }
 
-    /// Loaded kernel images by lowercase file name → (size, load order index),
-    /// from NtQuerySystemInformation(SystemModuleInformation).
-    fn kernel_modules() -> HashMap<String, (u64, u32)> {
-        let mut map = HashMap::new();
+    /// Loaded kernel images with their full paths, from
+    /// NtQuerySystemInformation(SystemModuleInformation); None when the
+    /// list could not be read.
+    fn kernel_modules() -> Option<Vec<LoadedModule>> {
+        let mut out = Vec::new();
         unsafe {
             let lib = wide("ntdll.dll");
             let h = LoadLibraryW(lib.as_ptr());
             if h.is_null() {
-                return map;
+                return None;
             }
-            let Some(f) = GetProcAddress(h, b"NtQuerySystemInformation\0".as_ptr()) else { return map };
+            let f = GetProcAddress(h, b"NtQuerySystemInformation\0".as_ptr())?;
             let query: unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32 = std::mem::transmute(f);
             let mut len = 0u32;
             query(11, null_mut(), 0, &mut len);
             if len == 0 {
-                return map;
+                return None;
             }
             let mut buf = vec![0u64; (len as usize + 65536) / 8];
             if query(11, buf.as_mut_ptr() as *mut c_void, (buf.len() * 8) as u32, &mut len) < 0 {
-                return map;
+                return None;
             }
             let base = buf.as_ptr() as *const u8;
             let count = *(base as *const u32) as usize;
@@ -300,18 +454,17 @@ mod imp {
                 }
                 let size = *(e.add(24) as *const u32) as u64;
                 let index = *(e.add(32) as *const u16) as u32;
-                let off = *(e.add(38) as *const u16) as usize;
                 let path = std::slice::from_raw_parts(e.add(40), 256);
                 let end = path.iter().position(|&b| b == 0).unwrap_or(256);
-                let name = String::from_utf8_lossy(&path[off.min(end)..end]).to_lowercase();
-                map.insert(name, (size, index));
+                out.push(LoadedModule { path: String::from_utf8_lossy(&path[..end]).into_owned(), size, index });
             }
         }
-        map
+        Some(out)
     }
 
     pub fn list_kernel() -> Result<Vec<KernelDriver>, String> {
         let modules = kernel_modules();
+        let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
         let mut out = Vec::new();
         unsafe {
             let scm = OpenSCManagerW(null(), null(), SC_MANAGER_ENUMERATE_SERVICE | SC_MANAGER_CONNECT);
@@ -335,15 +488,9 @@ mod imp {
                 let mut d = KernelDriver {
                     display: indirect(&from_wide(it.lpDisplayName), &service),
                     running: st.dwCurrentState == SERVICE_RUNNING,
-                    kind: match st.dwServiceType {
-                        t if t & SERVICE_FILE_SYSTEM_DRIVER != 0 => KernelKind::FileSystem,
-                        t if t & SERVICE_KERNEL_DRIVER != 0 => KernelKind::Kernel,
-                        t if t & 8 != 0 => KernelKind::Recognizer,
-                        t if t & 4 != 0 => KernelKind::Adapter,
-                        _ => KernelKind::Kernel,
-                    },
-                    start_type: "",
-                    start_code: 3,
+                    state_code: Some(st.dwCurrentState),
+                    kind: kernel_kind_from_type(st.dwServiceType),
+                    start_code: None,
                     ..Default::default()
                 };
                 let mut raw_path = String::new();
@@ -352,31 +499,36 @@ mod imp {
                     let mut need = 0u32;
                     if QueryServiceConfigW(h, cfg.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW, (cfg.len() * 8) as u32, &mut need) != 0 {
                         let c = &*(cfg.as_ptr() as *const QUERY_SERVICE_CONFIGW);
-                        d.start_code = c.dwStartType;
+                        d.start_code = Some(c.dwStartType);
                         raw_path = from_wide(c.lpBinaryPathName);
                         d.group = from_wide(c.lpLoadOrderGroup);
+                        if !c.lpDependencies.is_null() {
+                            // A list of nul-ended strings ended by an empty one: read up to the double nul.
+                            let mut n = 0;
+                            while !(*c.lpDependencies.add(n) == 0 && *c.lpDependencies.add(n + 1) == 0) {
+                                n += 1;
+                            }
+                            (d.depends_services, d.depends_groups) = parse_dependencies(std::slice::from_raw_parts(c.lpDependencies, n + 2));
+                        }
                     }
                     CloseServiceHandle(h);
                 }
-                d.start_type = match d.start_code {
-                    0 => "Boot",
-                    1 => "System",
-                    2 => "Automatic",
-                    3 => "Manual",
-                    4 => "Disabled",
-                    _ => "",
-                };
+                d.start_type = start_type_name(d.start_code);
                 d.path = resolve_image(&raw_path, &service);
                 if std::path::Path::new(&d.path).exists() {
                     let (v, c) = file_version(&d.path);
                     d.version = v;
                     d.vendor = c;
                 }
-                if d.running {
-                    let file = d.path.rsplit('\\').next().unwrap_or("").to_lowercase();
-                    if let Some((size, index)) = modules.get(&file) {
-                        d.image_size = Some(*size);
-                        d.load_index = Some(*index);
+                if d.is_loaded() {
+                    match &modules {
+                        Some(list) => {
+                            if let Some(m) = find_module(list, &d.path, &windir) {
+                                d.image_size = Some(m.size);
+                                d.load_index = Some(m.index);
+                            }
+                        }
+                        None => d.modules_unread = true,
                     }
                 }
                 d.service = service;
@@ -386,5 +538,24 @@ mod imp {
         }
         out.sort_by_key(|d| d.display.to_lowercase());
         Ok(out)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod pc_tests {
+    use super::*;
+
+    /// Reads this PC's kernel drivers: states, kinds and dependencies are plausible.
+    #[test]
+    #[ignore = "reads this PC's service control manager"]
+    fn this_pc_reports_states_kinds_groups_and_dependencies() {
+        let list = WindowsListing.kernel().expect("kernel drivers");
+        assert!(list.iter().all(|d| d.state_code.is_some()), "every state was read");
+        assert!(list.iter().any(|d| d.state_label() == "Running"));
+        assert!(list.iter().any(|d| d.kind.label() == "File system"));
+        assert!(list.iter().any(|d| !d.group.is_empty()), "some service has a load order group");
+        let with_deps: Vec<_> = list.iter().filter(|d| !d.depends_on_text().is_empty()).collect();
+        assert!(!with_deps.is_empty(), "some driver depends on a service or group");
+        println!("{} drivers, {} with dependencies", list.len(), with_deps.len());
     }
 }

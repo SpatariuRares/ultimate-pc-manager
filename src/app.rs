@@ -255,7 +255,8 @@ impl TaskApp {
         let args: Vec<String> = std::env::args().collect();
         // Flags owned by add-ons (e.g. `--scan`); one that is off ignores them.
         // An add-on's flag may ask for its page; `--page` wins.
-        let asked = addons.command_line(&args).page;
+        let line = addons.command_line(&args);
+        let asked = line.page;
         let request = args.iter().position(|a| a == "--page").and_then(|i| args.get(i + 1)).map(String::as_str).or(asked);
         let (page, addon_selected, show_addons) = match addons.landing(request, &settings.start_page, &settings.last_page) {
             Landing::Page(id) => (Page::of(id), None, false),
@@ -264,6 +265,10 @@ impl TaskApp {
         let mut app = Self::build(settings, sampler, addons, page, screenshot, std::sync::Arc::new(crate::system_lists::native::NativeSystem), std::sync::Arc::new(crate::system_actions::WindowsActions));
         if show_addons {
             app.pages.settings.open_addons(addon_selected);
+        }
+        // An add-on's flag that is wrong is told in the status line.
+        for error in line.errors {
+            app.say(error);
         }
         crate::theme::install_fonts(&cc.egui_ctx);
         app.apply_theme(&cc.egui_ctx);

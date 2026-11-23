@@ -4,17 +4,34 @@
 
 use super::engine::KernelScope;
 
-/// The kernel scope asked for by `--drivers-scope` among the app's
-/// arguments (a [`KernelScope::name`]); None when the flag is missing or
-/// its value is not a valid scope.
-pub fn kernel_scope(args: &[String]) -> Option<KernelScope> {
-    let value = args.iter().skip(1).enumerate().find_map(|(i, a)| {
+/// The raw value of `--drivers-scope` among the app's arguments; None when
+/// the flag is missing.
+fn scope_value(args: &[String]) -> Option<&str> {
+    args.iter().skip(1).enumerate().find_map(|(i, a)| {
         if a == "--drivers-scope" {
             return Some(args.get(i + 2).map(String::as_str).unwrap_or(""));
         }
         a.strip_prefix("--drivers-scope=")
-    })?;
-    KernelScope::parse(value)
+    })
+}
+
+/// The kernel scope asked for by `--drivers-scope` among the app's
+/// arguments (a [`KernelScope::name`]); None when the flag is missing or
+/// its value is not a valid scope.
+pub fn kernel_scope(args: &[String]) -> Option<KernelScope> {
+    KernelScope::parse_command_line(scope_value(args)?)
+}
+
+/// What to tell the user when `--drivers-scope` has a value that is not a
+/// scope: the value, then the valid ones. None when the flag is missing or
+/// valid.
+pub fn scope_error(args: &[String]) -> Option<String> {
+    let value = scope_value(args)?;
+    if KernelScope::parse_command_line(value).is_some() {
+        return None;
+    }
+    let valid: Vec<&str> = KernelScope::ALL.iter().map(|s| s.name()).collect();
+    Some(format!("{value} (valid scopes: {})", valid.join(", ")))
 }
 
 #[cfg(test)]
@@ -33,6 +50,17 @@ mod tests {
             assert_eq!(kernel_scope(&args(&["--page", "Drivers", &format!("--drivers-scope={value}")])), Some(scope), "{value}");
         }
         assert_eq!(kernel_scope(&args(&["--drivers-scope", "Not-Loaded"])), Some(NotLoaded), "case does not matter");
+    }
+
+    #[test]
+    fn an_invalid_scope_is_reported_with_the_valid_ones() {
+        let valid = "(valid scopes: all, loaded, not-loaded, third-party, file-system)";
+        assert_eq!(scope_error(&args(&["--drivers-scope", "kernel"])), Some(format!("kernel {valid}")));
+        assert_eq!(scope_error(&args(&["--drivers-scope=bogus"])), Some(format!("bogus {valid}")));
+        assert_eq!(scope_error(&args(&["--drivers-scope", "unsigned"])), Some(format!("unsigned {valid}")), "the page offers Unsigned, the command line does not");
+        assert_eq!(kernel_scope(&args(&["--drivers-scope", "unsigned"])), None);
+        assert_eq!(scope_error(&args(&["--drivers-scope", "Loaded"])), None, "valid in any case");
+        assert_eq!(scope_error(&args(&["--page", "Drivers"])), None, "no flag, no error");
     }
 
     #[test]
