@@ -394,7 +394,8 @@ impl PackageManager {
                     band_line(ui, pal.soft, "Install buttons wait until this one ends.");
                 }
                 Some(outcome) => {
-                    let color = match outcome.status() {
+                    let source = super::source_for(&install.package.catalog);
+                    let color = match outcome.status(source) {
                         Status::Ok => pal.green,
                         Status::OkRestart | Status::Skipped(_) | Status::Cancelled => pal.amber,
                         _ => pal.red,
@@ -402,7 +403,7 @@ impl PackageManager {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
                         dot(ui, color, 10.0);
-                        ui.add(egui::Label::new(RichText::new(outcome.text(&install.package.name)).size(18.0).strong().color(pal.text)).wrap());
+                        ui.add(egui::Label::new(RichText::new(outcome.text(source, &install.package.name)).size(18.0).strong().color(pal.text)).wrap());
                     });
                 }
             },
@@ -585,7 +586,8 @@ impl PackageManager {
                     crate::widgets::separator(ui);
                 }
                 if !b.done {
-                    let lines = super::primary_source().last_lines(&b.lines.join("\n"), 5);
+                    let running = b.items.iter().find(|i| i.status == Status::Running);
+                    let lines = running.map_or_else(super::primary_source, |i| super::source_for(&i.package.catalog)).last_lines(&b.lines.join("\n"), 5);
                     if !lines.is_empty() {
                         let name = b.items.iter().find(|i| i.status == Status::Running).map(|i| i.package.name.as_str()).unwrap_or("the package");
                         ui.label(RichText::new(format!("Last lines from {name}")).size(12.0).color(pal.label));

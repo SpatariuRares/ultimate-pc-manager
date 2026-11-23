@@ -188,11 +188,13 @@ pub fn summary(items: &[Item], kind: Kind) -> Vec<String> {
     let reasons = |pick: fn(&Status) -> Option<&String>| -> Vec<String> {
         items.iter().filter_map(|i| pick(&i.status).map(|why| format!("{} ({why})", i.package.name))).collect()
     };
+    // A series mixes catalogs, so names are joined in the primary source's words.
+    let source = super::primary_source();
     let classes = [
-        (title.to_string(), super::primary_source().join_names(&names(|s| *s == Status::Ok))),
-        (format!("{title}, restart Windows to finish"), super::primary_source().join_names(&names(|s| *s == Status::OkRestart))),
+        (title.to_string(), source.join_names(&names(|s| *s == Status::Ok))),
+        (format!("{title}, restart Windows to finish"), source.join_names(&names(|s| *s == Status::OkRestart))),
         ("Skipped".to_string(), reasons(|s| if let Status::Skipped(w) = s { Some(w) } else { None }).join("; ")),
-        ("Cancelled".to_string(), super::primary_source().join_names(&names(|s| *s == Status::Cancelled))),
+        ("Cancelled".to_string(), source.join_names(&names(|s| *s == Status::Cancelled))),
         ("Failed".to_string(), reasons(|s| if let Status::Failed(w) = s { Some(w) } else { None }).join("; ")),
         ("Not started".to_string(), reasons(|s| if let Status::NotStarted(w) = s { Some(w) } else { None }).join("; ")),
         ("To install by hand".to_string(), reasons(|s| if let Status::Manual(u) = s { Some(u) } else { None }).join("; ")),

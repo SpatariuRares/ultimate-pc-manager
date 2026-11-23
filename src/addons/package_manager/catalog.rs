@@ -97,6 +97,13 @@ pub enum ExitClass {
     Failed,
 }
 
+impl ExitClass {
+    /// The package is installed (updated, uninstalled) whatever the restart.
+    pub fn is_success(self) -> bool {
+        matches!(self, ExitClass::Installed | ExitClass::InstalledRestart)
+    }
+}
+
 /// A catalog source (see the module docs). `None` from a method that takes
 /// `stop`: it was set, and the work was ended.
 pub trait PackageSource: Send + Sync {
@@ -239,11 +246,7 @@ impl PackageSource for Winget {
     }
     fn register(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Result<(), String>> {
         let args = readiness::powershell_args(readiness::REGISTER_APP_INSTALLER);
-        Some(match readiness::ask(ctx, "powershell.exe", &args, stop)? {
-            readiness::Answer::Exited(0, _) => Ok(()),
-            readiness::Answer::Exited(code, out) => Err(format!("Registering App Installer failed (exit code {code}). {}", out.trim())),
-            readiness::Answer::NotStarted => Err("PowerShell did not start.".into()),
-        })
+        run_to_end(ctx, "powershell.exe", &args, stop, "PowerShell did not start.", |code, out| format!("Registering App Installer failed (exit code {code}). {}", out.trim()))
     }
     fn classify(&self, code: i32) -> ExitClass {
         use crate::platform::winget::ExitClass as W;
@@ -268,11 +271,7 @@ impl PackageSource for Winget {
         crate::platform::winget::last_lines(output, n)
     }
     fn refresh_catalogs(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Result<(), String>> {
-        Some(match readiness::ask(ctx, "winget", &["source", "update"], stop)? {
-            readiness::Answer::Exited(0, _) => Ok(()),
-            readiness::Answer::Exited(code, _) => Err(crate::platform::winget::describe(code)),
-            readiness::Answer::NotStarted => Err("winget did not start.".into()),
-        })
+        run_to_end(ctx, "winget", &["source", "update"], stop, "winget did not start.", |code, _| crate::platform::winget::describe(code))
     }
     fn inactive_catalogs(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Vec<String>> {
         Some(match Self::ask(ctx, &["source", "list", "--disable-interactivity"], stop)? {
@@ -365,6 +364,17 @@ impl PackageSource for Winget {
         let args = ["uninstall", "--id", target.id, "--exact", "--source", target.catalog, "--silent", "--disable-interactivity", "--log", &log];
         Self::run_package(ctx, &args, stop, on_line)
     }
+}
+
+/// Runs `program` and tells whether it ended well (exit code 0): `Err` is
+/// `not_started` when it did not start, and `failed(code, output)` when it
+/// exited otherwise. `None`: stopped.
+fn run_to_end(ctx: &AddonContext, program: &str, args: &[&str], stop: &AtomicBool, not_started: &str, failed: impl FnOnce(i32, &str) -> String) -> Option<Result<(), String>> {
+    Some(match readiness::ask(ctx, program, args, stop)? {
+        readiness::Answer::Exited(0, _) => Ok(()),
+        readiness::Answer::Exited(code, out) => Err(failed(code, &out)),
+        readiness::Answer::NotStarted => Err(not_started.into()),
+    })
 }
 
 /// `args` with `--accept-source-agreements` when the catalogs' agreements
@@ -562,13 +572,20 @@ mod tests {
     }
 
     #[test]
-    fn the_source_classifies_and_describes_exits_and_formats_messages() {
+    fn the_source_classifies_exit_codes_and_says_which_are_successes() {
         let w = &Winget as &dyn PackageSource;
         assert_eq!(w.classify(0), ExitClass::Installed);
         assert_eq!(w.classify(3010), ExitClass::InstalledRestart);
         assert_eq!(w.classify(1602), ExitClass::Cancelled);
         assert_eq!(w.classify(0x8A15_002B_u32 as i32), ExitClass::Skipped);
         assert_eq!(w.classify(1603), ExitClass::Failed);
+        assert!(w.classify(0).is_success() && w.classify(3010).is_success());
+        assert!(!w.classify(1602).is_success() && !w.classify(1603).is_success());
+    }
+
+    #[test]
+    fn the_source_describes_exits_and_formats_messages() {
+        let w = &Winget as &dyn PackageSource;
         assert_eq!(w.describe(1603), "exit code 1603");
         assert!(w.uninstall_needs_admin(crate::platform::winget::UNINSTALL_COMMAND_FAILED));
         assert!(!w.uninstall_needs_admin(1603));
