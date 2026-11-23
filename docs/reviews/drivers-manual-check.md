@@ -88,3 +88,24 @@ The automatic tests run the bootstrap with a real, non-elevated PowerShell. Thes
 3. Pick a folder you cannot write to (for example a read-only drive).
    - Expected: "Backup failed: <reason>" or "Not backed up: oemN.inf (<reason>)" per package.
 4. Restore one package from the backup with "More actions > Install from an INF file...".
+
+## #30: disable, enable and restart a device (needs UAC)
+
+Use a harmless device, for example a USB device you can unplug or a Bluetooth adapter. Never start with a display, disk or system device.
+
+1. Drivers, Device drivers, right click a harmless device.
+   - Expected: a "Device" group with "Disable device" (or "Enable device" if it is already disabled) and "Restart device", each with the shield. The side panel shows the same two buttons under "Device".
+2. Choose "Disable device".
+   - Expected: a dialog "Disable <name>?" saying "The device stops working until you enable it again.", with "Create a restore point first (same administrator prompt)" checked. Cancel changes nothing and shows no UAC prompt.
+3. Confirm with the restore point on, answer UAC **Yes**.
+   - Expected: one UAC prompt, then "Restore point created. Done." (or the honest restore point reason and the Continue/Cancel choice, as in #27). The list is read again: the device now says "Disabled" and the panel offers "Enable device".
+4. Choose "Enable device", confirm, UAC **Yes**.
+   - Expected: "Done." and the device says "Working" again.
+5. Choose "Restart device", confirm, UAC **Yes**.
+   - Expected: "Done." and the device works again. Close UAC with **No** on another try: "Cancelled at the Windows prompt: nothing was changed.", and the list is not read again.
+6. Try the action on a device Windows will not stop (some system devices): choose Restart on a device in use.
+   - Expected: "Windows refused: <what pnputil printed last>" or "Restart Windows to finish." when Windows needs a restart.
+7. Protected classes: select a Display adapter (and, on a spare PC, a disk drive or storage controller), right click, "Restart device".
+   - Expected: the dialog shows in red "This is a display adapter: you may lose your screen or your boot disk until Windows restarts." and the confirm button is off until "I understand, continue anyway" is ticked. The panel says the device asks for a stronger confirmation. "Enable device" on such a device asks no stronger confirmation. Only confirm this on a PC where you can afford a black screen for a moment.
+8. Start an Install update (or any other job) and, while the Windows prompt is open, right click a device.
+   - Expected: both device actions are greyed out until the job ends.

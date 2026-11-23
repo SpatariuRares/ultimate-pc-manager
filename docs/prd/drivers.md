@@ -92,14 +92,13 @@ It is the last add-on in the migration order proposed by the add-ons document.
 - **Kernel memory**: the sum of the image sizes of the loaded rows, each image file counted once (two services that point to the same file add its size once). When the list of loaded modules could not be read, the tile says "an unknown amount" and a note says why; it is never shown as 0.
 - **Matching modules**: a driver's image is matched to the loaded module by full path (case-insensitive, `\SystemRoot` and `\??\` spelled out); by file name alone only when the image path has no folder and one module has that name.
 
-<<<<<<< HEAD
 #### VirusTotal and SHA-256 (spec #11, #34)
 
 - "Copy SHA-256" on a kernel module hashes its file on this PC and copies the hash.
 - "Look up on VirusTotal" opens `https://www.virustotal.com/gui/file/<sha256>` in the browser: no API key, nothing uploaded; only the hash leaves the PC.
 - It is off by default (Settings, Add-ons, Drivers, "Offer \"Look up on VirusTotal\""). The first lookup asks "Send this file's SHA-256 to VirusTotal? The file itself is not uploaded."; the option and the consent are saved (`virusTotal`, `virusTotalConsent`), and cancelling saves nothing.
 - Both sit under "Advanced" in the kernel module menu and side panel. The hash is computed in the background and dropped if the add-on is turned off meanwhile.
-=======
+
 #### Signatures (spec #11, #25)
 
 - **Column and rows**: Kernel modules has a Signature column, and both detail panels (devices and kernel modules) a Signature row, with a Signer row when the signer's name is known. The values are "WHQL", "Signed", "Unsigned", "Not checked" (not checked yet) and "Could not check: <reason>", which is not "Unsigned".
@@ -109,7 +108,6 @@ It is the last add-on in the migration order proposed by the add-ons document.
 - **Unsigned scope**: a sixth scope on Kernel modules, with its count, lists the modules whose check found no signature (not the ones not checked yet, nor the ones that could not be checked). It is worked out with the other counts in the page's derived data, once per change of data or filter. `--drivers-scope unsigned` opens it.
 - **CSV**: the Signature column is the last one and is filled for kernel modules (empty on device rows).
 - **Add-on off**: the check ends before its next file, nothing is published after that and nothing new starts while the add-on is off.
->>>>>>> spec-11-drivers-v2
 
 ### Other actions (More actions)
 45. As a user, I want "Install from an INF file…" to add a driver package and install it on compatible devices (with UAC), with the outcomes "Driver package installed.", "The package was added, but no device needed it…", "Done. Restart Windows to finish.", so that I can install a driver downloaded from the manufacturer. *(our addition; exists, to be verified end to end)*
@@ -148,6 +146,14 @@ Windows Update installs and INF installs offer "Create a restore point first" in
 - The step uses `Checkpoint-Computer` with the `DEVICE_DRIVER_INSTALL` type and reports "Restore point created.", "System Restore is off on drive C:." or "Windows already created a restore point in the last 24 hours." (any other failure: "The restore point could not be created: <reason>").
 - When it is not created, the job stops before the change (nothing was changed) and the page asks "Continue without a new restore point?" with Continue and Cancel. Continue runs the change again without a restore point (a second UAC prompt, only on this path); Cancel says "Cancelled: nothing was changed.". When it is created its message leads the outcome message.
 - Unload and Scan make no restore point. The job is an uninterruptible elevated job like the others: turning the add-on off waits for it.
+
+### Device actions: Disable, Enable, Restart (spec #11, #30)
+The device context menu and the side panel offer "Disable device" (or "Enable device" for a device Windows reports as disabled, problem code 22) and "Restart device", with the administrator shield. They are greyed out while another driver job runs.
+- Each asks first: the dialog says what will happen ("The device stops working until you enable it again.", "Windows starts the device again.", "The device stops for a moment and starts again.") and carries the restore point option.
+- Protected classes (disk drives and storage controllers, display adapters, system devices; the boot disk and its controller are in the storage group) need a stronger warning for Disable and Restart: "This is a <kind>: you may lose your screen or your boot disk until Windows restarts." The confirm button stays off until the user ticks "I understand, continue anyway". Enable never asks for it.
+- The job is `pnputil /disable-device`, `/enable-device` or `/restart-device` with the instance ID, from the System32 folder, elevated, in the same one-UAC-prompt job as the optional restore point step (modes `disable-device`, `enable-device`, `restart-device` of the tool script). It is uninterruptible like the other elevated jobs.
+- Outcomes: "Done.", "Restart Windows to finish." (pnputil code 3010) or "Windows refused: <reason>" (the last line pnputil printed, or its exit code). The list is read again after each outcome except a dismissed UAC prompt, which changed nothing.
+- Roll back driver (#31) will sit first in the same menu group and panel section.
 
 ### Filter drivers (spec #11, #33)
 A "Filter drivers" tab lists the loaded file-system minifilters read-only: name, altitude, instances and frame, highest altitude first like `fltmc filters`, with a "Filter name" search.
