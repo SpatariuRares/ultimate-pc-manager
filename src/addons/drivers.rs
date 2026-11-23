@@ -29,7 +29,7 @@ const NAME: &str = "Drivers";
 /// The note under its requirements in Settings › Add-ons.
 pub const NEEDS: &str = "Searching for driver updates needs the internet and the Windows Update service. \
 Administrator rights are asked through UAC only to install, scan for hardware changes and unload drivers \
-(with PowerShell, pnputil and sc): do not start this app as administrator.";
+(with PowerShell, pnputil and sc): do not start this app as administrator. \nThe internet is also used by \"Look up on VirusTotal\", which is off by default and sends only a file's SHA-256.";
 
 /// Where the add-on reads the installed devices and kernel drivers from:
 /// the Windows reader in the app, a fake in tests. Owned by the add-on, not
@@ -88,6 +88,12 @@ struct Prefs {
     /// The Summary tile is on (off by default).
     #[serde(rename = "summaryTile", skip_serializing_if = "is_default")]
     summary_tile: bool,
+    /// "Look up on VirusTotal" is offered on kernel modules (off by default).
+    #[serde(rename = "virusTotal", skip_serializing_if = "is_default")]
+    virustotal: bool,
+    /// The user agreed to send a file's SHA-256 to VirusTotal (asked once).
+    #[serde(rename = "virusTotalConsent", skip_serializing_if = "is_default")]
+    virustotal_consent: bool,
     /// The fields of newer versions, written back untouched.
     #[serde(flatten)]
     rest: serde_json::Map<String, serde_json::Value>,
@@ -106,6 +112,8 @@ impl Default for Prefs {
             check_on_open: false,
             maker_years: DEFAULT_OLD_YEARS,
             summary_tile: false,
+            virustotal: false,
+            virustotal_consent: false,
             rest: serde_json::Map::new(),
         }
     }
@@ -117,6 +125,7 @@ impl Prefs {
         page.drv_ui.scope = self.scope;
         page.drv_ui.kernel_filter = self.kernel_filter;
         page.drv_ui.show_disconnected = self.show_disconnected;
+        page.virustotal_consent = self.virustotal_consent;
         self.apply_options_to(page);
     }
 
@@ -125,6 +134,7 @@ impl Prefs {
     fn apply_options_to(&self, page: &mut DriversPage) {
         page.check_on_open = self.check_on_open;
         page.old_years = self.maker_years.max(1);
+        page.virustotal = self.virustotal;
     }
 }
 
@@ -190,6 +200,8 @@ impl Drivers {
                 prefs.kernel_filter = page.drv_ui.kernel_filter;
             }
             prefs.show_disconnected = page.drv_ui.show_disconnected;
+            // The consent is given on the page; the option is the user's in Settings.
+            prefs.virustotal_consent = page.virustotal_consent;
         }
         prefs
     }
@@ -245,6 +257,16 @@ impl Addon for Drivers {
         let mut changed = setting_switch(ui, "Check Windows Update when the page opens", None, &mut self.prefs.check_on_open);
         changed |= setting_number(ui, "Suggest checking the maker's site for drivers older than", None, &mut self.prefs.maker_years, 1..=20, "years");
         if let (true, Some(page)) = (changed, &mut self.page) {
+            self.prefs.apply_options_to(page);
+        }
+        group_heading(ui, "Kernel modules");
+        let looked = setting_switch(
+            ui,
+            "Offer \"Look up on VirusTotal\"",
+            Some("Sends only the file's SHA-256 to VirusTotal after you agree once; the file is not uploaded"),
+            &mut self.prefs.virustotal,
+        );
+        if let (true, Some(page)) = (looked, &mut self.page) {
             self.prefs.apply_options_to(page);
         }
         group_heading(ui, "Summary");
@@ -601,6 +623,127 @@ mod settings_tests {
 
         addon.load_settings(&serde_json::Value::Null);
         assert_eq!(addon.summary_lines(), None, "the tile is off by default");
+    }
+
+    fn on(ctx: &AddonContext) -> Drivers {
+        let mut addon = Drivers::with_no_drivers();
+        addon.start(ctx);
+        addon
+    }
+
+    fn hub(addon: &mut Drivers) -> Hub {
+        addon.page().unwrap().drv.clone()
+    }
+
+    /// A file holding "abc" and its SHA-256.
+    const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    fn abc_file(name: &str) -> String {
+        let path = std::env::temp_dir().join(format!("upcm-t34-{}-{name}", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    /// Hashes the file for `purpose` and lets the page act on the result.
+    fn hashed(addon: &mut Drivers, path: &str, purpose: engine::HashFor) -> Vec<Action> {
+        let page = addon.page().unwrap();
+        page.drv.hash_file(path.to_string(), purpose);
+        until("the file is hashed", || page.drv.lock().hashed.is_some());
+        let mut actions = Vec::new();
+        page.settle_hash(&mut actions);
+        actions
+    }
+
+    #[test]
+    fn virustotal_url_is_built_only_from_a_valid_hash() {
+        assert_eq!(engine::virustotal_url(ABC).as_deref(), Some(&format!("https://www.virustotal.com/gui/file/{ABC}")[..]));
+        assert_eq!(engine::virustotal_url(&ABC.to_uppercase()).as_deref(), Some(&format!("https://www.virustotal.com/gui/file/{ABC}")[..]));
+        assert_eq!(engine::virustotal_url("abc"), None);
+        assert_eq!(engine::virustotal_url(&format!("{}/x", &ABC[..60])), None);
+    }
+
+    #[test]
+    fn copy_sha256_copies_the_hash_of_the_file() {
+        let (ctx, runner) = AddonContext::recording();
+        let mut addon = on(&ctx);
+        let actions = hashed(&mut addon, &abc_file("copy"), engine::HashFor::Copy);
+        assert!(actions.contains(&Action::Copy(ABC.into())), "{actions:?}");
+        assert!(runner.launches().is_empty(), "nothing is opened or sent");
+    }
+
+    #[test]
+    fn a_lookup_with_the_option_off_opens_nothing() {
+        let (ctx, runner) = AddonContext::recording();
+        let mut addon = on(&ctx);
+        hashed(&mut addon, &abc_file("off"), engine::HashFor::VirusTotal);
+        assert!(addon.page().unwrap().drv_ui.confirm_virustotal.is_none(), "no consent is asked either");
+        assert!(runner.launches().is_empty());
+    }
+
+    #[test]
+    fn the_first_lookup_asks_and_opens_only_after_consent() {
+        let (ctx, runner) = AddonContext::recording();
+        let mut addon = on(&ctx);
+        addon.load_settings(&serde_json::json!({ "virusTotal": true }));
+        hashed(&mut addon, &abc_file("first"), engine::HashFor::VirusTotal);
+        assert_eq!(addon.page().unwrap().drv_ui.confirm_virustotal.as_deref(), Some(ABC), "asked first");
+        assert!(runner.launches().is_empty(), "nothing is opened before the user agrees");
+    }
+
+    #[test]
+    fn a_declined_consent_opens_nothing_and_is_not_remembered() {
+        let (ctx, runner) = AddonContext::recording();
+        let mut addon = on(&ctx);
+        addon.load_settings(&serde_json::json!({ "virusTotal": true }));
+        hashed(&mut addon, &abc_file("declined"), engine::HashFor::VirusTotal);
+        addon.page().unwrap().drv_ui.confirm_virustotal = None; // Cancel
+        assert!(runner.launches().is_empty());
+        assert!(addon.settings().get("virusTotalConsent").is_none());
+    }
+
+    #[test]
+    fn after_consent_the_lookup_opens_the_page_of_the_hash_and_remembers_it() {
+        let (ctx, runner) = AddonContext::recording();
+        let mut addon = on(&ctx);
+        addon.load_settings(&serde_json::json!({ "virusTotal": true }));
+        hashed(&mut addon, &abc_file("agreed"), engine::HashFor::VirusTotal);
+        let page = addon.page().unwrap();
+        let sha = page.drv_ui.confirm_virustotal.take().unwrap();
+        page.virustotal_consent = true; // Send SHA-256
+        page.look_up_on_virustotal(sha);
+        let url = format!("https://www.virustotal.com/gui/file/{ABC}");
+        assert_eq!(runner.launches(), vec![Launch::Open(url.clone())]);
+        assert_eq!(addon.settings()["virusTotalConsent"], true);
+
+        // Asked once: the next lookup opens at once.
+        hashed(&mut addon, &abc_file("again"), engine::HashFor::VirusTotal);
+        assert_eq!(runner.launches(), vec![Launch::Open(url.clone()), Launch::Open(url)]);
+    }
+
+    #[test]
+    fn the_option_and_the_consent_are_saved_and_restored() {
+        let mut addon = Drivers::with_no_drivers();
+        assert_eq!(addon.settings(), serde_json::Value::Null, "off by default, nothing saved");
+        addon.load_settings(&serde_json::json!({ "virusTotal": true, "virusTotalConsent": true }));
+        let saved = addon.settings();
+        assert_eq!((saved["virusTotal"].clone(), saved["virusTotalConsent"].clone()), (true.into(), true.into()));
+        let (ctx, _) = AddonContext::recording();
+        let mut again = Drivers::with_no_drivers();
+        again.load_settings(&saved);
+        again.start(&ctx);
+        let page = again.page().unwrap();
+        assert!(page.virustotal && page.virustotal_consent);
+    }
+
+    #[test]
+    fn hashing_after_the_add_on_was_turned_off_publishes_nothing() {
+        let (ctx, _) = AddonContext::recording();
+        let mut addon = on(&ctx);
+        let h = hub(&mut addon);
+        addon.stop();
+        h.hash_file(abc_file("stopped"), engine::HashFor::Copy);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(h.lock().hashed.is_none());
     }
 }
 

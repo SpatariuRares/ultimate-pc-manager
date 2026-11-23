@@ -92,6 +92,13 @@ It is the last add-on in the migration order proposed by the add-ons document.
 - **Kernel memory**: the sum of the image sizes of the loaded rows, each image file counted once (two services that point to the same file add its size once). When the list of loaded modules could not be read, the tile says "an unknown amount" and a note says why; it is never shown as 0.
 - **Matching modules**: a driver's image is matched to the loaded module by full path (case-insensitive, `\SystemRoot` and `\??\` spelled out); by file name alone only when the image path has no folder and one module has that name.
 
+#### VirusTotal and SHA-256 (spec #11, #34)
+
+- "Copy SHA-256" on a kernel module hashes its file on this PC and copies the hash.
+- "Look up on VirusTotal" opens `https://www.virustotal.com/gui/file/<sha256>` in the browser: no API key, nothing uploaded; only the hash leaves the PC.
+- It is off by default (Settings, Add-ons, Drivers, "Offer \"Look up on VirusTotal\""). The first lookup asks "Send this file's SHA-256 to VirusTotal? The file itself is not uploaded."; the option and the consent are saved (`virusTotal`, `virusTotalConsent`), and cancelling saves nothing.
+- Both sit under "Advanced" in the kernel module menu and side panel. The hash is computed in the background and dropped if the add-on is turned off meanwhile.
+
 ### Other actions (More actions)
 45. As a user, I want "Install from an INF file…" to add a driver package and install it on compatible devices (with UAC), with the outcomes "Driver package installed.", "The package was added, but no device needed it…", "Done. Restart Windows to finish.", so that I can install a driver downloaded from the manufacturer. *(our addition; exists, to be verified end to end)*
 46. As a user, I want "Scan for hardware changes" (with UAC) and the outcome "Hardware scan finished.", so that Windows detects a device I just connected. *(our addition; exists, to be verified end to end)*

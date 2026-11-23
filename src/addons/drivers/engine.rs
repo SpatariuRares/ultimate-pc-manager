@@ -447,6 +447,32 @@ pub struct State {
     /// The last read of the security settings; `None` until the first
     /// listing has read them.
     pub security: Option<SecurityReading>,
+    /// The SHA-256 of a kernel module's file, waiting for the page to take it.
+    pub hashed: Option<Hashed>,
+}
+
+/// What a file's SHA-256 is wanted for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HashFor {
+    /// "Copy SHA-256".
+    Copy,
+    /// "Look up on VirusTotal".
+    VirusTotal,
+}
+
+/// The outcome of hashing a file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hashed {
+    pub purpose: HashFor,
+    /// The lowercase hex SHA-256, or why the file could not be read.
+    pub result: Result<String, String>,
+}
+
+/// The VirusTotal page of a file, by its SHA-256 (64 hex digits). Only the
+/// hash is part of the address: the file never leaves the PC.
+pub fn virustotal_url(sha256: &str) -> Option<String> {
+    let valid = sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit());
+    valid.then(|| format!("https://www.virustotal.com/gui/file/{}", sha256.to_ascii_lowercase()))
 }
 
 #[derive(Clone)]
@@ -624,6 +650,23 @@ impl Hub {
     /// Stops (unloads) a kernel driver service (sc stop).
     pub fn unload(&self, service: String) {
         self.pnputil("stop", service, false, "Asking the driver to unload \u{2014} confirm the Windows prompt\u{2026}");
+    }
+
+    /// Reads the file at `path` and hashes it with SHA-256 (no network, no
+    /// administrator rights). The outcome lands in [`State::hashed`]; it is
+    /// dropped when the add-on is turned off meanwhile.
+    pub fn hash_file(&self, path: String, purpose: HashFor) {
+        self.spawn(Some("Computing the SHA-256\u{2026}".into()), false, move |hub, run| {
+            let result = std::fs::read(&path).map(|bytes| crate::platform::sha256_hex(&bytes)).map_err(|e| format!("Could not read {path}: {e}"));
+            let Some(mut st) = hub.live() else { return };
+            run.release(&mut st);
+            st.hashed = Some(Hashed { purpose, result });
+        });
+    }
+
+    /// The finished hash, once: the page takes it and acts on it.
+    pub fn take_hashed(&self) -> Option<Hashed> {
+        self.lock().hashed.take()
     }
 
     /// Installing a package is uninterruptible; scanning and unloading are

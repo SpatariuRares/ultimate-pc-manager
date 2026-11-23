@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 #[cfg(windows)]
 mod elevated;
+pub use elevated::sha256_hex;
 pub mod install_queue;
 pub mod series;
 /// Windows notifications (toasts) through the notification area.

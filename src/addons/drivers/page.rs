@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use egui::{vec2, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, Ui};
 
-use super::engine::{self as drivers, DeviceDriver, DriverUpdate, Hub, KernelDriver, KernelFigures, KernelScope};
+use super::engine::{self as drivers, DeviceDriver, DriverUpdate, HashFor, Hub, KernelDriver, KernelFigures, KernelScope};
+use super::engine::virustotal_url;
 use crate::addons::plural;
 use crate::platform::{csv_field, csv_text_field, Action, AddonContext};
 use crate::theme;
@@ -41,6 +42,9 @@ pub struct DriversUi {
     pub selected_device: Option<String>,
     pub selected_kernel: Option<String>,
     pub confirm_unload: Option<String>,
+    /// The SHA-256 of a file waiting for the first-use consent to be sent
+    /// to VirusTotal.
+    pub confirm_virustotal: Option<String>,
     /// An offered driver that is not newer, waiting for "Install anyway".
     pub confirm_older: Option<DriverUpdate>,
     /// Bring the selected row into view on the next frame.
@@ -470,6 +474,10 @@ pub struct DriversPage {
     pub check_on_open: bool,
     /// Third-party drivers this many years old get "check the maker".
     pub old_years: i64,
+    /// "Look up on VirusTotal" is offered (off by default).
+    pub virustotal: bool,
+    /// The user agreed to send a file's SHA-256 to VirusTotal.
+    pub virustotal_consent: bool,
     /// The data worked out from the lists and the filter, reused until
     /// either changes.
     derived: Option<Arc<Derived>>,
@@ -486,6 +494,8 @@ impl DriversPage {
             said: Vec::new(),
             check_on_open: false,
             old_years: DEFAULT_OLD_YEARS,
+            virustotal: false,
+            virustotal_consent: false,
             derived: None,
             derived_builds: 0,
         }
@@ -544,10 +554,50 @@ impl DriversPage {
         }
     }
 
+    /// Starts hashing the file of a kernel module; a missing path or file is
+    /// told at once.
+    fn hash_module(&mut self, path: &str, purpose: HashFor, actions: &mut Vec<Action>) {
+        match reveal(path, |p| p.exists()) {
+            Action::Say(why) => actions.push(Action::Say(why)),
+            _ => self.drv.hash_file(path.to_string(), purpose),
+        }
+    }
+
+    /// Acts on a finished hash: copies it, or goes on to the VirusTotal lookup.
+    pub fn settle_hash(&mut self, actions: &mut Vec<Action>) {
+        let Some(hashed) = self.drv.take_hashed() else { return };
+        match (hashed.result, hashed.purpose) {
+            (Err(why), _) => actions.push(Action::Say(why)),
+            (Ok(sha), HashFor::Copy) => {
+                actions.push(Action::Copy(sha));
+                actions.push(Action::Say("SHA-256 copied.".into()));
+            }
+            (Ok(sha), HashFor::VirusTotal) => self.look_up_on_virustotal(sha),
+        }
+    }
+
+    /// Opens the VirusTotal page of this SHA-256 in the browser: nothing
+    /// when the option is off, and the first time only once the user agreed
+    /// to send the hash.
+    pub fn look_up_on_virustotal(&mut self, sha: String) {
+        if !self.virustotal {
+            return;
+        }
+        if !self.virustotal_consent {
+            self.drv_ui.confirm_virustotal = Some(sha);
+            return;
+        }
+        let Some(url) = virustotal_url(&sha) else { return };
+        if let Err(e) = self.context.open(&url) {
+            self.say(e);
+        }
+    }
+
     /// Draws the page below the app's header (title, Refresh).
     pub fn ui(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let th = theme::of_ui(ui);
         self.opened();
+        self.settle_hash(actions);
         let st = self.drv.lock();
         let devices = st.devices.clone();
         let kernel = st.kernel.clone();
@@ -1115,6 +1165,7 @@ impl DriversPage {
         ui.painter().rect_filled(Rect::from_min_size(Pos2::new(hr.left(), hr.bottom() - 1.0), vec2(w, 1.0)), CornerRadius::ZERO, th.line);
         let mut clicked = None;
         let (mut open_manager, mut unload) = (false, None);
+        let (virustotal, mut hash) = (self.virustotal, None);
         egui::ScrollArea::vertical().id_salt("drv-kernel-list").auto_shrink([false, false]).show_rows(ui, 28.0, rows.len(), |ui, range| {
             for &i in &rows[range] {
                 let d = &kernel[i];
@@ -1164,6 +1215,14 @@ impl DriversPage {
                         actions.push(Action::Copy(service.clone()));
                         ui.close();
                     }
+                    if ui.button("Copy SHA-256").clicked() {
+                        hash = Some((path.clone(), HashFor::Copy));
+                        ui.close();
+                    }
+                    if virustotal && ui.button("Look up on VirusTotal").clicked() {
+                        hash = Some((path.clone(), HashFor::VirusTotal));
+                        ui.close();
+                    }
                     if unloadable && ui.button("Unload\u{2026}").clicked() {
                         unload = Some(service.clone());
                         ui.close();
@@ -1180,6 +1239,9 @@ impl DriversPage {
         if unload.is_some() {
             self.drv_ui.confirm_unload = unload;
         }
+        if let Some((path, purpose)) = hash {
+            self.hash_module(&path, purpose, actions);
+        }
     }
 
     fn kernel_side(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, kernel: &[KernelDriver], admin: bool, idle: bool) {
@@ -1188,6 +1250,8 @@ impl DriversPage {
             empty_panel(ui, KERNEL_EMPTY);
             return;
         }
+        let (virustotal, mut hash) = (self.virustotal, None);
+        let path = chosen.map(|d| d.path.clone());
         parts::SidePanel::new("drv-side").show(ui, chosen, |ui, d| {
             let th = theme::of_ui(ui);
             let (offered, _) = d.unload_note(admin);
@@ -1216,18 +1280,49 @@ impl DriversPage {
                 if parts::outline_button(ui, "Copy details", true).clicked() {
                     actions.push(Action::Copy(kernel_details(d, admin)));
                 }
+                ui.label(RichText::new("Advanced").size(11.5).color(th.faint));
+                if parts::outline_button(ui, "Copy SHA-256", true).clicked() {
+                    hash = Some(HashFor::Copy);
+                }
+                if virustotal && parts::outline_button(ui, "Look up on VirusTotal", true).clicked() {
+                    hash = Some(HashFor::VirusTotal);
+                }
                 if offered {
-                    ui.label(RichText::new("Advanced").size(11.5).color(th.faint));
                     if parts::admin_button(ui, "Unload\u{2026}", false, idle).clicked() {
                         self.drv_ui.confirm_unload = Some(d.service.clone());
                     }
                 }
             });
         });
+        if let (Some(purpose), Some(path)) = (hash, path) {
+            self.hash_module(&path, purpose, actions);
+        }
     }
 
     fn drivers_dialogs(&mut self, ui: &mut Ui) {
         let th = theme::of_ui(ui);
+        if let Some(sha) = self.drv_ui.confirm_virustotal.clone() {
+            let mut decided = None;
+            egui::Window::new("Look up on VirusTotal").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+                ui.label("Send this file's SHA-256 to VirusTotal? The file itself is not uploaded.");
+                ui.label(RichText::new("Asked once. Off by default in Settings \u{203a} Add-ons \u{203a} Drivers.").color(th.label));
+                ui.horizontal(|ui| {
+                    if ui.button("Send SHA-256").clicked() {
+                        decided = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decided = Some(false);
+                    }
+                });
+            });
+            if decided == Some(true) {
+                self.virustotal_consent = true;
+                self.look_up_on_virustotal(sha);
+            }
+            if decided.is_some() {
+                self.drv_ui.confirm_virustotal = None;
+            }
+        }
         if let Some(service) = self.drv_ui.confirm_unload.clone() {
             let mut decided = None;
             egui::Window::new("Unload this driver?").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
@@ -1911,7 +2006,7 @@ use super::tests::{gpu, page_and_runner, page_with};
         let labels: Vec<&str> = items.iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(
             labels,
-            ["Open file location", "Open Device Manager", "Copy details", "Advanced", "Copy service name", "Unload\u{2026}"],
+            ["Open file location", "Open Device Manager", "Copy details", "Advanced", "Copy service name", "Copy SHA-256", "Unload\u{2026}"],
             "Unload sits among the advanced actions, under their caption"
         );
         let gap = |a: usize, b: usize| items[b].0 - items[a].0;
@@ -1938,6 +2033,39 @@ use super::tests::{gpu, page_and_runner, page_with};
         let y = items.iter().find(|(_, t)| t == "Open Device Manager").unwrap().0;
         screen.click(&mut page, Pos2::new(row.x + 10.0, y + 4.0), egui::PointerButton::Primary);
         assert_eq!(runner.launches(), vec![crate::platform::Launch::Open("devmgmt.msc".into())]);
+    }
+
+    #[test]
+    fn the_menu_offers_the_virustotal_lookup_only_when_the_option_is_on() {
+        let (mut page, mut screen) = (page_with(vec![], vec![module(r"C:\x\acme.sys")]), Screen::new());
+        let (_, items) = opened_menu(&mut screen, &mut page);
+        assert!(!items.iter().any(|(_, t)| t.contains("VirusTotal")), "{items:?}");
+
+        let (mut page, mut screen) = (page_with(vec![], vec![module(r"C:\x\acme.sys")]), Screen::new());
+        page.virustotal = true;
+        let (_, items) = opened_menu(&mut screen, &mut page);
+        let labels: Vec<&str> = items.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(labels[4..], ["Copy service name", "Copy SHA-256", "Look up on VirusTotal", "Unload\u{2026}"]);
+    }
+
+    #[test]
+    fn copy_sha256_from_the_menu_says_when_the_file_is_missing() {
+        let (mut page, mut screen) = (page_with(vec![], vec![module(r"C:\no\such\acme.sys")]), Screen::new());
+        let (row, items) = opened_menu(&mut screen, &mut page);
+        let y = items.iter().find(|(_, t)| t == "Copy SHA-256").unwrap().0;
+        screen.click(&mut page, Pos2::new(row.x + 10.0, y + 4.0), egui::PointerButton::Primary);
+        assert_eq!(screen.actions, vec![Action::Say(r"The file C:\no\such\acme.sys was not found.".into())]);
+    }
+
+    #[test]
+    fn the_consent_dialog_asks_the_question_and_sends_nothing_before_the_answer() {
+        let (mut page, runner) = page_and_runner(vec![], vec![module(r"C:\x\acme.sys")]);
+        page.virustotal = true;
+        page.drv_ui.confirm_virustotal = Some("a".repeat(64));
+        let shown = Screen::new().settle(&mut page).into_iter().map(|(_, t)| t).collect::<Vec<_>>().join("\n");
+        assert!(shown.contains("Send this file's SHA-256 to VirusTotal? The file itself is not uploaded."), "{shown}");
+        assert!(shown.contains("Send SHA-256") && shown.contains("Cancel"), "{shown}");
+        assert!(runner.launches().is_empty());
     }
 
     #[test]
