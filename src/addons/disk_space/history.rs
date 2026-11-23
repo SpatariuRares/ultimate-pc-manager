@@ -205,10 +205,10 @@ pub const DEFAULT_FOLDER: &str = "%APPDATA%\\UltimatePCManager\\DiskScans";
 
 /// The default History folder as the setting shows it.
 pub fn default_folder() -> String {
-    if cfg!(windows) {
-        return DEFAULT_FOLDER.into();
-    }
-    Store::app().map_or_else(|_| DEFAULT_FOLDER.into(), |s| s.dir.display().to_string())
+    #[cfg(windows)]
+    return DEFAULT_FOLDER.into();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    return Store::app().map_or_else(|_| DEFAULT_FOLDER.into(), |s| s.dir.display().to_string());
 }
 /// History's caption while it is empty.
 pub const EMPTY: &str = "Finished scans are saved here.";

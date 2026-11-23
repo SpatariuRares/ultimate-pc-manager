@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+compile_error!("supported systems: Windows, Linux, macOS");
+
 mod action_elevation;
 mod app;
 mod app_folders;

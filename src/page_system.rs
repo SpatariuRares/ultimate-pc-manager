@@ -21,8 +21,8 @@ pub struct SystemInfoPage {
 fn system_extra() -> Vec<(&'static str, String)> {
     #[cfg(target_os = "linux")]
     return crate::linux_facts::system_fields();
-    #[cfg(not(target_os = "linux"))]
-    Vec::new()
+    #[cfg(any(windows, target_os = "macos"))]
+    return Vec::new();
 }
 
 /// `fields` with each of `extra` replacing the field of its name, else appended.

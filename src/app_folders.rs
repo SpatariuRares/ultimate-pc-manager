@@ -61,13 +61,12 @@ pub enum System {
 impl System {
     /// The system the app runs on.
     pub const fn current() -> System {
-        if cfg!(windows) {
-            System::Windows
-        } else if cfg!(target_os = "macos") {
-            System::MacOs
-        } else {
-            System::Linux
-        }
+        #[cfg(windows)]
+        return System::Windows;
+        #[cfg(target_os = "linux")]
+        return System::Linux;
+        #[cfg(target_os = "macos")]
+        return System::MacOs;
     }
 }
 

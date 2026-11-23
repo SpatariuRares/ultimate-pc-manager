@@ -270,7 +270,7 @@ fn installed_fonts(read: impl Fn(&str) -> Option<Vec<u8>>) -> egui::FontDefiniti
 
 /// The bundled body faces (regular, semibold); only off Windows, so the
 /// Windows binary does not carry them.
-#[cfg(not(windows))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn bundled_body() -> Option<(Vec<u8>, Vec<u8>)> {
     Some((
         include_bytes!("../assets/Selawik-Regular.ttf").to_vec(),
@@ -772,7 +772,10 @@ mod tests {
     #[test]
     fn selawik_is_the_body_face_off_windows_and_segoe_on_windows() {
         let f = installed_fonts(|_| Some(vec![1]));
-        let (body, semi) = if cfg!(windows) { ("segoe", "segoe-semibold") } else { ("selawik", "selawik-semibold") };
+        #[cfg(windows)]
+        let (body, semi) = ("segoe", "segoe-semibold");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let (body, semi) = ("selawik", "selawik-semibold");
         assert_eq!(family(&f, FontFamily::Proportional)[0], body);
         assert_eq!(family(&f, semibold())[0], semi);
         assert_eq!(family(&f, display())[0], "michroma");
@@ -785,7 +788,7 @@ mod tests {
         assert_eq!(family(&f, semibold())[0], "selawik-semibold");
     }
 
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn the_bundled_selawik_files_are_truetype_fonts() {
         let (regular, semibold) = bundled_body().expect("bundled off Windows");
