@@ -92,12 +92,21 @@ fn reason(feature: Feature) -> Option<&'static str> {
 }
 
 /// Whether this system has the feature at all.
-pub(crate) fn system_has(_feature: Feature) -> bool {
+pub(crate) fn system_has(feature: Feature) -> bool {
     #[cfg(windows)]
-    return true;
-    // No current feature has a Linux or macOS implementation yet.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    return false;
+    return {
+        let _ = feature;
+        true
+    };
+    // Linux: signals, nice values and affinity work through kill, renice and taskset.
+    #[cfg(target_os = "linux")]
+    return matches!(feature, Feature::ProcessControl);
+    // No current feature has a macOS implementation yet.
+    #[cfg(target_os = "macos")]
+    return {
+        let _ = feature;
+        false
+    };
 }
 
 /// Is the feature available on this system.
@@ -182,11 +191,19 @@ mod tests {
         assert_eq!(unavailable_features(), Vec::<Feature>::new());
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[test]
-    fn no_current_feature_is_in_the_system_off_windows() {
+    fn no_current_feature_is_in_the_system_on_macos() {
         for &feature in Feature::ALL {
             assert!(!system_has(feature), "{feature:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_only_process_control_is_in_the_system_so_far() {
+        for &feature in Feature::ALL {
+            assert_eq!(system_has(feature), feature == Feature::ProcessControl, "{feature:?}");
         }
     }
 
