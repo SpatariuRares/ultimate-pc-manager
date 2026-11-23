@@ -76,7 +76,14 @@ pub fn bootstrap(job: &Job) -> Result<String, String> {
         }
         named.push_str(&format!(";{k}={}", ps_quote(v)));
     }
-    let caller_rights = if job.caller_full_control { "FullControl" } else { "ReadAndExecute, Delete, DeleteSubdirectoriesAndFiles" };
+    // The caller may read but never delete, rename or write: not the folder
+    // (rule for this folder only) and not the files in it (inherit-only).
+    let rule = |rights: &str, inherit: &str, prop: &str| format!("$sec.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($me,'{rights}','{inherit}','{prop}','Allow')))");
+    let caller_rules = if job.caller_full_control {
+        rule("FullControl", "ContainerInherit,ObjectInherit", "None")
+    } else {
+        format!("{}\n{}", rule("ReadAndExecute", "None", "None"), rule("ReadAndExecute", "ObjectInherit", "InheritOnly"))
+    };
     Ok(format!(
         r#"$ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
@@ -88,7 +95,14 @@ $h=([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-','').ToLowerI
 if($h -ne {hash}){{ exit {EXIT_SCRIPT_CHANGED} }}
 $text=[Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xFEFF)
 $dir={dir}
+$sidT=[Security.Principal.SecurityIdentifier]
 if(Test-Path -LiteralPath $dir){{ exit {EXIT_FOLDER_UNTRUSTED} }}
+# The caller cannot delete its result folders (that is what keeps them from
+# being replaced), so old ones are swept here: only real folders owned by
+# Administrators or SYSTEM, never a link or a folder someone else made.
+foreach($old in @(Get-ChildItem -LiteralPath (Split-Path $dir) -Directory -Filter 'upcm-*' -Force -ErrorAction SilentlyContinue)){{
+  try{{ if($old.LastWriteTime -lt (Get-Date).AddMinutes(-30) -and -not ($old.Attributes -band [IO.FileAttributes]::ReparsePoint) -and (@('S-1-5-32-544','S-1-5-18') -contains $old.GetAccessControl().GetOwner($sidT).Value)){{ Remove-Item -LiteralPath $old.FullName -Recurse -Force }} }}catch{{}}
+}}
 $sec=New-Object Security.AccessControl.DirectorySecurity
 $sec.SetAccessRuleProtection($true,$false)
 foreach($sid in 'S-1-5-18','S-1-5-32-544'){{
@@ -96,12 +110,11 @@ foreach($sid in 'S-1-5-18','S-1-5-32-544'){{
   $sec.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($id,'FullControl','ContainerInherit,ObjectInherit','None','Allow')))
 }}
 $me=New-Object Security.Principal.NTAccount({domain},{user})
-$sec.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($me,'{rights}','ContainerInherit,ObjectInherit','None','Allow')))
+{caller_rules}
 [void][IO.Directory]::CreateDirectory($dir,$sec)
 # CreateDirectory succeeds silently on a folder somebody else made first (and
 # then applies no ACL), so the folder is trusted only after its owner, ACL,
 # type and emptiness are checked.
-$sidT=[Security.Principal.SecurityIdentifier]
 $meSid=$me.Translate($sidT).Value
 $owners=@('S-1-5-32-544','S-1-5-18'){test_owner}
 $d=New-Object IO.DirectoryInfo($dir)
@@ -110,7 +123,7 @@ $ok=($owners -contains $acl.GetOwner($sidT).Value) -and $acl.AreAccessRulesProte
 foreach($r in $acl.GetAccessRules($true,$true,$sidT)){{
   $who=$r.IdentityReference.Value
   if($r.AccessControlType -ne 'Allow' -or @('S-1-5-18','S-1-5-32-544',$meSid) -notcontains $who){{ $ok=$false }}
-  if($who -eq $meSid -and -not {full} -and ([int]$r.FileSystemRights -band 0xC0116) -ne 0){{ $ok=$false }}
+  if($who -eq $meSid -and -not {full} -and ([int]$r.FileSystemRights -band 0xD0156) -ne 0){{ $ok=$false }}
 }}
 if(-not $ok){{ exit {EXIT_FOLDER_UNTRUSTED} }}
 $out=Join-Path $dir 'result.json'
@@ -120,9 +133,12 @@ $ErrorActionPreference='Continue'
 & $sb @a
 $ErrorActionPreference='Stop'
 if(-not (Test-Path -LiteralPath $out)){{ exit 5 }}
+$f=New-Object IO.FileInfo($out)
+if(($owners -notcontains $f.GetAccessControl().GetOwner($sidT).Value) -or ($f.Attributes -band [IO.FileAttributes]::ReparsePoint)){{ exit {EXIT_FOLDER_UNTRUSTED} }}
 $raw=[IO.File]::ReadAllText($out).TrimStart([char]0xFEFF)
 $envl='{{"token":"'+{token}+'","result":'+$raw+'}}'
 [IO.File]::WriteAllText((Join-Path $dir 'envelope.json'),$envl,(New-Object Text.UTF8Encoding $false))
+Remove-Item -LiteralPath $out -Force
 }} catch {{ exit 1 }}
 "#,
         script = ps_quote(&job.script_file.to_string_lossy()),
@@ -130,7 +146,7 @@ $envl='{{"token":"'+{token}+'","result":'+$raw+'}}'
         dir = ps_quote(&job.result_dir.to_string_lossy()),
         domain = ps_quote(job.caller.0),
         user = ps_quote(job.caller.1),
-        rights = caller_rights,
+        caller_rules = caller_rules,
         test_owner = if job.caller_full_control { "+@($meSid)" } else { "" },
         full = if job.caller_full_control { "$true" } else { "$false" },
         named = named,
@@ -296,7 +312,8 @@ mod tests {
         let job = Job { script_file: Path::new("C:\\x\\job.ps1"), script_sha256: "abc123", result_dir: Path::new("C:\\w\\upcm-1"), token: "TOK", args: &[("Ids", "a'b")], caller: ("PC", "me"), caller_full_control: false };
         let text = bootstrap(&job).unwrap();
         assert!(text.contains("'abc123'") && text.contains("'TOK'") && text.contains("Ids='a''b'"));
-        assert!(text.contains("'ReadAndExecute, Delete, DeleteSubdirectoriesAndFiles'"));
+        assert!(text.contains("'ReadAndExecute','None','None'") && text.contains("'ReadAndExecute','ObjectInherit','InheritOnly'"));
+        assert!(!text.contains("Delete"), "the caller is granted no delete right");
     }
 
     // The real PowerShell, not elevated: the bootstrap's own checks.
@@ -395,6 +412,24 @@ mod tests {
         let d = scratch("owner");
         let code = direct(&d, &d.join("upcm-fresh"), false);
         assert!(code == EXIT_FOLDER_UNTRUSTED || code == 0, "got {code}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_caller_holds_no_delete_write_or_permission_right_on_the_result_folder() {
+        // The folder is left behind by a refused (or finished) job; read its
+        // real ACL back. A caller that can delete or rename it could replace
+        // it and forge the result.
+        let d = scratch("acl");
+        let dir = d.join("upcm-acl");
+        direct(&d, &dir, false);
+        let script = format!("$a=(New-Object IO.DirectoryInfo '{}').GetAccessControl(); foreach($r in $a.GetAccessRules($true,$true,[Security.Principal.NTAccount])){{ if($r.IdentityReference.Value -notmatch 'SYSTEM|Administrators'){{ [int]$r.FileSystemRights }} }}", dir.display());
+        let out = std::process::Command::new("powershell.exe").args(["-NoProfile", "-Command", &script]).output().unwrap();
+        let rights: Vec<u32> = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect();
+        assert!(!rights.is_empty(), "the caller has a read rule: {}", String::from_utf8_lossy(&out.stderr));
+        for r in rights {
+            assert_eq!(r & 0xD0156, 0, "no delete, write, delete-child or permission rights (got {r:#x})");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

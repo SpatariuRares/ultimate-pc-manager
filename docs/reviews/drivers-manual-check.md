@@ -48,7 +48,7 @@ The automatic tests run the bootstrap with a real, non-elevated PowerShell. Thes
     - Expected: the action fails with "The administrator script was changed before it ran, so it was not run."; `C:\Users\Public\swapped.txt` does not exist.
     - Folder race (optional): while the prompt is open, run in a normal PowerShell a loop that keeps creating `%windir%\Temp\upcm-*` folders. The job must either run normally or fail with "The protected result folder could not be trusted, so the script was not run."; it must never show a result from a folder you created.
 13. Result protection: during a long elevated action (for example Install from an INF file), from a normal (non-elevated) PowerShell run `Get-ChildItem $env:windir\Temp\upcm-*` and try `New-Item $env:windir\Temp\upcm-*\envelope.json`.
-    - Expected: the folder can be listed or read, but creating or changing a file in it is denied (Access denied).
+    - Expected: the folder can be listed or read, but creating, changing, deleting or renaming a file or the folder itself is denied (Access denied). Try `Remove-Item $env:windir\Temp\upcm-* -Recurse` and `Rename-Item` too.
 14. Result forgery: a normal process cannot create `envelope.json` there (denied); a result with a wrong or missing token is shown as "The elevated result was rejected: it does not carry this job's token." (covered by an automatic test).
 15. Close UAC with **No**.
-    - Expected: still "Cancelled at the Windows prompt: nothing was changed.". After every step above, no `job-*.ps1` is left in the jobs folder and no `upcm-*` folder in `%windir%\Temp`.
+    - Expected: still "Cancelled at the Windows prompt: nothing was changed.". After every step above, no `job-*.ps1` is left in the jobs folder. A finished job leaves its `upcm-*` folder in `%windir%\Temp` (only the caller-readable `envelope.json`, because the caller cannot delete it); the next elevated job removes folders older than 30 minutes.
