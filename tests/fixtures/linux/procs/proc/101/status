@@ -1,0 +1,7 @@
+Name:	child
+State:	S (sleeping)
+Pid:	101
+PPid:	100
+Uid:	1000	1000	1000	1000
+Cpus_allowed:	f
+Cpus_allowed_list:	0-3

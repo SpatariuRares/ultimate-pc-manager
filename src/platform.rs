@@ -46,7 +46,7 @@ pub enum Action {
     OpenLocation(String),
     SearchOnline(String),
     Copy(String),
-    Service(String, &'static str),
+    Service(crate::system_lists::ServiceKey, &'static str),
     /// Enable or disable a startup entry, named by its stable id.
     Startup(String, bool),
     /// A short message in the status bar.

@@ -1,0 +1,6 @@
+processor	: 0
+vendor_id	: GenuineIntel
+model name	: Test Hybrid CPU 12th Gen
+cpu MHz		: 3000.000
+flags		: fpu vme sse sse2 vmx
+

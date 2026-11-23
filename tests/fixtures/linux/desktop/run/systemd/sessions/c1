@@ -1,0 +1,9 @@
+UID=120
+USER=gdm
+ACTIVE=1
+STATE=active
+TYPE=wayland
+CLASS=greeter
+SEAT=seat0
+TTY=tty1
+REMOTE=0

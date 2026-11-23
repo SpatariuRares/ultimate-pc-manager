@@ -10,6 +10,9 @@ mod system;
 mod system_info;
 mod fs_root;
 mod linux_facts;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod linux_disks;
+mod user_sessions;
 mod availability;
 mod core_page;
 mod page_summary;

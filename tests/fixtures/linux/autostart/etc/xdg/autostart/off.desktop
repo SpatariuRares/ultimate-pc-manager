@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Off By Default
+Exec=off-by-default
+X-GNOME-Autostart-enabled=false

@@ -44,7 +44,9 @@ features! {
     Elevation,
     /// Desktop notifications.
     Notifications,
-    /// Listing and controlling services.
+    /// Listing the services the system runs.
+    ServiceListing,
+    /// Starting, stopping and restarting services, and turning them on or off at boot.
     ServiceControl,
     /// Priority, affinity, suspend and efficiency of processes.
     ProcessControl,
@@ -98,9 +100,20 @@ pub(crate) fn system_has(feature: Feature) -> bool {
         let _ = feature;
         true
     };
-    // Linux reads these from /proc (open files, the program's ELF header).
+    // Linux: signals, nice values and affinity work through kill, renice and taskset;
+    // the startup entries are read from the XDG autostart folders; the service
+    // list and its control come from its sources (they say when no service manager is there);
+    // the open-file count and the architecture are read from /proc (the program's ELF header).
     #[cfg(target_os = "linux")]
-    return matches!(feature, Feature::ProcessHandleCounts | Feature::ProcessArchitecture);
+    return matches!(
+        feature,
+        Feature::ProcessControl
+            | Feature::StartupEntries
+            | Feature::ServiceListing
+            | Feature::ServiceControl
+            | Feature::ProcessHandleCounts
+            | Feature::ProcessArchitecture
+    );
     // No current feature has a macOS implementation yet.
     #[cfg(target_os = "macos")]
     return {
@@ -201,11 +214,17 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn on_linux_only_the_features_read_from_proc_are_in_the_system() {
-        let here: Vec<Feature> = Feature::ALL.iter().copied().filter(|f| system_has(*f)).collect();
-        assert_eq!(here, [Feature::ProcessHandleCounts, Feature::ProcessArchitecture]);
-        for feature in [Feature::ProcessGpuUsage, Feature::FileSignatures, Feature::FileVersionInfo, Feature::ProcessDump] {
-            assert!(!system_has(feature), "{feature:?} stays hidden until a later ticket fills it");
+    fn on_linux_process_control_startup_entries_services_and_the_proc_facts_are_in_the_system_so_far() {
+        let here = [
+            Feature::ProcessControl,
+            Feature::StartupEntries,
+            Feature::ServiceListing,
+            Feature::ServiceControl,
+            Feature::ProcessHandleCounts,
+            Feature::ProcessArchitecture,
+        ];
+        for &feature in Feature::ALL {
+            assert_eq!(system_has(feature), here.contains(&feature), "{feature:?}");
         }
     }
 

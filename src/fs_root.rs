@@ -43,6 +43,14 @@ impl FsRoot {
         self.path(rel).exists()
     }
 
+    /// The names of the entries of the folder `rel` (links included, names
+    /// starting with a dot left out), sorted; empty when it is missing.
+    pub fn list_dir(&self, rel: &str) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(self.path(rel)) else { return Vec::new() };
+        let mut names: Vec<String> = entries.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| !n.starts_with('.')).collect();
+        names.sort();
+        names
+    }
     /// The text of `rel`, trimmed; `None` when it is missing, unreadable or empty.
     /// A device-tree string ends in a NUL byte; that is trimmed too.
     pub fn read(&self, rel: &str) -> Option<String> {
@@ -72,6 +80,11 @@ mod tests {
         assert_eq!(FsRoot::system().path("proc/uptime"), std::path::Path::new("/").join("proc/uptime"));
     }
 
+    #[test]
+    fn a_folder_lists_its_entries_sorted_and_a_missing_one_lists_none() {
+        assert_eq!(fixture("runit").list_dir("etc/sv"), ["dhcpcd", "socklog", "sshd"]);
+        assert!(fixture("runit").list_dir("etc/nothing").is_empty());
+    }
     #[test]
     fn a_probe_tells_whether_the_interface_exists_under_the_root() {
         let full = fixture("desktop");

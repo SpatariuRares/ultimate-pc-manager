@@ -1,0 +1,8 @@
+pos:	0
+flags:	02
+drm-driver:	i915
+drm-pdev:	0000:00:02.0
+drm-client-id:	3
+drm-engine-render:	750000000 ns
+drm-engine-video:	0 ns
+drm-engine-capacity-video:	2

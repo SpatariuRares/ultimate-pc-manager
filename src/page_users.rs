@@ -1,6 +1,8 @@
-//! Users: the accounts running processes, with their processes.
+//! Users: the accounts running processes, with their processes, and on
+//! systems with a login manager who is logged in and in which session.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use egui::{vec2, RichText, Sense, Ui};
 
@@ -8,13 +10,44 @@ use crate::core_page::{CorePage, PageCtx};
 use crate::platform::Action;
 use crate::sampler::ProcRow;
 use crate::theme::{self, Theme};
+use crate::user_sessions::{self, Session};
 use crate::widgets::parts::{self, Mark, SidePanel, StatusBand};
 use crate::widgets::{fmt_bytes, fmt_mb};
 
-/// Users keeps its chosen and open accounts in egui's memory, so it has
-/// no state of its own.
-#[derive(Default)]
-pub struct UsersPage;
+/// How long the login sessions read stays good before the page reads again.
+const SESSIONS_EVERY: Duration = Duration::from_secs(5);
+
+/// Users keeps its chosen and open accounts in egui's memory; its own state
+/// is the login sessions last read and when.
+pub struct UsersPage {
+    reader: fn() -> Vec<Session>,
+    sessions: Vec<Session>,
+    read_at: Option<Instant>,
+}
+
+impl Default for UsersPage {
+    fn default() -> Self {
+        Self::with_reader(user_sessions::current)
+    }
+}
+
+impl UsersPage {
+    /// A page that asks `reader` who is logged in (the system's login
+    /// manager in the app, a fixture in tests).
+    pub fn with_reader(reader: fn() -> Vec<Session>) -> Self {
+        Self { reader, sessions: Vec::new(), read_at: None }
+    }
+
+    /// The sessions, read again when the last read is older than
+    /// [`SESSIONS_EVERY`].
+    fn sessions(&mut self) -> &[Session] {
+        if self.read_at.is_none_or(|at| at.elapsed() >= SESSIONS_EVERY) {
+            self.sessions = (self.reader)();
+            self.read_at = Some(Instant::now());
+        }
+        &self.sessions
+    }
+}
 
 impl CorePage for UsersPage {
     fn title(&self) -> Option<&'static str> {
@@ -23,7 +56,7 @@ impl CorePage for UsersPage {
 
     fn draw(&mut self, ui: &mut Ui, ctx: &PageCtx, _actions: &mut Vec<Action>) {
         let t = ctx.settings.theme();
-        let accounts = accounts(&ctx.snapshot.procs);
+        let accounts = accounts_with_sessions(&ctx.snapshot.procs, self.sessions());
         let n: usize = accounts.iter().map(|a| a.procs.len()).sum();
         let cpu: f32 = accounts.iter().map(|a| a.cpu).sum();
         let mem: u64 = accounts.iter().map(|a| a.mem).sum();
@@ -76,33 +109,48 @@ pub(crate) struct Account {
     pub cpu: f32,
     pub mem: u64,
     pub procs: Vec<ProcRow>,
+    /// The login sessions the account has; none without a login manager.
+    pub sessions: Vec<Session>,
 }
 
 /// The accounts that run processes, by name; processes without a user
 /// are "System".
-pub(crate) fn accounts(procs: &[ProcRow]) -> Vec<Account> {
+///
+/// Each account also has the login sessions given; an account that is
+/// logged in but runs nothing we list still gets its row.
+pub(crate) fn accounts_with_sessions(procs: &[ProcRow], sessions: &[Session]) -> Vec<Account> {
     let mut by: BTreeMap<String, Account> = BTreeMap::new();
     for p in procs {
         let name = if p.user.is_empty() { "System".to_string() } else { p.user.clone() };
-        let a = by.entry(name.clone()).or_insert_with(|| Account { name, cpu: 0.0, mem: 0, procs: Vec::new() });
+        let a = by.entry(name.clone()).or_insert_with(|| Account { name, cpu: 0.0, mem: 0, procs: Vec::new(), sessions: Vec::new() });
         a.cpu += p.cpu;
         a.mem += p.mem;
         a.procs.push(p.clone());
     }
+    for s in sessions {
+        let name = s.user.clone();
+        by.entry(name.clone()).or_insert_with(|| Account { name, cpu: 0.0, mem: 0, procs: Vec::new(), sessions: Vec::new() }).sessions.push(s.clone());
+    }
     let mut all: Vec<Account> = by.into_values().collect();
     for a in &mut all {
-        a.procs.sort_by(|x, y| y.mem.cmp(&x.mem));
+        a.procs.sort_by_key(|p| std::cmp::Reverse(p.mem));
     }
     all
 }
 
 /// The Users band's headline.
 pub(crate) fn users_headline(accounts: &[Account]) -> String {
-    match accounts {
-        [] => "No user sessions were reported".to_string(),
-        [one] => format!("Only {} is running processes", one.name),
-        many => format!("{} accounts are running processes", many.len()),
+    let running: Vec<&Account> = accounts.iter().filter(|a| !a.procs.is_empty()).collect();
+    match (accounts, running.as_slice()) {
+        ([], _) => "No user sessions were reported".to_string(),
+        (_, []) => format!("{} logged in", count(accounts.len(), "account is", "accounts are")),
+        (_, [one]) => format!("Only {} is running processes", one.name),
+        (_, many) => format!("{} accounts are running processes", many.len()),
     }
+}
+
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 /// x of each Users column from the right edge: CPU, Memory, Processes.
@@ -135,6 +183,11 @@ fn account_row(ui: &mut Ui, t: &Theme, width: f32, a: &Account, selected: bool, 
     let count = match a.procs.len() {
         1 => "1 process".to_string(),
         n => format!("{n} processes"),
+    };
+    let count = match a.sessions.len() {
+        0 => count,
+        1 => format!("{count} \u{b7} 1 session"),
+        n => format!("{count} \u{b7} {n} sessions"),
     };
     p.text(egui::pos2(rect.left() + 30.0, rect.top() + 30.0), egui::Align2::LEFT_CENTER, &count, egui::FontId::proportional(11.5), sub);
     let figures = [format!("{:.1}%", a.cpu), fmt_bytes(a.mem), a.procs.len().to_string()];
@@ -175,6 +228,13 @@ fn account_detail(ui: &mut Ui, t: &Theme, a: &Account) {
             ui.label(RichText::new(value).font(t.fonts.figure_small.clone()).color(ink));
         }
     });
+    if !a.sessions.is_empty() {
+        ui.add_space(12.0);
+        ui.label(RichText::new("Logged in").font(t.fonts.label.clone()).color(t.label));
+        for s in &a.sessions {
+            ui.label(RichText::new(s.describe()).font(t.fonts.row.clone()).color(t.text));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -196,7 +256,7 @@ mod tests {
     #[test]
     fn it_lists_the_accounts_of_a_snapshot_without_the_app() {
         let snap = snapshot(&[("chrome.exe", "spata", 5.0, 2_000_000_000), ("Code.exe", "spata", 3.2, 1_000_000_000), ("svchost.exe", "", 1.0, 50_000_000)]);
-        let drawn = draw(&mut UsersPage, &Settings::default(), &snap);
+        let drawn = draw(&mut UsersPage::with_reader(Vec::new), &Settings::default(), &snap);
         let has = |t: &str| drawn.texts.iter().any(|s| s == t);
         assert!(has("2 accounts are running processes"), "{:?}", drawn.texts);
         assert!(has("3 processes \u{b7} CPU 9.2% \u{b7} 2.8 GB memory"), "{:?}", drawn.texts);
@@ -206,23 +266,78 @@ mod tests {
 
     #[test]
     fn it_says_so_when_no_session_is_reported() {
-        let drawn = draw(&mut UsersPage, &Settings::default(), &snapshot(&[]));
+        let drawn = draw(&mut UsersPage::with_reader(Vec::new), &Settings::default(), &snapshot(&[]));
         assert!(drawn.texts.iter().any(|t| t == "No user sessions were reported"), "{:?}", drawn.texts);
     }
 
     #[test]
     fn it_names_the_only_account_running_processes() {
-        let drawn = draw(&mut UsersPage, &Settings::default(), &snapshot(&[("a.exe", "spata", 1.0, 1)]));
+        let drawn = draw(&mut UsersPage::with_reader(Vec::new), &Settings::default(), &snapshot(&[("a.exe", "spata", 1.0, 1)]));
         assert!(drawn.texts.iter().any(|t| t == "Only spata is running processes"), "{:?}", drawn.texts);
     }
 
     #[test]
     fn it_asks_nothing_of_the_app() {
-        assert!(draw(&mut UsersPage, &Settings::default(), &snapshot(&[("a.exe", "spata", 1.0, 1)])).actions.is_empty());
+        assert!(draw(&mut UsersPage::with_reader(Vec::new), &Settings::default(), &snapshot(&[("a.exe", "spata", 1.0, 1)])).actions.is_empty());
+    }
+
+    fn fixture_sessions() -> Vec<Session> {
+        user_sessions::read(&crate::fs_root::fixture("desktop"))
+    }
+
+    #[test]
+    fn logged_in_sessions_are_shown_per_user() {
+        let snap = snapshot(&[("firefox", "spata", 5.0, 2_000_000_000), ("sshd", "root", 0.1, 1_000_000)]);
+        let drawn = draw(&mut UsersPage::with_reader(fixture_sessions), &Settings::default(), &snap);
+        let has = |t: &str| drawn.texts.iter().any(|s| s == t);
+        assert!(has("1 process \u{b7} 2 sessions"), "{:?}", drawn.texts);
+        assert!(has("1 process") && has("spata") && has("root"), "{:?}", drawn.texts);
+    }
+
+    #[test]
+    fn accounts_carry_their_sessions_and_a_logged_in_account_without_processes_keeps_its_row() {
+        let procs = [proc(1, "sshd", "root", 0.1, 1)];
+        let accounts = accounts_with_sessions(&procs, &fixture_sessions());
+        let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["root", "spata"]);
+        assert!(accounts[0].sessions.is_empty());
+        assert_eq!(accounts[1].sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["2", "7"]);
+        assert!(accounts[1].procs.is_empty());
+        assert_eq!(users_headline(&accounts), "Only root is running processes");
+        assert_eq!(users_headline(&accounts[1..]), "1 account is logged in");
+    }
+
+    #[test]
+    fn a_system_without_a_login_manager_keeps_the_process_owner_grouping() {
+        let snap = snapshot(&[("chrome", "spata", 5.0, 2_000_000_000), ("init", "", 1.0, 50_000_000)]);
+        let none = user_sessions::read(&crate::fs_root::fixture("arm-board"));
+        assert!(none.is_empty());
+        let drawn = draw(&mut UsersPage::with_reader(Vec::new), &Settings::default(), &snap);
+        let has = |t: &str| drawn.texts.iter().any(|s| s == t);
+        assert!(has("2 accounts are running processes") && has("spata") && has("System"), "{:?}", drawn.texts);
+        assert!(!drawn.texts.iter().any(|t| t.contains("session")), "{:?}", drawn.texts);
+    }
+
+    #[test]
+    fn the_sessions_are_read_once_per_interval_not_once_per_frame() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        let mut page = UsersPage::with_reader(|| {
+            READS.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        });
+        let snap = snapshot(&[("a", "spata", 1.0, 1)]);
+        draw(&mut page, &Settings::default(), &snap);
+        draw(&mut page, &Settings::default(), &snap);
+        assert_eq!(READS.load(Ordering::SeqCst), 1);
     }
 
     fn proc(pid: u32, name: &str, user: &str, cpu: f32, mem: u64) -> ProcRow {
         ProcRow { pid, name: name.into(), user: user.into(), cpu, mem, ..Default::default() }
+    }
+
+    fn accounts(procs: &[ProcRow]) -> Vec<Account> {
+        accounts_with_sessions(procs, &[])
     }
 
     fn sample() -> Vec<ProcRow> {

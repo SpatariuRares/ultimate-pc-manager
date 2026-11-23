@@ -98,6 +98,13 @@ fn process_env(name: &str) -> Option<OsString> {
     std::env::var_os(name)
 }
 
+/// The user's own settings folder on Linux (`XDG_CONFIG_HOME`, else
+/// `~/.config`), not the app's: the one XDG rule, for readers of other
+/// programs' per-user files.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn xdg_config_home(env: Env) -> Option<PathBuf> {
+    linux::config(env)
+}
 /// The app's settings folder.
 pub fn config() -> Option<PathBuf> {
     resolve(System::current(), Folder::Config, &process_env)

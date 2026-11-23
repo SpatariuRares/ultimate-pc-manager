@@ -28,6 +28,46 @@ pub struct ServiceRow {
     pub pid: u32,
     pub status: String,
     pub start_type: String,
+    /// The service manager the row comes from ("systemd", "OpenRC" or "runit"); empty on Windows,
+    /// which has the one.
+    pub source: String,
+    /// The scope the service belongs to ("System" or "User"); empty when the
+    /// manager has none.
+    pub scope: String,
+    /// The actions ("start", "stop", "restart", "enable", "disable") the
+    /// row's manager can do to it; `None` where the system offers every one
+    /// (Windows).
+    pub actions: Option<&'static [&'static str]>,
+}
+
+impl ServiceRow {
+    /// Does the page offer `action` for this service?
+    pub fn can(&self, action: &str) -> bool {
+        self.actions.is_none_or(|list| list.contains(&action))
+    }
+
+    /// What names this service in an action: its name, with the manager and
+    /// scope it belongs to (a system and a user service can share a name).
+    pub fn key(&self) -> ServiceKey {
+        ServiceKey { name: self.name.clone(), source: self.source.clone(), scope: self.scope.clone() }
+    }
+}
+
+/// Names one service for an action: the name alone is not enough where
+/// several managers and scopes can hold the same one. `source` and `scope`
+/// are empty where the system has one manager and no scopes (Windows).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceKey {
+    pub name: String,
+    pub source: String,
+    pub scope: String,
+}
+
+impl From<&str> for ServiceKey {
+    /// A service known by its name only.
+    fn from(name: &str) -> Self {
+        ServiceKey { name: name.into(), ..Default::default() }
+    }
 }
 
 /// What the Services and Startup apps pages ask of the machine.
@@ -35,9 +75,10 @@ pub trait SystemLists {
     /// Every service with its state, or why the list could not be read.
     fn list_services(&self) -> Result<Vec<ServiceRow>, String>;
 
-    /// Starts, stops or restarts a service (`action` is "start", "stop" or
-    /// "restart"), or says why it could not be done.
-    fn control_service(&self, name: &str, action: &str) -> Result<(), String>;
+    /// Starts, stops or restarts a service, or turns it on or off at boot
+    /// (`action` is "start", "stop", "restart", "enable" or "disable"), or
+    /// says why it could not be done.
+    fn control_service(&self, service: &ServiceKey, action: &str) -> Result<(), String>;
 
     /// Every startup entry with its state. Startup has no error state: a
     /// location that cannot be read simply lists nothing.
@@ -58,6 +99,9 @@ pub struct StartupRow {
     pub command: String,
     pub location: String,
     pub enabled: bool,
+    /// The file the entry lives in, when it has one to show ("Open file
+    /// location" opens its folder); empty when the command is the target.
+    pub file: String,
 }
 
 /// Said when an action names a startup entry that has left the list.

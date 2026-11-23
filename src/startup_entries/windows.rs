@@ -32,6 +32,7 @@ pub fn list_startup() -> Vec<StartupEntry> {
                     location: label.into(),
                     hkcu,
                     approved_key: APPROVED_RUN.into(),
+                    ..Default::default()
                 });
             }
         }
@@ -52,6 +53,7 @@ pub fn list_startup() -> Vec<StartupEntry> {
                     location: "Startup folder".into(),
                     hkcu: true,
                     approved_key: APPROVED_FOLDER.into(),
+                    ..Default::default()
                 });
             }
         }
