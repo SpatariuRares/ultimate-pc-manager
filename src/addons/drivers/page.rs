@@ -12,7 +12,7 @@ use egui::{vec2, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Rec
 
 use super::engine::{self as drivers, DeviceDriver, DriverUpdate, Hub, KernelDriver, KernelFigures, KernelScope};
 use crate::addons::plural;
-use crate::platform::{csv_field, Action, AddonContext};
+use crate::platform::{csv_field, csv_text_field, Action, AddonContext};
 use crate::theme;
 use crate::widgets::parts::{self, BandArea, Mark, StatusBand};
 use crate::widgets::{long_date, parse_date, separator, short_time, split_version, tick};
@@ -1214,29 +1214,49 @@ impl DriversPage {
 
     fn export_drivers_csv(&mut self, devices: &[DeviceDriver], kernel: &[KernelDriver], updates: Option<&[DriverUpdate]>) {
         let Some(path) = self.context.pick_save_as(&crate::platform::CSV_FILE, "drivers.csv") else { return };
-        let mut s = String::from("Kind,Name,Class/Type,Provider/Vendor,Version,Date,Status,INF/Service,Windows Update,Instance ID/Path\n");
-        for d in devices {
-            let u = updates.and_then(|u| u.iter().find(|x| x.device.as_deref() == Some(d.instance_id.as_str())));
-            let up = match (updates, u) {
-                (None, _) => "not checked".to_string(),
-                (Some(_), Some(u)) if u.worth_installing() => format!("newer: {}", u.version),
-                (Some(_), Some(u)) => format!("up to date (offers older {})", u.version),
-                (Some(_), None) => "up to date".to_string(),
-            };
-            let f = ["Device", &d.name, &d.class, &d.provider, &d.version, &d.date, &d.status(), &d.inf, &up, &d.instance_id];
-            s.push_str(&f.iter().map(|x| csv_field(x)).collect::<Vec<_>>().join(","));
-            s.push('\n');
-        }
-        for d in kernel {
-            let f = ["Kernel driver", &d.display, d.kind.label(), &d.vendor, &d.version, "", if d.running { "Running" } else { "Stopped" }, &d.service, "", &d.path];
-            s.push_str(&f.iter().map(|x| csv_field(x)).collect::<Vec<_>>().join(","));
-            s.push('\n');
-        }
+        let s = drivers_csv(devices, kernel, updates);
         match std::fs::write(&path, format!("\u{feff}{s}")) {
             Ok(()) => self.say(format!("Saved {path}")),
             Err(e) => self.say(format!("Could not save: {e}")),
         }
     }
+}
+
+/// The CSV text of the export. Text cells are neutralised against spreadsheet
+/// formulas; numbers (load index, kernel memory in bytes) stay plain.
+/// The kernel-only columns come last and are empty on device rows.
+fn drivers_csv(devices: &[DeviceDriver], kernel: &[KernelDriver], updates: Option<&[DriverUpdate]>) -> String {
+    let mut s = String::from("Kind,Name,Class/Type,Provider/Vendor,Version,Date,Status,INF/Service,Windows Update,Instance ID/Path,Start type,Driver kind,Load index,Kernel memory (bytes),Load order group,Depends on\n");
+    for d in devices {
+        let u = updates.and_then(|u| u.iter().find(|x| x.device.as_deref() == Some(d.instance_id.as_str())));
+        let up = match (updates, u) {
+            (None, _) => "not checked".to_string(),
+            (Some(_), Some(u)) if u.worth_installing() => format!("newer: {}", u.version),
+            (Some(_), Some(u)) => format!("up to date (offers older {})", u.version),
+            (Some(_), None) => "up to date".to_string(),
+        };
+        let f = ["Device", &d.name, &d.class, &d.provider, &d.version, &d.date, &d.status(), &d.inf, &up, &d.instance_id];
+        let mut line: Vec<String> = f.iter().map(|x| csv_text_field(x)).collect();
+        line.extend(std::iter::repeat(String::new()).take(6));
+        s.push_str(&line.join(","));
+        s.push('\n');
+    }
+    for d in kernel {
+        let depends: Vec<String> = d.depends_services.iter().cloned().chain(d.depends_groups.iter().map(|g| format!("group {g}"))).collect();
+        // The Signature column (#25) goes at the end of this list and of the header.
+        let text = [
+            "Kernel driver", &d.display, d.kind.label(), &d.vendor, &d.version, "", if d.running { "Running" } else { "Stopped" },
+            &d.service, "", &d.path, d.start_type, d.kind.label(),
+        ];
+        let mut cells: Vec<String> = text.iter().map(|x| csv_text_field(x)).collect();
+        cells.push(csv_field(&d.load_index.map(|i| i.to_string()).unwrap_or_default()));
+        cells.push(csv_field(&d.image_size.map(|i| i.to_string()).unwrap_or_default()));
+        cells.push(csv_text_field(&d.group));
+        cells.push(csv_text_field(&depends.join("; ")));
+        s.push_str(&cells.join(","));
+        s.push('\n');
+    }
+    s
 }
 
 /// Michroma size for the version change: smaller when several are listed.
@@ -1577,6 +1597,31 @@ mod tests {
 #[cfg(test)]
 mod kernel_detail_tests {
     use super::*;
+
+    #[test]
+    fn csv_export_carries_kernel_columns_and_neutralises_text() {
+        let k = KernelDriver {
+            service: "=svc".into(), display: "@Disk".into(), vendor: "-Acme".into(), running: true, start_type: "Boot",
+            load_index: Some(7), image_size: Some(4096), group: "+Base".into(),
+            depends_services: vec!["Tcpip".into()], depends_groups: vec!["NDIS".into()], ..Default::default()
+        };
+        let csv = drivers_csv(&[], &[k], None);
+        let mut lines = csv.lines();
+        let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+        assert_eq!(&header[10..], ["Start type", "Driver kind", "Load index", "Kernel memory (bytes)", "Load order group", "Depends on"]);
+        let row = lines.next().unwrap();
+        assert!(row.contains(",'@Disk,") && row.contains(",'-Acme,") && row.contains(",'=svc,"));
+        assert!(row.ends_with(",Boot,Kernel,7,4096,'+Base,Tcpip; group NDIS"), "{row}");
+    }
+
+    #[test]
+    fn csv_export_device_rows_keep_their_columns() {
+        let d = DeviceDriver { name: "=Evil".into(), instance_id: "PCI-X".into(), ..Default::default() };
+        let csv = drivers_csv(&[d], &[], None);
+        let row = csv.lines().nth(1).unwrap();
+        assert!(row.starts_with("Device,'=Evil,"), "{row}");
+        assert!(row.ends_with(",not checked,PCI-X,,,,,,"), "{row}");
+    }
 
     fn sample() -> KernelDriver {
         KernelDriver {
