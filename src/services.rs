@@ -7,9 +7,9 @@
 
 // The service managers a Linux system can run (tested on every system).
 #[cfg(any(target_os = "linux", test))]
-mod sources;
+pub(crate) mod sources;
 #[cfg(any(target_os = "linux", test))]
-mod systemd;
+pub(crate) mod systemd;
 
 #[cfg(windows)]
 mod windows;

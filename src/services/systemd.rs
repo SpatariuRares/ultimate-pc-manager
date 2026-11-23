@@ -73,9 +73,9 @@ struct Unit {
 
 /// A unit file as `list-unit-files` tells it: its name and state.
 #[derive(Debug, PartialEq, Eq)]
-struct UnitFile {
-    name: String,
-    state: String,
+pub(crate) struct UnitFile {
+    pub(crate) name: String,
+    pub(crate) state: String,
 }
 
 fn scope_rows(runner: &dyn ProcessRunner, scope: Scope) -> Result<Vec<ServiceRow>, SourceError> {
@@ -103,7 +103,7 @@ fn scope_rows(runner: &dyn ProcessRunner, scope: Scope) -> Result<Vec<ServiceRow
 }
 
 /// One list, from the JSON call, else from the plain-text call.
-fn ask<T>(runner: &dyn ProcessRunner, json_args: &[&str], text_args: &[&str], from_json: fn(&str) -> Option<Vec<T>>, from_text: fn(&str) -> Vec<T>) -> Result<Vec<T>, SourceError> {
+pub(crate) fn ask<T>(runner: &dyn ProcessRunner, json_args: &[&str], text_args: &[&str], from_json: fn(&str) -> Option<Vec<T>>, from_text: fn(&str) -> Vec<T>) -> Result<Vec<T>, SourceError> {
     match run_text(runner, "systemctl", json_args) {
         Output::NotStarted => return Err(SourceError::Absent),
         Output::Exited(0, text) => {
@@ -123,7 +123,7 @@ fn ask<T>(runner: &dyn ProcessRunner, json_args: &[&str], text_args: &[&str], fr
 /// A systemctl that ran but cannot talk to a systemd that runs the system
 /// (a container, another init) means systemd is not here; anything else is
 /// a failure with what systemctl said.
-fn failure(code: i32, text: &str) -> SourceError {
+pub(crate) fn failure(code: i32, text: &str) -> SourceError {
     let lower = text.to_lowercase();
     if lower.contains("not been booted with systemd") || lower.contains("failed to connect to bus") {
         return SourceError::Absent;
@@ -144,7 +144,7 @@ fn parse_units_json(text: &str) -> Option<Vec<Unit>> {
     )
 }
 
-fn parse_files_json(text: &str) -> Option<Vec<UnitFile>> {
+pub(crate) fn parse_files_json(text: &str) -> Option<Vec<UnitFile>> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let field = |v: &serde_json::Value, key: &str| v.get(key).and_then(|s| s.as_str()).unwrap_or("").to_string();
     Some(value.as_array()?.iter().map(|v| UnitFile { name: field(v, "unit_file"), state: field(v, "state") }).collect())
@@ -170,7 +170,7 @@ fn parse_units_text(text: &str) -> Vec<Unit> {
 }
 
 /// `UNIT FILE STATE [PRESET]` lines.
-fn parse_files_text(text: &str) -> Vec<UnitFile> {
+pub(crate) fn parse_files_text(text: &str) -> Vec<UnitFile> {
     text.lines()
         .filter_map(|line| {
             let mut words = line.split_whitespace();
