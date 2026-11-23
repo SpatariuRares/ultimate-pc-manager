@@ -254,8 +254,7 @@ fn visuals(t: &Theme) -> egui::Visuals {
 /// (headlines lose their weight, not their size); without the body file every
 /// face uses egui's default fonts after its own first choice.
 pub fn install_fonts(ctx: &egui::Context) {
-    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
-    let fonts = std::path::Path::new(&windir).join("Fonts");
+    let fonts = crate::app_folders::windows_dir().join("Fonts");
     ctx.set_fonts(installed_fonts(|file| std::fs::read(fonts.join(file)).ok()));
 }
 

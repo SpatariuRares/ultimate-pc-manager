@@ -17,14 +17,6 @@ pub struct SystemInfoPage {
     extra: Option<Vec<(&'static str, String)>>,
 }
 
-/// The system's own facts: Linux reads them, other systems add nothing.
-fn system_extra() -> Vec<(&'static str, String)> {
-    #[cfg(target_os = "linux")]
-    return crate::linux_facts::system_fields();
-    #[cfg(any(windows, target_os = "macos"))]
-    return Vec::new();
-}
-
 /// `fields` with each of `extra` replacing the field of its name, else appended.
 pub(crate) fn merge_fields(mut fields: Vec<(&'static str, String)>, extra: Vec<(&'static str, String)>) -> Vec<(&'static str, String)> {
     for (k, v) in extra {
@@ -62,7 +54,7 @@ impl CorePage for SystemInfoPage {
             ("Network adapters", s.net.len().to_string()),
             ("Up time", fmt_uptime(s.uptime)),
         ];
-        let fields = merge_fields(base, self.extra.clone().unwrap_or_else(system_extra));
+        let fields = merge_fields(base, self.extra.clone().unwrap_or_else(crate::system_info::fields));
         let computer = fields.iter().find(|(k, _)| *k == "Computer name").map(|(_, v)| v.clone()).unwrap_or(computer);
         let os = fields.iter().find(|(k, _)| *k == "Operating system").map(|(_, v)| v.clone()).unwrap_or(os);
         let paused = ctx.settings.interval_ms() == 0;

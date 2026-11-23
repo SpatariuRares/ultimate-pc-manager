@@ -60,7 +60,7 @@ impl SystemActions for WindowsActions {
         crate::platform::open_elevated(cmdline)
     }
     fn offers_run_as_admin(&self) -> bool {
-        crate::app_folders::System::current() != crate::app_folders::System::Windows
+        false
     }
     fn open_power_options(&self) -> Result<(), String> {
         run_open::open_power_options()

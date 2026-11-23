@@ -6,6 +6,8 @@ compile_error!("supported systems: Windows, Linux, macOS");
 mod action_elevation;
 mod app;
 mod app_folders;
+mod system;
+mod system_info;
 mod fs_root;
 mod linux_facts;
 mod availability;

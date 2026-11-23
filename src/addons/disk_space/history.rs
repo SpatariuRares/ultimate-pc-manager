@@ -199,16 +199,16 @@ pub const UNREADABLE_FOLDER: &str = "The scan history folder could not be read."
 pub const BAD_ID: &str = "Couldn't save scan history because the scan id is malformed.";
 pub const TOO_MANY: &str = "Couldn't save scan history because its folder contains too many entries to manage safely.";
 pub const NOT_WRITTEN: &str = "Couldn't save scan history: the snapshot file could not be written.";
-/// Where History is kept unless the "History folder" setting says otherwise.
-/// (Windows: this text; elsewhere the real folder, see [`default_folder`].)
-pub const DEFAULT_FOLDER: &str = "%APPDATA%\\UltimatePCManager\\DiskScans";
-
-/// The default History folder as the setting shows it.
+/// Where History is kept unless the "History folder" setting says otherwise,
+/// as the setting shows it (the system's data folder names the place).
 pub fn default_folder() -> String {
-    #[cfg(windows)]
-    return DEFAULT_FOLDER.into();
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    return Store::app().map_or_else(|_| DEFAULT_FOLDER.into(), |s| s.dir.display().to_string());
+    default_folder_in(crate::app_folders::shown_data())
+}
+
+/// [`default_folder`] for the data folder `data` (none: the system names no
+/// such folder, so the setting says so instead of showing a wrong place).
+fn default_folder_in(data: Option<PathBuf>) -> String {
+    data.map_or_else(|| NO_FOLDER.to_string(), |d| d.join("DiskScans").display().to_string())
 }
 /// History's caption while it is empty.
 pub const EMPTY: &str = "Finished scans are saved here.";
@@ -605,7 +605,8 @@ pub(crate) mod tests {
 
     #[test]
     fn on_linux_the_history_saves_and_reloads_from_the_xdg_data_folder() {
-        use crate::app_folders::{resolve, Folder, System};
+        use crate::app_folders::{resolve, Folder};
+        use crate::system::System;
         let home = std::env::temp_dir().join(format!("mtm-disk-history-xdg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let env = |name: &str| (name == "XDG_DATA_HOME").then(|| home.clone().into_os_string());
@@ -618,6 +619,16 @@ pub(crate) mod tests {
         assert_eq!(store.load(&s.id).unwrap(), s);
         let _ = std::fs::remove_dir_all(&home);
         assert_eq!(Store::in_data_folder(None).unwrap_err(), NO_FOLDER);
+    }
+
+    #[test]
+    fn the_setting_shows_the_default_history_folder_or_says_there_is_none() {
+        use std::path::PathBuf;
+        let shown = default_folder_in(Some(PathBuf::from("data")));
+        assert_eq!(PathBuf::from(shown), PathBuf::from("data").join("DiskScans"));
+        assert_eq!(default_folder_in(None), NO_FOLDER, "no data folder: no folder from another system is shown");
+        #[cfg(windows)]
+        assert_eq!(default_folder(), "%APPDATA%\\UltimatePCManager\\DiskScans");
     }
 
     #[test]

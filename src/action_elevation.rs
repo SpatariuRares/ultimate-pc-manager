@@ -29,7 +29,7 @@
 //! The pure parts here take the system and the environment as values and
 //! the launch as a closure, so the tests cover every system on any host.
 
-use crate::app_folders::System;
+use crate::system::System;
 
 /// How an elevated launch ended.
 #[derive(Clone, Debug, PartialEq, Eq)]

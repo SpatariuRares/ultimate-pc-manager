@@ -350,8 +350,8 @@ pub trait ProcessRunner: Send + Sync {
         crate::action_elevation::spawn_and_wait(argv)
     }
     /// The system whose way of asking for administrator rights is used.
-    fn elevation_system(&self) -> crate::app_folders::System {
-        crate::app_folders::System::current()
+    fn elevation_system(&self) -> crate::system::System {
+        crate::system::System::current()
     }
     /// The value of an environment variable, if set.
     fn env_var(&self, name: &str) -> Option<String> {
@@ -424,7 +424,7 @@ pub struct RecordingRunner {
     stopped: std::sync::atomic::AtomicUsize,
     /// The system an elevated launch is built for (the running one unless
     /// a test says so) and how its launcher ends.
-    elevation: std::sync::Mutex<Option<(crate::app_folders::System, crate::action_elevation::Spawned)>>,
+    elevation: std::sync::Mutex<Option<(crate::system::System, crate::action_elevation::Spawned)>>,
     /// The environment variables an elevated launch can read.
     env: std::sync::Mutex<Vec<(String, String)>>,
 }
@@ -433,7 +433,7 @@ pub struct RecordingRunner {
 impl RecordingRunner {
     /// Elevated launches are built for `system` and their launcher ends as
     /// `spawned` (without it: the running system, exit code 0).
-    pub fn elevate_as(&self, system: crate::app_folders::System, spawned: crate::action_elevation::Spawned) {
+    pub fn elevate_as(&self, system: crate::system::System, spawned: crate::action_elevation::Spawned) {
         *self.elevation.lock().unwrap_or_else(|e| e.into_inner()) = Some((system, spawned));
     }
     /// Sets an environment variable elevated launches can read.
@@ -641,8 +641,8 @@ impl ProcessRunner for RecordingRunner {
             None => crate::action_elevation::Spawned::Exited { code: 0, stderr: String::new() },
         }
     }
-    fn elevation_system(&self) -> crate::app_folders::System {
-        self.elevation.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(s, _)| *s).unwrap_or_else(crate::app_folders::System::current)
+    fn elevation_system(&self) -> crate::system::System {
+        self.elevation.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(s, _)| *s).unwrap_or_else(crate::system::System::current)
     }
     fn env_var(&self, name: &str) -> Option<String> {
         self.env.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
@@ -973,7 +973,7 @@ use windows as system;
 mod tests {
     use super::*;
     use crate::action_elevation::{Spawned, PERMISSION_DISMISSED, PERMISSION_REFUSED, PKEXEC_MISSING};
-    use crate::app_folders::System;
+    use crate::system::System;
 
     // ---- Per-action elevation ----
 

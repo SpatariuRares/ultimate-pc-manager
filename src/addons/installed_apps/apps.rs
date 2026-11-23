@@ -754,7 +754,7 @@ pub fn rot13(s: &str) -> String {
 /// Known-folder ids UserAssist puts in front of paths.
 fn known_folder(guid: &str) -> Option<String> {
     let env = |k: &str| std::env::var(k).ok();
-    let windir = env("WINDIR").unwrap_or_else(|| r"C:\Windows".into());
+    let windir = crate::app_folders::windows_dir().to_string_lossy().into_owned();
     Some(match guid.to_uppercase().as_str() {
         "{6D809377-6AF0-444B-8957-A3773F02200E}" => env("ProgramW6432").or_else(|| env("ProgramFiles"))?,
         "{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}" => env("ProgramFiles(x86)")?,

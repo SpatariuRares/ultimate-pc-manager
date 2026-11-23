@@ -5,6 +5,7 @@
 //! through the host, so an add-on that is off gets none of them. Each
 //! migrated add-on lives in `addons/<id>.rs`.
 
+pub use crate::system::System;
 use crate::platform::{AddonContext, PageContext};
 use crate::sampler::Snapshot;
 use std::collections::HashMap;
@@ -92,29 +93,6 @@ pub struct Requirements {
 impl Default for Requirements {
     fn default() -> Self {
         Requirements { systems: &System::ALL, admin: false, network: false, programs: &[], note: None }
-    }
-}
-
-/// An operating system the app supports.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum System {
-    Windows,
-    Linux,
-    MacOs,
-}
-
-impl System {
-    /// The three supported systems.
-    pub const ALL: [System; 3] = [System::Windows, System::Linux, System::MacOs];
-
-    /// The system the app runs on.
-    pub fn current() -> System {
-        #[cfg(windows)]
-        return System::Windows;
-        #[cfg(target_os = "linux")]
-        return System::Linux;
-        #[cfg(target_os = "macos")]
-        return System::MacOs;
     }
 }
 
