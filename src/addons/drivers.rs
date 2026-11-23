@@ -792,7 +792,8 @@ mod reader_tests {
 
     #[test]
     fn an_unavailable_listing_shows_as_unavailable_and_never_as_an_empty_list() {
-        let _unavailable = crate::availability::unavailable_in_test(&[crate::availability::Feature::DriversListing]);
+        use crate::availability::{unavailable_in_test, Feature};
+        let _unavailable = unavailable_in_test(&[Feature::DeviceSetupApi]);
         let reader = Fake::devices(vec![Ok(vec![device("Alpha GPU")])]);
         let mut host = on(&reader);
         until("the unavailable state is shown", || shown(&mut host).contains("Not available on this system."));

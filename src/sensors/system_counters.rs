@@ -82,7 +82,7 @@ impl Provider for SystemCounters {
             None => Err("performance counters are off on this PC".into()),
         };
         #[cfg(not(windows))]
-        Err(crate::availability::unavailable_error(crate::availability::Feature::SensorProviders))
+        Err(crate::availability::unavailable_error(crate::availability::Feature::HardwareSensors))
     }
     fn counted(&mut self) -> Vec<CounterSet> {
         std::mem::take(&mut self.counted)

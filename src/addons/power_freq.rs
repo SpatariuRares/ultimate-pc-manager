@@ -20,6 +20,7 @@ pub use pins::{pinned_lines, NOT_ON_THIS_PC, PIN, PINS_TIER_ID, UNPIN};
 use egui::{vec2, Align, Color32, Layout, RichText, Ui};
 
 use crate::addons::{read_settings, Addon, Consumption, Recording, Requirements, Tier};
+use crate::availability::{is_available, Feature};
 use crate::platform::{Action, AddonContext, PageContext};
 use crate::sensors::cpu::{BASE_HZ, CORE_AVERAGE, LIMIT_REASONS, NO_LIMIT};
 use std::collections::BTreeSet;
@@ -870,7 +871,9 @@ impl PowerFreq {
             return None;
         };
         let admin = self.context.as_ref().is_some_and(|c| c.is_admin());
-        let lines = notice::notice(frame, admin).map(|n| n.lines()).unwrap_or_default();
+        let mut lines = notice::notice(frame, admin).map(|n| n.lines()).unwrap_or_default();
+        // A system that cannot restart elevated offers no restart.
+        lines.retain(|(offer, _)| *offer != notice::Offer::Restart || is_available(Feature::Elevation));
         let mark = Mark::Dot(if lines.is_empty() { t.green } else { t.amber });
         let sub = top.details.join("  ·  ");
         let mut clicked = None;
@@ -1215,7 +1218,7 @@ impl PowerFreq {
                 if self.pins_offered() && frame.reading(&id).is_some() && ui.link(RichText::new(self.pin_label(&id)).size(12.5)).clicked() {
                     self.toggle_pin(&id);
                 }
-                if ui.link(RichText::new("Open Windows power options").size(12.5)).clicked() {
+                if is_available(Feature::PowerOptionsPanel) && ui.link(RichText::new("Open Windows power options").size(12.5)).clicked() {
                     page.actions.push(Action::OpenPowerOptions);
                 }
             });
@@ -1695,6 +1698,37 @@ mod tests {
             .filter_map(|s| if let egui::Shape::Text(t) = s { Some(t.galley.text().to_string()) } else { None })
             .collect();
         assert!(texts.iter().any(|t| t == crate::widgets::parts::EMPTY_DETAIL), "{texts:?}");
+    }
+
+    /// The words of one frame of the side panel and of the status band, with
+    /// a Ryzen sensor that needs administrator rights.
+    fn side_and_band_words() -> Vec<String> {
+        use crate::sensors::model::SourceStatus;
+        use crate::sensors::ryzen;
+        let rows = ryzen::readings(Err(ryzen::NEEDS_ADMIN), "AMD Ryzen 5 7600X", Instant::now());
+        let sources = vec![SourceStatus { name: ryzen::SOURCE, problem: Some(ryzen::NEEDS_ADMIN.into()) }];
+        let frame = Frame::build(1, &[rows, made_up_frame().readings().cloned().collect()], sources);
+        let mut p = PowerFreq::default();
+        let (settings, snap) = (Settings::default(), Snapshot::default());
+        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        let out = crate::test_ui::run(&ctx, (1000.0, 900.0), vec![], |ui| {
+            let top = status(&frame, false);
+            p.status_band(ui, Some((&frame, &top)), crate::theme::of_ui(ui).primary);
+            p.side_panel(ui, Some(&frame), &mut PageContext::new(&settings, &snap));
+        });
+        crate::test_ui::texts(&out)
+    }
+
+    #[test]
+    fn an_unavailable_feature_is_hidden_while_the_power_and_freq_page_stays() {
+        use crate::availability::unavailable_in_test;
+        let offers = |words: &[String]| (words.iter().any(|w| w.contains("Restart as administrator")), words.iter().any(|w| w == "Open Windows power options"));
+        let on_this_system = side_and_band_words();
+        assert_eq!(offers(&on_this_system), (is_available(Feature::Elevation), is_available(Feature::PowerOptionsPanel)), "{on_this_system:?}");
+        let _unavailable = unavailable_in_test(&[Feature::Elevation, Feature::PowerOptionsPanel]);
+        let words = side_and_band_words();
+        assert_eq!(offers(&words), (false, false), "{words:?}");
+        assert!(words.iter().any(|w| w == "Sources on this PC"), "the page stays: {words:?}");
     }
 
     #[test]

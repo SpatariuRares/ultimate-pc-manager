@@ -314,7 +314,7 @@ pub fn open_power_options() -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        Err(crate::availability::unavailable_error(crate::availability::Feature::PowerOptions))
+        Err(crate::availability::unavailable_error(crate::availability::Feature::PowerOptionsPanel))
     }
 }
 
@@ -965,7 +965,7 @@ mod imp {
     use super::*;
     use crate::availability::{unavailable_error, Feature};
     /// No Service Control Manager: an error.
-    pub fn list_services() -> Result<Vec<ServiceRow>, String> { Err(unavailable_error(Feature::Services)) }
+    pub fn list_services() -> Result<Vec<ServiceRow>, String> { Err(unavailable_error(Feature::ServiceControl)) }
     /// No running services: no (PID, service) pair.
     pub fn running_service_pids() -> Vec<(u32, String)> { Vec::new() }
     /// No running services.
@@ -975,7 +975,7 @@ mod imp {
     /// No version resources: no file description.
     pub fn file_description(_: &str) -> Option<String> { None }
     /// Services cannot be started or stopped: an error.
-    pub fn control_service(_: &str, _: &str) -> Result<(), String> { Err(unavailable_error(Feature::Services)) }
+    pub fn control_service(_: &str, _: &str) -> Result<(), String> { Err(unavailable_error(Feature::ServiceControl)) }
     /// Priorities cannot be set: an error.
     pub fn set_priority(_: u32, _: &str) -> Result<(), String> { Err(unavailable_error(Feature::ProcessControl)) }
     /// No priority is known.

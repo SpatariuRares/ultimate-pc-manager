@@ -10,6 +10,7 @@ use std::time::Duration;
 use egui::{vec2, Align, Layout, RichText, TextStyle, Ui};
 
 use crate::app::Action;
+use crate::availability::{unavailable_text, Feature};
 use crate::page_perf::fmt_bytes_rate;
 use crate::proc_info::{self, Missing, Resource, ResourceKind};
 use crate::sampler::ProcRow;
@@ -290,16 +291,18 @@ impl Inspector {
                 Some(Ok(_)) => two_columns(ui, &t, "inspector-environment", ("Variable", "Value"), shown.iter().map(|(k, v)| (k.as_str(), v.as_str()))),
             }
             heading(ui, &t, "Open resources");
-            let unavailable = crate::availability::availability(crate::availability::Feature::OpenResources).text();
-            match self.details.as_ref().map(|d| &d.resources) {
-                _ if unavailable.is_some() => soft(ui, &t, unavailable.as_deref().unwrap_or_default()),
-                None => soft(ui, &t, RESOURCES_LOADING),
-                Some(Err(m)) => soft(ui, &t, missing_text(*m)),
-                Some(Ok(list)) => {
-                    let count = |k| list.iter().filter(|r| r.kind == k).count();
-                    let sum = format!("{} files, {} keys, {} pipes/sockets", count(ResourceKind::File), count(ResourceKind::Key), count(ResourceKind::Socket));
-                    soft(ui, &t, &sum);
-                    two_columns(ui, &t, "inspector-resources", ("Type", "Name"), list.iter().map(|r| (kind_label(r.kind), r.name.as_str())));
+            if let Some(why) = unavailable_text(Feature::OpenHandles) {
+                soft(ui, &t, &why);
+            } else {
+                match self.details.as_ref().map(|d| &d.resources) {
+                    None => soft(ui, &t, RESOURCES_LOADING),
+                    Some(Err(m)) => soft(ui, &t, missing_text(*m)),
+                    Some(Ok(list)) => {
+                        let count = |k| list.iter().filter(|r| r.kind == k).count();
+                        let sum = format!("{} files, {} keys, {} pipes/sockets", count(ResourceKind::File), count(ResourceKind::Key), count(ResourceKind::Socket));
+                        soft(ui, &t, &sum);
+                        two_columns(ui, &t, "inspector-resources", ("Type", "Name"), list.iter().map(|r| (kind_label(r.kind), r.name.as_str())));
+                    }
                 }
             }
         });
@@ -335,6 +338,7 @@ fn two_columns<'a>(ui: &mut Ui, t: &Theme, id: &str, titles: (&str, &str), rows:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::availability::unavailable_in_test;
     use crate::theme::Mode;
 
     /// NordVPN.exe as the approved prototype shows it, its parent gone.
@@ -401,7 +405,7 @@ mod tests {
 
     #[test]
     fn unavailable_open_resources_show_as_unavailable_not_as_a_list() {
-        let _unavailable = crate::availability::unavailable_in_test(&[crate::availability::Feature::OpenResources]);
+        let _unavailable = unavailable_in_test(&[Feature::OpenHandles]);
         let ctx = crate::test_ui::context(Mode::Dark);
         let mut inspector = Inspector::with_details(26920, &[nordvpn()], read_ok());
         let texts: Vec<String> = frame(&ctx, &mut inspector, &mut 620.0, vec![]).into_iter().map(|x| x.0).collect();

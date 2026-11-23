@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use egui::{vec2, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui};
 
 use super::apps::{self, App, Hub, Source};
+use crate::availability::{is_available, Feature};
 use crate::page_perf::{display, fit};
 use crate::platform::{csv_field, AddonContext};
 use crate::theme::{self, Theme};
@@ -820,8 +821,9 @@ impl AppsPage {
                     let folder = a.folder();
                     let details = details_text(a);
                     let blocked = a.uninstall_blocker().is_some();
+                    let can_uninstall = is_available(Feature::UninstallRegistry);
                     resp.context_menu(|ui| {
-                        if ui.add_enabled(!blocked, egui::Button::new("Uninstall\u{2026}")).clicked() {
+                        if can_uninstall && ui.add_enabled(!blocked, egui::Button::new("Uninstall\u{2026}")).clicked() {
                             menu_uninstall = Some(key.clone());
                             ui.close();
                         }
@@ -917,7 +919,7 @@ impl AppsPage {
             if !upd.is_empty() && parts::primary_button(ui, &format!("Update {} with a newer version", upd.len()), idle).clicked() {
                 self.apps_ui.confirm_update = Some(upd.clone());
             }
-            if parts::destructive_button(ui, &format!("Uninstall {} apps\u{2026}", ticked.len()), idle).clicked() {
+            if is_available(Feature::UninstallRegistry) && parts::destructive_button(ui, &format!("Uninstall {} apps\u{2026}", ticked.len()), idle).clicked() {
                 self.apps_ui.confirm_uninstall = Some(ticked.iter().map(|a| a.key.clone()).collect());
             }
             if parts::outline_button(ui, "Clear ticks", true).clicked() {
@@ -1038,13 +1040,17 @@ impl AppsPage {
             ui.label(RichText::new(format!("The installer may ask for permission. Close {} first if it is open.", short_name(&a.name, &a.version))).size(11.5).color(th.label));
             ui.add_space(4.0);
         }
-        let blocker = a.uninstall_blocker();
+        // Without the system's uninstall registry the app stays listed but
+        // offers no uninstall.
+        let blocker = a.uninstall_blocker().filter(|_| is_available(Feature::UninstallRegistry));
         ui.horizontal_wrapped(|ui| {
-            let un = parts::destructive_button(ui, "Uninstall\u{2026}", idle && blocker.is_none());
-            if let Some(b) = &blocker {
-                un.on_disabled_hover_text(b);
-            } else if un.clicked() {
-                self.apps_ui.confirm_uninstall = Some(vec![a.key.clone()]);
+            if is_available(Feature::UninstallRegistry) {
+                let un = parts::destructive_button(ui, "Uninstall\u{2026}", idle && blocker.is_none());
+                if let Some(b) = &blocker {
+                    un.on_disabled_hover_text(b);
+                } else if un.clicked() {
+                    self.apps_ui.confirm_uninstall = Some(vec![a.key.clone()]);
+                }
             }
             if a.can_modify() && parts::outline_button(ui, "Modify", idle).on_hover_text("Starts the app's own setup to add or remove parts of it").clicked() {
                 self.apps.modify(a.key.clone(), false);
@@ -1456,5 +1462,46 @@ mod csv_export_tests {
 
         let classic = App { key: "HKLM\\Audacity_is1".into(), uninstall: "unins000.exe".into(), ..Default::default() };
         assert!(details_text(&classic).contains("\nRegistry key: Audacity_is1\n"), "a classic program keeps its key");
+    }
+}
+
+/// The page without the system's uninstall registry (issue #116).
+#[cfg(test)]
+mod unavailable_registry_tests {
+    use super::*;
+    use crate::availability::unavailable_in_test;
+
+    /// The words of one frame of a page listing `Tool`, selected or ticked.
+    fn words_of_page(ticked: bool) -> Vec<String> {
+        let (ctx, _) = AddonContext::recording();
+        let hub = Hub::new(ctx.clone());
+        hub.lock().apps = vec![App { key: "HKLM\\Tool".into(), name: "Tool".into(), uninstall: "tool.exe /S".into(), ..Default::default() }];
+        let mut page = AppsPage::new(hub, ctx);
+        page.apps_ui.started = true;
+        page.apps_ui.list_group = Some(ListGroup::All);
+        page.apps_ui.show_tools = true;
+        if ticked {
+            page.apps_ui.checked.insert("HKLM\\Tool".into());
+            page.apps_ui.checked.insert("HKLM\\Other".into());
+            page.apps.lock().apps.push(App { key: "HKLM\\Other".into(), name: "Other".into(), uninstall: "other.exe /S".into(), ..Default::default() });
+        } else {
+            page.apps_ui.selected = Some("HKLM\\Tool".into());
+        }
+        let ui_ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        crate::test_ui::texts(&crate::test_ui::run(&ui_ctx, (1500.0, 900.0), vec![], |ui| page.ui(ui)))
+    }
+
+    #[test]
+    fn an_unavailable_uninstall_registry_hides_the_uninstall_buttons_and_the_page_stays() {
+        let uninstalls = |words: &[String]| words.iter().filter(|w| w.starts_with("Uninstall")).count();
+        for ticked in [false, true] {
+            if is_available(Feature::UninstallRegistry) {
+                assert!(uninstalls(&words_of_page(ticked)) > 0, "the buttons are there when the registry is (ticked: {ticked})");
+            }
+            let _unavailable = unavailable_in_test(&[Feature::UninstallRegistry]);
+            let words = words_of_page(ticked);
+            assert_eq!(uninstalls(&words), 0, "no uninstall offered (ticked: {ticked}): {words:?}");
+            assert!(words.iter().any(|w| w == "Tool" || w.starts_with("Tool")), "the page and its apps stay (ticked: {ticked}): {words:?}");
+        }
     }
 }

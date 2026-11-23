@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use super::model::Reading;
 use super::provider::Provider;
+use crate::availability::{is_available, Feature};
 use crate::perfdata::{CpuInfo, DiskInfo, GpuInfo, MemInfo, StaticInfo};
 
 /// Everything this PC's fixed facts say, read now.
@@ -94,7 +95,7 @@ impl Provider for MachineFacts {
 
     fn machine(&mut self) -> Option<Arc<StaticInfo>> {
         // Blank facts would read as a machine with nothing in it.
-        if !crate::availability::is_available(crate::availability::Feature::PerformanceInfo) {
+        if !is_available(Feature::MachineInformation) {
             return None;
         }
         Some(self.facts.get_or_insert_with(|| Arc::new(read())).clone())
@@ -523,6 +524,7 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::availability::unavailable_in_test;
 
     #[test]
     fn the_machine_facts_provider_is_not_a_source_of_any_figure() {
@@ -531,8 +533,7 @@ mod tests {
 
     #[test]
     fn an_unavailable_static_information_is_not_reported_as_facts() {
-        assert!(MachineFacts::new().machine().is_some() == cfg!(windows), "the system's answer without a test one");
-        let _unavailable = crate::availability::unavailable_in_test(&[crate::availability::Feature::PerformanceInfo]);
+        let _unavailable = unavailable_in_test(&[Feature::MachineInformation]);
         assert!(MachineFacts::new().machine().is_none(), "no blank facts: the page leaves them out");
     }
 

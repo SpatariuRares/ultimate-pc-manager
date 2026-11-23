@@ -52,7 +52,7 @@ impl Provider for IntelDtt {
         #[cfg(windows)]
         return availability(&cpu_vendor(), crate::winsys::service_running(SERVICE));
         #[cfg(not(windows))]
-        Err(crate::availability::unavailable_error(crate::availability::Feature::SensorProviders))
+        Err(crate::availability::unavailable_error(crate::availability::Feature::HardwareSensors))
     }
 
     /// Only a PC with an Intel processor lists Intel DTT.

@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::{AddonContext, Waited};
+use crate::availability::{unavailable_text, Feature};
 
 /// An installed program as Windows lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +59,13 @@ impl Uninstaller {
     /// Uninstalls `name`; `waiting` is told when the wait for its
     /// uninstaller starts (true) and ends (false). Ok once it is gone.
     pub fn uninstall(&self, name: &str, target: &Target, mut waiting: impl FnMut(bool)) -> Result<(), String> {
+        // Without the installed-programs registry nothing could tell the entry
+        // is gone (or list the program at all): say so for every kind of
+        // target, instead of running an uninstaller and reporting it "still
+        // installed".
+        if let Some(why) = unavailable_text(Feature::UninstallRegistry) {
+            return Err(why);
+        }
         let (key, command, msi_code) = match target {
             Target::Msix { package } => {
                 let v = self.ctx.powershell(REMOVE_SCRIPT, &[("Package", package.as_str())], false)?;
@@ -69,11 +77,6 @@ impl Uninstaller {
             }
             Target::Registry { key, command, msi_code } => (key, command, msi_code),
         };
-        // Without the registry nothing could tell the entry is gone: say so
-        // instead of running the uninstaller and reporting it "still installed".
-        if let Some(why) = crate::availability::availability(crate::availability::Feature::UninstallRegistry).text() {
-            return Err(why);
-        }
         if command.trim().is_empty() && msi_code.is_empty() {
             return Err(not_registered(name));
         }
@@ -215,7 +218,8 @@ pub fn registry_entry(key: &str) -> Option<Target> {
 
 #[cfg(not(windows))]
 mod imp {
-    /// The uninstall registry is Windows only: nothing is ever gone.
+    /// The uninstall registry is Windows only. [`Uninstaller::uninstall`]
+    /// reports that before it gets here, so "still listed" is never asked.
     pub fn still_listed(_: &str) -> bool {
         true
     }
@@ -264,6 +268,7 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::availability::unavailable_in_test;
     use crate::platform::Launch;
 
     /// The uninstaller of the windowless add-on host, and its test executor.
@@ -282,12 +287,15 @@ mod tests {
 
     #[test]
     fn an_unavailable_uninstall_registry_is_reported_and_nothing_is_started() {
-        let _unavailable = crate::availability::unavailable_in_test(&[crate::availability::Feature::UninstallRegistry]);
+        let _unavailable = unavailable_in_test(&[Feature::UninstallRegistry]);
         let (u, runner) = through_the_host();
-        let mut told = Vec::new();
-        let result = u.uninstall("Tool", &registry("uninst.exe /S", ""), |w| told.push(w));
-        assert_eq!(result, Err("Not available on this system.".into()));
-        assert!(runner.launches().is_empty() && told.is_empty(), "no uninstaller runs and nothing waits for it");
+        let store = Target::Msix { package: "Calc_1.0_x64__abc".into() };
+        for target in [registry("uninst.exe /S", ""), store] {
+            let mut told = Vec::new();
+            let result = u.uninstall("Tool", &target, |w| told.push(w));
+            assert_eq!(result, Err("Not available on this system.".into()), "{target:?}");
+            assert!(runner.launches().is_empty() && told.is_empty(), "no uninstaller runs and nothing waits for it: {target:?}");
+        }
     }
 
     #[test]

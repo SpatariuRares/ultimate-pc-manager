@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::addons::plural;
+use crate::availability::{unavailable_text, Feature};
 use crate::platform::uninstaller::expand_env;
 use crate::platform::uninstaller::{not_registered, Target, Uninstaller};
 use crate::platform::winget::{describe, last_lines, match_rows, uninstall_summary, update_summary, InstalledEntry};
@@ -350,15 +351,15 @@ impl Hub {
             if st.listing {
                 return;
             }
-            st.listing = true;
             // A system without the listing says so; it never reads as "no apps".
-            if let Some(why) = crate::availability::availability(crate::availability::Feature::InstalledApps).text() {
+            // The `true` of a message marks an error.
+            if let Some(why) = unavailable_text(Feature::UninstallRegistry) {
                 st.apps.clear();
-                st.listing = false;
                 st.listed_at = crate::pro::clock_now();
                 st.message = Some((why, true));
                 return;
             }
+            st.listing = true;
         }
         let hub = self.clone();
         std::thread::spawn(move || hub.refresh_now());

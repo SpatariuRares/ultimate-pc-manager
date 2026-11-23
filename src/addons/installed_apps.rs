@@ -280,7 +280,8 @@ mod tests {
 
     #[test]
     fn an_unavailable_listing_reports_it_and_reads_nothing() {
-        let _unavailable = crate::availability::unavailable_in_test(&[crate::availability::Feature::InstalledApps]);
+        use crate::availability::{unavailable_in_test, Feature};
+        let _unavailable = unavailable_in_test(&[Feature::UninstallRegistry]);
         let (ctx, _) = AddonContext::recording();
         let mut addon = InstalledApps::default();
         addon.start(&ctx);

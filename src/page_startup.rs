@@ -5,9 +5,11 @@ use egui::{Align, Layout, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 
 use crate::addons::Core;
+use crate::availability::{is_available, unavailable_text, Feature};
 use crate::core_page::{page_title, CorePage, PageCtx};
 use crate::list_pages::{fact_values, panel_title, summary_band, GAP};
 use crate::platform::Action;
+use crate::theme;
 use crate::system_lists::{StartupRow, SystemLists};
 use crate::widgets::parts::{
     self, cell_text, column_heading, design_table, facts, list_with_panel, CellInk, Mark, SidePanel, TABLE_HEADER_HEIGHT, TABLE_ROW_HEIGHT,
@@ -26,7 +28,8 @@ impl StartupPage {
     /// The one place the startup list is read: every reader (first draw,
     /// Refresh, F5, the sidebar, an Enable or Disable) comes here.
     pub fn reload(&mut self, system: &dyn SystemLists) {
-        self.list = Some(system.list_startup());
+        // A system without startup entries has nothing to read; the page says so.
+        self.list = Some(if is_available(Feature::StartupEntries) { system.list_startup() } else { Vec::new() });
     }
 
     /// Whether the list has been read yet.
@@ -65,6 +68,11 @@ impl CorePage for StartupPage {
             });
         });
         ui.add_space(GAP);
+        if let Some(why) = unavailable_text(Feature::StartupEntries) {
+            let t = theme::of_ui(ui);
+            summary_band(ui, Mark::Dot(t.red), "The startup apps could not be read", &why);
+            return;
+        }
         let off = list.iter().filter(|r| !r.enabled).count();
         let sub = format!("{off} of them are turned off. From the Run keys and Startup folders, read when the page opens and on Refresh.");
         summary_band(ui, Mark::None, &startup_headline(&list), &sub);
@@ -211,6 +219,20 @@ mod tests {
         assert!(!has(&chosen, EMPTY_DETAIL));
         assert_eq!(chosen.iter().filter(|w| *w == "HKCU Run").count(), 2, "the location in the list and in the panel");
         assert_eq!(chosen.iter().filter(|w| *w == "Disable").count(), 2, "Disable in the header and in the panel");
+    }
+
+    #[test]
+    fn an_unavailable_startup_list_shows_the_unavailable_state_and_reads_nothing() {
+        let env = Env::new();
+        env.system.script_startup(vec![entry("a", "Steam", true)]);
+        let mut page = StartupPage::default();
+        let ui = ui_ctx();
+        let _unavailable = crate::availability::unavailable_in_test(&[Feature::StartupEntries]);
+        let shown = texts(&ui, &mut page, &env.ctx());
+        assert!(has(&shown, "Startup apps"), "the page stays: {shown:?}");
+        assert!(has(&shown, "Not available on this system."), "{shown:?}");
+        assert!(!has(&shown, "Steam") && !shown.iter().any(|w| w.contains("startup apps are enabled")), "not an empty or a real list: {shown:?}");
+        assert_eq!(env.system.startup_reads(), 0, "nothing is read");
     }
 
     #[test]

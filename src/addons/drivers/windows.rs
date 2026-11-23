@@ -22,10 +22,10 @@ mod imp {
     use super::super::engine::*;
     use crate::availability::{unavailable_error, Feature};
     pub fn list_devices() -> Result<Vec<DeviceDriver>, String> {
-        Err(unavailable_error(Feature::DriversListing))
+        Err(unavailable_error(Feature::DeviceSetupApi))
     }
     pub fn list_kernel() -> Result<Vec<KernelDriver>, String> {
-        Err(unavailable_error(Feature::DriversListing))
+        Err(unavailable_error(Feature::DeviceSetupApi))
     }
 }
 

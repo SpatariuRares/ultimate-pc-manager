@@ -14,6 +14,7 @@ use std::time::Duration;
 use egui::{vec2, Align, Layout, RichText, Ui};
 
 use crate::app::Action;
+use crate::availability::{is_available, Feature};
 use crate::platform::lock_state;
 use crate::sampler::ProcRow;
 use crate::theme::{self, Theme};
@@ -633,7 +634,7 @@ impl FileActivity {
                 clear = outline_button(ui, "Clear", !self.activity.is_empty()).clicked();
             });
         });
-        if self.status == Status::NeedsAdmin && admin_button(ui, RESTART, false, true).clicked() {
+        if self.status == Status::NeedsAdmin && is_available(Feature::Elevation) && admin_button(ui, RESTART, false, true).clicked() {
             actions.push(Action::RestartAsAdministrator);
         }
         ui.add_space(6.0);
@@ -1380,6 +1381,19 @@ mod tests {
         let button = spots.iter().find(|s| s.0.trim() == RESTART).unwrap_or_else(|| panic!("{RESTART} in {all:?}")).1;
         let (_, actions) = frame(&ctx, &mut w, click(button));
         assert_eq!(actions, [Action::RestartAsAdministrator]);
+    }
+
+    #[test]
+    fn a_system_that_cannot_restart_elevated_hides_the_restart_button_and_the_window_stays() {
+        let ctx = crate::test_ui::context(Mode::Dark);
+        let words = |w: &mut FileActivity| frame(&ctx, w, vec![]).0.into_iter().map(|s| s.0).collect::<Vec<_>>();
+        let mut shown = FileActivity::open(26920, &[nordvpn()], false);
+        let on_this_system = words(&mut shown);
+        assert_eq!(on_this_system.iter().any(|t| t.trim() == RESTART), is_available(Feature::Elevation), "{on_this_system:?}");
+        let _unavailable = crate::availability::unavailable_in_test(&[Feature::Elevation]);
+        let hidden = words(&mut shown);
+        assert!(!hidden.iter().any(|t| t.trim() == RESTART), "{hidden:?}");
+        assert!(hidden.iter().any(|t| t == NEEDS_ADMIN), "the window still says why it cannot trace: {hidden:?}");
     }
 
     #[test]

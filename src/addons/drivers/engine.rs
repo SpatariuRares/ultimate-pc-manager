@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::addons::plural;
+use crate::availability::{unavailable_text, Feature};
 use crate::platform::install_queue::{Request, Work};
 use crate::platform::series::{Run, Series};
 use crate::platform::{AddonContext, Generation};
@@ -386,8 +387,9 @@ impl Hub {
             if st.listing {
                 return;
             }
-            // A system without drivers says so; it never reads as an empty list.
-            if let Some(why) = crate::availability::availability(crate::availability::Feature::DriversListing).text() {
+            // A system without drivers says so; it never reads as an empty
+            // list. Each tab shows its own list's error, so both get it.
+            if let Some(why) = unavailable_text(Feature::DeviceSetupApi) {
                 publish_listing(&mut st, Err(why.clone()), Err(why));
                 st.listed_at = crate::pro::clock_now();
                 return;

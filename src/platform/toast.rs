@@ -168,9 +168,11 @@ impl Toasts {
 
 #[cfg(not(windows))]
 mod imp {
+    use crate::availability::{unavailable_error, Feature};
+
     /// Notifications are Windows only.
     pub fn show(_: &str, _: &str) -> Result<(), String> {
-        Err(crate::availability::unavailable_error(crate::availability::Feature::Notifications))
+        Err(unavailable_error(Feature::Notifications))
     }
 
     pub fn shutdown() {}

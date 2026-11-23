@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use egui::{vec2, Align2, Color32, CornerRadius, FontFamily, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui};
 
 use crate::app::{PerfItem, TaskApp};
+use crate::availability::{unavailable_text, Feature};
 use crate::core_page::{CorePage, PageCtx, PerfHistory};
 use crate::platform::Action;
 use crate::settings::Settings;
@@ -144,6 +145,9 @@ pub(crate) struct Dev {
 pub(crate) struct Stats {
     pub(crate) top: Vec<(String, String)>,
     pub(crate) table: Vec<(String, String)>,
+    /// Why the machine's fixed facts are not known; set, the facts are left
+    /// out ([`Stats::fact_top`], [`Stats::fact_row`]) and said once.
+    facts_unavailable: Option<String>,
 }
 
 impl Stats {
@@ -152,6 +156,19 @@ impl Stats {
     }
     fn row(&mut self, k: &str, v: impl Into<String>) {
         self.table.push((k.into(), v.into()));
+    }
+    /// A figure from the machine's fixed facts: blank facts would read as a
+    /// machine with nothing in it, so none is shown when they are unknown.
+    fn fact_top(&mut self, k: &str, v: impl Into<String>) {
+        if self.facts_unavailable.is_none() {
+            self.top(k, v);
+        }
+    }
+    /// A line of the table from the machine's fixed facts (see [`Stats::fact_top`]).
+    fn fact_row(&mut self, k: &str, v: impl Into<String>) {
+        if self.facts_unavailable.is_none() {
+            self.row(k, v);
+        }
     }
     fn height(&self) -> f32 {
         let rows = self.top.len().div_ceil(4) as f32;
@@ -779,7 +796,7 @@ impl<'a> Frame<'a> {
         let s = &self.snap;
         let info = self.machine();
         let pf = &s.perf;
-        let mut st = Stats::default();
+        let mut st = Stats { facts_unavailable: unavailable_text(Feature::MachineInformation), ..Default::default() };
         let dash = "\u{2014}";
         match item {
             PerfItem::Cpu => {
@@ -792,19 +809,19 @@ impl<'a> Frame<'a> {
                 st.top("Threads", pf.threads.to_string());
                 st.top("Up time", fmt_uptime(s.uptime));
                 let yes_no = |b: bool| if b { "Yes" } else { "No" };
-                st.row("Fast Startup:", c.fast_startup.map(yes_no).unwrap_or(dash));
-                st.row("Base speed:", if c.base_mhz > 0 { format!("{:.2} GHz", c.base_mhz as f32 / 1000.0) } else { dash.into() });
-                st.row("Sockets:", c.sockets.max(1).to_string());
-                st.row("Physical cores:", c.cores.to_string());
+                st.fact_row("Fast Startup:", c.fast_startup.map(yes_no).unwrap_or(dash));
+                st.fact_row("Base speed:", if c.base_mhz > 0 { format!("{:.2} GHz", c.base_mhz as f32 / 1000.0) } else { dash.into() });
+                st.fact_row("Sockets:", c.sockets.max(1).to_string());
+                st.fact_row("Physical cores:", c.cores.to_string());
                 st.row("Logical processors:", s.cpu_per_core.len().to_string());
-                st.row("Virtualization:", c.virtualization.map(|v| if v { "Enabled" } else { "Disabled" }).unwrap_or(dash));
-                st.row("Virtual machine:", yes_no(c.vm));
-                st.row("L1 cache:", fmt_size(c.l1));
-                st.row("L2 cache:", fmt_size(c.l2));
-                st.row("L3 cache:", fmt_size(c.l3));
+                st.fact_row("Virtualization:", c.virtualization.map(|v| if v { "Enabled" } else { "Disabled" }).unwrap_or(dash));
+                st.fact_row("Virtual machine:", yes_no(c.vm));
+                st.fact_row("L1 cache:", fmt_size(c.l1));
+                st.fact_row("L2 cache:", fmt_size(c.l2));
+                st.fact_row("L3 cache:", fmt_size(c.l3));
                 st.row("Frequency driver:", "Windows processor power management");
-                st.row("Frequency governor:", if c.plan.is_empty() { dash.to_string() } else { c.plan.clone() });
-                st.row("Power preference:", if c.overlay.is_empty() { dash.to_string() } else { c.overlay.clone() });
+                st.fact_row("Frequency governor:", if c.plan.is_empty() { dash.to_string() } else { c.plan.clone() });
+                st.fact_row("Power preference:", if c.overlay.is_empty() { dash.to_string() } else { c.overlay.clone() });
                 st.row("Handles:", pf.handles.to_string());
             }
             PerfItem::Memory => {
@@ -815,10 +832,10 @@ impl<'a> Frame<'a> {
                 st.top("Cached", fmt_size(pf.cached));
                 st.top("Swap used", fmt_size(s.swap_used));
                 st.top("Swap available", fmt_size(s.swap_total.saturating_sub(s.swap_used)));
-                st.top("Speed", m.speed_mts.map(|v| format!("{v} MT/s")).unwrap_or_else(|| dash.into()));
-                st.top("Slots used", if m.slots > 0 { format!("{} of {}", m.used_slots, m.slots) } else { dash.into() });
-                st.top("Form factor", m.form.unwrap_or(dash));
-                st.top("Type", m.kind.unwrap_or(dash));
+                st.fact_top("Speed", m.speed_mts.map(|v| format!("{v} MT/s")).unwrap_or_else(|| dash.into()));
+                st.fact_top("Slots used", if m.slots > 0 { format!("{} of {}", m.used_slots, m.slots) } else { dash.into() });
+                st.fact_top("Form factor", m.form.unwrap_or(dash));
+                st.fact_top("Type", m.kind.unwrap_or(dash));
                 st.top("Compressed", fmt_size(s.compressed));
                 st.top("Page ins", pf.page_ins.to_string());
                 st.top("Hard faults", format!("{:.0} pages/s", pf.hard_faults));
@@ -832,10 +849,10 @@ impl<'a> Frame<'a> {
                 st.top("Total written", fmt_size(live.total_written));
                 st.top("Active time", pct1(live.active));
                 st.top("Avg. response time", format!("{:.2} ms", live.resp_ms));
-                st.top("Capacity", fixed.map(|d| fmt_size(d.capacity)).unwrap_or_else(|| dash.into()));
-                st.top("Formatted", fixed.filter(|d| d.formatted > 0).map(|d| fmt_size(d.formatted)).unwrap_or_else(|| "Unavailable".into()));
-                st.top("System disk", if fixed.map(|d| d.system).unwrap_or(false) { "Yes" } else { "No" });
-                st.top("Type", fixed.map(|d| d.bus).unwrap_or(dash));
+                st.fact_top("Capacity", fixed.map(|d| fmt_size(d.capacity)).unwrap_or_else(|| dash.into()));
+                st.fact_top("Formatted", fixed.filter(|d| d.formatted > 0).map(|d| fmt_size(d.formatted)).unwrap_or_else(|| "Unavailable".into()));
+                st.fact_top("System disk", if fixed.map(|d| d.system).unwrap_or(false) { "Yes" } else { "No" });
+                st.fact_top("Type", fixed.map(|d| d.bus).unwrap_or(dash));
             }
             PerfItem::Network => {
                 let crate::metrics::Adapters { rx_bps: rx, tx_bps: tx, .. } = crate::metrics::combine_adapters(&s.net);
@@ -877,8 +894,8 @@ impl<'a> Frame<'a> {
                 st.row("Temperature:", dash);
                 st.row("Graphics API:", "Direct3D 12");
                 st.row("PCI Express:", "Unavailable");
-                st.row("Driver version:", fixed.map(|g| g.driver.clone()).filter(|v| !v.is_empty()).unwrap_or_else(|| dash.into()));
-                st.row("Physical location:", fixed.map(|g| g.location.clone()).filter(|v| !v.is_empty()).unwrap_or_else(|| dash.into()));
+                st.fact_row("Driver version:", fixed.map(|g| g.driver.clone()).filter(|v| !v.is_empty()).unwrap_or_else(|| dash.into()));
+                st.fact_row("Physical location:", fixed.map(|g| g.location.clone()).filter(|v| !v.is_empty()).unwrap_or_else(|| dash.into()));
             }
             PerfItem::Power => {
                 let h = self.hist("power");
@@ -889,6 +906,9 @@ impl<'a> Frame<'a> {
                 st.top("Peak", format!("{peak:.1} W"));
                 st.top("Source", "Windows energy meter");
             }
+        }
+        if let Some(why) = st.facts_unavailable.take() {
+            st.row("Machine facts:", why);
         }
         st
     }
@@ -1191,6 +1211,20 @@ mod tests {
         }
         assert!(!shows(&drawn.texts, HARD_FAULTS), "the CPU is the device shown, not Memory");
         assert!(drawn.actions.is_empty(), "drawing alone asks for nothing");
+    }
+
+    #[test]
+    fn unavailable_machine_facts_show_the_unavailable_wording_and_no_blank_facts() {
+        let facts = ["Sockets:", "Physical cores:", "Base speed:", "L1 cache:", "Virtual machine:"];
+        let on_this_system = draw(&mut PerformancePage::default(), &Settings::default(), &Snapshot::default()).texts;
+        assert_eq!(shows(&on_this_system, "Sockets:"), unavailable_text(Feature::MachineInformation).is_none(), "{on_this_system:?}");
+        let _unavailable = crate::availability::unavailable_in_test(&[Feature::MachineInformation]);
+        let drawn = draw(&mut PerformancePage::default(), &Settings::default(), &Snapshot::default());
+        assert!(shows(&drawn.texts, "Not available on this system."), "{:?}", drawn.texts);
+        assert!(shows(&drawn.texts, "Performance") && shows(&drawn.texts, "CPU"), "the page stays: {:?}", drawn.texts);
+        for fact in facts {
+            assert!(!shows(&drawn.texts, fact), "{fact} is left out: {:?}", drawn.texts);
+        }
     }
 
     #[test]

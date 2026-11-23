@@ -866,29 +866,30 @@ pub fn is_admin() -> bool {
 #[cfg(not(windows))]
 mod imp {
     use super::*;
+    use crate::availability::{unavailable_error, Feature};
     /// PowerShell is Windows only.
     pub fn run_script(_: &str, _: &[(&str, &str)], _: bool) -> Result<serde_json::Value, String> {
-        Err(crate::availability::unavailable_error(crate::availability::Feature::PowerShell))
+        Err(unavailable_error(Feature::PowerShell))
     }
     /// PowerShell is Windows only.
     pub fn run_script_until(_: &str, _: &[(&str, &str)], _: &AtomicBool) -> Result<serde_json::Value, String> {
-        Err(crate::availability::unavailable_error(crate::availability::Feature::PowerShell))
+        Err(unavailable_error(Feature::PowerShell))
     }
     /// winget is Windows only.
     pub fn winget(_: &[&str]) -> Result<(i32, String), String> {
-        Err(crate::availability::unavailable_error(crate::availability::Feature::Winget))
+        Err(unavailable_error(Feature::Winget))
     }
     /// Running programs is Windows only.
     pub fn run(_: &str, _: &[&str], _: &std::path::Path, _: &AtomicBool, _: &mut dyn FnMut(&str)) -> Ran {
-        Ran::NotStarted(crate::availability::unavailable_error(crate::availability::Feature::RunPrograms))
+        Ran::NotStarted(unavailable_error(Feature::ProgramLaunch))
     }
     /// Starting programs this way is Windows only.
     pub fn run_and_wait(_: &str, _: &str, _: &AtomicBool) -> Result<Waited, String> {
-        Err(crate::availability::unavailable_error(crate::availability::Feature::RunPrograms))
+        Err(unavailable_error(Feature::ProgramLaunch))
     }
     /// Elevation is Windows only.
     pub fn restart_elevated(_: &[&str]) -> Result<(), String> {
-        Err(crate::availability::unavailable_error(crate::availability::Feature::Elevation))
+        Err(unavailable_error(Feature::Elevation))
     }
     /// No file dialog: always cancelled.
     pub fn file_dialog(_: bool, _: &str, _: &str, _: &str, _: &str) -> Option<String> {

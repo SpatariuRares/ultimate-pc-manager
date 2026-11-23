@@ -88,7 +88,7 @@ impl Provider for PowerPlan {
         #[cfg(windows)]
         return Ok(());
         #[cfg(not(windows))]
-        Err(crate::availability::unavailable_error(crate::availability::Feature::SensorProviders))
+        Err(crate::availability::unavailable_error(crate::availability::Feature::HardwareSensors))
     }
 
     fn read(&mut self, at: Instant) -> Vec<Reading> {
