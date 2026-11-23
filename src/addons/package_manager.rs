@@ -1165,6 +1165,7 @@ mod tests {
     use crate::platform::{Launch, RecordingRunner, When};
     use crate::sampler::Snapshot;
     use crate::settings::Settings;
+    use crate::test_ui::{drawn_text, page_text};
     use serde_json::json;
 
     /// Runs one windowless egui frame with a page context.
@@ -1698,40 +1699,6 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
         }
     }
 
-    /// Every text the page shows in one frame, a line each.
-    fn page_text(host: &mut AddonHost) -> String {
-        drawn_text(|ui, page| {
-            host.ui(ID, ui, page);
-        })
-        .0
-    }
-
-    /// Every text `draw` shows in one frame, and the actions it asked for.
-    fn drawn_text(mut draw: impl FnMut(&mut egui::Ui, &mut PageContext)) -> (String, Vec<crate::platform::Action>) {
-        fn collect(shape: &egui::Shape, out: &mut Vec<String>) {
-            match shape {
-                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
-                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
-                _ => {}
-            }
-        }
-        let (settings, sample) = (Settings::default(), Snapshot::default());
-        let ctx = egui::Context::default();
-        // The app\'s faces, as at start-up: pages draw in them.
-        crate::theme::install_fonts(&ctx);
-        let mut actions = Vec::new();
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let mut page = PageContext::new(&settings, &sample);
-                draw(ui, &mut page);
-                actions = std::mem::take(&mut page.actions);
-            });
-        });
-        let mut out = Vec::new();
-        output.shapes.iter().for_each(|c| collect(&c.shape, &mut out));
-        (out.join("\n"), actions)
-    }
-
     /// What the status bar shows of the add-ons that are on.
     fn status_bar_text(host: &mut AddonHost) -> String {
         drawn_text(|ui, page| {
@@ -1747,7 +1714,7 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
         runner.prepare(When::Arg("--version".into()), 0, "v1.9.25200");
         open_page(&mut host);
         until("ready", || matches!(check_of(&view), Check::Known(Readiness::Ready(_))));
-        let text = page_text(&mut host);
+        let text = page_text(|ui, pc| host.ui(ID, ui, pc));
         assert!(text.contains("winget 1.9.25200 is ready"), "{text}");
         assert!(text.contains("You can search and install programs from the winget catalogs."), "{text}");
 
@@ -1755,7 +1722,7 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
         runner.prepare(When::Arg("--version".into()), 0, "v1.2.10271");
         open_page(&mut host);
         until("too old", || matches!(check_of(&view), Check::Known(Readiness::TooOld(_))));
-        let text = page_text(&mut host);
+        let text = page_text(|ui, pc| host.ui(ID, ui, pc));
         assert!(text.contains("winget 1.2.10271 is too old"), "{text}");
         assert!(text.contains("Update in the Microsoft Store"), "{text}");
     }
@@ -1771,7 +1738,7 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
         open_page(&mut host);
         until("update failed", || matches!(lock_state(&view).catalogs, Catalogs::Failed(_)));
         assert_eq!(lock_state(&view).catalogs, Catalogs::Failed("exit code 1".into()));
-        assert!(page_text(&mut host).contains("Could not update the catalogs: exit code 1"), "{}", page_text(&mut host));
+        assert!(page_text(|ui, pc| host.ui(ID, ui, pc)).contains("Could not update the catalogs: exit code 1"), "{}", page_text(|ui, pc| host.ui(ID, ui, pc)));
 
         runner.prepare(When::Arg("--query".into()), 0, SEARCH);
         act(&mut host, &commands, Command::Search("vlc".into()));
@@ -1789,7 +1756,7 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
         runner.prepare(When::Arg("--version".into()), 0, "v1.9.25200");
         open_page(&mut host);
         until("ready", || matches!(check_of(&view), Check::Known(Readiness::Ready(_))));
-        assert!(page_text(&mut host).contains(note), "{}", page_text(&mut host));
+        assert!(page_text(|ui, pc| host.ui(ID, ui, pc)).contains(note), "{}", page_text(|ui, pc| host.ui(ID, ui, pc)));
 
         runner.prepare(When::Arg("install".into()), 0, "Successfully installed");
         runner.prepare(When::Arg("list".into()), 0, LISTED);
@@ -1801,13 +1768,13 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
         runner.prepare(When::Arg("--version".into()), 0, "v1.9.25200");
         open_page(&mut host);
         until("ready", || matches!(check_of(&view), Check::Known(Readiness::Ready(_))));
-        assert!(!page_text(&mut host).contains(note), "not after the first install");
+        assert!(!page_text(|ui, pc| host.ui(ID, ui, pc)).contains(note), "not after the first install");
 
         let (mut host, runner, view, _) = host_with_settings(&logs, json!({ "acceptAgreements": false }));
         runner.prepare(When::Arg("--version".into()), 0, "v1.9.25200");
         open_page(&mut host);
         until("ready", || matches!(check_of(&view), Check::Known(Readiness::Ready(_))));
-        assert!(!page_text(&mut host).contains(note), "nothing is accepted automatically");
+        assert!(!page_text(|ui, pc| host.ui(ID, ui, pc)).contains(note), "nothing is accepted automatically");
     }
 
     #[test]
@@ -2095,17 +2062,17 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
     fn the_page_shows_who_holds_the_install_queue_and_how_many_items_wait() {
         let logs = scratch("queue-line");
         let (mut host, runner, view, commands) = host_with_logs(&logs);
-        assert!(!page_text(&mut host).contains("Install queue"), "nothing while the queue is free");
+        assert!(!page_text(|ui, pc| host.ui(ID, ui, pc)).contains("Install queue"), "nothing while the queue is free");
         let held = host.context().install_queue().enter(drivers_request(), |_| {}).unwrap();
-        assert!(page_text(&mut host).contains("Install queue: Drivers is installing 1 item."));
+        assert!(page_text(|ui, pc| host.ui(ID, ui, pc)).contains("Install queue: Drivers is installing 1 item."));
         act(&mut host, &commands, Command::InstallAll(vec![pkg("A"), pkg("B")]));
         until("waiting", || host.context().install_queue().waiting() == 2);
-        assert!(page_text(&mut host).contains("Install queue: Drivers is installing 1 item; 2 items wait."));
+        assert!(page_text(|ui, pc| host.ui(ID, ui, pc)).contains("Install queue: Drivers is installing 1 item; 2 items wait."));
         exits(&runner, "A", 0);
         exits(&runner, "B", 0);
         drop(held);
         until("the series ends", || series_done(&view));
-        assert!(!page_text(&mut host).contains("Install queue"), "its own job is not shown as another's");
+        assert!(!page_text(|ui, pc| host.ui(ID, ui, pc)).contains("Install queue"), "its own job is not shown as another's");
         let _ = std::fs::remove_dir_all(&logs);
     }
 
@@ -2236,14 +2203,14 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
     #[test]
     fn continuing_an_interrupted_run_installs_only_the_missing_packages() {
         let (mut host, runner, view, commands, logs) = host_after_an_interrupted_run("resume");
-        let text = page_text(&mut host);
+        let text = page_text(|ui, pc| host.ui(ID, ui, pc));
         assert!(text.contains(OFFER) && text.contains("Continue") && text.contains("Ignore"), "{text}");
         exits(&runner, "B", 0);
         exits(&runner, "C", 0);
         act(&mut host, &commands, Command::ContinueInterrupted);
         until("the resumed series ends", || series_done(&view));
         assert_eq!(installed_ids(&runner), ["Vendor.B", "Vendor.C"]);
-        assert!(!page_text(&mut host).contains(OFFER), "offered once");
+        assert!(!page_text(|ui, pc| host.ui(ID, ui, pc)).contains(OFFER), "offered once");
         let old: serde_json::Value = serde_json::from_slice(&std::fs::read(logs.join("journal").join("run-000000000000001-000000.json")).unwrap()).unwrap();
         assert_eq!(old["finished"], json!(true), "continued: not offered again");
         assert_eq!(journal_statuses(&logs), pairs(&[("Vendor.B", "ok"), ("Vendor.C", "ok")]), "the resumed series has its own journal");
@@ -2264,7 +2231,7 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
         assert_eq!(journal(&logs)["finished"], json!(false));
         assert_eq!(journal(&logs)["updating"], json!(true));
         let (mut again, runner, view, commands) = host_with_logs(&logs);
-        assert!(page_text(&mut again).contains("The last run was interrupted: 1 of 2 done."));
+        assert!(page_text(|ui, pc| again.ui(ID, ui, pc)).contains("The last run was interrupted: 1 of 2 done."));
         exits(&runner, "B", 0);
         act(&mut again, &commands, Command::ContinueInterrupted);
         until("the resumed series ends", || series_done(&view));
@@ -2288,12 +2255,12 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
     fn ignoring_an_interrupted_run_installs_nothing_and_closes_it() {
         let (mut host, runner, view, commands, logs) = host_after_an_interrupted_run("ignore");
         act(&mut host, &commands, Command::IgnoreInterrupted);
-        assert!(!page_text(&mut host).contains(OFFER));
+        assert!(!page_text(|ui, pc| host.ui(ID, ui, pc)).contains(OFFER));
         assert_eq!(lock_state(&view).batch, None);
         assert!(winget_runs(&runner, "install").is_empty());
         assert_eq!(journal(&logs)["finished"], json!(true));
         let (mut again, ..) = host_with_logs(&logs);
-        assert!(!page_text(&mut again).contains(OFFER), "not offered at the next start");
+        assert!(!page_text(|ui, pc| again.ui(ID, ui, pc)).contains(OFFER), "not offered at the next start");
     }
 
     #[test]
@@ -2389,7 +2356,7 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
         act(&mut host, &commands, Command::AddManualEntry { name: "Tool".into(), url: "https://example.com/tool".into() });
         act(&mut host, &commands, Command::AddManualEntry { name: "Bad".into(), url: "file:///C:/x.exe".into() });
         assert_eq!(bundle_rows(&view).len(), 3, "the bad link is not added");
-        assert!(page_text(&mut host).contains("not a web address"));
+        assert!(page_text(|ui, pc| host.ui(ID, ui, pc)).contains("not a web address"));
         std::fs::create_dir_all(&logs).unwrap();
         let path = logs.join("mine.upmbundle");
         act(&mut host, &commands, Command::SaveBundle(path.clone()));
@@ -2397,7 +2364,7 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
         assert_eq!(saved["schema_version"], json!(1));
         assert_eq!(saved["created"].as_str().map(str::len), Some("2026-11-18T09:30:00Z".len()));
         assert_eq!(saved["entries"], json!([{ "catalog": "winget", "id": "Git.Git" }, { "manual": true, "name": "Tool", "url": "https://example.com/tool" }]));
-        assert!(page_text(&mut host).contains("mine.upmbundle"), "the page says where it was saved");
+        assert!(page_text(|ui, pc| host.ui(ID, ui, pc)).contains("mine.upmbundle"), "the page says where it was saved");
         let _ = std::fs::remove_dir_all(&logs);
     }
 
@@ -2422,7 +2389,7 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
         act(&mut host, &commands, Command::OpenBundle(path));
         let shown = ["Git.Git", "Store app", "git", "Tool"].map(String::from);
         assert_eq!(bundle_rows(&view), [(shown[0].clone(), true), (shown[1].clone(), true), (shown[2].clone(), false), (shown[3].clone(), true)]);
-        let text = page_text(&mut host);
+        let text = page_text(|ui, pc| host.ui(ID, ui, pc));
         for words in ["Entry 3 was skipped", "catalog not available", "https://example.com/tool", "2.47.0", "machine"] {
             assert!(text.contains(words), "the page shows {words:?}: {text}");
         }
@@ -2455,7 +2422,7 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
         act(&mut host, &commands, Command::OpenBundle(path));
         act(&mut host, &commands, Command::InstallBundle);
         until("the series ends", || series_done(&view));
-        let text = page_text(&mut host);
+        let text = page_text(|ui, pc| host.ui(ID, ui, pc));
         assert!(text.contains("Open the site"), "the series row offers the site: {text}");
         act(&mut host, &commands, Command::OpenItemSite(0));
         assert_eq!(runner.launches().last(), Some(&Launch::Open("https://example.com/tool".into())));
@@ -2503,7 +2470,7 @@ winget https://cdn.winget.microsoft.com/cache false\n";
         std::fs::write(&path, json!({ "schema_version": 1, "created": "2026-11-18T09:30:00Z", "entries": entries }).to_string()).unwrap();
         act(&mut host, &commands, Command::OpenBundle(path));
         assert_eq!(bundle_rows(&view), [("Vendor.A".to_string(), true), ("Store app".to_string(), false)]);
-        assert!(page_text(&mut host).contains("catalog not available"));
+        assert!(page_text(|ui, pc| host.ui(ID, ui, pc)).contains("catalog not available"));
         act(&mut host, &commands, Command::TickBundleEntry(1, true));
         assert_eq!(bundle_rows(&view)[1], ("Store app".to_string(), false), "it cannot be ticked");
         exits(&runner, "A", 0);
@@ -2583,7 +2550,7 @@ winget https://cdn.winget.microsoft.com/cache false\n";
         assert_eq!((j["entries"][1]["pin_version"].clone(), j["entries"][1]["scope"].clone()), (json!("2.47.0"), json!("user")));
         assert_eq!((j["entries"][2]["name"].clone(), j["entries"][2]["why"].clone()), (json!("Tool"), json!("https://example.com/tool")));
         let (mut again, runner, view, commands) = host_with_logs(&logs);
-        assert!(page_text(&mut again).contains("The last run was interrupted: 1 of 2 done."), "the manual entry is not counted");
+        assert!(page_text(|ui, pc| again.ui(ID, ui, pc)).contains("The last run was interrupted: 1 of 2 done."), "the manual entry is not counted");
         exits(&runner, "G", 0);
         act(&mut again, &commands, Command::ContinueInterrupted);
         until("the resumed series ends", || series_done(&view));
@@ -2632,7 +2599,7 @@ winget https://cdn.winget.microsoft.com/cache false\n";
         std::fs::write(&path, file.to_string()).unwrap();
         act(&mut host, &commands, Command::OpenBundle(path));
         assert_eq!(bundle_rows(&view), [("Git.Git".to_string(), true), ("9NBLGGH4VVNH".to_string(), true)]);
-        let text = page_text(&mut host);
+        let text = page_text(|ui, pc| host.ui(ID, ui, pc));
         for words in ["Package 2 was skipped", "Package 3 was skipped", "2.47.0", "machine", "latest"] {
             assert!(text.contains(words), "the page shows {words:?} before starting: {text}");
         }
@@ -2662,7 +2629,7 @@ winget https://cdn.winget.microsoft.com/cache false\n";
         act(&mut host, &commands, Command::SetBundleVersion(1, String::new()));
         act(&mut host, &commands, Command::SetBundleScope(1, None));
         act(&mut host, &commands, Command::SetBundleVersion(2, "1.0 --override /S".into()));
-        let text = page_text(&mut host);
+        let text = page_text(|ui, pc| host.ui(ID, ui, pc));
         for words in ["1.2.3", "user", "not allowed"] {
             assert!(text.contains(words), "the page shows {words:?} before starting: {text}");
         }
@@ -2696,7 +2663,7 @@ winget https://cdn.winget.microsoft.com/cache false\n";
         assert_eq!(saved["Sources"].as_array().map(Vec::len), Some(1), "{saved}");
         assert_eq!(saved["Sources"][0]["SourceDetails"]["Name"], json!("winget"));
         assert_eq!(saved["Sources"][0]["Packages"], json!([{ "PackageIdentifier": "Git.Git", "Scope": "machine" }]), "only the ticked packages");
-        let text = page_text(&mut host);
+        let text = page_text(|ui, pc| host.ui(ID, ui, pc));
         assert!(text.contains("for-winget.json") && text.contains("1 manual entry was left out"), "{text}");
         let _ = std::fs::remove_dir_all(&logs);
     }

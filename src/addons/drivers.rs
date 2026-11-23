@@ -426,7 +426,6 @@ mod tests {
             ("page_colors.rs", include_str!("../page_colors.rs")),
             ("page_settings.rs", include_str!("../page_settings.rs")),
             ("platform.rs", include_str!("../platform.rs")),
-            ("pro.rs", include_str!("../pro.rs")),
         ];
         for (file, src) in sources {
             for word in [concat!("drivers", "::"), concat!("page_", "drivers"), concat!("drv", "_ui"), concat!("self.", "drv")] {

@@ -288,7 +288,7 @@ impl Benchmarks {
             return;
         }
         let st = self.engine.state();
-        let at = crate::pro::local_secs();
+        let at = crate::platform::local_secs();
         for test in std::mem::take(&mut self.watching) {
             let Some((_, outcome)) = st.ended.iter().find(|(name, _)| *name == test.name()) else { continue };
             let end = match outcome {
@@ -309,7 +309,7 @@ impl Benchmarks {
     fn save_run(&mut self, test: Test, figures: &[engine::Figure], at: i64) {
         let run = history::Run {
             test: test.name().to_string(),
-            date: crate::pro::iso_text(at),
+            date: crate::platform::iso_text(at),
             figures: figures.iter().map(|f| history::SavedFigure { name: f.name.into(), value: f.value, unit: f.unit.label.into() }).collect(),
             score: score::test_score(test, figures.iter().map(|f| (f.name, f.value))),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -354,7 +354,7 @@ impl Benchmarks {
     /// The last saved run of `test`: its first figure and when it ran.
     fn last_saved(&self, test: Test) -> Option<(Option<String>, i64)> {
         let run = *self.history.runs(test.name()).first()?;
-        let at = crate::pro::iso_secs(&run.date)?;
+        let at = crate::platform::iso_secs(&run.date)?;
         let figure = run.figures.first().map(|f| match test.figures().iter().find(|(n, _)| *n == f.name) {
             Some(&(name, unit)) => engine::Figure { name, value: f.value, unit }.text(),
             None => format!("{} {}", f.value, f.unit),
@@ -1168,7 +1168,7 @@ impl Addon for Benchmarks {
         self.settle();
         let st = self.engine.state();
         let t = theme::of_ui(ui);
-        let now = crate::pro::local_secs();
+        let now = crate::platform::local_secs();
         if st.running.is_some() || !self.watching.is_empty() {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
@@ -1355,7 +1355,7 @@ mod tests {
     #[test]
     fn the_rail_tells_each_test_state() {
         let mut b = Benchmarks::default();
-        let now = crate::pro::local_secs();
+        let now = crate::platform::local_secs();
         let status = |b: &mut Benchmarks, v: View| {
             wait_idle(&b.engine);
             b.settle();
@@ -1486,7 +1486,7 @@ mod tests {
         b.settle();
         // Choosing another card after the run still names the tested one.
         b.gpu_choice = Some(7);
-        let now = crate::pro::local_secs();
+        let now = crate::platform::local_secs();
         let line = b.hardware_line(View::Gpu, now).unwrap();
         assert!(line.starts_with("Tested on NVIDIA GeForce RTX 4080 \u{b7} last run today at "), "{line}");
         assert!(b.rail_status(View::Gpu, &b.engine.state(), now).starts_with("43293 GFLOPS \u{b7} today at "));
@@ -1667,7 +1667,7 @@ mod tests {
         run_to_end(&mut b, Test::Cpu, fake_cpu(false));
         assert!(b.history.runs("CPU").is_empty(), "no skewed numbers in the history");
         assert_eq!(b.overall_score(), None, "nor in the score");
-        let status = b.rail_status(View::Cpu, &b.engine.state(), crate::pro::local_secs());
+        let status = b.rail_status(View::Cpu, &b.engine.state(), crate::platform::local_secs());
         assert!(status.starts_with("1234 Mops/sec \u{b7} today at "), "{status}");
     }
 
@@ -1698,7 +1698,7 @@ mod tests {
 
         let mut next = with_history(&dir);
         next.adapters = Some(cards());
-        let line = next.hardware_line(View::Gpu, crate::pro::local_secs()).unwrap();
+        let line = next.hardware_line(View::Gpu, crate::platform::local_secs()).unwrap();
         assert!(line.starts_with("Tested on NVIDIA GeForce RTX 4080 \u{b7} last run today at "), "{line}");
     }
 
@@ -1733,14 +1733,14 @@ mod tests {
         assert_eq!(run.figures, [history::SavedFigure { name: "Single core".into(), value: 1234.0, unit: "Mops/sec".into() }]);
         assert_eq!(run.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(run.platform, format!("{} {}", std::env::consts::OS, std::env::consts::ARCH));
-        assert!(crate::pro::iso_secs(&run.date).is_some(), "ISO date: {}", run.date);
+        assert!(crate::platform::iso_secs(&run.date).is_some(), "ISO date: {}", run.date);
         assert!(!run.hardware.is_empty());
 
         b.stop();
         let (ctx, _) = AddonContext::recording();
         b.start(&ctx);
         assert_eq!(b.history.runs("CPU").len(), 1, "read back when the add-on starts again");
-        let status = b.rail_status(View::Cpu, &b.engine.state(), crate::pro::local_secs());
+        let status = b.rail_status(View::Cpu, &b.engine.state(), crate::platform::local_secs());
         assert!(status.starts_with("1234 Mops/sec \u{b7} today at "), "{status}");
     }
 
@@ -1982,7 +1982,7 @@ mod score_tests {
         let dir = history::tests::TempDir::new("score-view");
         let mut b = with_history(&dir);
         b.selected = View::Score;
-        let now = crate::pro::local_secs();
+        let now = crate::platform::local_secs();
         assert_eq!(b.rail_status(View::Score, &b.engine.state(), now), "Not run yet");
         run_to_end(&mut b, Test::Cpu, cpu_200());
         run_to_end(&mut b, Test::Disk, disk_50());
@@ -2191,7 +2191,7 @@ mod run_all_tests {
             _ => fake(test, ran.clone()),
         });
         wait_started.recv().unwrap();
-        let now = crate::pro::local_secs();
+        let now = crate::platform::local_secs();
         let st = b.engine.state();
         assert_eq!(b.rail_status(View::Disk, &st, now), "Waiting");
         assert_eq!(b.rail_status(View::Internet, &st, now), "Waiting");

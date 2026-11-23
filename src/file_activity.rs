@@ -389,7 +389,7 @@ pub fn now_local_ms() -> i64 {
 /// How far local time is ahead of UTC, in milliseconds.
 fn local_offset_ms() -> i64 {
     let utc_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    (crate::pro::local_secs() - utc_secs) * 1000
+    (crate::platform::local_secs() - utc_secs) * 1000
 }
 
 /// Where the trace stands.

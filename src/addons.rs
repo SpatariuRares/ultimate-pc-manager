@@ -3292,6 +3292,7 @@ mod install_queue_tests {
     use super::{until, Addon};
     use crate::platform::install_queue::Work;
     use crate::platform::{AddonContext, Launch};
+    use crate::test_ui::page_text;
 
     fn tool(key: &str) -> App {
         App { key: key.into(), name: key.into(), uninstall: format!("{key}.exe /S"), ..Default::default() }
@@ -3365,27 +3366,6 @@ mod install_queue_tests {
         until("the driver install ends", || !drivers.uninterruptible());
     }
 
-    /// Every text an add-on's page shows in one frame.
-    fn page_text(addon: &mut dyn Addon) -> String {
-        fn collect(shape: &egui::Shape, out: &mut Vec<String>) {
-            match shape {
-                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
-                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
-                _ => {}
-            }
-        }
-        let (settings, sample) = (crate::settings::Settings::default(), crate::sampler::Snapshot::default());
-        let ctx = egui::Context::default();
-        // The app's faces, as at start-up: pages draw in them.
-        crate::theme::install_fonts(&ctx);
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| addon.ui(ui, &mut crate::platform::PageContext::new(&settings, &sample)));
-        });
-        let mut out = Vec::new();
-        output.shapes.iter().for_each(|c| collect(&c.shape, &mut out));
-        out.join("\n")
-    }
-
     #[test]
     fn installed_apps_and_drivers_pages_show_who_holds_the_queue_while_they_wait() {
         let (ctx, runner) = AddonContext::recording();
@@ -3401,7 +3381,7 @@ mod install_queue_tests {
         hub.update(vec!["tool".into()]);
         runner.wait_for(1);
         drv.install_inf(r"C:\pkg\driver.inf".into());
-        until("the Drivers page says who holds the queue", || page_text(&mut drivers).contains("Installed Apps is updating 1 item; this starts when it is done\u{2026}"));
+        until("the Drivers page says who holds the queue", || page_text(|ui, pc| drivers.ui(ui, pc)).contains("Installed Apps is updating 1 item; this starts when it is done\u{2026}"));
         assert_eq!(ctx.install_queue().waiting(), 1);
         runner.release();
         until("the update and the driver install end", || !apps.uninterruptible() && !drivers.uninterruptible());
@@ -3414,7 +3394,7 @@ mod install_queue_tests {
         runner.wait_for(before + 1);
         hub.uninstall(vec!["other".into()]);
         until("Installed Apps waits", || ctx.install_queue().waiting() == 1);
-        until("the Installed Apps page says who holds the queue", || page_text(&mut apps).contains("Drivers is installing 1 item; this starts when it is done\u{2026}"));
+        until("the Installed Apps page says who holds the queue", || page_text(|ui, pc| apps.ui(ui, pc)).contains("Drivers is installing 1 item; this starts when it is done\u{2026}"));
         assert_eq!(ctx.install_queue().waiting(), 1);
         hub.stop_waiting();
         runner.release();

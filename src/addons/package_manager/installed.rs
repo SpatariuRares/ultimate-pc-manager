@@ -481,6 +481,7 @@ mod tests {
     use crate::platform::{Launch, PageContext, RecordingRunner, When};
     use crate::sampler::Snapshot;
     use crate::settings::Settings;
+    use crate::test_ui::page_text;
     use serde_json::json;
 
     use crate::platform::winget::{describe, NO_PACKAGE_FOUND, UNINSTALL_COMMAND_FAILED};
@@ -944,29 +945,6 @@ mod tests {
         assert_eq!(registry_key("ARP\\Machine\\X64\\"), None);
     }
 
-    /// Every text the page shows in one frame, a line each.
-    fn page_text(host: &mut AddonHost) -> String {
-        fn collect(shape: &egui::Shape, out: &mut Vec<String>) {
-            match shape {
-                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
-                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
-                _ => {}
-            }
-        }
-        let (settings, sample) = (Settings::default(), Snapshot::default());
-        let ctx = egui::Context::default();
-        // The app\'s faces, as at start-up: pages draw in them.
-        crate::theme::install_fonts(&ctx);
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                host.ui(ID, ui, &mut PageContext::new(&settings, &sample));
-            });
-        });
-        let mut out = Vec::new();
-        output.shapes.iter().for_each(|c| collect(&c.shape, &mut out));
-        out.join("\n")
-    }
-
     #[test]
     fn the_page_offers_the_updates_and_an_uninstall_for_every_package() {
         let mut page = Page::new("draw", no_entry);
@@ -974,7 +952,7 @@ mod tests {
         page.runner.prepare(When::Arg("list".into()), 0, &list());
         page.act(Command::ListInstalled);
         until("winget is ready and the list read", || matches!(page.state().check, super::super::Check::Known(_)) && matches!(page.state().installed.listing, Listing::Read { .. }));
-        let text = page_text(&mut page.host);
+        let text = page_text(|ui, pc| page.host.ui(ID, ui, pc));
         for words in ["Installed packages", "Update all (2)", "3.0.21", "Old Tool"] {
             assert!(text.contains(words), "the page shows {words:?}: {text}");
         }
@@ -989,7 +967,7 @@ mod tests {
         page.runner.prepare(When::Arg("list".into()), 0, &list());
         page.act(Command::ListInstalled);
         until("winget is ready and the list read", || matches!(page.state().check, super::super::Check::Known(_)) && matches!(page.state().installed.listing, Listing::Read { .. }));
-        let text = page_text(&mut page.host);
+        let text = page_text(|ui, pc| page.host.ui(ID, ui, pc));
         for heading in ["Name", "Id", "Version", "Available"] {
             assert!(text.lines().any(|l| l == heading), "the list has a {heading:?} column: {text}");
         }

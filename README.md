@@ -173,13 +173,12 @@ git push origin v0.2.0
 | `src/page_perf.rs` | Performance page. |
 | `src/core_page.rs` | The interface every core page shares (its own state, a new sample, refresh, drawing) and the order a sample reaches the pages in. |
 | `src/page_summary.rs`, `src/summary_view.rs`, `src/summary_tiles.rs` | Summary. |
-| `src/page_processes.rs` | Processes. |
+| `src/page_processes.rs`, `src/process_menu.rs` | Processes, and the context menu of a process row. |
 | `src/page_system.rs`, `src/page_users.rs` | System Info, Users. |
 | `src/page_settings.rs`, `src/page_colors.rs` | Settings, Settings › Add-ons, Colors. |
 | `src/page_services.rs`, `src/page_startup.rs`, `src/page_history.rs`, `src/list_pages.rs` | Services, Startup apps, App history, and what the three share (`list_pages.rs`). |
 | `src/addons.rs`, `src/addons/` | Add-on registry and their pages: Power & Freq, Flight Recorder, Connections, Installed Apps, Drivers, Disk Space, Benchmarks. |
 | `src/platform.rs`, `src/sensors.rs`, `src/sensors/` | Services shared by the add-ons (actions, PowerShell, sensors). |
-| `src/pro.rs` | Local clock and ISO-8601 dates of the histories. |
 | `src/winsys.rs` | Services, automatic startup, priorities and other Windows actions. |
 | `src/widgets.rs` | Charts, icons and parts of the app frame. |
 | `src/widgets/parts.rs` | Shared parts of design A: buttons, filter groups, status band, tables, side panel. |

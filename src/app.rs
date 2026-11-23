@@ -13,7 +13,7 @@ use crate::page_processes::{ProcView, ProcessInputs, ProcessesChange};
 use crate::platform::PageContext;
 use crate::sampler::{Sampler, Snapshot};
 use crate::settings::{Settings, SPEEDS};
-use crate::widgets::{health_colour, local_ip, logo, nav_entry_back, nav_heading, push, refresh_button};
+use crate::widgets::{local_ip, logo, nav_entry_back, nav_heading, push, refresh_button};
 use crate::system_lists::SystemLists;
 use crate::winsys;
 
@@ -96,6 +96,19 @@ impl ProviderState {
             n if n == crate::perfdata::sources().count() => ProviderState::Unavailable,
             _ => ProviderState::Degraded,
         }
+    }
+}
+
+/// The colour of the status bar's health dot: amber while updates are
+/// paused or some counters failed, green when every counter answered, red
+/// when none did, faint while starting.
+pub fn health_colour(t: &crate::theme::Theme, paused: bool, providers: ProviderState) -> Color32 {
+    match providers {
+        _ if paused => t.amber,
+        ProviderState::Healthy => t.green,
+        ProviderState::Degraded => t.amber,
+        ProviderState::Unavailable => t.red,
+        ProviderState::Waiting => t.faint,
     }
 }
 
@@ -2279,10 +2292,14 @@ mod tests {
             ("inspector.rs", include_str!("inspector.rs")),
             ("wait_chain.rs", include_str!("wait_chain.rs")),
             ("file_activity.rs", include_str!("file_activity.rs")),
+            ("list_pages.rs", include_str!("list_pages.rs")),
+            ("page_perf.rs", include_str!("page_perf.rs")),
+            ("summary_view.rs", include_str!("summary_view.rs")),
+            ("summary_tiles.rs", include_str!("summary_tiles.rs")),
         ];
         let host = AddonHost::standard();
         for (file, src) in sources {
-            let code = src.split("#[cfg(test)]").next().unwrap();
+            let code = crate::test_ui::non_test_code(src);
             for (addon, _) in host.addons() {
                 for word in [addon.id(), addon.name()] {
                     assert!(!code.contains(word), "{file} names the {} add-on ({word})", addon.name());
@@ -2293,7 +2310,7 @@ mod tests {
 
     #[test]
     fn the_registry_is_the_only_list_of_core_ids_and_names() {
-        let code = include_str!("app.rs").split("#[cfg(test)]").next().unwrap();
+        let code = crate::test_ui::non_test_code(include_str!("app.rs"));
         let host = AddonHost::standard();
         for (entry, _) in host.entries().filter(|(e, _)| host.is_core(e.id())) {
             assert!(!code.contains(&format!("\"{}\"", entry.id())), "app.rs repeats the core id {}", entry.id());

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use egui::{vec2, Color32, RichText, Sense, Ui};
 
 use crate::addons::AddonHost;
+use crate::app::health_colour;
 use crate::core_page::{CorePage, PageCtx, SampleSlot};
 use crate::platform::{Action, PageContext};
 use crate::sampler::ProcRow;

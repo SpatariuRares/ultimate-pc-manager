@@ -391,7 +391,7 @@ impl Hub {
             // list. Each tab shows its own list's error, so both get it.
             if let Some(why) = unavailable_text(Feature::DeviceSetupApi) {
                 publish_listing(&mut st, Err(why.clone()), Err(why));
-                st.listed_at = crate::pro::clock_now();
+                st.listed_at = crate::platform::clock_now();
                 return;
             }
             st.listing = true;
@@ -407,7 +407,7 @@ impl Hub {
         let kernel = self.reader.kernel();
         let Some(mut st) = self.live() else { return };
         publish_listing(&mut st, devices, kernel);
-        st.listed_at = crate::pro::clock_now();
+        st.listed_at = crate::platform::clock_now();
     }
 
     /// Searches Windows Update for driver updates (takes 10–60 s).
@@ -428,7 +428,7 @@ impl Hub {
             let result = hub.ctx.powershell_until(SEARCH_SCRIPT, &[], &hub.halt);
             let Some(mut st) = hub.live() else { return };
             run.release(&mut st);
-            publish_check(&mut st, result.and_then(|v| parse_search(&v)), by_hand, &crate::pro::clock_now());
+            publish_check(&mut st, result.and_then(|v| parse_search(&v)), by_hand, &crate::platform::clock_now());
         });
     }
 

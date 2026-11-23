@@ -205,7 +205,7 @@ impl FlightRecorder {
             return Err(why);
         }
         let machine = sysinfo::System::host_name().unwrap_or_else(|| "Unknown machine".into());
-        let mut header = Header::new(&machine, crate::pro::local_secs(), interval_ms, sample.mem_total, sample.cpu_per_core.len()).split_cores(self.history.topology());
+        let mut header = Header::new(&machine, crate::platform::local_secs(), interval_ms, sample.mem_total, sample.cpu_per_core.len()).split_cores(self.history.topology());
         if let Some(engines) = engines_now(sample) {
             let names = |cells: &[(String, f32)]| cells.iter().map(|c| c.0.clone()).collect::<Vec<_>>();
             header.panels.push(PanelHeader { panel: Panel::GpuCores, cells: names(&engines.cells) });
@@ -1671,7 +1671,7 @@ mod tests {
 
     #[test]
     fn the_platform_keeps_no_recorder_code() {
-        for (file, src) in [("app.rs", include_str!("../app.rs")), ("pro.rs", include_str!("../pro.rs"))] {
+        for (file, src) in [("app.rs", include_str!("../app.rs"))] {
             for word in ["Recorder", "recorder", "RecSample", "RECORD_LIMIT"] {
                 let code = src.split("#[cfg(test)]").next().unwrap();
                 let hits = code.lines().filter(|l| l.contains(word)).count();
