@@ -308,6 +308,8 @@ mod tests {
         assert_eq!(told, vec![true, false], "the wait starts and ends");
     }
 
+    // Windows only: registry uninstallers and msiexec.
+    #[cfg(windows)]
     #[test]
     fn a_windows_installer_product_is_removed_with_msiexec_x() {
         let (u, runner) = through_the_host();
@@ -325,6 +327,8 @@ mod tests {
         );
     }
 
+    // Windows only: registry uninstallers and msiexec.
+    #[cfg(windows)]
     #[test]
     fn a_windows_installer_product_cancelled_or_whose_prompt_was_closed_is_not_uninstalled() {
         let (u, runner) = through_the_host();
@@ -347,6 +351,8 @@ mod tests {
         assert!(told.is_empty(), "nothing to wait for");
     }
 
+    // Windows only: registry uninstallers and msiexec.
+    #[cfg(windows)]
     #[test]
     fn stop_waiting_ends_the_wait_and_the_uninstaller_keeps_running() {
         let (u, runner) = through_the_host();

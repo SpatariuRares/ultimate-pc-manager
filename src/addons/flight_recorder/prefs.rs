@@ -72,6 +72,7 @@ pub fn documents() -> PathBuf {
 mod tests {
     use super::*;
     use crate::addons::{read_settings, write_settings};
+    use crate::test_paths::host;
     use serde_json::json;
 
     #[test]
@@ -100,8 +101,8 @@ mod tests {
     #[test]
     fn replay_remembers_the_folder_of_the_trace_it_opened() {
         let mut prefs = Prefs::default();
-        prefs.remember_replay(Path::new("C:\\Runs\\slow.upmtrace"));
-        assert_eq!(prefs.replay_folder(), PathBuf::from("C:\\Runs"));
+        prefs.remember_replay(Path::new(host("C:\\Runs\\slow.upmtrace")));
+        assert_eq!(prefs.replay_folder(), PathBuf::from(host("C:\\Runs")));
     }
 
     #[test]

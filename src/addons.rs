@@ -1507,6 +1507,7 @@ impl AddonHost {
 mod tests {
     use super::*;
     use crate::platform::PageContext;
+    use crate::test_paths::host as fixture;
     use crate::sampler::Snapshot;
     use crate::settings::Settings;
     use serde_json::json;
@@ -1573,7 +1574,7 @@ mod tests {
 
     impl PathOwner for Owns {
         fn owner_of(&self, path: &std::path::Path) -> Option<String> {
-            path.starts_with(r"C:\Apps\Tool").then(|| "Tool".to_string())
+            path.starts_with(fixture("C:\\Apps\\Tool")).then(|| "Tool".to_string())
         }
         fn reveal(&mut self, path: &std::path::Path) {
             self.0.lock().unwrap().push(path.to_path_buf());
@@ -1586,7 +1587,7 @@ mod tests {
     impl Addon for Asks {
         test_addon!("asks", "Asks", "Asks who owns a file.");
         fn ui(&mut self, _: &mut egui::Ui, page: &mut PageContext) {
-            *self.0.lock().unwrap() = page.owner_of(std::path::Path::new(r"C:\Apps\Tool\tool.exe"));
+            *self.0.lock().unwrap() = page.owner_of(std::path::Path::new(fixture("C:\\Apps\\Tool\\tool.exe")));
             page.actions.push(crate::platform::Action::Say("asked".into()));
         }
     }
@@ -1605,7 +1606,7 @@ mod tests {
         let owner = asked.lock().unwrap().clone().expect("owned while on");
         assert_eq!((owner.addon, owner.page, owner.label.as_str()), ("owns", "Owns", "Tool"));
         assert_eq!(said, 1, "the page's own actions reach the app");
-        let file = std::path::Path::new(r"C:\Apps\Tool\tool.exe");
+        let file = std::path::Path::new(fixture("C:\\Apps\\Tool\\tool.exe"));
         assert!(host.reveal("owns", file));
         assert_eq!(*revealed.lock().unwrap(), vec![file.to_path_buf()]);
 

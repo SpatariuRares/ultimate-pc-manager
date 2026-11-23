@@ -133,6 +133,8 @@ mod tests {
         assert_eq!(value_text(&data, outside, 4), None, "a value outside the buffer is not read");
     }
 
+    // Windows only: version resources of an executable.
+    #[cfg(windows)]
     #[test]
     fn the_tests_own_executable_shows_its_description() {
         // build.rs embeds the version details into every executable of the crate.

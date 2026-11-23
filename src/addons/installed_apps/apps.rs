@@ -1416,6 +1416,8 @@ mod action_rules_tests {
         assert!(!App { winget_id: "Vendor.App".into(), ..app("C") }.has_update());
     }
 
+    // Windows only: a registry location and icon on a drive.
+    #[cfg(windows)]
     #[test]
     fn the_folder_comes_from_the_location_then_the_icon() {
         let dir = temp_app_folder("folder");

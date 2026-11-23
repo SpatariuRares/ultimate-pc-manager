@@ -62,6 +62,13 @@ impl Node {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many folders' own files were read on this thread: lets a test
+    /// tell a view that walks a level from one that reads kept lists.
+    pub static LOOSE_FILES_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Where tree revisions come from: unique across trees, so a revision
 /// names one state of one tree.
 static REVISIONS: AtomicU64 = AtomicU64::new(1);
@@ -401,6 +408,8 @@ impl SpaceTree {
     /// The largest files directly in the folder (at most the tree's
     /// `keep`), largest first.
     pub fn loose_files(&self, n: NodeId) -> Vec<(PathBuf, u64)> {
+        #[cfg(test)]
+        LOOSE_FILES_READS.with(|c| c.set(c.get() + 1));
         let dir = self.path(n);
         self.nodes[n].own_largest.iter().map(|(name, b)| (dir.join(name), *b)).collect()
     }
@@ -535,6 +544,7 @@ fn keep_largest<T>(list: &mut Vec<(T, u64)>, keep: usize, item: impl FnOnce() ->
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::test_paths::host;
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
@@ -562,12 +572,13 @@ pub(super) mod tests {
 
     #[test]
     fn a_virtual_root_holds_several_drives() {
-        let mut t = SpaceTree::virtual_root("All disks", &["C:\\", "D:\\"], 8);
-        t.apply([Event::File(p("C:\\a\\x"), 600), Event::File(p("D:\\y"), 40), Event::File(p("E:\\z"), 1), Event::Unreadable(p("D:\\locked"))]);
+        let mut t = SpaceTree::virtual_root("All disks", &[host("C:\\"), host("D:\\")], 8);
+        t.apply([Event::File(p(host("C:\\a\\x")), 600), Event::File(p(host("D:\\y")), 40), Event::File(p(host("E:\\z")), 1), Event::Unreadable(p(host("D:\\locked")))]);
         assert_eq!(t.path(SpaceTree::ROOT), Path::new("All disks"));
         assert_eq!((t.bytes(SpaceTree::ROOT), t.files(SpaceTree::ROOT), t.unreadable(SpaceTree::ROOT)), (640, 2, 1), "E: is not one of its drives");
-        assert_eq!(names(&t.largest_folders(SpaceTree::ROOT, 8)), s(&[("C:/", 600), ("D:/", 40)]));
-        assert_eq!(names(&t.largest_files(SpaceTree::ROOT, 8)), s(&[("C:/a/x", 600), ("D:/y", 40)]));
+        let slashed = |windows: &'static str| host(windows).replace('\\', "/");
+        assert_eq!(names(&t.largest_folders(SpaceTree::ROOT, 8)), vec![(slashed("C:\\"), 600), (slashed("D:\\"), 40)]);
+        assert_eq!(names(&t.largest_files(SpaceTree::ROOT, 8)), vec![(slashed("C:\\a\\x"), 600), (slashed("D:\\y"), 40)]);
     }
 
     #[test]
@@ -791,7 +802,7 @@ pub(super) mod tests {
     #[ignore]
     fn a_tree_of_500k_folders_keeps_their_names_not_their_paths() {
         let before = private_bytes();
-        let mut t = SpaceTree::new("C:\\", 8);
+        let mut t = SpaceTree::new(host("C:\\"), 8);
         let mut path = String::new();
         for i in 0..500_000 {
             use std::fmt::Write;

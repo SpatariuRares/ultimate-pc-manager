@@ -2981,6 +2981,8 @@ pub(crate) mod tests {
         assert!(in_column("3", "many.exe") && in_column("1", "one.exe") && in_column("0", "none.exe"), "{spots:?}");
     }
 
+    // Windows only: signatures and version resources of an executable.
+    #[cfg(windows)]
     #[test]
     fn publisher_and_description_are_hidden_until_chosen_then_show_the_programs_signer_and_description() {
         // The test's own executable: build.rs gives it a description, and

@@ -34,6 +34,8 @@ mod summary_tiles;
 mod system_actions;
 mod signature;
 #[cfg(test)]
+mod test_paths;
+#[cfg(test)]
 mod test_ui;
 mod theme;
 mod version_info;
