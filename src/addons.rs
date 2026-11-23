@@ -1716,11 +1716,10 @@ mod tests {
     #[test]
     fn an_add_on_that_waits_gives_its_reason_to_close_only_while_it_is_on_and_works() {
         let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Series(true)))], &json!({}));
-        assert!(host.close_questions().is_empty(), "off: closing does not wait for it");
-        host.set_enabled("series", true);
         assert_eq!(host.close_questions(), vec!["A series is running.".to_string()]);
+        host.set_enabled("series", false);
+        assert!(host.close_questions().is_empty(), "off: closing does not wait for it");
         let (mut idle, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Series(false)))], &json!({}));
-        idle.set_enabled("series", true);
         assert!(idle.close_questions().is_empty(), "nothing runs: closes without asking");
     }
 
