@@ -34,7 +34,7 @@ Administrator rights are asked through UAC only to install, scan for hardware ch
 /// Where the add-on reads the installed devices and kernel drivers from:
 /// the Windows reader in the app, a fake in tests. Owned by the add-on, not
 /// by the shared add-on context.
-pub trait Listing: Send + Sync {
+pub trait ListingReader: Send + Sync {
     /// The devices with a driver, or why they could not be read.
     fn devices(&self) -> Result<Vec<DeviceDriver>, String>;
     /// The kernel driver services, or why they could not be read.
@@ -44,7 +44,7 @@ pub trait Listing: Send + Sync {
 /// The add-on: its page while it is on, and while it waits to turn off.
 pub struct Drivers {
     /// Asked for the listing each time the page reads it.
-    reader: Arc<dyn Listing>,
+    reader: Arc<dyn ListingReader>,
     /// The page and its background work, while the add-on is on. Turned
     /// off during a driver install, the page stays (its hub stopped) to
     /// follow that install until it ends.
@@ -129,7 +129,7 @@ impl Default for Drivers {
 impl Drivers {
     /// The add-on reading its listing from `reader`.
     #[cfg(test)]
-    pub fn with_reader(reader: Arc<dyn Listing>) -> Self {
+    pub fn with_reader(reader: Arc<dyn ListingReader>) -> Self {
         Drivers { reader, ..Drivers::default() }
     }
 
@@ -639,6 +639,7 @@ mod command_line_tests {
 mod reader_tests {
     use super::*;
     use crate::addons::{until, AddonHost, Entry};
+    use crate::platform::When;
     use crate::sampler::Snapshot;
     use crate::settings::Settings;
     use serde_json::json;
@@ -646,34 +647,55 @@ mod reader_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    /// A reader that answers from a script (the last answer repeats) and
-    /// counts how many times it was asked for the devices.
+    /// What a read answers, in order (the last answer repeats).
+    type Script<T> = Mutex<VecDeque<Result<Vec<T>, String>>>;
+
+    /// A reader that answers from scripts and counts its calls.
     struct Fake {
-        script: Mutex<VecDeque<Result<Vec<DeviceDriver>, String>>>,
-        asked: AtomicUsize,
+        devices: Script<DeviceDriver>,
+        kernel: Script<KernelDriver>,
+        devices_asked: AtomicUsize,
+        kernel_asked: AtomicUsize,
+    }
+
+    fn next<T: Clone>(script: &Script<T>) -> Result<Vec<T>, String> {
+        let mut script = script.lock().unwrap();
+        if script.len() > 1 {
+            script.pop_front().unwrap()
+        } else {
+            script.front().cloned().unwrap_or_else(|| Ok(Vec::new()))
+        }
     }
 
     impl Fake {
-        fn answering(script: Vec<Result<Vec<DeviceDriver>, String>>) -> Arc<Fake> {
-            Arc::new(Fake { script: Mutex::new(script.into()), asked: AtomicUsize::new(0) })
+        fn answering(devices: Vec<Result<Vec<DeviceDriver>, String>>, kernel: Vec<Result<Vec<KernelDriver>, String>>) -> Arc<Fake> {
+            Arc::new(Fake {
+                devices: Mutex::new(devices.into()),
+                kernel: Mutex::new(kernel.into()),
+                devices_asked: AtomicUsize::new(0),
+                kernel_asked: AtomicUsize::new(0),
+            })
         }
-        fn asked(&self) -> usize {
-            self.asked.load(Ordering::SeqCst)
+        /// A reader whose kernel list is empty.
+        fn devices(devices: Vec<Result<Vec<DeviceDriver>, String>>) -> Arc<Fake> {
+            Fake::answering(devices, vec![Ok(Vec::new())])
+        }
+        fn devices_asked(&self) -> usize {
+            self.devices_asked.load(Ordering::SeqCst)
+        }
+        fn kernel_asked(&self) -> usize {
+            self.kernel_asked.load(Ordering::SeqCst)
         }
     }
 
-    impl Listing for Fake {
+    impl ListingReader for Fake {
         fn devices(&self) -> Result<Vec<DeviceDriver>, String> {
-            self.asked.fetch_add(1, Ordering::SeqCst);
-            let mut script = self.script.lock().unwrap();
-            if script.len() > 1 {
-                script.pop_front().unwrap()
-            } else {
-                script.front().cloned().unwrap_or_else(|| Ok(Vec::new()))
-            }
+            self.devices_asked.fetch_add(1, Ordering::SeqCst);
+            next(&self.devices)
         }
         fn kernel(&self) -> Result<Vec<KernelDriver>, String> {
-            Ok(Vec::new())
+            self.kernel_asked.fetch_add(1, Ordering::SeqCst);
+            next(&self.kernel)
         }
     }
 
@@ -681,10 +703,14 @@ mod reader_tests {
         DeviceDriver { instance_id: name.into(), name: name.into(), class: "Display".into(), provider: "Acme".into(), present: true, ..Default::default() }
     }
 
-    fn host_with(reader: &Arc<Fake>, enabled: bool) -> AddonHost {
-        let reader: Arc<dyn Listing> = reader.clone();
+    fn host_with(reader: &Arc<Fake>, section: serde_json::Value) -> (AddonHost, Arc<crate::platform::RecordingRunner>) {
+        let reader: Arc<dyn ListingReader> = reader.clone();
         let entries = vec![Entry::Addon(Box::new(Drivers::with_reader(reader)))];
-        AddonHost::for_tests_with(entries, &json!({ "drivers": { "enabled": enabled } })).0
+        AddonHost::for_tests_with(entries, &json!({ "drivers": section }))
+    }
+
+    fn on(reader: &Arc<Fake>) -> AddonHost {
+        host_with(reader, json!({ "enabled": true })).0
     }
 
     /// Every text of one frame of the page, as the user sees it.
@@ -717,41 +743,78 @@ mod reader_tests {
     }
 
     #[test]
-    fn opening_the_page_reads_once_and_shows_the_rows() {
-        let reader = Fake::answering(vec![Ok(vec![device("Alpha GPU")])]);
-        let mut host = host_with(&reader, true);
+    fn opening_the_page_reads_devices_and_kernel_drivers_once() {
+        let reader = Fake::devices(vec![Ok(vec![device("Alpha GPU")])]);
+        let mut host = on(&reader);
         until("the row is shown", || shown(&mut host).contains("Alpha GPU"));
         shown(&mut host);
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(reader.asked(), 1, "drawing the page again reads nothing more");
+        assert_eq!((reader.devices_asked(), reader.kernel_asked()), (1, 1), "drawing the page again reads nothing more");
     }
 
     #[test]
-    fn a_failed_read_shows_its_reason_and_drops_the_old_rows_and_a_good_read_clears_it() {
-        let reader = Fake::answering(vec![Ok(vec![device("Alpha GPU")]), Err("the listing broke".into()), Ok(vec![device("Beta NIC")])]);
-        let mut host = host_with(&reader, true);
-        until("the first read is shown", || shown(&mut host).contains("Alpha GPU"));
+    fn a_failed_device_read_shows_its_reason() {
+        let reader = Fake::devices(vec![Err("the listing broke".into())]);
+        let mut host = on(&reader);
+        until("the failure is shown", || shown(&mut host).contains("the listing broke"));
+        assert!(shown(&mut host).contains("Drivers could not be enumerated"));
+    }
 
+    #[test]
+    fn a_failed_device_read_drops_the_old_rows() {
+        let reader = Fake::devices(vec![Ok(vec![device("Alpha GPU")]), Err("the listing broke".into())]);
+        let mut host = on(&reader);
+        until("the first read is shown", || shown(&mut host).contains("Alpha GPU"));
         assert!(host.refresh("drivers"));
         until("the failure is shown", || shown(&mut host).contains("the listing broke"));
-        let page = shown(&mut host);
-        assert!(page.contains("Drivers could not be enumerated"), "{page}");
-        assert!(!page.contains("Alpha GPU"), "the old rows are dropped: {page}");
+        assert!(!shown(&mut host).contains("Alpha GPU"), "the old rows are gone");
+    }
 
+    #[test]
+    fn a_successful_read_clears_the_error() {
+        let reader = Fake::devices(vec![Err("the listing broke".into()), Ok(vec![device("Beta NIC")])]);
+        let mut host = on(&reader);
+        until("the failure is shown", || shown(&mut host).contains("the listing broke"));
         assert!(host.refresh("drivers"));
         until("the new rows are shown", || shown(&mut host).contains("Beta NIC"));
         let page = shown(&mut host);
         assert!(!page.contains("the listing broke") && !page.contains("could not be enumerated"), "the error is cleared: {page}");
-        assert_eq!(reader.asked(), 3);
+    }
+
+    #[test]
+    fn a_failed_kernel_read_shows_its_reason_on_the_kernel_tab() {
+        let reader = Fake::answering(vec![Ok(vec![device("Alpha GPU")])], vec![Err("the service manager refused".into())]);
+        let (mut host, _) = host_with(&reader, json!({ "enabled": true, "settings": { "scope": "kernel" } }));
+        until("the failure is shown", || shown(&mut host).contains("the service manager refused"));
+        assert!(shown(&mut host).contains("Drivers could not be enumerated"));
+        assert_eq!(reader.kernel_asked(), 1);
     }
 
     #[test]
     fn turned_off_refresh_asks_the_reader_nothing() {
-        let reader = Fake::answering(vec![Ok(vec![device("Alpha GPU")])]);
-        let mut host = host_with(&reader, false);
+        let reader = Fake::devices(vec![Ok(vec![device("Alpha GPU")])]);
+        let (mut host, _) = host_with(&reader, json!({ "enabled": false }));
         assert!(!host.refresh("drivers"), "no page to refresh");
         assert_eq!(shown(&mut host), "", "nothing is drawn");
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(reader.asked(), 0);
+        assert_eq!((reader.devices_asked(), reader.kernel_asked()), (0, 0));
+    }
+
+    #[test]
+    fn windows_update_offers_are_matched_against_the_drivers_a_refresh_just_listed() {
+        let installed = |version: &str| DeviceDriver { hardware_ids: vec![r"PCI\VEN_1".into()], version: version.into(), date: "2020-01-01".into(), ..device("Alpha GPU") };
+        let reader = Fake::devices(vec![Ok(vec![installed("1.0.0.0")]), Ok(vec![installed("2.0.0.0")])]);
+        let (mut host, runner) = host_with(&reader, json!({ "enabled": true, "settings": { "checkOnOpen": true } }));
+        let offer = json!({ "ok": true, "updates": [{ "Id": "u1", "Title": "Acme GPU (2.0.0.0)", "HardwareId": r"PCI\VEN_1", "Date": "2024-01-01" }] });
+        runner.prepare(When::Nth(0), 0, &offer.to_string());
+
+        until("the offer is newer than the installed driver", || shown(&mut host).contains("New: 2.0.0.0"));
+
+        assert!(host.refresh("drivers"));
+        until("the refresh lists the driver the offer now equals", || !shown(&mut host).contains("New: 2.0.0.0"));
+        let page = shown(&mut host);
+        assert!(page.contains("Up to date"), "{page}");
+        assert!(page.contains("Windows Update offers the older 2.0.0.0"), "{page}");
+        assert_eq!(reader.devices_asked(), 2);
     }
 }

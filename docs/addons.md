@@ -199,7 +199,8 @@ Each add-on's own settings sit under its `id`, so they do not mix with the globa
 
 What an add-on reads from the machine (Drivers: devices and kernel drivers)
 goes through a reader the add-on owns, not through the shared add-on context:
-the Windows reader in the app, a fake in tests (`Drivers::with_reader`). The
+the Windows reader in the app, a fake in tests (the `ListingReader` trait,
+`Drivers::with_reader`). The
 platform keeps no add-on code. Programs (PowerShell, pnputil, sc) still run
 through the context's runner.
 

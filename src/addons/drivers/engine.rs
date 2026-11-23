@@ -19,8 +19,7 @@ use crate::platform::install_queue::{Request, Work};
 use crate::platform::series::{Run, Series};
 use crate::platform::{AddonContext, Generation};
 
-use super::windows::WindowsListing;
-use super::Listing;
+use super::ListingReader;
 
 #[derive(Clone, Debug, Default)]
 pub struct DeviceDriver {
@@ -314,7 +313,7 @@ pub struct Hub {
     /// Every PowerShell run goes through the platform's executor.
     ctx: AddonContext,
     /// Where the devices and kernel drivers are read from.
-    reader: Arc<dyn Listing>,
+    reader: Arc<dyn ListingReader>,
     /// Runs the listing, the search and the installs one at a time.
     /// Stopped once by [`Hub::stop`]: from then on its work publishes
     /// nothing and no new work starts; driver installs are not cut short.
@@ -324,7 +323,7 @@ pub struct Hub {
 }
 
 impl Hub {
-    pub fn new(ctx: AddonContext, reader: Arc<dyn Listing>) -> Self {
+    pub fn new(ctx: AddonContext, reader: Arc<dyn ListingReader>) -> Self {
         let st = Arc::new(Mutex::new(State::default()));
         let series = Series::new(&st, &Generation::default(), |s: &mut State| &mut s.busy);
         Hub { st, ctx, reader, series, halt: Default::default() }
@@ -794,6 +793,7 @@ fn publish_check(st: &mut State, found: Result<Vec<DriverUpdate>, String>, by_ha
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::addons::drivers::windows::WindowsListing;
     use crate::platform::Launch;
 
     #[test]
@@ -1070,6 +1070,7 @@ mod listing_tests {
 #[cfg(test)]
 mod outcome_tests {
     use super::*;
+    use crate::addons::drivers::windows::WindowsListing;
     use crate::platform::ELEVATION_CANCELLED;
     use serde_json::json;
 

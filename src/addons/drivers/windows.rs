@@ -2,13 +2,13 @@
 //! code, moved unchanged. Elsewhere it lists nothing.
 
 use super::engine::{DeviceDriver, KernelDriver};
-use super::Listing;
+use super::ListingReader;
 
 /// The Drivers add-on's reader on a real PC.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WindowsListing;
 
-impl Listing for WindowsListing {
+impl ListingReader for WindowsListing {
     fn devices(&self) -> Result<Vec<DeviceDriver>, String> {
         imp::list_devices()
     }

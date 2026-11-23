@@ -423,6 +423,7 @@ impl RecordingRunner {
         self.stopped.load(Ordering::SeqCst)
     }
     /// Prepares the reply (exit code and output) of one later winget,
+    /// PowerShell (the output is the script's JSON result),
     /// [`ProcessRunner::run`] or [`ProcessRunner::run_and_wait`] request
     /// (its parameters split at spaces are its arguments): the first one
     /// `when` matches gets it, once. Requests nothing matches get the usual
@@ -449,7 +450,7 @@ impl RecordingRunner {
     /// (counted in [`RecordingRunner::stopped`]), and a winget or run
     /// request may get a prepared reply.
     fn record_until(&self, launch: Launch, stop: &AtomicBool) -> Answer {
-        let answerable = matches!(launch, Launch::Winget(_) | Launch::Run { .. } | Launch::Program { .. });
+        let answerable = matches!(launch, Launch::Winget(_) | Launch::Run { .. } | Launch::Program { .. } | Launch::PowerShell { .. });
         let index = {
             let mut launches = self.launches.lock().unwrap_or_else(|e| e.into_inner());
             launches.push(launch.clone());
@@ -521,13 +522,17 @@ enum Answer {
 impl ProcessRunner for RecordingRunner {
     fn powershell(&self, script: &str, args: &[(&str, &str)], elevated: bool) -> Result<serde_json::Value, String> {
         let args = args.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        Err(self.record(Launch::PowerShell { script: script.into(), args, elevated }))
+        match self.record_until(Launch::PowerShell { script: script.into(), args, elevated }, &AtomicBool::new(false)) {
+            Answer::Prepared(p) => serde_json::from_str(&p.output).map_err(|e| e.to_string()),
+            Answer::Stopped => unreachable!("nothing stops a PowerShell wait here"),
+            Answer::Error(e) => Err(e),
+        }
     }
     fn powershell_until(&self, script: &str, args: &[(&str, &str)], stop: &AtomicBool) -> Result<serde_json::Value, String> {
         let args = args.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         match self.record_until(Launch::PowerShell { script: script.into(), args, elevated: false }, stop) {
             Answer::Stopped => Err(STOPPED.into()),
-            Answer::Prepared(..) => unreachable!("PowerShell requests are not answered"),
+            Answer::Prepared(p) => serde_json::from_str(&p.output).map_err(|e| e.to_string()),
             Answer::Error(e) => Err(e),
         }
     }
