@@ -787,6 +787,17 @@ pub fn csv_field(s: &str) -> String {
     }
 }
 
+/// A CSV text field: like [`csv_field`], but a cell starting with `=`, `+`,
+/// `-` or `@` gets a leading single quote so a spreadsheet never runs it as a
+/// formula. For text only; numbers keep [`csv_field`] so they are not mangled.
+pub fn csv_text_field(s: &str) -> String {
+    if s.starts_with(['=', '+', '-', '@']) {
+        csv_field(&format!("'{s}"))
+    } else {
+        csv_field(s)
+    }
+}
+
 /// Starts this app again as administrator (UAC asks) on the page `page` (a
 /// `--page` value), without waiting: the executor [`AddonContext::restart_elevated`]
 /// uses, for core pages that have no add-on context.
@@ -1578,6 +1589,21 @@ mod tests {
         assert_eq!(csv_field("plain"), "plain");
         assert_eq!(csv_field("a,b"), "\"a,b\"");
         assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        // Unchanged by the formula neutralisation: csv_field stays as it was.
+        assert_eq!(csv_field("=1+1"), "=1+1");
+        assert_eq!(csv_field("-5"), "-5");
+    }
+
+    #[test]
+    fn csv_text_field_neutralises_formulas() {
+        for s in ["=1+1", "+1", "-1", "@SUM(A1)"] {
+            assert_eq!(csv_text_field(s), format!("'{s}"));
+        }
+        assert_eq!(csv_text_field("=a,b"), "\"'=a,b\"");
+        assert_eq!(csv_text_field("plain"), "plain");
+        assert_eq!(csv_text_field("a=b"), "a=b");
+        assert_eq!(csv_text_field("a,b"), csv_field("a,b"));
+        assert_eq!(csv_text_field(""), "");
     }
 }
 
