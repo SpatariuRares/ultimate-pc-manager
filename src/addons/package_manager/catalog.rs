@@ -102,8 +102,10 @@ pub trait PackageSource: Send + Sync {
     #[cfg_attr(not(test), allow(dead_code))] // in the catalog interface #113 defines; v1 has one source and nothing asks it yet
     fn can_uninstall_foreign(&self) -> bool;
     /// Whether it can be used, and how to repair it.
-    #[cfg_attr(not(test), allow(dead_code))] // in the catalog interface #113 defines; v1 has one source and nothing asks it yet
     fn availability(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Readiness>;
+    /// Lets it bring its catalogs up to date (slow the first time); `Err`
+    /// says why it could not.
+    fn refresh_catalogs(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Result<(), String>>;
     /// The catalogs it serves that are not active on this PC (removed or
     /// disabled there); empty when it could not tell.
     fn inactive_catalogs(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Vec<String>>;
@@ -226,6 +228,13 @@ impl PackageSource for Winget {
     }
     fn availability(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Readiness> {
         readiness::check(ctx, stop)
+    }
+    fn refresh_catalogs(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Result<(), String>> {
+        Some(match readiness::ask(ctx, "winget", &["source", "update"], stop)? {
+            readiness::Answer::Exited(0, _) => Ok(()),
+            readiness::Answer::Exited(code, _) => Err(crate::platform::winget::describe(code)),
+            readiness::Answer::NotStarted => Err("winget did not start.".into()),
+        })
     }
     fn inactive_catalogs(&self, ctx: &AddonContext, stop: &AtomicBool) -> Option<Vec<String>> {
         Some(match Self::ask(ctx, &["source", "list", "--disable-interactivity"], stop)? {
@@ -490,6 +499,19 @@ mod tests {
         let (ctx, runner) = AddonContext::recording();
         runner.prepare(crate::platform::When::Arg("--version".into()), 0, "v1.9.25200");
         assert_eq!(Winget.availability(&ctx, &AtomicBool::new(false)), Some(Readiness::Ready("1.9.25200".into())));
+    }
+
+    #[test]
+    fn refreshing_the_catalogs_is_winget_source_update() {
+        let stop = AtomicBool::new(false);
+        let (ctx, runner) = AddonContext::recording();
+        runner.prepare(crate::platform::When::Arg("source".into()), 0, "Done");
+        assert_eq!(Winget.refresh_catalogs(&ctx, &stop), Some(Ok(())));
+        assert_eq!(runner.launches().len(), 1);
+        let (ctx, runner) = AddonContext::recording();
+        runner.prepare(crate::platform::When::Arg("source".into()), 1, "boom");
+        let Some(Err(why)) = Winget.refresh_catalogs(&ctx, &stop) else { panic!("a failed update is an error") };
+        assert_eq!(why, crate::platform::winget::describe(1));
     }
 
     #[test]

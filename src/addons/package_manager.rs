@@ -452,6 +452,12 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 
+/// The source whose availability the page shows and whose catalogs it
+/// refreshes: v1 has one source, so the first registered.
+fn primary_source() -> &'static dyn PackageSource {
+    catalog::SOURCES[0]
+}
+
 /// Installs `package` with `source`, its log in `log` (inside the folder
 /// `logs`, made first), then checks that it shows as installed when the
 /// exit code says it was. `on_line` gets each line of winget's output. An
@@ -897,7 +903,7 @@ impl PackageManager {
     /// Checks winget again in the background.
     fn begin_check(&mut self) {
         self.spawn(Check::Checking, |context, stop, job| {
-            if let Some(r) = readiness::check(context, stop) {
+            if let Some(r) = primary_source().availability(context, stop) {
                 job.publish(|s| s.check = Check::Known(r));
             }
         });
@@ -922,11 +928,10 @@ impl PackageManager {
         lock_state(&self.state).catalogs = Catalogs::Updating;
         let (job, stop) = (Job::new(&self.state, &self.generation), self.stop.clone());
         std::thread::spawn(move || {
-            let outcome = match readiness::ask(&context, "winget", &["source", "update"], &stop) {
+            let outcome = match primary_source().refresh_catalogs(&context, &stop) {
                 None => return,
-                Some(Answer::Exited(0, _)) => Catalogs::Updated,
-                Some(Answer::Exited(code, _)) => Catalogs::Failed(crate::platform::winget::describe(code)),
-                Some(Answer::NotStarted) => Catalogs::Failed("winget did not start.".into()),
+                Some(Ok(())) => Catalogs::Updated,
+                Some(Err(why)) => Catalogs::Failed(why),
             };
             // The catalogs removed or disabled on this PC: their bundle
             // entries cannot be installed.
@@ -962,7 +967,7 @@ impl PackageManager {
                     Some(Answer::Exited(code, out)) => Some(format!("Registering App Installer failed (exit code {code}). {}", out.trim())),
                     Some(Answer::NotStarted) => Some("PowerShell did not start.".into()),
                 };
-                if let Some(r) = readiness::check(context, stop) {
+                if let Some(r) = primary_source().availability(context, stop) {
                     job.publish(|s| {
                         s.check = Check::Known(r);
                         s.repair_error = error.map(|e| e.trim().to_string());
