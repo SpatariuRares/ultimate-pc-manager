@@ -20,9 +20,10 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $zip = "ultimate-pc-manager-${{ github.ref_name }}-windows-x64.zip"
-          Compress-Archive -Path target/release/ultimate-pc-manager.exe, README.md, assets/Michroma-OFL.txt -DestinationPath $zip
+          # The exe is named as the app, so a shortcut to it reads "Ultimate PC Manager".
+          Copy-Item target/release/ultimate-pc-manager.exe "Ultimate PC Manager.exe"
+          Compress-Archive -Path "Ultimate PC Manager.exe", README.md, assets/Michroma-OFL.txt -DestinationPath UltimatePCManager.zip
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: ultimate-pc-manager-*-windows-x64.zip
+          files: UltimatePCManager.zip

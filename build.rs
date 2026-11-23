@@ -10,6 +10,6 @@ fn main() {
     res.set_icon("assets/brand/icon.ico");
     res.set("ProductName", "Ultimate PC Manager");
     res.set("FileDescription", "Ultimate PC Manager");
-    res.set("OriginalFilename", "ultimate-pc-manager.exe");
+    res.set("OriginalFilename", "Ultimate PC Manager.exe");
     res.compile().expect("could not embed the Windows icon (is the Windows SDK installed?)");
 }
