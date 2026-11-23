@@ -28,6 +28,12 @@ pub struct ServiceRow {
     pub pid: u32,
     pub status: String,
     pub start_type: String,
+    /// The service manager the row comes from ("systemd"); empty on Windows,
+    /// which has the one.
+    pub source: String,
+    /// The scope the service belongs to ("System" or "User"); empty when the
+    /// manager has none.
+    pub scope: String,
 }
 
 /// What the Services and Startup apps pages ask of the machine.

@@ -44,7 +44,9 @@ features! {
     Elevation,
     /// Desktop notifications.
     Notifications,
-    /// Listing and controlling services.
+    /// Listing the services the system runs.
+    ServiceListing,
+    /// Starting, stopping and restarting services.
     ServiceControl,
     /// Priority, affinity, suspend and efficiency of processes.
     ProcessControl,
@@ -99,9 +101,10 @@ pub(crate) fn system_has(feature: Feature) -> bool {
         true
     };
     // Linux: signals, nice values and affinity work through kill, renice and taskset;
-    // the startup entries are read from the XDG autostart folders.
+    // the startup entries are read from the XDG autostart folders; the service
+    // list comes from its sources (they say when no service manager is there).
     #[cfg(target_os = "linux")]
-    return matches!(feature, Feature::ProcessControl | Feature::StartupEntries);
+    return matches!(feature, Feature::ProcessControl | Feature::StartupEntries | Feature::ServiceListing);
     // No current feature has a macOS implementation yet.
     #[cfg(target_os = "macos")]
     return {
@@ -202,9 +205,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn on_linux_only_process_control_and_startup_entries_are_in_the_system_so_far() {
+    fn on_linux_process_control_startup_entries_and_the_service_list_are_in_the_system_so_far() {
         for &feature in Feature::ALL {
-            assert_eq!(system_has(feature), matches!(feature, Feature::ProcessControl | Feature::StartupEntries), "{feature:?}");
+            assert_eq!(system_has(feature), matches!(feature, Feature::ProcessControl | Feature::StartupEntries | Feature::ServiceListing), "{feature:?}");
         }
     }
 

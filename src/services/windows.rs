@@ -184,6 +184,7 @@ pub fn list_services() -> Result<Vec<ServiceRow>, String> {
                 pid: it.ServiceStatusProcess.dwProcessId,
                 status: state_text(it.ServiceStatusProcess.dwCurrentState).to_string(),
                 start_type,
+                ..Default::default()
             });
         }
         CloseServiceHandle(scm);
