@@ -22,6 +22,9 @@ impl ListingReader for WindowsListing {
     fn store(&self) -> Result<Vec<StorePackage>, String> {
         imp::read_store()
     }
+    fn signature(&self, path: &str) -> super::signature::Signature {
+        super::signature::check(path)
+    }
 }
 
 #[cfg(not(windows))]

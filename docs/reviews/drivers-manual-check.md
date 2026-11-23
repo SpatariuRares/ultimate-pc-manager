@@ -52,3 +52,15 @@ The automatic tests run the bootstrap with a real, non-elevated PowerShell. Thes
 14. Result forgery: a normal process cannot create `envelope.json` there (denied); a result with a wrong or missing token is shown as "The elevated result was rejected: it does not carry this job's token." (covered by an automatic test).
 15. Close UAC with **No**.
     - Expected: still "Cancelled at the Windows prompt: nothing was changed.". After every step above, no `job-*.ps1` is left in the jobs folder. A finished job leaves its `upcm-*` folder in `%windir%\Temp` (only the caller-readable `envelope.json`, because the caller cannot delete it); the next elevated job removes folders older than 30 minutes.
+
+## #27: restore point (needs UAC and System Restore)
+
+1. Page Drivers, "More actions > Install from an INF file...", pick a package. The confirm dialog shows "Create a restore point first (same administrator prompt)", checked.
+   - Expected with System Restore on and no point in the last 24 hours: one UAC prompt, then "Restore point created. Driver package installed." (check `rstrui.exe`: a "Ultimate PC Manager: driver change" point exists).
+2. Repeat at once (Windows allows one point per 24 hours by default).
+   - Expected: one UAC prompt, then "Restore point not created" with "Windows already created a restore point in the last 24 hours." Cancel: "Cancelled: nothing was changed.", nothing installed. Repeat and Continue: a second UAC prompt, then "Driver package installed." with no restore point.
+3. Turn System Restore off for C: (System Properties > System Protection) and repeat.
+   - Expected: "System Restore is off on drive C:." with the same Continue/Cancel choice.
+4. Uncheck the option, confirm, and restart the app.
+   - Expected: no restore point step, the same single prompt as before, and the option stays unchecked next time.
+5. Same for "Install update" (Windows Update) and "Install ... anyway".

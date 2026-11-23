@@ -11,6 +11,8 @@ pub mod cli;
 pub mod engine;
 /// The Drivers page.
 pub mod page;
+/// Driver signatures: WinVerifyTrust, catalogs and WHQL.
+pub mod signature;
 /// The driver store: reading and classifying the packages.
 pub mod store;
 /// The Windows reader of the listing.
@@ -50,6 +52,11 @@ pub trait ListingReader: Send + Sync {
     /// they could not be read.
     fn store(&self) -> Result<Vec<store::StorePackage>, String> {
         Err("this reader does not read the driver store".into())
+    }
+    /// The signature of the driver file at `path`, read with normal rights.
+    /// Called on a background thread, one file at a time.
+    fn signature(&self, _path: &str) -> signature::Signature {
+        signature::Signature::CouldNotCheck("this reader does not check signatures".into())
     }
 }
 
@@ -95,9 +102,16 @@ struct Prefs {
     /// The Summary tile is on (off by default).
     #[serde(rename = "summaryTile", skip_serializing_if = "is_default")]
     summary_tile: bool,
+    /// "Create a restore point first" in the confirm dialogs (on by default).
+    #[serde(rename = "restorePoint", skip_serializing_if = "is_true")]
+    restore_point: bool,
     /// The fields of newer versions, written back untouched.
     #[serde(flatten)]
     rest: serde_json::Map<String, serde_json::Value>,
+}
+
+fn is_true(on: &bool) -> bool {
+    *on
 }
 
 fn is_default_years(years: &i64) -> bool {
@@ -113,6 +127,7 @@ impl Default for Prefs {
             check_on_open: false,
             maker_years: DEFAULT_OLD_YEARS,
             summary_tile: false,
+            restore_point: true,
             rest: serde_json::Map::new(),
         }
     }
@@ -124,6 +139,7 @@ impl Prefs {
         page.drv_ui.scope = self.scope;
         page.drv_ui.kernel_filter = self.kernel_filter;
         page.drv_ui.show_disconnected = self.show_disconnected;
+        page.restore_point = self.restore_point;
         self.apply_options_to(page);
     }
 
@@ -197,6 +213,7 @@ impl Drivers {
                 prefs.kernel_filter = page.drv_ui.kernel_filter;
             }
             prefs.show_disconnected = page.drv_ui.show_disconnected;
+            prefs.restore_point = page.restore_point;
         }
         prefs
     }
@@ -583,6 +600,20 @@ mod settings_tests {
         assert_eq!(addon.settings(), serde_json::json!({ "makerYears": 5 }));
         addon.load_settings(&serde_json::json!({ "makerYears": 0 }));
         assert_eq!(addon.page().unwrap().old_years, 1, "at least one year");
+    }
+
+    #[test]
+    fn the_restore_point_option_is_on_by_default_and_remembered_when_turned_off() {
+        let (ctx, _) = AddonContext::recording();
+        let mut addon = Drivers::default();
+        addon.start(&ctx);
+        assert!(addon.page().unwrap().restore_point, "on by default");
+        assert_eq!(addon.settings(), serde_json::Value::Null, "the default is not saved");
+        addon.page().unwrap().restore_point = false;
+        assert_eq!(addon.settings(), serde_json::json!({ "restorePoint": false }));
+        addon.stop();
+        addon.start(&ctx);
+        assert!(!addon.page().unwrap().restore_point, "the choice comes back");
     }
 
     #[test]
