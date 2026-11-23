@@ -1,7 +1,7 @@
 //! The Windows adapter: the Service Control Manager and the startup
 //! locations, through the per-concern modules (`crate::services`, `crate::startup_entries`).
 
-use super::{ServiceRow, StartupRow, SystemLists, STARTUP_GONE};
+use super::{ServiceKey, ServiceRow, StartupRow, SystemLists, STARTUP_GONE};
 
 /// The machine this app runs on.
 pub struct NativeSystem;
@@ -11,8 +11,8 @@ impl SystemLists for NativeSystem {
         crate::services::list_services()
     }
 
-    fn control_service(&self, name: &str, action: &str) -> Result<(), String> {
-        crate::services::control_service(name, action)
+    fn control_service(&self, service: &ServiceKey, action: &str) -> Result<(), String> {
+        crate::services::control_service(service, action)
     }
 
     fn list_startup(&self) -> Vec<StartupRow> {

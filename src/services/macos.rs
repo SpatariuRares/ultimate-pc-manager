@@ -19,6 +19,6 @@ pub fn service_description(_: &str) -> String {
 }
 
 /// Services cannot be started or stopped: an error.
-pub fn control_service(_: &str, _: &str) -> Result<(), String> {
+pub fn control_service(_: &crate::system_lists::ServiceKey, _: &str) -> Result<(), String> {
     Err(unavailable_error(Feature::ServiceControl))
 }
