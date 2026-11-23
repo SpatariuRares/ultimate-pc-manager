@@ -93,6 +93,12 @@ It is the last add-on in the migration order proposed by the add-ons document.
 52. As a user, I want "Drivers could not be enumerated" with the reason when reading fails, instead of a silent empty list, so that I understand it is an error. *(missing: today a reading error gives an empty list)*
 53. As a user, I want "No drivers were reported" / "Windows published no driver registrations." when Windows returns nothing, distinct from "No drivers here." and from the filter states, so that I can tell a problem from a filter. *(missing)*
 
+### Security band (spec #11, #32)
+A compact read-only "Security" strip under the status band shows Memory integrity (`HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled`) and the vulnerable driver blocklist (`HKLM\SYSTEM\CurrentControlSet\Control\CI\Config\VulnerableDriverBlocklistEnable`).
+- Each value shows as "On" (1), "Off" (0), "Not set" (no key or value: the page does not guess) or "could not be read" (access denied, another type, any other number), each with its own explaining line; an unreadable value is never shown as off.
+- The values are read with normal rights, in process, in the same read as the driver listing; nothing is written and no elevated job is added. When the add-on is turned off the read is dropped and nothing new starts.
+- "Open Windows Security" opens `windowsdefender://coreisolation`; the strip says "Read-only: change them in Windows Security."
+
 ### Behavior as an add-on
 54. As a user, I want to turn Drivers on or off from the Add-ons page in Settings, so that I keep the app light if I do not need it. *(our addition)*
 55. As a user, I want the add-on, when off, not to appear in the side menu nor be reachable with `--page "Drivers"`, so that it is truly absent. *(our addition)*

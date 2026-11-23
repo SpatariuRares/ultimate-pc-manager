@@ -1,7 +1,7 @@
 //! The Windows reader: today's SetupDi, service-manager and file-version
 //! code, moved unchanged. Elsewhere it lists nothing.
 
-use super::engine::{DeviceDriver, KernelDriver};
+use super::engine::{DeviceDriver, KernelDriver, SecurityReading};
 use super::ListingReader;
 
 /// The Drivers add-on's reader on a real PC.
@@ -15,6 +15,9 @@ impl ListingReader for WindowsListing {
     fn kernel(&self) -> Result<Vec<KernelDriver>, String> {
         imp::list_kernel()
     }
+    fn security(&self) -> SecurityReading {
+        imp::read_security()
+    }
 }
 
 #[cfg(not(windows))]
@@ -26,6 +29,9 @@ mod imp {
     }
     pub fn list_kernel() -> Result<Vec<KernelDriver>, String> {
         Err(unavailable_error(Feature::DeviceSetupApi))
+    }
+    pub fn read_security() -> SecurityReading {
+        SecurityReading::unreadable(&unavailable_error(Feature::DeviceSetupApi))
     }
 }
 
@@ -42,6 +48,29 @@ mod imp {
     use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
     use windows_sys::Win32::System::Services::*;
+
+    /// One DWORD of HKLM, opened with read rights only (no write path).
+    fn read_dword(subkey: &str, name: &str) -> Reading {
+        use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+        let missing = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+        match winreg::RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(subkey, KEY_READ) {
+            Err(e) if missing(&e) => Reading::NotSet,
+            Err(e) => Reading::Failed(e.to_string()),
+            Ok(key) => match key.get_value::<u32, _>(name) {
+                Ok(v) => Reading::Value(v),
+                Err(e) if missing(&e) => Reading::NotSet,
+                Err(e) => Reading::Failed(e.to_string()),
+            },
+        }
+    }
+
+    /// Memory integrity and the vulnerable-driver blocklist.
+    pub fn read_security() -> SecurityReading {
+        SecurityReading {
+            memory_integrity: read_dword(r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity", "Enabled"),
+            blocklist: read_dword(r"SYSTEM\CurrentControlSet\Control\CI\Config", "VulnerableDriverBlocklistEnable"),
+        }
+    }
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(Some(0)).collect()

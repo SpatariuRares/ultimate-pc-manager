@@ -518,6 +518,7 @@ impl DriversPage {
         let kernel_error = st.kernel_error.clone();
         let checked_at = st.checked_at.clone();
         let listed_at = st.listed_at.clone();
+        let security = st.security.clone();
         drop(st);
         let admin = self.context.is_admin();
         let idle = busy.is_none();
@@ -556,6 +557,8 @@ impl DriversPage {
                 ui.label(RichText::new(&output).monospace().size(11.0));
             });
         }
+        ui.add_space(8.0);
+        self.security_strip(ui, security.as_ref());
         ui.add_space(12.0);
 
         // ------------------------------------------------ scope row
@@ -620,6 +623,51 @@ impl DriversPage {
         }
 
         self.drivers_dialogs(ui);
+    }
+
+    /// The read-only "Security" strip under the status band: Memory
+    /// integrity and the vulnerable-driver blocklist, and a link to Windows
+    /// Security, where they are changed. The page never writes them.
+    fn security_strip(&mut self, ui: &mut Ui, reading: Option<&drivers::SecurityReading>) {
+        let th = theme::of_ui(ui);
+        let view = drivers::security_view(reading);
+        let mut open = false;
+        crate::widgets::strip(ui, |ui| {
+            ui.label(RichText::new("Security").size(12.0).strong().color(th.soft));
+            for (name, state) in view.items {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let color = match state {
+                        Some(drivers::Setting::On) => th.green,
+                        Some(drivers::Setting::Off) => th.amber,
+                        _ => th.faint,
+                    };
+                    crate::widgets::dot(ui, color);
+                    ui.label(RichText::new(format!("{name}:")).size(12.0).color(th.soft));
+                    if let Some(state) = state {
+                        ui.label(RichText::new(state.text()).size(12.0).strong().color(th.soft));
+                    }
+                });
+            }
+            if !view.note.is_empty() {
+                ui.label(RichText::new(&view.note).size(12.0).color(th.label));
+            }
+            if ui.link(RichText::new("Open Windows Security").size(12.0)).clicked() {
+                open = true;
+            }
+            ui.label(RichText::new(drivers::SECURITY_READ_ONLY).size(12.0).color(th.faint));
+        });
+        if open {
+            self.open_windows_security();
+        }
+    }
+
+    /// Opens Windows Security's core isolation page, where Memory integrity
+    /// is changed; a failure is told in the status bar.
+    pub fn open_windows_security(&mut self) {
+        if let Err(e) = self.context.open(drivers::CORE_ISOLATION_LINK) {
+            self.say(e);
+        }
     }
 
     /// The status band: the page's answer and its main action.
