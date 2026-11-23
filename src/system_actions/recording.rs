@@ -135,6 +135,12 @@ impl SystemActions for RecordingActions {
     fn run_new_task(&self, cmdline: &str) -> Result<(), String> {
         self.record(Request::RunNewTask(cmdline.into()))
     }
+    fn run_new_task_as_admin(&self, cmdline: &str) -> Result<(), String> {
+        self.record(Request::RunNewTaskAsAdmin(cmdline.into()))
+    }
+    fn offers_run_as_admin(&self) -> bool {
+        true
+    }
     fn open_power_options(&self) -> Result<(), String> {
         self.record(Request::OpenPowerOptions)
     }
