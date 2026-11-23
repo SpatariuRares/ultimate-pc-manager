@@ -55,6 +55,9 @@ pub struct Drivers {
     /// The tab and kernel scope `--drivers-scope` opened the page on: not
     /// saved until the user picks another one.
     from_command_line: Option<(Scope, KernelScope)>,
+    /// What an invalid `--drivers-scope` value is told as, until the host
+    /// takes it for the status line.
+    scope_error: Option<String>,
 }
 
 /// Drivers' own settings, as saved: a default value is left out, and the
@@ -122,7 +125,7 @@ impl Prefs {
 
 impl Default for Drivers {
     fn default() -> Self {
-        Drivers { reader: Arc::new(windows::WindowsListing), page: None, prefs: Prefs::default(), from_command_line: None }
+        Drivers { reader: Arc::new(windows::WindowsListing), page: None, prefs: Prefs::default(), from_command_line: None, scope_error: None }
     }
 }
 
@@ -282,11 +285,20 @@ impl Addon for Drivers {
     /// on Kernel modules with that scope, without saving it; an invalid
     /// value is ignored.
     fn command_line(&mut self, args: &[String]) -> bool {
+        self.scope_error = if self.page.is_some() { cli::scope_error(args) } else { None };
         let (Some(page), Some(scope)) = (&mut self.page, cli::kernel_scope(args)) else { return false };
         page.drv_ui.scope = Scope::Kernel;
         page.drv_ui.kernel_filter = scope;
         self.from_command_line = self.view();
         true
+    }
+
+    fn command_line_error(&mut self) -> Option<String> {
+        self.scope_error.take()
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &["kernel-modules", "modules"]
     }
 
     fn refresh(&mut self) {
@@ -639,6 +651,30 @@ mod command_line_tests {
         addon.command_line(&args(&["--drivers-scope", "loaded"]));
         addon.page().unwrap().drv_ui.kernel_filter = KernelScope::ThirdParty;
         assert_eq!(addon.settings(), serde_json::json!({ "scope": "kernel", "kernelFilter": "third-party" }), "the user's own pick is saved");
+    }
+
+    #[test]
+    fn every_name_of_the_page_opens_it_in_any_case() {
+        let (host, _) = crate::addons::AddonHost::for_tests(&serde_json::json!({ "drivers": { "enabled": true } }));
+        for name in ["drivers", "kernel-modules", "modules", "Drivers", "DRIVERS", "Kernel-Modules", "MODULES", "Modules"] {
+            assert_eq!(host.landing(Some(name), "Summary", "Summary"), crate::addons::Landing::Page("drivers"), "{name}");
+        }
+        assert_eq!(host.landing(Some("kernel"), "Summary", "Summary"), crate::addons::Landing::Page("Summary"), "other names still fall back");
+    }
+
+    #[test]
+    fn an_invalid_drivers_scope_is_told_and_leaves_the_saved_scope() {
+        let (mut host, _) = crate::addons::AddonHost::for_tests(&serde_json::json!({ "drivers": { "enabled": true, "scope": "builtin" } }));
+        let saved = host.settings("drivers");
+        assert!(saved.is_some());
+        let line = host.command_line(&args(&["--page", "modules", "--drivers-scope", "everything"]));
+        assert_eq!(line.errors, vec!["everything (valid scopes: all, loaded, not-loaded, third-party, file-system)".to_string()]);
+        assert_eq!(line.page, None, "an invalid value does not ask for the page");
+        assert_eq!(host.settings("drivers"), saved, "the saved scope stays");
+
+        for ok in [&["--drivers-scope", "loaded"][..], &["--drivers-scope=third-party"], &["--page", "Drivers"], &[]] {
+            assert!(host.command_line(&args(ok)).errors.is_empty(), "{ok:?}");
+        }
     }
 
     #[test]
