@@ -322,6 +322,9 @@ pub struct State {
     /// Output of the last pnputil / sc run.
     pub output: String,
     pub reboot_required: bool,
+    /// The last read of the security settings; `None` until the first
+    /// listing has read them.
+    pub security: Option<SecurityReading>,
 }
 
 #[derive(Clone)]
@@ -421,8 +424,14 @@ impl Hub {
         }
         let devices = self.reader.devices();
         let kernel = self.reader.kernel();
+        // Read-only and with normal rights; skipped once the hub was stopped.
+        if self.live().is_none() {
+            return;
+        }
+        let security = self.reader.security();
         let Some(mut st) = self.live() else { return };
         publish_listing(&mut st, devices, kernel);
+        st.security = Some(security);
         st.listed_at = crate::platform::clock_now();
     }
 
@@ -790,6 +799,111 @@ try {
 } catch { $res.error = $_.Exception.Message }
 ConvertTo-Json -InputObject $res -Depth 5 | Out-File -FilePath $Out -Encoding utf8
 "#;
+
+/// One registry value of the security band, as read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reading {
+    /// The DWORD the value holds.
+    Value(u32),
+    /// The key or the value does not exist: Windows was never told.
+    NotSet,
+    /// The read failed (access denied, a value of another type): why.
+    Failed(String),
+}
+
+/// The two settings the Security band shows, read from the registry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecurityReading {
+    /// `DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled`.
+    pub memory_integrity: Reading,
+    /// `CI\Config\VulnerableDriverBlocklistEnable`.
+    pub blocklist: Reading,
+}
+
+impl SecurityReading {
+    /// Both settings could not be read, for `why`.
+    pub fn unreadable(why: &str) -> Self {
+        SecurityReading { memory_integrity: Reading::Failed(why.into()), blocklist: Reading::Failed(why.into()) }
+    }
+}
+
+/// What the band says about one setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Setting {
+    On,
+    Off,
+    /// Windows holds no value: the page does not guess.
+    NotSet,
+    /// The value could not be read (or holds something unexpected).
+    Unreadable,
+}
+
+impl Setting {
+    /// The word shown after the setting's name.
+    pub fn text(self) -> &'static str {
+        match self {
+            Setting::On => "On",
+            Setting::Off => "Off",
+            Setting::NotSet => "Not set",
+            Setting::Unreadable => "could not be read",
+        }
+    }
+}
+
+/// A value read becomes a state: 1 is on, 0 is off, a missing value is not
+/// set, and a failed read or any other number is unreadable (never "off").
+pub fn setting_of(reading: &Reading) -> Setting {
+    match reading {
+        Reading::Value(1) => Setting::On,
+        Reading::Value(0) => Setting::Off,
+        Reading::NotSet => Setting::NotSet,
+        Reading::Value(_) | Reading::Failed(_) => Setting::Unreadable,
+    }
+}
+
+/// The name of the first setting.
+pub const MEMORY_INTEGRITY: &str = "Memory integrity";
+/// The name of the second setting.
+pub const BLOCKLIST: &str = "Vulnerable driver blocklist";
+/// The link the band opens: Windows Security's core isolation page.
+pub const CORE_ISOLATION_LINK: &str = "windowsdefender://coreisolation";
+/// The band's reminder that the page never changes these settings.
+pub const SECURITY_READ_ONLY: &str = "Read-only: change them in Windows Security.";
+
+/// What the Security band shows: both settings and one explaining line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecurityView {
+    /// (name, state) in display order; no state while nothing was read yet.
+    pub items: [(&'static str, Option<Setting>); 2],
+    /// Explains anything that is not plainly on; empty when all is on.
+    pub note: String,
+}
+
+/// The band for a reading (`None` while it has not been read yet).
+pub fn security_view(reading: Option<&SecurityReading>) -> SecurityView {
+    let Some(r) = reading else {
+        return SecurityView { items: [(MEMORY_INTEGRITY, None), (BLOCKLIST, None)], note: "Reading the security settings\u{2026}".into() };
+    };
+    let (memory, blocklist) = (setting_of(&r.memory_integrity), setting_of(&r.blocklist));
+    let mut notes: Vec<String> = Vec::new();
+    match (memory, blocklist) {
+        (Setting::Unreadable, Setting::Unreadable) => notes.push("Windows did not let us read these settings, so we do not guess.".into()),
+        (Setting::Unreadable, _) => notes.push("Windows did not let us read Memory integrity, so we do not guess.".into()),
+        (_, Setting::Unreadable) => notes.push("Windows did not let us read the vulnerable driver blocklist, so we do not guess.".into()),
+        _ => {}
+    }
+    match memory {
+        Setting::Off => notes.push("Memory integrity is off: Windows does not isolate the kernel from unsafe code.".into()),
+        Setting::NotSet => notes.push("Memory integrity has no value in Windows, so we do not say whether it is on.".into()),
+        _ => {}
+    }
+    match blocklist {
+        Setting::Off => notes.push("The blocklist is off: Windows does not block known vulnerable drivers.".into()),
+        Setting::NotSet => notes.push("The blocklist has no value in Windows, so we do not say whether it is on.".into()),
+        _ => {}
+    }
+    SecurityView { items: [(MEMORY_INTEGRITY, Some(memory)), (BLOCKLIST, Some(blocklist))], note: notes.join(" ") }
+}
 
 /// Puts the outcome of a read of devices and driver services into `st`: a
 /// failed read leaves its list empty and keeps the reason, so the page can
@@ -1380,5 +1494,164 @@ mod outcome_tests {
     #[test]
     fn unload_with_administrator_rights_is_offered() {
         assert_eq!(kernel(true, 2).unload_note(true), (true, "Offered: most drivers refuse the request while the system runs."));
+    }
+}
+
+/// The Security band: which state a value shows, what the band says, and
+/// the read through the hub (#32).
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use crate::addons::drivers::windows::WindowsListing;
+    use crate::addons::until;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn a_value_shows_as_on_off_not_set_or_unreadable() {
+        assert_eq!(setting_of(&Reading::Value(1)), Setting::On);
+        assert_eq!(setting_of(&Reading::Value(0)), Setting::Off);
+        assert_eq!(setting_of(&Reading::NotSet), Setting::NotSet);
+        assert_eq!(setting_of(&Reading::Failed("access is denied".into())), Setting::Unreadable);
+        assert_eq!(setting_of(&Reading::Value(7)), Setting::Unreadable, "an unexpected number is not guessed as off");
+    }
+
+    #[test]
+    fn every_state_has_its_own_text() {
+        let texts = [Setting::On, Setting::Off, Setting::NotSet, Setting::Unreadable].map(Setting::text);
+        assert_eq!(texts, ["On", "Off", "Not set", "could not be read"]);
+    }
+
+    fn reading(memory: Reading, blocklist: Reading) -> SecurityReading {
+        SecurityReading { memory_integrity: memory, blocklist }
+    }
+
+    #[test]
+    fn both_on_has_nothing_to_explain() {
+        let v = security_view(Some(&reading(Reading::Value(1), Reading::Value(1))));
+        assert_eq!(v.items, [(MEMORY_INTEGRITY, Some(Setting::On)), (BLOCKLIST, Some(Setting::On))]);
+        assert_eq!(v.note, "");
+    }
+
+    #[test]
+    fn an_off_setting_says_what_it_means() {
+        let v = security_view(Some(&reading(Reading::Value(1), Reading::Value(0))));
+        assert_eq!(v.items[1], (BLOCKLIST, Some(Setting::Off)));
+        assert_eq!(v.note, "The blocklist is off: Windows does not block known vulnerable drivers.");
+        let v = security_view(Some(&reading(Reading::Value(0), Reading::Value(1))));
+        assert_eq!(v.note, "Memory integrity is off: Windows does not isolate the kernel from unsafe code.");
+    }
+
+    #[test]
+    fn an_unreadable_value_says_so_and_is_not_called_off() {
+        let denied = || Reading::Failed("access is denied".into());
+        let both = security_view(Some(&reading(denied(), denied())));
+        assert_eq!(both.items, [(MEMORY_INTEGRITY, Some(Setting::Unreadable)), (BLOCKLIST, Some(Setting::Unreadable))]);
+        assert_eq!(both.note, "Windows did not let us read these settings, so we do not guess.");
+        let one = security_view(Some(&reading(Reading::Value(1), denied())));
+        assert_eq!(one.items[0].1, Some(Setting::On), "the other value is still shown");
+        assert_eq!(one.note, "Windows did not let us read the vulnerable driver blocklist, so we do not guess.");
+        let other = security_view(Some(&reading(denied(), Reading::Value(0))));
+        assert_eq!(
+            other.note,
+            "Windows did not let us read Memory integrity, so we do not guess. The blocklist is off: Windows does not block known vulnerable drivers."
+        );
+    }
+
+    #[test]
+    fn a_missing_value_is_not_set_and_is_not_guessed() {
+        let v = security_view(Some(&reading(Reading::NotSet, Reading::NotSet)));
+        assert_eq!(v.items, [(MEMORY_INTEGRITY, Some(Setting::NotSet)), (BLOCKLIST, Some(Setting::NotSet))]);
+        assert!(v.note.contains("Memory integrity has no value") && v.note.contains("The blocklist has no value"), "{}", v.note);
+    }
+
+    #[test]
+    fn before_the_first_read_nothing_is_claimed() {
+        let v = security_view(None);
+        assert_eq!(v.items, [(MEMORY_INTEGRITY, None), (BLOCKLIST, None)]);
+        assert_eq!(v.note, "Reading the security settings\u{2026}");
+    }
+
+    /// A reader that answers the security band from a script, counts how
+    /// often it was asked and can hold the kernel read until released.
+    struct Fake {
+        security: SecurityReading,
+        asked: AtomicUsize,
+        in_kernel: AtomicBool,
+        release: AtomicBool,
+        hold: bool,
+    }
+
+    impl Fake {
+        fn new(security: SecurityReading, hold: bool) -> Arc<Fake> {
+            Arc::new(Fake { security, asked: AtomicUsize::new(0), in_kernel: AtomicBool::new(false), release: AtomicBool::new(!hold), hold })
+        }
+    }
+
+    impl ListingReader for Fake {
+        fn devices(&self) -> Result<Vec<DeviceDriver>, String> {
+            Ok(Vec::new())
+        }
+        fn kernel(&self) -> Result<Vec<KernelDriver>, String> {
+            self.in_kernel.store(true, Ordering::SeqCst);
+            while self.hold && !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(Vec::new())
+        }
+        fn security(&self) -> SecurityReading {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            self.security.clone()
+        }
+    }
+
+    #[test]
+    fn a_listing_reads_the_security_band_with_normal_rights_and_starts_nothing_elevated() {
+        let (ctx, runner) = AddonContext::recording();
+        let fake = Fake::new(reading(Reading::Value(1), Reading::Value(0)), false);
+        let hub = Hub::new(ctx, fake.clone());
+        assert!(hub.lock().security.is_none(), "nothing is read before the page asks");
+        hub.refresh();
+        until("the band is read", || hub.lock().security.is_some());
+        assert_eq!(hub.lock().security, Some(reading(Reading::Value(1), Reading::Value(0))));
+        assert_eq!(fake.asked.load(Ordering::SeqCst), 1);
+        assert!(runner.launches().is_empty(), "no PowerShell, no elevation: the registry is read in process");
+    }
+
+    #[test]
+    fn a_hub_that_was_stopped_reads_nothing_and_publishes_nothing() {
+        let (ctx, _) = AddonContext::recording();
+        let fake = Fake::new(reading(Reading::Value(1), Reading::Value(1)), false);
+        let hub = Hub::new(ctx, fake.clone());
+        hub.stop();
+        hub.refresh();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(fake.asked.load(Ordering::SeqCst), 0, "nothing starts while off");
+        assert!(hub.lock().security.is_none());
+    }
+
+    #[test]
+    fn turning_off_while_the_listing_runs_drops_the_security_read() {
+        let (ctx, _) = AddonContext::recording();
+        let fake = Fake::new(reading(Reading::Value(1), Reading::Value(1)), true);
+        let hub = Hub::new(ctx, fake.clone());
+        hub.refresh();
+        until("the listing is running", || fake.in_kernel.load(Ordering::SeqCst));
+        hub.stop();
+        fake.release.store(true, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(fake.asked.load(Ordering::SeqCst), 0, "the band is not read once the add-on is off");
+        assert!(hub.lock().security.is_none(), "and nothing is published");
+    }
+
+    /// Reads this PC's two values (run with `--ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn reads_the_security_values_of_this_pc() {
+        let r = WindowsListing.security();
+        println!("memory integrity: {:?} -> {:?}", r.memory_integrity, setting_of(&r.memory_integrity));
+        println!("blocklist: {:?} -> {:?}", r.blocklist, setting_of(&r.blocklist));
+        println!("{:?}", security_view(Some(&r)));
+        assert!(!matches!(r.memory_integrity, Reading::Failed(_)), "read with normal rights: {:?}", r.memory_integrity);
+        assert!(!matches!(r.blocklist, Reading::Failed(_)), "read with normal rights: {:?}", r.blocklist);
     }
 }

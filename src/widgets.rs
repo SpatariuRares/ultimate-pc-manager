@@ -388,6 +388,19 @@ pub fn dot(ui: &mut Ui, color: Color32) {
     ui.painter().circle_filled(r.center(), 4.0, color);
 }
 
+/// A compact bordered strip (panel fill, 1 px rule, 6 radius) that lays its
+/// contents out in a wrapping row: the Drivers "Security" band.
+pub fn strip(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    let t = theme::of_ui(ui);
+    egui::Frame::new().fill(t.panel).stroke(Stroke::new(1.0, t.line)).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(14.0, 6.0);
+            add(ui);
+        });
+    });
+}
+
 // ------------------------------------------- drawn line icons and tree rows
 
 /// A line icon drawn on a 24-unit grid (the prototypes' SVG icons).

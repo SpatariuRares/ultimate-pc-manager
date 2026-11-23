@@ -39,6 +39,11 @@ pub trait ListingReader: Send + Sync {
     fn devices(&self) -> Result<Vec<DeviceDriver>, String>;
     /// The kernel driver services, or why they could not be read.
     fn kernel(&self) -> Result<Vec<KernelDriver>, String>;
+    /// Memory integrity and the vulnerable-driver blocklist, read-only and
+    /// with normal rights. A reader that cannot read them says so.
+    fn security(&self) -> engine::SecurityReading {
+        engine::SecurityReading::unreadable("this reader does not read the security settings")
+    }
 }
 
 /// The add-on: its page while it is on, and while it waits to turn off.
@@ -886,5 +891,62 @@ mod reader_tests {
         assert!(page.contains("Up to date"), "{page}");
         assert!(page.contains("Windows Update offers the older 2.0.0.0"), "{page}");
         assert_eq!(reader.devices_asked(), 2);
+    }
+
+    /// A reader whose security band answers `security`.
+    struct Secure(engine::SecurityReading);
+
+    impl ListingReader for Secure {
+        fn devices(&self) -> Result<Vec<DeviceDriver>, String> {
+            Ok(vec![device("Alpha GPU")])
+        }
+        fn kernel(&self) -> Result<Vec<KernelDriver>, String> {
+            Ok(Vec::new())
+        }
+        fn security(&self) -> engine::SecurityReading {
+            self.0.clone()
+        }
+    }
+
+    fn secure_host(memory: engine::Reading, blocklist: engine::Reading) -> AddonHost {
+        let reader: Arc<dyn ListingReader> = Arc::new(Secure(engine::SecurityReading { memory_integrity: memory, blocklist }));
+        let entries = vec![Entry::Addon(Box::new(Drivers::with_reader(reader)))];
+        AddonHost::for_tests_with(entries, &json!({ "drivers": { "enabled": true } })).0
+    }
+
+    #[test]
+    fn the_security_strip_shows_each_state_with_its_own_text() {
+        use engine::Reading::{Failed, NotSet, Value};
+        let mut host = secure_host(Value(1), Value(0));
+        until("the strip is read", || shown(&mut host).contains("Vulnerable driver blocklist:"));
+        let page = shown(&mut host);
+        assert!(page.contains("Security") && page.contains("Memory integrity:") && page.contains("On") && page.contains("Off"), "{page}");
+        assert!(page.contains("The blocklist is off: Windows does not block known vulnerable drivers."), "{page}");
+        assert!(page.contains("Open Windows Security") && page.contains("Read-only: change them in Windows Security."), "{page}");
+
+        let mut host = secure_host(Failed("access is denied".into()), Failed("access is denied".into()));
+        until("the unreadable strip is shown", || shown(&mut host).contains("could not be read"));
+        let page = shown(&mut host);
+        assert!(page.contains("Windows did not let us read these settings, so we do not guess."), "{page}");
+        assert!(!page.contains("Memory integrity is off") && !page.contains("The blocklist is off"), "an unreadable value is never shown as off: {page}");
+
+        let mut host = secure_host(NotSet, Value(1));
+        until("the not-set strip is shown", || shown(&mut host).contains("Not set"));
+    }
+
+    #[test]
+    fn a_reader_without_a_security_read_shows_it_as_unreadable() {
+        let reader = Fake::devices(vec![Ok(vec![device("Alpha GPU")])]);
+        let mut host = on(&reader);
+        until("the strip is shown", || shown(&mut host).contains("Windows did not let us read these settings"));
+    }
+
+    #[test]
+    fn open_windows_security_opens_core_isolation_and_nothing_else() {
+        let (ctx, runner) = AddonContext::recording();
+        let mut addon = Drivers::with_no_drivers();
+        addon.start(&ctx);
+        addon.page().unwrap().open_windows_security();
+        assert_eq!(runner.launches(), vec![crate::platform::Launch::Open("windowsdefender://coreisolation".into())]);
     }
 }
