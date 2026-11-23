@@ -93,15 +93,21 @@ fn reason(feature: Feature) -> Option<&'static str> {
 
 /// Whether this system has the feature at all.
 pub(crate) fn system_has(feature: Feature) -> bool {
-    let _ = feature;
     #[cfg(windows)]
-    return true;
-    // Linux has the startup entries; every other feature is Windows-only for
-    // now. macOS has none yet.
+    return {
+        let _ = feature;
+        true
+    };
+    // Linux: signals, nice values and affinity work through kill, renice and taskset;
+    // the startup entries are read from the XDG autostart folders.
     #[cfg(target_os = "linux")]
-    return matches!(feature, Feature::StartupEntries);
+    return matches!(feature, Feature::ProcessControl | Feature::StartupEntries);
+    // No current feature has a macOS implementation yet.
     #[cfg(target_os = "macos")]
-    return false;
+    return {
+        let _ = feature;
+        false
+    };
 }
 
 /// Is the feature available on this system.
@@ -186,12 +192,19 @@ mod tests {
         assert_eq!(unavailable_features(), Vec::<Feature>::new());
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     #[test]
-    fn only_the_features_with_an_implementation_are_in_the_system_off_windows() {
+    fn no_current_feature_is_in_the_system_on_macos() {
         for &feature in Feature::ALL {
-            let has = cfg!(target_os = "linux") && matches!(feature, Feature::StartupEntries);
-            assert_eq!(system_has(feature), has, "{feature:?}");
+            assert!(!system_has(feature), "{feature:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_only_process_control_and_startup_entries_are_in_the_system_so_far() {
+        for &feature in Feature::ALL {
+            assert_eq!(system_has(feature), matches!(feature, Feature::ProcessControl | Feature::StartupEntries), "{feature:?}");
         }
     }
 

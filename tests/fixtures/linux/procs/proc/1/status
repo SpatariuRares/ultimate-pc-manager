@@ -1,0 +1,7 @@
+Name:	init
+State:	S (sleeping)
+Pid:	1
+PPid:	0
+Uid:	0	0	0	0
+Cpus_allowed:	f
+Cpus_allowed_list:	0-3
