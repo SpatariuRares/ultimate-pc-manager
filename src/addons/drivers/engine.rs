@@ -994,6 +994,16 @@ pub fn setting_of(reading: &Reading) -> Setting {
     }
 }
 
+/// Memory integrity: as Windows Security shows it, a missing value (or key)
+/// means it was never turned on, so it is off. A failed read or any number
+/// other than 0 and 1 stays unreadable.
+pub fn memory_integrity_of(reading: &Reading) -> Setting {
+    match reading {
+        Reading::NotSet => Setting::Off,
+        other => setting_of(other),
+    }
+}
+
 /// The name of the first setting.
 pub const MEMORY_INTEGRITY: &str = "Memory integrity";
 /// The name of the second setting.
@@ -1017,7 +1027,7 @@ pub fn security_view(reading: Option<&SecurityReading>) -> SecurityView {
     let Some(r) = reading else {
         return SecurityView { items: [(MEMORY_INTEGRITY, None), (BLOCKLIST, None)], note: "Reading the security settings\u{2026}".into() };
     };
-    let (memory, blocklist) = (setting_of(&r.memory_integrity), setting_of(&r.blocklist));
+    let (memory, blocklist) = (memory_integrity_of(&r.memory_integrity), setting_of(&r.blocklist));
     let mut notes: Vec<String> = Vec::new();
     match (memory, blocklist) {
         (Setting::Unreadable, Setting::Unreadable) => notes.push("Windows did not let us read these settings, so we do not guess.".into()),
@@ -1027,7 +1037,6 @@ pub fn security_view(reading: Option<&SecurityReading>) -> SecurityView {
     }
     match memory {
         Setting::Off => notes.push("Memory integrity is off: Windows does not isolate the kernel from unsafe code.".into()),
-        Setting::NotSet => notes.push("Memory integrity has no value in Windows, so we do not say whether it is on.".into()),
         _ => {}
     }
     match blocklist {
@@ -1794,10 +1803,21 @@ mod security_tests {
     }
 
     #[test]
-    fn a_missing_value_is_not_set_and_is_not_guessed() {
-        let v = security_view(Some(&reading(Reading::NotSet, Reading::NotSet)));
-        assert_eq!(v.items, [(MEMORY_INTEGRITY, Some(Setting::NotSet)), (BLOCKLIST, Some(Setting::NotSet))]);
-        assert!(v.note.contains("Memory integrity has no value") && v.note.contains("The blocklist has no value"), "{}", v.note);
+    fn a_missing_memory_integrity_value_is_off_as_windows_security_shows_it() {
+        let v = security_view(Some(&reading(Reading::NotSet, Reading::Value(1))));
+        assert_eq!(v.items, [(MEMORY_INTEGRITY, Some(Setting::Off)), (BLOCKLIST, Some(Setting::On))]);
+        assert_eq!(v.note, "Memory integrity is off: Windows does not isolate the kernel from unsafe code.");
+        assert_eq!(memory_integrity_of(&Reading::Value(1)), Setting::On);
+        assert_eq!(memory_integrity_of(&Reading::Value(0)), Setting::Off);
+        assert_eq!(memory_integrity_of(&Reading::Value(7)), Setting::Unreadable, "an unknown value is not guessed");
+        assert_eq!(memory_integrity_of(&Reading::Failed("access is denied".into())), Setting::Unreadable, "a failed read is not off");
+    }
+
+    #[test]
+    fn a_missing_blocklist_value_stays_not_set_and_is_not_guessed() {
+        let v = security_view(Some(&reading(Reading::Value(1), Reading::NotSet)));
+        assert_eq!(v.items, [(MEMORY_INTEGRITY, Some(Setting::On)), (BLOCKLIST, Some(Setting::NotSet))]);
+        assert_eq!(v.note, "The blocklist has no value in Windows, so we do not say whether it is on.");
     }
 
     #[test]

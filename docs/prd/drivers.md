@@ -107,7 +107,9 @@ It is the last add-on in the migration order proposed by the add-ons document.
 
 ### Security band (spec #11, #32)
 A compact read-only "Security" strip under the status band shows Memory integrity (`HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled`) and the vulnerable driver blocklist (`HKLM\SYSTEM\CurrentControlSet\Control\CI\Config\VulnerableDriverBlocklistEnable`).
-- Each value shows as "On" (1), "Off" (0), "Not set" (no key or value: the page does not guess) or "could not be read" (access denied, another type, any other number), each with its own explaining line; an unreadable value is never shown as off.
+- Each value shows as "On" (1), "Off" (0), "Not set" or "could not be read" (access denied, another type, any other number), each with its own explaining line; an unreadable value is never shown as off.
+- **Memory integrity with no value or no key shows "Off"** (owner decision on #32), as Windows Security does when the setting was never turned on; "could not be read" is kept for a real read failure or an unknown value. The vulnerable driver blocklist is unchanged: with no value it still shows "Not set".
+- Possible later improvement: read the running state from WMI `Win32_DeviceGuard.SecurityServicesRunning`.
 - The values are read with normal rights, in process, in the same read as the driver listing; nothing is written and no elevated job is added. When the add-on is turned off the read is dropped and nothing new starts.
 - "Open Windows Security" opens `windowsdefender://coreisolation`; the strip says "Read-only: change them in Windows Security."
 

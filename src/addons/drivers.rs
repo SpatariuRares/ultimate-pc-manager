@@ -938,7 +938,12 @@ mod reader_tests {
         assert!(!page.contains("Memory integrity is off") && !page.contains("The blocklist is off"), "an unreadable value is never shown as off: {page}");
 
         let mut host = secure_host(NotSet, Value(1));
-        until("the not-set strip is shown", || shown(&mut host).contains("Not set"));
+        until("the missing memory integrity value is shown as off", || shown(&mut host).contains("Memory integrity is off"));
+        let page = shown(&mut host);
+        assert!(!page.contains("Not set") && !page.contains("could not be read"), "a missing value is off, as Windows Security shows it: {page}");
+
+        let mut host = secure_host(Value(1), NotSet);
+        until("the not-set blocklist is shown", || shown(&mut host).contains("Not set"));
     }
 
     /// A reader whose Filter Manager read answers `filters`.
