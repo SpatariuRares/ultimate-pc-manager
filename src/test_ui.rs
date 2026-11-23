@@ -65,26 +65,44 @@ pub fn colours(out: &egui::FullOutput) -> Vec<egui::Color32> {
     all
 }
 
-/// Every text `draw` shows in one frame of a page, a line each, and the actions it asked for.
-pub fn drawn_text<R>(mut draw: impl FnMut(&mut Ui, &mut crate::platform::PageContext) -> R) -> (String, Vec<crate::platform::Action>) {
+/// One frame of a page drawn with `input`: its texts and the actions it asked for.
+fn draw_page<R>(input: RawInput, mut draw: impl FnMut(&mut Ui, &mut crate::platform::PageContext) -> R) -> (Vec<String>, Vec<crate::platform::Action>) {
     let (settings, sample) = (crate::settings::Settings::default(), crate::sampler::Snapshot::default());
     let ctx = egui::Context::default();
     // The app's faces, as at start-up: pages draw in them.
     theme::install_fonts(&ctx);
     let mut actions = Vec::new();
-    let output = ctx.run(RawInput::default(), |ctx| {
+    let output = ctx.run(input, |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut page = crate::platform::PageContext::new(&settings, &sample);
             draw(ui, &mut page);
             actions = std::mem::take(&mut page.actions);
         });
     });
-    (texts(&output).join("\n"), actions)
+    (texts(&output), actions)
+}
+
+/// Every text `draw` shows in one frame of a page, a line each, and the actions it asked for.
+pub fn drawn_text<R>(draw: impl FnMut(&mut Ui, &mut crate::platform::PageContext) -> R) -> (String, Vec<crate::platform::Action>) {
+    let (lines, actions) = draw_page(RawInput::default(), draw);
+    (lines.join("\n"), actions)
 }
 
 /// Every text `draw` shows in one frame of a page, a line each.
 pub fn page_text<R>(draw: impl FnMut(&mut Ui, &mut crate::platform::PageContext) -> R) -> String {
     drawn_text(draw).0
+}
+
+/// Every text `draw` shows in one frame of a page, one entry each.
+pub fn drawn_lines<R>(draw: impl FnMut(&mut Ui, &mut crate::platform::PageContext) -> R) -> Vec<String> {
+    draw_page(RawInput::default(), draw).0
+}
+
+/// Every text `draw` shows in a window of `size`, one entry each; text laid
+/// out past its edges is not painted.
+pub fn drawn_lines_in<R>(size: egui::Vec2, draw: impl FnMut(&mut Ui, &mut crate::platform::PageContext) -> R) -> Vec<String> {
+    let input = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), ..Default::default() };
+    draw_page(input, draw).0
 }
 
 /// Settings whose CPU colour is the user's own, and that colour.

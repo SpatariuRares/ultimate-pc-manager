@@ -3319,7 +3319,7 @@ mod install_queue_tests {
         hub.update(vec!["tool".into()]);
         runner.wait_for(1);
 
-        let mut drivers = Drivers::default();
+        let mut drivers = Drivers::with_no_drivers();
         drivers.start(&ctx);
         let drv = drivers.page().unwrap().drv.clone();
         drv.install(vec!["update-1".into()]);
@@ -3343,7 +3343,7 @@ mod install_queue_tests {
     #[test]
     fn an_uninstall_waiting_for_the_queue_never_runs_once_turned_off() {
         let (ctx, runner) = AddonContext::recording();
-        let mut drivers = Drivers::default();
+        let mut drivers = Drivers::with_no_drivers();
         drivers.start(&ctx);
         runner.hold();
         drivers.page().unwrap().drv.install_inf(r"C:\pkg\driver.inf".into());
@@ -3373,7 +3373,7 @@ mod install_queue_tests {
         apps.start(&ctx);
         let hub = apps.page().unwrap().apps.clone();
         hub.lock().apps = vec![newer("tool"), tool("other")];
-        let mut drivers = Drivers::default();
+        let mut drivers = Drivers::with_no_drivers();
         drivers.start(&ctx);
         let drv = drivers.page().unwrap().drv.clone();
 
@@ -3405,7 +3405,7 @@ mod install_queue_tests {
     fn change_and_repair_wait_for_the_install_queue_and_say_what_they_do() {
         for (repair, verb) in [(false, "changing"), (true, "repairing")] {
             let (ctx, runner) = AddonContext::recording();
-            let mut drivers = Drivers::default();
+            let mut drivers = Drivers::with_no_drivers();
             drivers.start(&ctx);
             runner.hold();
             drivers.page().unwrap().drv.install_inf(r"C:\pkg\driver.inf".into());

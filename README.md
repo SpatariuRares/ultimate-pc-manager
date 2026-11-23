@@ -133,7 +133,7 @@ minimum of runner minutes:
 | Workflow | When | What it does |
 |---|---|---|
 | `.github/workflows/ci.yml` | pull requests that change `src/`, `assets/`, `Cargo.toml`/`Cargo.lock` or the workflow; manual | `cargo test --release` only (tests that read the real PC are `#[ignore]` and skipped). Doc-only changes and pushes to `main` do not run it. |
-| `.github/workflows/release.yml` | push of a `v*` tag | `cargo build --release` and a GitHub Release with `ultimate-pc-manager-<tag>-windows-x64.zip` (exe, README, font license). |
+| `.github/workflows/release.yml` | push of a `v*` tag | `cargo build --release` and a GitHub Release with `UltimatePCManager.zip` (`Ultimate PC Manager.exe`, README, font license). |
 
 Both have a 30-minute timeout and reuse the Cargo cache. To publish a version:
 

@@ -1599,7 +1599,7 @@ mod tests {
         let expected = if cfg!(debug_assertions) { Some("You are running a debug build, benchmarks are not valid") } else { None };
         assert_eq!(debug_build_warning(), expected);
         if expected.is_some() {
-            let texts = super::score_tests::drawn_texts(|ui, page| Benchmarks::default().ui(ui, page));
+            let texts = crate::test_ui::drawn_lines(|ui, page| Benchmarks::default().ui(ui, page));
             let banner = "You are running a debug build, benchmarks are not valid. Runs are not saved.";
             assert!(texts.iter().any(|t| t == banner), "{texts:?}");
         }
@@ -1705,14 +1705,14 @@ mod tests {
     #[test]
     fn the_history_panel_stays_on_screen_in_a_normal_window() {
         let mut b = Benchmarks { selected: View::Disk, ..Default::default() };
-        let texts = super::score_tests::drawn_texts_in(egui::vec2(1100.0, 700.0), |ui, page| b.ui(ui, page));
+        let texts = crate::test_ui::drawn_lines_in(egui::vec2(1100.0, 700.0), |ui, page| b.ui(ui, page));
         assert!(texts.iter().any(|t| t == "Disk history"), "history panel not drawn in {texts:?}");
     }
 
     #[test]
     fn the_history_panel_says_what_to_do_if_a_test_fails() {
         let mut b = Benchmarks { selected: View::Disk, ..Default::default() };
-        let texts = super::score_tests::drawn_texts(|ui, _| b.history_panel(ui));
+        let texts = crate::test_ui::drawn_lines(|ui, _| b.history_panel(ui));
         for wanted in ["If a test fails, the status band says why in red and the previous results stay.",
             "Choose a test folder you can write to, on a drive with 256 MB free.",
         ] {
@@ -1900,6 +1900,7 @@ mod settings_tests {
 #[cfg(test)]
 mod score_tests {
     use super::tests::{run_to_end, with_history};
+    use crate::test_ui::drawn_lines;
     use super::*;
     use crate::addons::AddonHost;
     use serde_json::json;
@@ -1922,33 +1923,6 @@ mod score_tests {
     /// Half the reference machine's disk (score 50).
     fn disk_50() -> Unit {
         fake(Test::Disk, &[(WRITE_SPEED, 3863.0 / 2.0, MBS), (READ_SPEED, 5161.0 / 2.0, MBS)])
-    }
-
-    /// The texts drawn by `draw` in one frame.
-    pub(super) fn drawn_texts(draw: impl FnMut(&mut Ui, &mut PageContext)) -> Vec<String> {
-        drawn_texts_with(egui::RawInput::default(), draw)
-    }
-
-    /// Texts drawn in a window of `size`; text laid out past its edges is not painted.
-    pub(super) fn drawn_texts_in(size: egui::Vec2, draw: impl FnMut(&mut Ui, &mut PageContext)) -> Vec<String> {
-        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
-        drawn_texts_with(input, draw)
-    }
-
-    fn drawn_texts_with(input: egui::RawInput, mut draw: impl FnMut(&mut Ui, &mut PageContext)) -> Vec<String> {
-        let (settings, sample) = (crate::settings::Settings::default(), crate::sampler::Snapshot::default());
-        let ctx = egui::Context::default();
-        crate::theme::install_fonts(&ctx);
-        let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| draw(ui, &mut PageContext::new(&settings, &sample)));
-        });
-        out.shapes
-            .iter()
-            .filter_map(|s| match &s.shape {
-                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
-                _ => None,
-            })
-            .collect()
     }
 
     #[test]
@@ -1989,7 +1963,7 @@ mod score_tests {
         assert_eq!(b.rail_status(View::Score, &b.engine.state(), now), "100");
         assert_eq!(View::Score.label(), "Ultimate score");
 
-        let texts = drawn_texts(|ui, page| b.ui(ui, page));
+        let texts = drawn_lines(|ui, page| b.ui(ui, page));
         for wanted in [
             "Ultimate score",
             "100",
@@ -2025,10 +1999,10 @@ mod score_tests {
     fn the_summary_tile_is_gone_with_the_addon_off() {
         let section = json!({ "benchmarks": { "enabled": true, "settings": { "summaryTile": true } } });
         let (mut host, _) = AddonHost::for_tests(&section);
-        let on = drawn_texts(|ui, page| host.summary_tiles(ui, page));
+        let on = drawn_lines(|ui, page| host.summary_tiles(ui, page));
         assert!(on.iter().any(|t| t == "Benchmarks") && on.iter().any(|t| t == "No score yet"), "{on:?}");
         assert!(host.set_enabled("benchmarks", false));
-        let off = drawn_texts(|ui, page| host.summary_tiles(ui, page));
+        let off = drawn_lines(|ui, page| host.summary_tiles(ui, page));
         assert!(!off.iter().any(|t| t == "Benchmarks" || t == "No score yet"), "{off:?}");
     }
 }
@@ -2036,7 +2010,7 @@ mod score_tests {
 /// "Run All Benchmarks" (#33).
 #[cfg(test)]
 mod run_all_tests {
-    use super::score_tests::drawn_texts;
+    use crate::test_ui::drawn_lines;
     use super::tests::with_history;
     use super::*;
     use std::sync::mpsc::{channel, Sender};
@@ -2106,7 +2080,7 @@ mod run_all_tests {
         wait_started.recv().unwrap();
         let line = "Running all benchmarks: CPU done, now testing GPU graphics";
         assert_eq!(b.run_all_line(&b.engine.state()).as_deref(), Some(line));
-        let texts = drawn_texts(|ui, page| b.ui(ui, page));
+        let texts = drawn_lines(|ui, page| b.ui(ui, page));
         assert!(texts.iter().any(|t| t == line), "{texts:?}");
         assert!(texts.iter().any(|t| t == "Cancel"), "{texts:?}");
         assert!(!texts.iter().any(|t| t == "Run All Benchmarks"), "{texts:?}");
@@ -2205,9 +2179,9 @@ mod run_all_tests {
     #[test]
     fn run_all_is_in_the_band_and_in_the_benchmarks_menu_when_idle() {
         let mut b = Benchmarks::default();
-        let band = drawn_texts(|ui, page| b.ui(ui, page));
+        let band = drawn_lines(|ui, page| b.ui(ui, page));
         assert!(band.iter().any(|t| t == "Run All Benchmarks"), "{band:?}");
-        let menu = drawn_texts(|ui, page| b.header_menu(ui, page));
+        let menu = drawn_lines(|ui, page| b.header_menu(ui, page));
         assert!(menu.iter().any(|t| t == "Run All Benchmarks"), "{menu:?}");
     }
 }

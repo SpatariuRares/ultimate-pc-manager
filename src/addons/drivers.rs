@@ -133,6 +133,22 @@ impl Drivers {
         Drivers { reader, ..Drivers::default() }
     }
 
+    /// The add-on with a reader that finds no drivers, for tests about
+    /// something else: it never reads the real PC, which can take seconds.
+    #[cfg(test)]
+    pub fn with_no_drivers() -> Self {
+        struct Nothing;
+        impl ListingReader for Nothing {
+            fn devices(&self) -> Result<Vec<engine::DeviceDriver>, String> {
+                Ok(Vec::new())
+            }
+            fn kernel(&self) -> Result<Vec<engine::KernelDriver>, String> {
+                Ok(Vec::new())
+            }
+        }
+        Drivers::with_reader(Arc::new(Nothing))
+    }
+
     /// The page while the add-on is on (or waits to turn off).
     #[cfg(test)]
     pub fn page(&mut self) -> Option<&mut DriversPage> {
