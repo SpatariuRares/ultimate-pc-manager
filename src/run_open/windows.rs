@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn the_shell_finds_an_item_whose_path_is_longer_than_260_characters() {
-        let root = std::env::temp_dir().join(format!("mtm-winsys-long-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("mtm-longpath-{}", std::process::id()));
         let mut dir = root.clone();
         while dir.as_os_str().len() < 300 {
             dir.push("a-rather-long-folder-name-for-the-test");

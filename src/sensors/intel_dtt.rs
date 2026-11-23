@@ -49,18 +49,12 @@ impl Provider for IntelDtt {
     }
 
     fn availability(&mut self) -> Result<(), String> {
-        #[cfg(windows)]
-        return availability(&cpu_vendor(), crate::services::service_running(SERVICE));
-        #[cfg(not(windows))]
-        Err(crate::availability::unavailable_error(crate::availability::Feature::HardwareSensors))
+        imp::provider_availability()
     }
 
     /// Only a PC with an Intel processor lists Intel DTT.
     fn for_this_pc(&mut self) -> bool {
-        #[cfg(windows)]
-        return for_a_cpu_from(&cpu_vendor());
-        #[cfg(not(windows))]
-        false
+        imp::for_this_pc()
     }
 
     /// CPU › Temperatures › Package, grey with [`NOT_SUPPORTED`].
@@ -75,15 +69,19 @@ pub fn for_a_cpu_from(vendor: &str) -> bool {
     vendor == "GenuineIntel"
 }
 
-/// The CPU's vendor id ("GenuineIntel", "AuthenticAMD").
 #[cfg(windows)]
-fn cpu_vendor() -> String {
-    use winreg::enums::HKEY_LOCAL_MACHINE;
-    winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
-        .and_then(|k| k.get_value::<String, _>("VendorIdentifier"))
-        .unwrap_or_default()
-}
+mod windows;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(windows)]
+use windows as imp;
+#[cfg(target_os = "linux")]
+use linux as imp;
+#[cfg(target_os = "macos")]
+use macos as imp;
 
 #[cfg(test)]
 mod tests {

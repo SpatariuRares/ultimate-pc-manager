@@ -14,16 +14,9 @@ use super::provider::Provider;
 /// The provider's name in "Sources on this PC" / "Read from".
 pub const SOURCE: &str = "GPU counters";
 
-/// The shortest span between two collects of the rate counters.
-#[cfg(windows)]
-const MIN_SPAN: std::time::Duration = std::time::Duration::from_millis(200);
-
 /// The GPU counter provider. Built on its worker thread (holds a PDH query).
 pub struct GpuCounters {
-    #[cfg(windows)]
-    query: Option<super::pdh::Query>,
-    #[cfg(windows)]
-    collected: Instant,
+    counters: imp::Counters,
     /// What the last read counted: every engine, the adapters' dedicated and
     /// shared memory.
     counted: Vec<CounterSet>,
@@ -31,19 +24,7 @@ pub struct GpuCounters {
 
 impl GpuCounters {
     pub fn new() -> Self {
-        #[cfg(windows)]
-        use crate::perfdata::counter;
-        GpuCounters {
-            #[cfg(windows)]
-            query: super::pdh::Query::open(&[
-                (counter::GPU, r"\GPU Engine(*)\Utilization Percentage"),
-                (counter::GDED, r"\GPU Adapter Memory(*)\Dedicated Usage"),
-                (counter::GSH, r"\GPU Adapter Memory(*)\Shared Usage"),
-            ]),
-            #[cfg(windows)]
-            collected: Instant::now(),
-            counted: Vec::new(),
-        }
+        GpuCounters { counters: imp::Counters::open(), counted: Vec::new() }
     }
 }
 
@@ -52,30 +33,29 @@ impl Provider for GpuCounters {
         SOURCE
     }
     fn availability(&mut self) -> Result<(), String> {
-        #[cfg(windows)]
-        return match self.query {
-            Some(_) => Ok(()),
-            None => Err("performance counters are off on this PC".into()),
-        };
-        #[cfg(not(windows))]
-        Err(crate::availability::unavailable_error(crate::availability::Feature::HardwareSensors))
+        self.counters.availability()
     }
     fn counted(&mut self) -> Vec<CounterSet> {
         std::mem::take(&mut self.counted)
     }
     fn read(&mut self, _at: Instant) -> Vec<Reading> {
-        #[cfg(windows)]
-        if let Some(q) = self.query.as_mut() {
-            use crate::perfdata::counter;
-            // A rate counter needs a span between two collects.
-            let wait = MIN_SPAN.saturating_sub(self.collected.elapsed());
-            if !wait.is_zero() {
-                std::thread::sleep(wait);
-            }
-            q.collect();
-            self.collected = Instant::now();
-            self.counted = [counter::GPU, counter::GDED, counter::GSH].into_iter().map(|key| q.counted(key, false)).collect();
+        if let Some(sets) = self.counters.read() {
+            self.counted = sets;
         }
         Vec::new()
     }
 }
+
+#[cfg(windows)]
+mod windows;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(windows)]
+use windows as imp;
+#[cfg(target_os = "linux")]
+use linux as imp;
+#[cfg(target_os = "macos")]
+use macos as imp;
