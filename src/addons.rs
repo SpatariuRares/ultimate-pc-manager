@@ -42,28 +42,26 @@ pub enum Tier {
     Paid,
 }
 
-/// Every add-on's tier, one line per add-on id: the only place a tier is
-/// written down. Making an add-on paid (or free) is a one-word edit here.
-/// [`Addon::tier`] reads it; an id missing from it counts as Free.
-/// Every add-on is free for now (the project lives on donations).
-pub const TIERS: &[(&str, Tier)] = &[
-    ("power-freq", Tier::Free),
-    ("flight-recorder", Tier::Free),
-    // A feature line, not an add-on: Power & Freq's threshold alerts (#194).
+/// Tier lines of features that are not add-ons (Power & Freq's alerts and
+/// pins), by feature id. An add-on's own tier is its row in [`ADDONS`].
+/// Every feature is free for now (the project lives on donations).
+pub const FEATURE_TIERS: &[(&str, Tier)] = &[
+    // Power & Freq's threshold alerts (#194).
     ("power-freq.alerts", Tier::Free),
-    // A feature line, not an add-on: Power & Freq's pinned sensors (#193).
+    // Power & Freq's pinned sensors (#193).
     ("power-freq.pins", Tier::Free),
-    ("connections", Tier::Free),
-    ("installed-apps", Tier::Free),
-    ("drivers", Tier::Free),
-    ("disk-space", Tier::Free),
-    ("benchmarks", Tier::Free),
-    ("package-manager", Tier::Free),
 ];
 
-/// The tier [`TIERS`] gives the add-on `id` (Free when it has no line).
+/// The tier of the add-on or feature `id` (Free when it has no line): an
+/// add-on's row in [`ADDONS`], else a line of [`FEATURE_TIERS`].
 pub fn tier_of(id: &str) -> Tier {
-    TIERS.iter().find(|(i, _)| *i == id).map_or(Tier::Free, |(_, t)| *t)
+    static ADDON_TIERS: std::sync::OnceLock<Vec<(&'static str, Tier)>> = std::sync::OnceLock::new();
+    let addon_tiers = ADDON_TIERS.get_or_init(|| ADDONS.iter().map(|(tier, make)| (make().id(), *tier)).collect());
+    addon_tiers
+        .iter()
+        .chain(FEATURE_TIERS)
+        .find(|(i, _)| *i == id)
+        .map_or(Tier::Free, |(_, t)| *t)
 }
 
 impl Tier {
@@ -111,7 +109,7 @@ pub trait Addon {
     fn requirements(&self) -> Requirements;
     /// The resources it uses, in words.
     fn consumption(&self) -> Consumption;
-    /// Free or paid: its line in [`TIERS`]. Only test add-ons override it.
+    /// Free or paid: its row in [`ADDONS`]. Only test add-ons override it.
     fn tier(&self) -> Tier {
         tier_of(self.id())
     }
@@ -483,19 +481,23 @@ impl Entry {
     }
 }
 
+/// Every add-on, in menu order: its tier and how to make it. Adding an
+/// add-on is one line here. Every add-on is free for now.
+const ADDONS: &[(Tier, fn() -> Box<dyn Addon>)] = &[
+    (Tier::Free, || Box::<power_freq::PowerFreq>::default()),
+    (Tier::Free, || Box::<flight_recorder::FlightRecorder>::default()),
+    (Tier::Free, || Box::<connections::Connections>::default()),
+    (Tier::Free, || Box::<installed_apps::InstalledApps>::default()),
+    (Tier::Free, || Box::<drivers::Drivers>::default()),
+    (Tier::Free, || Box::<disk_space::DiskSpace>::default()),
+    (Tier::Free, || Box::<benchmarks::Benchmarks>::default()),
+    (Tier::Free, || Box::<package_manager::PackageManager>::default()),
+];
+
 /// The ordered registry of every page: the core, then the add-ons.
 pub fn registry() -> Vec<Entry> {
     let mut entries: Vec<Entry> = Core::ALL.into_iter().map(Entry::Core).collect();
-    entries.extend([
-        Entry::Addon(Box::<power_freq::PowerFreq>::default()),
-        Entry::Addon(Box::<flight_recorder::FlightRecorder>::default()),
-        Entry::Addon(Box::<connections::Connections>::default()),
-        Entry::Addon(Box::<installed_apps::InstalledApps>::default()),
-        Entry::Addon(Box::<drivers::Drivers>::default()),
-        Entry::Addon(Box::<disk_space::DiskSpace>::default()),
-        Entry::Addon(Box::<benchmarks::Benchmarks>::default()),
-        Entry::Addon(Box::<package_manager::PackageManager>::default()),
-    ]);
+    entries.extend(ADDONS.iter().map(|(_, make)| Entry::Addon(make())));
     entries
 }
 
@@ -2234,26 +2236,21 @@ mod tests {
         }
 
         #[test]
-        fn the_tier_table_covers_every_registered_addon() {
-            for entry in crate::addons::registry() {
-                if let Entry::Addon(a) = entry {
-                    assert!(TIERS.iter().any(|(id, _)| *id == a.id()), "{} has no line in TIERS", a.id());
-                }
+        fn the_feature_tier_lines_name_no_addon() {
+            let ids = addon_ids();
+            for (id, _) in FEATURE_TIERS {
+                assert!(!ids.contains(id), "{id} is an add-on: its tier belongs to its registry row");
             }
         }
 
         #[test]
-        fn the_tier_table_has_a_free_line_for_power_freq_alerts() {
-            let id = crate::addons::power_freq::alerts::TIER_ID;
-            assert!(TIERS.iter().any(|(i, _)| *i == id), "{id} has no line in TIERS");
-            assert_eq!(tier_of(id), Tier::Free, "shipped Free");
+        fn power_freq_alerts_ship_free() {
+            assert_eq!(tier_of(crate::addons::power_freq::alerts::TIER_ID), Tier::Free);
         }
 
         #[test]
-        fn the_tier_table_has_a_free_line_for_power_freq_pins() {
-            let id = crate::addons::power_freq::PINS_TIER_ID;
-            assert!(TIERS.iter().any(|(i, _)| *i == id), "{id} has no line in TIERS");
-            assert_eq!(tier_of(id), Tier::Free, "shipped Free");
+        fn power_freq_pins_ship_free() {
+            assert_eq!(tier_of(crate::addons::power_freq::PINS_TIER_ID), Tier::Free);
         }
 
         #[test]

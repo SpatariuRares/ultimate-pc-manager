@@ -514,7 +514,7 @@ pub struct PowerFreq {
     fahrenheit: bool,
     /// What Flight Recorder can do now, told by the host before each draw.
     recording: Recording,
-    /// Where its features' tiers are read ([`crate::addons::TIERS`]).
+    /// Where its features' tiers are read ([`crate::addons::FEATURE_TIERS`]).
     tiers: Tiers,
 }
 
@@ -529,7 +529,7 @@ impl Default for Tiers {
     }
 }
 
-/// Said where a feature whose [`crate::addons::TIERS`] line is not Free
+/// Said where a feature whose [`crate::addons::FEATURE_TIERS`] line is not Free
 /// would be: there is no way to buy one yet, so it is simply not offered.
 pub const NOT_INCLUDED: &str = "Not included in this version.";
 
@@ -1270,7 +1270,7 @@ mod tests {
         });
     }
 
-    /// Alerts and pins as if their [`crate::addons::TIERS`] lines said Paid.
+    /// Alerts and pins as if their [`crate::addons::FEATURE_TIERS`] lines said Paid.
     fn paid_features(id: &str) -> Tier {
         if id == alerts::TIER_ID || id == PINS_TIER_ID {
             Tier::Paid

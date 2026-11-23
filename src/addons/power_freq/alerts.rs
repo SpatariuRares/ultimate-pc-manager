@@ -5,7 +5,7 @@
 use crate::sensors::model::{fahrenheit_of, Frame, Reading, Unit};
 use std::time::{Duration, Instant};
 
-/// The id of the alerts' line in [`crate::addons::TIERS`].
+/// The id of the alerts' line in [`crate::addons::FEATURE_TIERS`].
 pub const TIER_ID: &str = "power-freq.alerts";
 
 /// What a new alert watches until the user picks another sensor.

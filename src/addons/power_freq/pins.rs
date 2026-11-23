@@ -4,7 +4,7 @@
 
 use super::*;
 
-/// The id of the pinned sensors' line in [`crate::addons::TIERS`].
+/// The id of the pinned sensors' line in [`crate::addons::FEATURE_TIERS`].
 pub const PINS_TIER_ID: &str = "power-freq.pins";
 
 /// The side panel's link to pin the selected sensor.
@@ -28,7 +28,7 @@ pub fn pinned_lines(frame: &Frame, pinned: &[String], fahrenheit: bool) -> Vec<S
 }
 
 impl PowerFreq {
-    /// Pins are offered: their line in [`crate::addons::TIERS`]
+    /// Pins are offered: their line in [`crate::addons::FEATURE_TIERS`]
     /// ([`PINS_TIER_ID`]) is Free.
     pub fn pins_offered(&self) -> bool {
         (self.tiers.0)(PINS_TIER_ID) == Tier::Free
