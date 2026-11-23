@@ -99,7 +99,7 @@ impl Uninstaller {
         if msi && matches!(waited, Waited::Finished(Some(MSI_CANCELLED))) {
             return Err(cancelled(name));
         }
-        if !imp::still_listed(key) {
+        if !system::still_listed(key) {
             return Ok(());
         }
         Err(match waited {
@@ -207,7 +207,7 @@ pub fn expand_env(s: &str) -> String {
 /// "HKCU\{id}") as a target: the command it registered and, for a Windows
 /// Installer product, its product code. `None` when the entry is not there.
 pub fn registry_entry(key: &str) -> Option<Target> {
-    imp::entry(key).map(|(command, msi)| {
+    system::entry(key).map(|(command, msi)| {
         let sub = key.split_once('\\').map(|(_, s)| s).unwrap_or_default();
         let msi_code = if msi && sub.starts_with('{') { sub.to_string() } else { String::new() };
         Target::Registry { key: key.to_string(), command, msi_code }
@@ -216,54 +216,19 @@ pub fn registry_entry(key: &str) -> Option<Target> {
 
 // -------------------------------------------------------------- platform
 
-#[cfg(not(windows))]
-mod imp {
-    /// The uninstall registry is Windows only. [`Uninstaller::uninstall`]
-    /// reports that before it gets here, so "still listed" is never asked.
-    pub fn still_listed(_: &str) -> bool {
-        true
-    }
-
-    /// The uninstall registry is Windows only: no entry is there.
-    pub fn entry(_: &str) -> Option<(String, bool)> {
-        None
-    }
-}
-
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(windows)]
-mod imp {
-    use winreg::enums::*;
-    use winreg::RegKey;
+mod windows;
 
-    const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
-    const UNINSTALL32: &str = r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
-
-    /// Whether the uninstall registry still has the entry `key`
-    /// ("HKLM\{id}", "HKLM32\{id}" or "HKCU\{id}").
-    pub fn still_listed(key: &str) -> bool {
-        open(key).is_some()
-    }
-
-    /// The entry `key`'s UninstallString and whether it is a Windows
-    /// Installer product (WindowsInstaller = 1).
-    pub fn entry(key: &str) -> Option<(String, bool)> {
-        let k = open(key)?;
-        let command = k.get_value::<String, _>("UninstallString").unwrap_or_default().trim().to_string();
-        Some((command, k.get_value::<u32, _>("WindowsInstaller").unwrap_or(0) == 1))
-    }
-
-    /// Opens the entry `key`, if it is there.
-    fn open(key: &str) -> Option<RegKey> {
-        let (hive, sub) = key.split_once('\\')?;
-        let (root, path) = match hive {
-            "HKLM" => (RegKey::predef(HKEY_LOCAL_MACHINE), UNINSTALL),
-            "HKLM32" => (RegKey::predef(HKEY_LOCAL_MACHINE), UNINSTALL32),
-            "HKCU" => (RegKey::predef(HKEY_CURRENT_USER), UNINSTALL),
-            _ => return None,
-        };
-        root.open_subkey(format!(r"{path}\{sub}")).ok()
-    }
-}
+#[cfg(target_os = "linux")]
+use linux as system;
+#[cfg(target_os = "macos")]
+use macos as system;
+#[cfg(windows)]
+use windows as system;
 
 #[cfg(test)]
 mod tests {

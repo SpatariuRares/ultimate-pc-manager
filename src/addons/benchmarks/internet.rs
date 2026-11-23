@@ -216,25 +216,23 @@ fn wildcard(pattern: &str, text: &str) -> bool {
     }
 }
 
-/// The system proxy for [`HOST`], from the user's Windows Internet settings
-/// (proxy auto-config scripts are not read).
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(windows)]
-fn system_proxy() -> Option<String> {
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
-    let key = winreg::RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings", KEY_READ)
-        .ok()?;
-    if key.get_value::<u32, _>("ProxyEnable").ok()? != 1 {
-        return None;
-    }
-    let server: String = key.get_value("ProxyServer").ok()?;
-    let bypass: String = key.get_value("ProxyOverride").unwrap_or_default();
-    proxy_for(&server, &bypass, HOST)
-}
+mod windows;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+use linux as system;
+#[cfg(target_os = "macos")]
+use macos as system;
+#[cfg(windows)]
+use windows as system;
+
+/// The system proxy for [`HOST`] (none where the system's settings are not read).
 fn system_proxy() -> Option<String> {
-    None
+    system::system_proxy()
 }
 
 /// The failure a ureq error means; `any_data` tells whether some bytes of
