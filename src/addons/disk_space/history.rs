@@ -200,7 +200,16 @@ pub const BAD_ID: &str = "Couldn't save scan history because the scan id is malf
 pub const TOO_MANY: &str = "Couldn't save scan history because its folder contains too many entries to manage safely.";
 pub const NOT_WRITTEN: &str = "Couldn't save scan history: the snapshot file could not be written.";
 /// Where History is kept unless the "History folder" setting says otherwise.
+/// (Windows: this text; elsewhere the real folder, see [`default_folder`].)
 pub const DEFAULT_FOLDER: &str = "%APPDATA%\\UltimatePCManager\\DiskScans";
+
+/// The default History folder as the setting shows it.
+pub fn default_folder() -> String {
+    if cfg!(windows) {
+        return DEFAULT_FOLDER.into();
+    }
+    Store::app().map_or_else(|_| DEFAULT_FOLDER.into(), |s| s.dir.display().to_string())
+}
 /// History's caption while it is empty.
 pub const EMPTY: &str = "Finished scans are saved here.";
 /// The note beside Start.
@@ -297,8 +306,14 @@ impl Store {
     /// The app's history folder, beside its settings.
     #[cfg_attr(test, allow(dead_code))]
     pub fn app() -> Result<Store, String> {
-        let base = std::env::var_os("APPDATA").ok_or_else(|| NO_FOLDER.to_string())?;
-        Ok(Store::new(std::path::Path::new(&base).join(crate::settings::DATA_FOLDER).join("DiskScans")))
+        Store::in_data_folder(crate::app_folders::data())
+    }
+
+    /// The history folder inside the app's data folder `data` (none: the
+    /// system names no such folder).
+    fn in_data_folder(data: Option<PathBuf>) -> Result<Store, String> {
+        let data = data.ok_or_else(|| NO_FOLDER.to_string())?;
+        Ok(Store::new(data.join("DiskScans")))
     }
 
     /// Writes a finished scan; gives what History lists of it.
@@ -586,6 +601,23 @@ pub(crate) mod tests {
         assert_eq!(clear_text(1), "One saved scan will be removed. This cannot be undone.");
         store.0.clear().unwrap();
         assert_eq!(store.0.list(), Shelf::default());
+    }
+
+    #[test]
+    fn on_linux_the_history_saves_and_reloads_from_the_xdg_data_folder() {
+        use crate::app_folders::{resolve, Folder, System};
+        let home = std::env::temp_dir().join(format!("mtm-disk-history-xdg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let env = |name: &str| (name == "XDG_DATA_HOME").then(|| home.clone().into_os_string());
+        let data = resolve(System::Linux, Folder::Data, &env);
+        let store = Store::in_data_folder(data).unwrap();
+        assert_eq!(store.dir, home.join("UltimatePCManager").join("DiskScans"));
+        let s = Snapshot::of(&sample(), &new_id(), 100, 200, LIMIT);
+        store.save(&s).unwrap();
+        assert_eq!(store.list().entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec![s.id.as_str()]);
+        assert_eq!(store.load(&s.id).unwrap(), s);
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(Store::in_data_folder(None).unwrap_err(), NO_FOLDER);
     }
 
     #[test]
