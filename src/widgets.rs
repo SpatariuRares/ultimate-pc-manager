@@ -368,6 +368,20 @@ pub fn tick(p: &egui::Painter, c: Pos2) {
     icons::draw_glyph(p, c, 14.0, "done", icons::Ink::Theme);
 }
 
+/// A tick box drawn at `rect` inside a list row, clickable on its own (the
+/// row under it keeps the rest of the click). `on` is the current state.
+pub fn tick_box(ui: &mut Ui, rect: Rect, id: egui::Id, on: bool) -> egui::Response {
+    let t = theme::of_ui(ui);
+    let resp = ui.interact(rect, id, Sense::click());
+    let side = Rect::from_center_size(rect.center(), vec2(16.0, 16.0));
+    let (fill, line) = if on { (t.primary, t.primary) } else { (Color32::TRANSPARENT, t.control_line) };
+    ui.painter().rect(side, CornerRadius::same(3), fill, Stroke::new(1.0, line), StrokeKind::Inside);
+    if on {
+        icons::draw_glyph(ui.painter(), side.center(), 14.0, "done", icons::Ink::On(t.on_primary));
+    }
+    resp
+}
+
 // ------------------------------------------- requirement icons
 
 /// The icon of a requirement: the UAC shield (administrator rights), a
