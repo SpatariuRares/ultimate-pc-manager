@@ -10,6 +10,10 @@
 mod sources;
 #[cfg(any(target_os = "linux", test))]
 mod systemd;
+#[cfg(any(target_os = "linux", test))]
+mod openrc;
+#[cfg(any(target_os = "linux", test))]
+mod runit;
 
 #[cfg(windows)]
 mod windows;
