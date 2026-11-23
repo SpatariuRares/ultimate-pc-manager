@@ -1419,15 +1419,19 @@ fn scans_real_folders_of_this_pc() {
     println!("{:?}", v.rows(Group::FileType).iter().map(|r| (&r.label, text::size(r.bytes))).collect::<Vec<_>>());
     assert!(v.types.iter().any(|t| t.category == Category::Code && t.files > 0), "the project's sources count as Code");
 
-    let profile = Path::new(host("C:\\Users\\Default"));
-    let d = DiskSpace::default();
-    d.scan(profile, None);
-    let v = wait_idle(&d);
-    println!("{}: {} in {}, {} unreadable", profile.display(), text::size(v.bytes), text::files(v.files), v.unreadable);
-    assert!(v.files > 0);
-    let through_junction = v.folders.iter().chain(&v.largest).any(|(p, _)| p.contains("Application Data") || p.contains("Local Settings"));
-    assert!(!through_junction, "junctions are not followed: {:?}", v.folders);
-    assert!(v.unreadable == 0, "junctions are skipped, not counted as unreadable");
+    // The default user profile and its junctions exist only on Windows.
+    #[cfg(windows)]
+    {
+        let profile = Path::new("C:\\Users\\Default");
+        let d = DiskSpace::default();
+        d.scan(profile, None);
+        let v = wait_idle(&d);
+        println!("{}: {} in {}, {} unreadable", profile.display(), text::size(v.bytes), text::files(v.files), v.unreadable);
+        assert!(v.files > 0);
+        let through_junction = v.folders.iter().chain(&v.largest).any(|(p, _)| p.contains("Application Data") || p.contains("Local Settings"));
+        assert!(!through_junction, "junctions are not followed: {:?}", v.folders);
+        assert!(v.unreadable == 0, "junctions are skipped, not counted as unreadable");
+    }
 }
 
 #[test]
