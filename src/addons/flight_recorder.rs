@@ -555,7 +555,7 @@ impl Addon for FlightRecorder {
     /// It records sensors for other pages (Power & Freq's "Record with
     /// Flight Recorder").
     fn offers(&mut self) -> Offers<'_> {
-        Offers { sensor_recorder: Some(self) }
+        Offers { sensor_recorder: Some(self), ..Offers::default() }
     }
 
     fn settings(&self) -> serde_json::Value {
