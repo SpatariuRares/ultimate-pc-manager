@@ -155,7 +155,7 @@ pub struct Owner {
 }
 
 /// Asks the add-ons that are on who owns a path.
-pub type Owners<'a> = &'a dyn Fn(&std::path::Path) -> Option<Owner>;
+pub type Owners<'a> = &'a std::cell::RefCell<dyn FnMut(&std::path::Path) -> Option<Owner> + 'a>;
 
 /// What an add-on gets while it draws (its page, Summary tile or settings
 /// section): the latest performance sample, the global settings (theme,
@@ -171,18 +171,21 @@ pub struct PageContext<'a> {
     /// Where the host keeps the sensor interest of the surface being drawn
     /// (set by the host; see [`PageContext::sensors`]).
     pub lease: Option<Lease>,
+    /// What the add-on that records sensors can do now, asked of the host
+    /// before an add-on's page is drawn (Off when none is on).
+    pub recording: crate::addons::Recording,
 }
 
 impl<'a> PageContext<'a> {
     /// A context with these settings and sample and no action queued.
     pub fn new(settings: &'a Settings, sample: &'a Snapshot) -> Self {
-        PageContext { settings, sample, actions: Vec::new(), owners: None, lease: None }
+        PageContext { settings, sample, actions: Vec::new(), owners: None, lease: None, recording: Default::default() }
     }
 
     /// The row of another add-on that is on which owns `path` (None when
     /// no add-on that is on claims it).
     pub fn owner_of(&self, path: &std::path::Path) -> Option<Owner> {
-        self.owners.and_then(|ask| ask(path))
+        self.owners.and_then(|ask| (ask.borrow_mut())(path))
     }
 
     /// The shared sensor service, for what is drawn now: the latest frame,

@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use egui::{RichText, Ui};
 
-use crate::addons::{is_default, is_true, plural, read_settings, write_settings, Addon, Consumption, ProcessColumn, Requirements};
+use crate::addons::{is_default, is_true, plural, read_settings, write_settings, Addon, Consumption, Asked, Capability, ProcessColumn, ProcessColumnProvider, Requirements};
 use crate::platform::{Action, PageContext};
 use crate::widgets::parts;
 
@@ -272,6 +272,41 @@ impl Connections {
     }
 }
 
+impl ProcessColumnProvider for Connections {
+    /// The column "Connections" (an addition): how many rows of the
+    /// inventory each process owns.
+    fn process_column(&self) -> ProcessColumn {
+        ProcessColumn { title: "Connections", menu_item: "Go to connections" }
+    }
+
+    fn process_figures(&mut self, settings: &crate::settings::Settings) -> Option<HashMap<u32, usize>> {
+        self.column_shown = true;
+        let inventory = self.current(settings.interval_ms())?;
+        if !self.counts.as_ref().is_some_and(|(of, _)| Arc::ptr_eq(of, &inventory)) {
+            let mut by_pid = HashMap::new();
+            for r in &inventory.rows {
+                *by_pid.entry(r.pid).or_insert(0) += 1;
+            }
+            self.counts = Some((inventory, by_pid));
+        }
+        self.counts.as_ref().map(|(_, by_pid)| by_pid.clone())
+    }
+
+    /// A hidden column keeps no inventory either.
+    fn process_column_hidden(&mut self) {
+        self.column_shown = false;
+        self.hidden();
+    }
+
+    /// Go to connections: the page lists that process's rows, in every
+    /// scope (Find "PID n").
+    fn reveal_process(&mut self, pid: u32) {
+        self.find = format!("PID {pid}");
+        self.prefs.scope = Scope::All;
+        self.table.selected = None;
+    }
+}
+
 impl Addon for Connections {
     fn id(&self) -> &'static str {
         ID
@@ -344,37 +379,11 @@ impl Addon for Connections {
         self.hidden();
     }
 
-    /// The Processes column "Connections" (an addition): how many rows of
-    /// the inventory each process owns.
-    fn process_column(&self) -> Option<ProcessColumn> {
-        Some(ProcessColumn { title: "Connections", menu_item: "Go to connections" })
-    }
-
-    fn process_figures(&mut self, settings: &crate::settings::Settings) -> Option<HashMap<u32, usize>> {
-        self.column_shown = true;
-        let inventory = self.current(settings.interval_ms())?;
-        if !self.counts.as_ref().is_some_and(|(of, _)| Arc::ptr_eq(of, &inventory)) {
-            let mut by_pid = HashMap::new();
-            for r in &inventory.rows {
-                *by_pid.entry(r.pid).or_insert(0) += 1;
-            }
-            self.counts = Some((inventory, by_pid));
+    fn offers(&mut self, asked: Asked) -> Option<Capability<'_>> {
+        match asked {
+            Asked::ProcessColumn => Some(Capability::ProcessColumn(self)),
+            _ => None,
         }
-        self.counts.as_ref().map(|(_, by_pid)| by_pid.clone())
-    }
-
-    /// A hidden column keeps no inventory either.
-    fn process_column_hidden(&mut self) {
-        self.column_shown = false;
-        self.hidden();
-    }
-
-    /// Go to connections: the page lists that process's rows, in every
-    /// scope (Find "PID n").
-    fn reveal_process(&mut self, pid: u32) {
-        self.find = format!("PID {pid}");
-        self.prefs.scope = Scope::All;
-        self.table.selected = None;
     }
 
     /// The default scope, grouping, sort, the System traffic tile and the

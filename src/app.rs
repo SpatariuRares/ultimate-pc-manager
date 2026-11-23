@@ -979,7 +979,7 @@ impl TaskApp {
         if ctx.input(|i| i.viewport().close_requested()) && !self.addons.request_close() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
-        let Some(q) = self.addons.close_question() else { return };
+        let Some(q) = self.addons.close_save_question() else { return };
         let title = format!("{} has unsaved work", q.name);
         if let Some(answer) = Self::ask_unsaved(ctx, &title, q.question) {
             if self.addons.answer_close(answer) {

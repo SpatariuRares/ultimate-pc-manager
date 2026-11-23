@@ -42,28 +42,25 @@ pub enum Tier {
     Paid,
 }
 
-/// Every add-on's tier, one line per add-on id: the only place a tier is
-/// written down. Making an add-on paid (or free) is a one-word edit here.
-/// [`Addon::tier`] reads it; an id missing from it counts as Free.
-/// Every add-on is free for now (the project lives on donations).
-pub const TIERS: &[(&str, Tier)] = &[
-    ("power-freq", Tier::Free),
-    ("flight-recorder", Tier::Free),
-    // A feature line, not an add-on: Power & Freq's threshold alerts (#194).
+/// Tier lines of features that are not add-ons (Power & Freq's alerts and
+/// pins), by feature id. An add-on's own tier is its row in [`ADDONS`].
+/// Every feature is free for now (the project lives on donations).
+pub const FEATURE_TIERS: &[(&str, Tier)] = &[
+    // Power & Freq's threshold alerts (#194).
     ("power-freq.alerts", Tier::Free),
-    // A feature line, not an add-on: Power & Freq's pinned sensors (#193).
+    // Power & Freq's pinned sensors (#193).
     ("power-freq.pins", Tier::Free),
-    ("connections", Tier::Free),
-    ("installed-apps", Tier::Free),
-    ("drivers", Tier::Free),
-    ("disk-space", Tier::Free),
-    ("benchmarks", Tier::Free),
-    ("package-manager", Tier::Free),
 ];
 
-/// The tier [`TIERS`] gives the add-on `id` (Free when it has no line).
+/// The tier of the add-on or feature `id` (Free when it has no line): an
+/// add-on's row in [`ADDONS`], else a line of [`FEATURE_TIERS`].
 pub fn tier_of(id: &str) -> Tier {
-    TIERS.iter().find(|(i, _)| *i == id).map_or(Tier::Free, |(_, t)| *t)
+    ADDONS
+        .iter()
+        .map(|(i, tier, _)| (*i, *tier))
+        .chain(FEATURE_TIERS.iter().copied())
+        .find(|(i, _)| *i == id)
+        .map_or(Tier::Free, |(_, t)| t)
 }
 
 impl Tier {
@@ -111,7 +108,7 @@ pub trait Addon {
     fn requirements(&self) -> Requirements;
     /// The resources it uses, in words.
     fn consumption(&self) -> Consumption;
-    /// Free or paid: its line in [`TIERS`]. Only test add-ons override it.
+    /// Free or paid: its row in [`ADDONS`]. Only test add-ons override it.
     fn tier(&self) -> Tier {
         tier_of(self.id())
     }
@@ -126,24 +123,6 @@ pub trait Addon {
     /// ("turns off when done"); see [`AddonHost::is_stopping`].
     fn uninterruptible(&self) -> bool {
         false
-    }
-    /// What the app asks before it closes while this add-on works (e.g. a
-    /// series of installs); `None`, the default, closes without asking.
-    /// See [`AddonHost::close`].
-    fn close_question(&self) -> Option<String> {
-        None
-    }
-    /// Work that turning it off would lose (e.g. a recording running):
-    /// the question the app asks first, with Save / Discard / Cancel (see
-    /// [`AddonHost::off_question`]). None, the default, turns off at once.
-    fn unsaved_work(&self) -> Option<&'static str> {
-        None
-    }
-    /// Save on that question: keeps the work (e.g. writes it to a file).
-    /// False when it was not saved (dialog cancelled, write failed): the
-    /// add-on then stays on with its work.
-    fn save_work(&mut self) -> bool {
-        true
     }
     /// How many threads of its own run now (0 by default). Contract-tested:
     /// none once it is off.
@@ -207,55 +186,19 @@ pub trait Addon {
     fn command_line(&mut self, _args: &[String]) -> bool {
         false
     }
-    /// The name of its row that owns `path` (e.g. the installed app whose
-    /// folder holds it), so another add-on's page can link to it
-    /// (optional; none by default). Asked only while it is on; keep it cheap.
-    fn owner_of(&self, _path: &std::path::Path) -> Option<String> {
-        None
-    }
-    /// Shows the row that owns `path` on its page (after
-    /// [`Addon::owner_of`] named it); the app then opens the page.
-    fn reveal(&mut self, _path: &std::path::Path) {}
-    /// Its column in the Processes table and its item in a process's menu
-    /// (optional; none by default). Asked only while it is on; keep it cheap.
-    fn process_column(&self) -> Option<ProcessColumn> {
-        None
-    }
-    /// The figure of each process (by PID) in that column, asked once per
-    /// frame while the column shows: it may start reading then (see
-    /// [`Addon::process_column_hidden`]). None until it has a reading.
-    fn process_figures(&mut self, _settings: &crate::settings::Settings) -> Option<HashMap<u32, usize>> {
-        None
-    }
-    /// Called once when its column, drawn in the last frame, is not drawn
-    /// any more (hidden, or another page opened). Drop here what only the
-    /// column needs.
-    fn process_column_hidden(&mut self) {}
-    /// Opens its page on the process `pid` (its menu item was chosen); the
-    /// app then opens the page.
-    fn reveal_process(&mut self, _pid: u32) {}
     /// "Packages changed": a job of the install queue (see
     /// [`AddonContext::install_queue`]) ended; `by` is the id of the add-on
     /// that ran it (it may be this one). Told only while it is on, once per
     /// job; reload here what lists installed software (optional).
     fn packages_changed(&mut self, _by: &'static str) {}
-    /// What it can do now at the update speed `interval_ms` when it records
-    /// sensors for other add-ons' pages (Flight Recorder); `None`, the
-    /// default, for every other add-on. Asked even while it is off (the
-    /// host then says [`Recording::Off`]); keep it cheap.
-    fn sensor_recording(&self, _interval_ms: u64) -> Option<Recording> {
+    /// The capability it offers when `asked` for it (optional); none by
+    /// default. The host asks one capability at a time, so an add-on can
+    /// offer several: it answers each it offers with itself and the others
+    /// with `None`. Whether an add-on counts as offering it is decided once,
+    /// by the lookup that asks (see [`Capability`]).
+    fn offers(&mut self, _asked: Asked) -> Option<Capability<'_>> {
         None
     }
-    /// Starts (`on`) or stops its sensor recording for another add-on's
-    /// page, through its own Record and Stop (optional; refused by default).
-    /// Only called while it is on; see [`AddonHost::record_sensors`].
-    fn set_sensor_recording(&mut self, _on: bool, _page: &mut PageContext) -> Result<(), &'static str> {
-        Err(RECORDING_OFF)
-    }
-    /// Before its page is drawn: what the add-on that records sensors can
-    /// do now (optional), so the page can offer to record or stop with
-    /// [`crate::platform::Action::RecordSensors`].
-    fn recording_shown(&mut self, _recording: Recording) {}
     /// Its own settings, opaque to the host (optional). `Null`, the
     /// default, means it keeps none of its own and the host keeps the value
     /// last given to it. Saved with the add-on's entry, kept while it is off.
@@ -268,9 +211,108 @@ pub trait Addon {
     fn load_settings(&mut self, _settings: &serde_json::Value) {}
 }
 
+/// Lists the capabilities an add-on can offer to the others once: each gets a
+/// variant of [`Asked`] (what the host asks for) and of [`Capability`] (what an
+/// add-on lends when it is asked), so a capability is never named twice.
+macro_rules! capabilities {
+    ($($(#[$doc:meta])* $name:ident($offered:path),)*) => {
+        /// What the host asks an add-on to offer (see [`Addon::offers`]).
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub enum Asked {
+            $($(#[$doc])* $name,)*
+        }
+
+        /// What an add-on lends of itself when it is [`Asked`] for a
+        /// capability: the variant is the one asked for.
+        pub enum Capability<'a> {
+            $($name(&'a mut dyn $offered),)*
+        }
+    };
+}
+
+// To add a capability: a trait for it, one line here, a host method that asks
+// `provider` (or `providers`) for it, and the add-ons that offer it answering
+// that `Asked` in `Addon::offers`.
+capabilities! {
+    /// Recording sensors for other add-ons' pages (Flight Recorder).
+    SensorRecorder(SensorRecorder),
+    /// A column in the Processes table and an item in a process's menu
+    /// (Connections).
+    ProcessColumn(ProcessColumnProvider),
+    /// Owning paths, so other add-ons' pages can link to its row (Installed
+    /// Apps).
+    PathOwner(PathOwner),
+    /// Holding work that turning it off or closing the app would lose
+    /// (Flight Recorder's recording).
+    UnsavedWork(UnsavedWork),
+    /// A reason to wait before the app closes (Package Manager's series of
+    /// installs).
+    CloseWait(CloseWait),
+}
+
+/// The Processes column capability: a column in the Processes table and an
+/// item in a process's menu, only while the add-on that offers it is on.
+pub trait ProcessColumnProvider {
+    /// Its column and menu item; keep it cheap.
+    fn process_column(&self) -> ProcessColumn;
+    /// The figure of each process (by PID) in that column, asked once per
+    /// frame while the column shows: it may start reading then (see
+    /// [`ProcessColumnProvider::process_column_hidden`]). None until it has
+    /// a reading.
+    fn process_figures(&mut self, settings: &crate::settings::Settings) -> Option<HashMap<u32, usize>>;
+    /// Called once when its column, drawn in the last frame, is not drawn
+    /// any more (hidden, or another page opened). Drop here what only the
+    /// column needs.
+    fn process_column_hidden(&mut self);
+    /// Opens its page on the process `pid` (its menu item was chosen); the
+    /// app then opens the page.
+    fn reveal_process(&mut self, pid: u32);
+}
+
+/// The owner-of-paths capability: what Disk Space's link to a row talks to.
+pub trait PathOwner {
+    /// The name of its row that owns `path` (e.g. the installed app whose
+    /// folder holds it). Asked while it is on; keep it cheap.
+    fn owner_of(&self, path: &std::path::Path) -> Option<String>;
+    /// Shows the row that owns `path` on its page (after
+    /// [`PathOwner::owner_of`] named it); the app then opens the page.
+    fn reveal(&mut self, path: &std::path::Path);
+}
+
+/// The unsaved work capability: what the app asks about before it turns
+/// the add-on off or closes.
+pub trait UnsavedWork {
+    /// Work that turning it off would lose (e.g. a recording running):
+    /// the question the app asks first, with Save / Discard / Cancel (see
+    /// [`AddonHost::off_question`]). None: nothing would be lost.
+    fn unsaved_work(&self) -> Option<&'static str>;
+    /// Save on that question: keeps the work (e.g. writes it to a file).
+    /// False when it was not saved (dialog cancelled, write failed): the
+    /// add-on then stays on with its work.
+    fn save_work(&mut self) -> bool;
+}
+
+/// The reason to wait before the app closes while the add-on works (e.g. a
+/// series of installs).
+pub trait CloseWait {
+    /// What the app asks before it closes; `None` closes without asking.
+    /// See [`AddonHost::close_questions`].
+    fn close_reason(&self) -> Option<String>;
+}
+
+/// The sensor recorder capability: what Power & Freq's "Record" talks to.
+pub trait SensorRecorder {
+    /// What it can do now at the update speed `interval_ms`; keep it cheap.
+    fn sensor_recording(&self, interval_ms: u64) -> Recording;
+    /// Starts (`on`) or stops its sensor recording for another add-on's
+    /// page, through its own Record and Stop (see
+    /// [`AddonHost::record_sensors`]).
+    fn set_sensor_recording(&mut self, on: bool, page: &mut PageContext) -> Result<(), &'static str>;
+}
+
 /// What the add-on that records sensors for other pages (Flight Recorder)
 /// can do now, as the host tells another add-on's page (see
-/// [`Addon::sensor_recording`] and [`Addon::recording_shown`]).
+/// [`SensorRecorder::sensor_recording`] and [`PageContext::recording`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Recording {
     /// It is off (or stopping, or not registered): nothing can be recorded.
@@ -483,19 +525,24 @@ impl Entry {
     }
 }
 
+/// Every add-on, in menu order: its id (the one [`Addon::id`] gives), its tier
+/// and how to make it. Adding an add-on is one line here. Every add-on is free
+/// for now.
+const ADDONS: &[(&str, Tier, fn() -> Box<dyn Addon>)] = &[
+    ("power-freq", Tier::Free, || Box::<power_freq::PowerFreq>::default()),
+    ("flight-recorder", Tier::Free, || Box::<flight_recorder::FlightRecorder>::default()),
+    ("connections", Tier::Free, || Box::<connections::Connections>::default()),
+    ("installed-apps", Tier::Free, || Box::<installed_apps::InstalledApps>::default()),
+    ("drivers", Tier::Free, || Box::<drivers::Drivers>::default()),
+    ("disk-space", Tier::Free, || Box::<disk_space::DiskSpace>::default()),
+    ("benchmarks", Tier::Free, || Box::<benchmarks::Benchmarks>::default()),
+    ("package-manager", Tier::Free, || Box::<package_manager::PackageManager>::default()),
+];
+
 /// The ordered registry of every page: the core, then the add-ons.
 pub fn registry() -> Vec<Entry> {
     let mut entries: Vec<Entry> = Core::ALL.into_iter().map(Entry::Core).collect();
-    entries.extend([
-        Entry::Addon(Box::<power_freq::PowerFreq>::default()),
-        Entry::Addon(Box::<flight_recorder::FlightRecorder>::default()),
-        Entry::Addon(Box::<connections::Connections>::default()),
-        Entry::Addon(Box::<installed_apps::InstalledApps>::default()),
-        Entry::Addon(Box::<drivers::Drivers>::default()),
-        Entry::Addon(Box::<disk_space::DiskSpace>::default()),
-        Entry::Addon(Box::<benchmarks::Benchmarks>::default()),
-        Entry::Addon(Box::<package_manager::PackageManager>::default()),
-    ]);
+    entries.extend(ADDONS.iter().map(|(_, _, make)| Entry::Addon(make())));
     entries
 }
 
@@ -504,24 +551,86 @@ struct Slot {
     entry: Entry,
     enabled: bool,
     /// Turned off during an uninterruptible operation: off in every way
-    /// (no page, hook or new work) but waiting for that operation to end.
+    /// (no hook, capability or new work; its page stays drawn, without
+    /// sensors, to follow the operation) but waiting for that operation to
+    /// end. The work it still holds counts until then (see
+    /// [`providers_until_off`]).
     stopping: bool,
     /// The add-on's own settings, opaque to the host (`Null` for core pages
     /// and add-ons that saved none).
     settings: serde_json::Value,
 }
 
-/// What the first add-on among `slots` that records sensors can do now
-/// (see [`Addon::sensor_recording`]): Off while it is off or stopping, or
-/// when none of them records sensors.
-fn recording_of<'a>(slots: impl IntoIterator<Item = &'a Slot>, interval_ms: u64) -> Recording {
-    slots
-        .into_iter()
-        .find_map(|s| match &s.entry {
-            Entry::Addon(a) => a.sensor_recording(interval_ms).map(|r| if s.enabled && !s.stopping { r } else { Recording::Off }),
-            Entry::Core(_) => None,
+/// An add-on that offers a capability, as the lookup answers.
+struct Provider<'s> {
+    id: &'static str,
+    /// The add-on's shown name.
+    name: &'static str,
+    capability: Capability<'s>,
+}
+
+/// THE place that decides whether a capability counts: it counts only while
+/// its add-on is on and not stopping. Every use of a capability goes through
+/// this lookup (or [`providers_until_off`], below). The add-ons among `slots`
+/// that offer what is `asked`, in registry order; a disabled or stopping
+/// add-on offers nothing.
+fn providers<'s>(slots: impl IntoIterator<Item = &'s mut Slot>, asked: Asked) -> impl Iterator<Item = Provider<'s>> {
+    offering(slots, asked, false)
+}
+
+/// The first of [`providers`]: the add-on that answers for `asked`.
+fn provider<'s>(slots: impl IntoIterator<Item = &'s mut Slot>, asked: Asked) -> Option<Provider<'s>> {
+    providers(slots, asked).next()
+}
+
+/// The documented exception to "not stopping", for the capabilities that
+/// speak for work still held: [`UnsavedWork`] (the question before turning
+/// off or closing, its answers) and [`CloseWait`] (the reason to wait before
+/// closing). An add-on turned off during an uninterruptible operation is
+/// stopping but still on, holds that work and the app still has to ask about
+/// it before closing (pinned by the close tests), so these count until it is
+/// off for good.
+fn providers_until_off<'s>(slots: impl IntoIterator<Item = &'s mut Slot>, asked: Asked) -> impl Iterator<Item = Provider<'s>> {
+    offering(slots, asked, true)
+}
+
+/// The one implementation of the rule behind [`providers`] and
+/// [`providers_until_off`].
+fn offering<'s>(slots: impl IntoIterator<Item = &'s mut Slot>, asked: Asked, until_off: bool) -> impl Iterator<Item = Provider<'s>> {
+    slots.into_iter().filter(move |s| s.enabled && (until_off || !s.stopping)).filter_map(move |s| match &mut s.entry {
+        Entry::Addon(a) => {
+            let (id, name) = (a.id(), a.name());
+            a.offers(asked).map(|capability| Provider { id, name, capability })
+        }
+        Entry::Core(_) => None,
+    })
+}
+
+/// The one other exception: asks an add-on that is off whatever its state,
+/// for the notice that tells a column it is no longer drawn (the add-on may
+/// have been turned off in this very frame, so no lookup would reach it).
+fn ask_directly(addon: &mut dyn Addon, asked: Asked) -> Option<Capability<'_>> {
+    addon.offers(asked)
+}
+
+/// The question about the unsaved work of the add-on in `slot`, which is
+/// being turned off or closed with (see [`providers_until_off`]).
+fn unsaved_work_of(slot: &mut Slot) -> Option<&'static str> {
+    providers_until_off(std::iter::once(slot), Asked::UnsavedWork).find_map(|p| match p.capability {
+        Capability::UnsavedWork(work) => work.unsaved_work(),
+        _ => None,
+    })
+}
+
+/// Saves the unsaved work of the add-on in `slot` (true when there is none to
+/// save or it was saved).
+fn save_work_of(slot: &mut Slot) -> bool {
+    providers_until_off(std::iter::once(slot), Asked::UnsavedWork)
+        .find_map(|p| match p.capability {
+            Capability::UnsavedWork(work) => Some(work.save_work()),
+            _ => None,
         })
-        .unwrap_or(Recording::Off)
+        .unwrap_or(true)
 }
 
 /// The page every invalid request falls back to.
@@ -566,7 +675,7 @@ pub struct OffQuestion {
     pub id: &'static str,
     /// The add-on's shown name.
     pub name: &'static str,
-    /// What would be lost (its [`Addon::unsaved_work`]).
+    /// What would be lost (its [`UnsavedWork`]).
     pub question: &'static str,
 }
 
@@ -593,7 +702,7 @@ pub struct AddonHost {
     /// for the answer to its [`OffQuestion`].
     asking: Option<&'static str>,
     /// The app was asked to close while add-ons held unsaved work: it
-    /// waits for the answer to their [`AddonHost::close_question`].
+    /// waits for the answer to their [`AddonHost::close_save_question`].
     closing: bool,
     /// Add-on pages drawn in this frame and in the last one.
     shown: FrameSet,
@@ -786,7 +895,7 @@ impl AddonHost {
     /// the menu with its page open to follow that operation (and is saved
     /// as on) until [`AddonHost::settle`] sees the operation end.
     ///
-    /// An add-on holding unsaved work ([`Addon::unsaved_work`]) is not
+    /// An add-on holding unsaved work ([`UnsavedWork`]) is not
     /// turned off yet: the host asks first ([`AddonHost::off_question`])
     /// and turns it off on the answer ([`AddonHost::answer_off`]).
     pub fn set_enabled(&mut self, id: &str, on: bool) -> bool {
@@ -796,18 +905,19 @@ impl AddonHost {
         let Entry::Addon(addon) = &mut slot.entry else {
             return false;
         };
+        let id = addon.id();
         if slot.stopping {
             return !on;
         }
-        if self.asking == Some(addon.id()) {
+        if self.asking == Some(id) {
             self.asking = None;
         }
         if slot.enabled != on {
             if on {
                 addon.start(&self.context);
                 slot.enabled = true;
-            } else if addon.unsaved_work().is_some() {
-                self.asking = Some(addon.id());
+            } else if unsaved_work_of(slot).is_some() {
+                self.asking = Some(id);
             } else {
                 Self::turn_off(slot, &self.context);
             }
@@ -831,10 +941,11 @@ impl AddonHost {
 
     /// The question to ask before turning off an add-on that holds unsaved
     /// work, while it waits for the answer (None once that work is gone).
-    pub fn off_question(&self) -> Option<OffQuestion> {
+    pub fn off_question(&mut self) -> Option<OffQuestion> {
         let id = self.asking?;
-        let Entry::Addon(addon) = &self.slot(id)?.entry else { return None };
-        addon.unsaved_work().map(|question| OffQuestion { id, name: addon.name(), question })
+        let slot = self.slots.iter_mut().find(|s| s.entry.id() == id)?;
+        let question = unsaved_work_of(slot)?;
+        Some(OffQuestion { id, name: slot.entry.name(), question })
     }
 
     /// Answers the [`OffQuestion`]: Save saves the work and turns the
@@ -844,9 +955,8 @@ impl AddonHost {
     pub fn answer_off(&mut self, answer: OffAnswer) -> bool {
         let Some(id) = self.asking.take() else { return false };
         let Some(slot) = self.slots.iter_mut().find(|s| s.entry.id() == id) else { return false };
-        let Entry::Addon(addon) = &mut slot.entry else { return false };
         let off = match answer {
-            OffAnswer::Save => addon.save_work(),
+            OffAnswer::Save => save_work_of(slot),
             OffAnswer::Discard => true,
             OffAnswer::Cancel => false,
         };
@@ -857,16 +967,16 @@ impl AddonHost {
     }
 
     /// The first add-on that is on and holds unsaved work, with its question.
-    fn first_unsaved(&self) -> Option<OffQuestion> {
-        self.slots.iter().filter(|s| s.enabled).find_map(|s| match &s.entry {
-            Entry::Addon(addon) => addon.unsaved_work().map(|question| OffQuestion { id: addon.id(), name: addon.name(), question }),
-            Entry::Core(_) => None,
+    fn first_unsaved(&mut self) -> Option<OffQuestion> {
+        providers_until_off(self.slots.iter_mut(), Asked::UnsavedWork).find_map(|p| match p.capability {
+            Capability::UnsavedWork(work) => Some(OffQuestion { id: p.id, name: p.name, question: work.unsaved_work()? }),
+            _ => None,
         })
     }
 
     /// The app is asked to close (window X, File › Exit, Alt+F4). True
     /// when it may close now; false when an add-on holds unsaved work:
-    /// the app stays open and asks first ([`AddonHost::close_question`]).
+    /// the app stays open and asks first ([`AddonHost::close_save_question`]).
     /// Replaces a pending [`AddonHost::off_question`].
     pub fn request_close(&mut self) -> bool {
         self.asking = None;
@@ -874,9 +984,9 @@ impl AddonHost {
         !self.closing
     }
 
-    /// The question to ask before closing the app: the same as turning off
+    /// The save question to ask before closing the app: the same as turning off
     /// ([`OffQuestion`]), for the next add-on whose work would be lost.
-    pub fn close_question(&self) -> Option<OffQuestion> {
+    pub fn close_save_question(&mut self) -> Option<OffQuestion> {
         if self.closing {
             self.first_unsaved()
         } else {
@@ -884,21 +994,22 @@ impl AddonHost {
         }
     }
 
-    /// Answers the [`AddonHost::close_question`]. Save saves the work
+    /// Answers the [`AddonHost::close_save_question`]. Save saves the work
     /// (stays open when it was not saved), Discard stops the add-on so
     /// its work and threads are gone, Cancel stays open. The add-ons stay
     /// on (saved as they are). True when the app may close now; false
     /// while it stays open or another add-on still has to be asked.
     pub fn answer_close(&mut self, answer: OffAnswer) -> bool {
-        let Some(q) = self.close_question() else { return false };
+        let Some(q) = self.close_save_question() else { return false };
         let Some(slot) = self.slots.iter_mut().find(|s| s.entry.id() == q.id) else { return false };
-        let Entry::Addon(addon) = &mut slot.entry else { return false };
         let done = match answer {
-            OffAnswer::Save => addon.save_work(),
+            OffAnswer::Save => save_work_of(slot),
             OffAnswer::Discard => {
-                addon.stop();
-                self.context.leases().release(addon.id());
-                self.context.install_queue().withdraw(addon.id());
+                if let Entry::Addon(addon) = &mut slot.entry {
+                    addon.stop();
+                    self.context.leases().release(addon.id());
+                    self.context.install_queue().withdraw(addon.id());
+                }
                 true
             }
             OffAnswer::Cancel => false,
@@ -946,9 +1057,14 @@ impl AddonHost {
     }
 
     /// What the add-ons that are on ask before the app closes (see
-    /// [`Addon::close_question`]); empty: it closes without asking.
-    pub fn close_questions(&self) -> Vec<String> {
-        self.addons().filter(|(_, on)| *on).filter_map(|(a, _)| a.close_question()).collect()
+    /// [`CloseWait`]); empty: it closes without asking.
+    pub fn close_questions(&mut self) -> Vec<String> {
+        providers_until_off(self.slots.iter_mut(), Asked::CloseWait)
+            .filter_map(|p| match p.capability {
+                Capability::CloseWait(wait) => wait.close_reason(),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The app is closing: stops every add-on that is on, as turning it off
@@ -1065,17 +1181,21 @@ impl AddonHost {
         let Entry::Addon(addon) = &mut slot.entry else {
             return false;
         };
-        // The page may ask the other add-ons that are on who owns a path.
-        let others = |path: &std::path::Path| {
-            before.iter().chain(after.iter()).filter(|s| s.enabled && !s.stopping).find_map(|s| match &s.entry {
-                Entry::Addon(a) => a.owner_of(path).map(|label| crate::platform::Owner { addon: a.id(), page: a.name(), label }),
-                Entry::Core(_) => None,
-            })
+        // The page is told what the add-on that records sensors can do now.
+        let interval_ms = page.settings.interval_ms();
+        let recording = match provider(before.iter_mut().chain(after.iter_mut()), Asked::SensorRecorder) {
+            Some(Provider { capability: Capability::SensorRecorder(recorder), .. }) => recorder.sensor_recording(interval_ms),
+            _ => Recording::Off,
         };
-        // And what the add-on that records sensors can do now.
-        addon.recording_shown(recording_of(before.iter().chain(after.iter()), page.settings.interval_ms()));
+        // And it may ask the other add-ons that are on who owns a path.
+        let others = std::cell::RefCell::new(|path: &std::path::Path| {
+            providers(before.iter_mut().chain(after.iter_mut()), Asked::PathOwner).find_map(|p| match p.capability {
+                Capability::PathOwner(owner) => owner.owner_of(path).map(|label| crate::platform::Owner { addon: p.id, page: p.name, label }),
+                _ => None,
+            })
+        });
         let id = addon.id();
-        let mut inner = PageContext { settings: page.settings, sample: page.sample, actions: std::mem::take(&mut page.actions), owners: Some(&others), lease: None };
+        let mut inner = PageContext { settings: page.settings, sample: page.sample, actions: std::mem::take(&mut page.actions), owners: Some(&others), lease: None, recording };
         // A stopping add-on is off: its page reads no sensors.
         inner.lease = (!slot.stopping).then(|| self.context.leases().lease(leases::Surface::Page(id)));
         addon.ui(ui, &mut inner);
@@ -1125,67 +1245,63 @@ impl AddonHost {
     }
 
     /// Shows the row of the add-on `id` that owns `path` (see
-    /// [`Addon::reveal`]). False (and nothing done) when it is off.
+    /// [`PathOwner::reveal`]). False (and nothing done) when it is off or
+    /// does not offer owning paths.
     pub fn reveal(&mut self, id: &str, path: &std::path::Path) -> bool {
-        match self.enabled_addon(id) {
-            Some(addon) => {
-                addon.reveal(path);
+        match providers(&mut self.slots, Asked::PathOwner).find(|p| p.id == id) {
+            Some(Provider { capability: Capability::PathOwner(owner), .. }) => {
+                owner.reveal(path);
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
-    /// The Processes columns of the add-ons that are on, by add-on id, in
-    /// registry order (see [`Addon::process_column`]).
+    /// The Processes column offered by the add-on that is on, by add-on id
+    /// (see [`ProcessColumnProvider`]); empty when none offers it.
     pub fn process_columns(&mut self) -> Vec<(&'static str, ProcessColumn)> {
-        self.enabled_addons().filter_map(|a| a.process_column().map(|c| (a.id(), c))).collect()
+        match provider(&mut self.slots, Asked::ProcessColumn) {
+            Some(Provider { id, capability: Capability::ProcessColumn(column), .. }) => vec![(id, column.process_column())],
+            _ => Vec::new(),
+        }
     }
 
     /// The figures of the add-on `id`'s Processes column, which is drawn in
-    /// this frame (see [`Addon::process_figures`]). None when it is off or
-    /// has no reading yet.
+    /// this frame (see [`ProcessColumnProvider::process_figures`]). None when
+    /// it is off, offers no column or has no reading yet.
     pub fn process_figures(&mut self, id: &str, settings: &crate::settings::Settings) -> Option<HashMap<u32, usize>> {
-        let addon = self.enabled_addon(id)?;
-        let id = addon.id();
-        let figures = addon.process_figures(settings);
-        self.columns.mark(id);
+        let Some(Provider { id: provider_id, capability: Capability::ProcessColumn(column), .. }) = provider(&mut self.slots, Asked::ProcessColumn) else { return None };
+        if provider_id != id {
+            return None;
+        }
+        let figures = column.process_figures(settings);
+        self.columns.mark(provider_id);
         figures
     }
 
     /// Opens the page of the add-on `id` on the process `pid` (see
-    /// [`Addon::reveal_process`]). False (and nothing done) when it is off.
+    /// [`ProcessColumnProvider::reveal_process`]). False (and nothing done)
+    /// when it is off or offers no column.
     pub fn reveal_process(&mut self, id: &str, pid: u32) -> bool {
-        match self.enabled_addon(id) {
-            Some(addon) => {
-                addon.reveal_process(pid);
+        match provider(&mut self.slots, Asked::ProcessColumn) {
+            Some(Provider { id: provider_id, capability: Capability::ProcessColumn(column), .. }) if provider_id == id => {
+                column.reveal_process(pid);
                 true
             }
-            None => false,
+            _ => false,
         }
-    }
-
-    /// What the add-on that records sensors can do now at the update speed
-    /// `interval_ms` (see [`Addon::sensor_recording`]): [`Recording::Off`]
-    /// while it is off or stopping, or when none is registered.
-    pub fn sensor_recording(&self, interval_ms: u64) -> Recording {
-        recording_of(&self.slots, interval_ms)
     }
 
     /// [`crate::platform::Action::RecordSensors`]: starts (`on`) or stops
     /// the sensor recording of the add-on that records sensors, through its
     /// own Record and Stop. Refused with [`RECORDING_OFF`] while it is off.
     pub fn record_sensors(&mut self, on: bool, page: &mut PageContext) -> Result<(), &'static str> {
-        let interval_ms = page.settings.interval_ms();
-        let recorder = self.slots.iter_mut().filter(|s| s.enabled && !s.stopping).find_map(|s| match &mut s.entry {
-            Entry::Addon(a) if a.sensor_recording(interval_ms).is_some() => Some(a),
-            _ => None,
-        });
-        match recorder {
-            Some(a) => a.set_sensor_recording(on, page),
-            None => Err(RECORDING_OFF),
+        match provider(&mut self.slots, Asked::SensorRecorder) {
+            Some(Provider { capability: Capability::SensorRecorder(recorder), .. }) => recorder.set_sensor_recording(on, page),
+            _ => Err(RECORDING_OFF),
         }
     }
+
 
     /// The sensors for a core surface (the Summary page), asked in this
     /// frame: the host keeps them while the surface asks and drops them at
@@ -1213,7 +1329,9 @@ impl AddonHost {
                     a.summary_hidden();
                 }
                 if columns_hidden.contains(&a.id()) {
-                    a.process_column_hidden();
+                    if let Some(Capability::ProcessColumn(column)) = ask_directly(a.as_mut(), Asked::ProcessColumn) {
+                        column.process_column_hidden();
+                    }
                 }
             }
         }
@@ -1362,6 +1480,15 @@ mod tests {
         });
     }
 
+    #[test]
+    fn every_registry_row_names_the_id_of_the_add_on_it_makes() {
+        for (id, tier, make) in ADDONS {
+            let addon = make();
+            assert_eq!(*id, addon.id(), "the row's id is the add-on's");
+            assert_eq!(tier_of(id), *tier, "its tier is read from the row");
+        }
+    }
+
     /// An add-on owning the files under `C:\Apps\Tool` (as "Tool"); notes
     /// what it was asked to reveal.
     struct Owns(std::sync::Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>);
@@ -1369,6 +1496,15 @@ mod tests {
     impl Addon for Owns {
         test_addon!("owns", "Owns", "Owns a folder.");
         fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
+        fn offers(&mut self, asked: Asked) -> Option<Capability<'_>> {
+            match asked {
+                Asked::PathOwner => Some(Capability::PathOwner(self)),
+                _ => None,
+            }
+        }
+    }
+
+    impl PathOwner for Owns {
         fn owner_of(&self, path: &std::path::Path) -> Option<String> {
             path.starts_with(r"C:\Apps\Tool").then(|| "Tool".to_string())
         }
@@ -1625,6 +1761,15 @@ mod tests {
     /// An add-on that reads the sensors and holds work closing would lose.
     struct LooksAndKeeps(bool);
 
+    impl UnsavedWork for LooksAndKeeps {
+        fn unsaved_work(&self) -> Option<&'static str> {
+            self.0.then_some("Not saved.")
+        }
+        fn save_work(&mut self) -> bool {
+            true
+        }
+    }
+
     impl Addon for LooksAndKeeps {
         test_addon!("keeps", "Keeps", "Reads sensors and holds work.");
         fn ui(&mut self, _: &mut egui::Ui, page: &mut PageContext) {
@@ -1632,8 +1777,11 @@ mod tests {
                 sensors.latest();
             }
         }
-        fn unsaved_work(&self) -> Option<&'static str> {
-            self.0.then_some("Not saved.")
+        fn offers(&mut self, asked: Asked) -> Option<Capability<'_>> {
+            match asked {
+                Asked::UnsavedWork => Some(Capability::UnsavedWork(self)),
+                _ => None,
+            }
         }
         fn stop(&mut self) {
             self.0 = false; // the work is gone
@@ -1650,19 +1798,134 @@ mod tests {
         until("no sensor thread", || sensor_threads(&host) == 0);
     }
 
+    /// An add-on with a series running: it gives a reason to wait before
+    /// the app closes.
+    struct Series(bool);
+
+    impl CloseWait for Series {
+        fn close_reason(&self) -> Option<String> {
+            self.0.then(|| "A series is running.".to_string())
+        }
+    }
+
+    impl Addon for Series {
+        test_addon!("series", "Series", "Runs a series.");
+        fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
+        fn offers(&mut self, asked: Asked) -> Option<Capability<'_>> {
+            match asked {
+                Asked::CloseWait => Some(Capability::CloseWait(self)),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn an_add_on_that_waits_gives_its_reason_to_close_only_while_it_is_on_and_works() {
+        let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Series(true)))], &json!({}));
+        assert_eq!(host.close_questions(), vec!["A series is running.".to_string()]);
+        host.set_enabled("series", false);
+        assert!(host.close_questions().is_empty(), "off: closing does not wait for it");
+        let (mut idle, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Series(false)))], &json!({}));
+        assert!(idle.close_questions().is_empty(), "nothing runs: closes without asking");
+    }
+
     /// An add-on that records sensors for other pages: Ready, or Running
     /// once asked to start.
     struct Records(bool);
 
-    impl Addon for Records {
-        test_addon!("records", "Records", "Records sensors.");
-        fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
-        fn sensor_recording(&self, _interval_ms: u64) -> Option<Recording> {
-            Some(if self.0 { Recording::Running } else { Recording::Ready })
+    impl SensorRecorder for Records {
+        fn sensor_recording(&self, _interval_ms: u64) -> Recording {
+            if self.0 {
+                Recording::Running
+            } else {
+                Recording::Ready
+            }
         }
         fn set_sensor_recording(&mut self, on: bool, _page: &mut PageContext) -> Result<(), &'static str> {
             self.0 = on;
             Ok(())
+        }
+    }
+
+    impl Addon for Records {
+        test_addon!("records", "Records", "Records sensors.");
+        fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
+        fn offers(&mut self, asked: Asked) -> Option<Capability<'_>> {
+            match asked {
+                Asked::SensorRecorder => Some(Capability::SensorRecorder(self)),
+                _ => None,
+            }
+        }
+    }
+
+    /// A recorder with its own id, Ready until it is asked to start; it
+    /// notes in the log that it was started.
+    struct NamedRecorder(&'static str, std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+    impl SensorRecorder for NamedRecorder {
+        fn sensor_recording(&self, _interval_ms: u64) -> Recording {
+            Recording::Ready
+        }
+        fn set_sensor_recording(&mut self, on: bool, _page: &mut PageContext) -> Result<(), &'static str> {
+            if on {
+                self.1.lock().unwrap().push(self.0);
+            }
+            Ok(())
+        }
+    }
+
+    impl Addon for NamedRecorder {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn description(&self) -> &'static str {
+            "A named recorder."
+        }
+        fn requirements(&self) -> Requirements {
+            Requirements::default()
+        }
+        fn consumption(&self) -> Consumption {
+            Consumption { cpu: "None", network: "None", disk: "None", when: "Never" }
+        }
+        fn tier(&self) -> Tier {
+            Tier::Free
+        }
+        fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
+        fn offers(&mut self, asked: Asked) -> Option<Capability<'_>> {
+            match asked {
+                Asked::SensorRecorder => Some(Capability::SensorRecorder(self)),
+                _ => None,
+            }
+        }
+    }
+
+    /// A recorder in an operation that cannot be interrupted: turned off,
+    /// it is stopping.
+    struct RecorderKeeping;
+
+    impl SensorRecorder for RecorderKeeping {
+        fn sensor_recording(&self, _interval_ms: u64) -> Recording {
+            Recording::Ready
+        }
+        fn set_sensor_recording(&mut self, _on: bool, _page: &mut PageContext) -> Result<(), &'static str> {
+            Ok(())
+        }
+    }
+
+    impl Addon for RecorderKeeping {
+        test_addon!("keeping-recorder", "Keeping recorder", "Records and holds work.");
+        fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
+        fn offers(&mut self, asked: Asked) -> Option<Capability<'_>> {
+            match asked {
+                Asked::SensorRecorder => Some(Capability::SensorRecorder(self)),
+                _ => None,
+            }
+        }
+        fn uninterruptible(&self) -> bool {
+            true
         }
     }
 
@@ -1671,10 +1934,92 @@ mod tests {
 
     impl Addon for Shows {
         test_addon!("shows", "Shows", "Offers to record.");
-        fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
-        fn recording_shown(&mut self, recording: Recording) {
-            *self.0.lock().unwrap() = Some(recording);
+        fn ui(&mut self, _: &mut egui::Ui, page: &mut PageContext) {
+            *self.0.lock().unwrap() = Some(page.recording);
         }
+    }
+
+    /// What the page "shows" is told by `host` when it is drawn.
+    fn recording_shown_by(host: &mut AddonHost, told: &std::sync::Mutex<Option<Recording>>) -> Option<Recording> {
+        frame(|ui, page| {
+            host.ui("shows", ui, page);
+        });
+        told.lock().unwrap().take()
+    }
+
+    fn record(host: &mut AddonHost, on: bool) -> Result<(), &'static str> {
+        let (settings, sample) = (Settings::default(), Snapshot::default());
+        host.record_sensors(on, &mut PageContext::new(&settings, &sample))
+    }
+
+    /// What a Processes-column test add-on was asked: `(hidden, revealed pids)`.
+    type ColumnLog = std::sync::Arc<std::sync::Mutex<(u32, Vec<u32>)>>;
+
+    /// An add-on that offers a Processes column of its own; it has no page
+    /// of the kind Connections has.
+    struct Counts(ColumnLog);
+
+    impl ProcessColumnProvider for Counts {
+        fn process_column(&self) -> ProcessColumn {
+            ProcessColumn { title: "Counts", menu_item: "Go to counts" }
+        }
+        fn process_figures(&mut self, _settings: &Settings) -> Option<HashMap<u32, usize>> {
+            Some(HashMap::from([(7, 3)]))
+        }
+        fn process_column_hidden(&mut self) {
+            self.0.lock().unwrap().0 += 1;
+        }
+        fn reveal_process(&mut self, pid: u32) {
+            self.0.lock().unwrap().1.push(pid);
+        }
+    }
+
+    impl Addon for Counts {
+        test_addon!("counts", "Counts", "Counts per process.");
+        fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
+        fn offers(&mut self, asked: Asked) -> Option<Capability<'_>> {
+            match asked {
+                Asked::ProcessColumn => Some(Capability::ProcessColumn(self)),
+                _ => None,
+            }
+        }
+    }
+
+    fn counts_host() -> (AddonHost, ColumnLog) {
+        let log = ColumnLog::default();
+        let entries = vec![Entry::Addon(Box::new(Records(false))), Entry::Addon(Box::new(Counts(std::sync::Arc::clone(&log))))];
+        (AddonHost::for_tests_with(entries, &json!({})).0, log)
+    }
+
+    #[test]
+    fn a_processes_column_comes_from_whichever_addon_offers_it_while_that_addon_is_on() {
+        let (mut host, _) = counts_host();
+        let column = ProcessColumn { title: "Counts", menu_item: "Go to counts" };
+        assert_eq!(host.process_columns(), [("counts", column)]);
+        assert_eq!(host.process_figures("counts", &Settings::default()), Some(HashMap::from([(7, 3)])));
+        host.set_enabled("counts", false);
+        assert!(host.process_columns().is_empty(), "no column while it is off");
+        assert_eq!(host.process_figures("counts", &Settings::default()), None);
+    }
+
+    #[test]
+    fn go_to_a_process_reaches_the_offering_addon_only_while_it_is_on() {
+        let (mut host, log) = counts_host();
+        assert!(host.reveal_process("counts", 42));
+        assert!(!host.reveal_process("records", 42), "an add-on that offers no column is not asked");
+        host.set_enabled("counts", false);
+        assert!(!host.reveal_process("counts", 42));
+        assert_eq!(log.lock().unwrap().1, [42]);
+    }
+
+    #[test]
+    fn a_column_no_longer_drawn_is_told_to_drop_what_only_it_needs() {
+        let (mut host, log) = counts_host();
+        host.process_figures("counts", &Settings::default());
+        host.end_frame();
+        assert_eq!(log.lock().unwrap().0, 0, "still drawn in the last frame");
+        host.end_frame();
+        assert_eq!(log.lock().unwrap().0, 1);
     }
 
     #[test]
@@ -1682,31 +2027,52 @@ mod tests {
         let told = std::sync::Arc::default();
         let entries = vec![Entry::Addon(Box::new(Shows(std::sync::Arc::clone(&told)))), Entry::Addon(Box::new(Records(false)))];
         let (mut host, _) = AddonHost::for_tests_with(entries, &json!({}));
-        let shown = |host: &mut AddonHost| {
-            frame(|ui, page| {
-                host.ui("shows", ui, page);
-            });
-            told.lock().unwrap().take()
-        };
-        assert_eq!(host.sensor_recording(1000), Recording::Ready);
-        assert_eq!(shown(&mut host), Some(Recording::Ready), "the page is told before it is drawn");
-        let (settings, sample) = (Settings::default(), Snapshot::default());
-        assert_eq!(host.record_sensors(true, &mut PageContext::new(&settings, &sample)), Ok(()));
-        assert_eq!(host.sensor_recording(1000), Recording::Running);
-        assert_eq!(shown(&mut host), Some(Recording::Running), "the page follows the recorder's state");
-        assert_eq!(host.record_sensors(false, &mut PageContext::new(&settings, &sample)), Ok(()));
-        assert_eq!(host.sensor_recording(1000), Recording::Ready);
+        assert_eq!(recording_shown_by(&mut host, &told), Some(Recording::Ready), "the page is told before it is drawn");
+        assert_eq!(record(&mut host, true), Ok(()));
+        assert_eq!(recording_shown_by(&mut host, &told), Some(Recording::Running), "the page follows the recorder's state");
+        assert_eq!(record(&mut host, false), Ok(()));
+        assert_eq!(recording_shown_by(&mut host, &told), Some(Recording::Ready));
+    }
 
+    #[test]
+    fn a_disabled_recorder_says_off() {
+        let told = std::sync::Arc::default();
+        let entries = vec![Entry::Addon(Box::new(Shows(std::sync::Arc::clone(&told)))), Entry::Addon(Box::new(Records(false)))];
+        let (mut host, _) = AddonHost::for_tests_with(entries, &json!({}));
         host.set_enabled("records", false);
-        assert_eq!(host.sensor_recording(1000), Recording::Off);
-        assert_eq!(shown(&mut host), Some(Recording::Off), "off is told too");
-        assert_eq!(host.record_sensors(true, &mut PageContext::new(&settings, &sample)), Err(RECORDING_OFF), "nothing starts while it is off");
+        assert_eq!(recording_shown_by(&mut host, &told), Some(Recording::Off), "off is told too");
+        assert_eq!(record(&mut host, true), Err(RECORDING_OFF), "nothing starts while it is off");
     }
 
     #[test]
     fn without_an_addon_that_records_sensors_the_recording_is_off() {
-        let (host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Shows(std::sync::Arc::default())))], &json!({}));
-        assert_eq!(host.sensor_recording(1000), Recording::Off);
+        let told = std::sync::Arc::default();
+        let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Shows(std::sync::Arc::clone(&told))))], &json!({}));
+        assert_eq!(recording_shown_by(&mut host, &told), Some(Recording::Off));
+        assert_eq!(record(&mut host, true), Err(RECORDING_OFF));
+    }
+
+    #[test]
+    fn a_stopping_recorder_does_not_count() {
+        let told = std::sync::Arc::default();
+        let entries = vec![Entry::Addon(Box::new(Shows(std::sync::Arc::clone(&told)))), Entry::Addon(Box::new(RecorderKeeping))];
+        let (mut host, _) = AddonHost::for_tests_with(entries, &json!({}));
+        assert_eq!(recording_shown_by(&mut host, &told), Some(Recording::Ready), "on: it counts");
+        host.set_enabled("keeping-recorder", false);
+        assert_eq!(recording_shown_by(&mut host, &told), Some(Recording::Off), "stopping: it does not count");
+        assert_eq!(record(&mut host, true), Err(RECORDING_OFF));
+    }
+
+    #[test]
+    fn with_two_recorders_the_first_in_registry_order_answers() {
+        let log = std::sync::Arc::default();
+        let entries = vec![Entry::Addon(Box::new(NamedRecorder("first", std::sync::Arc::clone(&log)))), Entry::Addon(Box::new(NamedRecorder("second", std::sync::Arc::clone(&log))))];
+        let (mut host, _) = AddonHost::for_tests_with(entries, &json!({}));
+        assert_eq!(record(&mut host, true), Ok(()));
+        assert_eq!(*log.lock().unwrap(), ["first"]);
+        host.set_enabled("first", false);
+        assert_eq!(record(&mut host, true), Ok(()));
+        assert_eq!(*log.lock().unwrap(), ["first", "second"], "with the first off, the next one answers");
     }
 
     /// An add-on that notes which of its hooks the host called.
@@ -2234,26 +2600,21 @@ mod tests {
         }
 
         #[test]
-        fn the_tier_table_covers_every_registered_addon() {
-            for entry in crate::addons::registry() {
-                if let Entry::Addon(a) = entry {
-                    assert!(TIERS.iter().any(|(id, _)| *id == a.id()), "{} has no line in TIERS", a.id());
-                }
+        fn the_feature_tier_lines_name_no_addon() {
+            let ids = addon_ids();
+            for (id, _) in FEATURE_TIERS {
+                assert!(!ids.contains(id), "{id} is an add-on: its tier belongs to its registry row");
             }
         }
 
         #[test]
-        fn the_tier_table_has_a_free_line_for_power_freq_alerts() {
-            let id = crate::addons::power_freq::alerts::TIER_ID;
-            assert!(TIERS.iter().any(|(i, _)| *i == id), "{id} has no line in TIERS");
-            assert_eq!(tier_of(id), Tier::Free, "shipped Free");
+        fn power_freq_alerts_ship_free() {
+            assert_eq!(tier_of(crate::addons::power_freq::alerts::TIER_ID), Tier::Free);
         }
 
         #[test]
-        fn the_tier_table_has_a_free_line_for_power_freq_pins() {
-            let id = crate::addons::power_freq::PINS_TIER_ID;
-            assert!(TIERS.iter().any(|(i, _)| *i == id), "{id} has no line in TIERS");
-            assert_eq!(tier_of(id), Tier::Free, "shipped Free");
+        fn power_freq_pins_ship_free() {
+            assert_eq!(tier_of(crate::addons::power_freq::PINS_TIER_ID), Tier::Free);
         }
 
         #[test]
@@ -2675,6 +3036,15 @@ mod tests {
                 n.stopped += 1;
                 n.dirty = false;
             }
+            fn offers(&mut self, asked: Asked) -> Option<Capability<'_>> {
+                match asked {
+                    Asked::UnsavedWork => Some(Capability::UnsavedWork(self)),
+                    _ => None,
+                }
+            }
+        }
+
+        impl UnsavedWork for Notebook {
             fn unsaved_work(&self) -> Option<&'static str> {
                 self.0.lock().unwrap().dirty.then_some("The notes are not saved.")
             }
@@ -2774,14 +3144,14 @@ mod tests {
             let (mut host, notes) = notebook(true);
             notes.lock().unwrap().dirty = false;
             assert!(host.request_close());
-            assert_eq!(host.close_question(), None);
+            assert_eq!(host.close_save_question(), None);
         }
 
         #[test]
         fn closing_with_unsaved_work_asks_the_same_question_first() {
             let (mut host, notes) = notebook(true);
             assert!(!host.request_close(), "the app stays open until the user answers");
-            assert_eq!(host.close_question(), Some(OffQuestion { id: "notebook", name: "Notebook", question: "The notes are not saved." }));
+            assert_eq!(host.close_save_question(), Some(OffQuestion { id: "notebook", name: "Notebook", question: "The notes are not saved." }));
             assert_eq!(notes.lock().unwrap().stopped, 0, "nothing stopped yet");
         }
 
@@ -2792,7 +3162,7 @@ mod tests {
             assert!(host.answer_close(OffAnswer::Save));
             assert_eq!(notes.lock().unwrap().saved, 1);
             assert!(host.is_enabled("notebook"), "closing the app does not turn it off");
-            assert_eq!(host.close_question(), None);
+            assert_eq!(host.close_save_question(), None);
             assert!(host.request_close(), "nothing left to lose: the close goes through");
         }
 
@@ -2802,7 +3172,7 @@ mod tests {
             host.request_close();
             assert!(!host.answer_close(OffAnswer::Save));
             assert!(notes.lock().unwrap().dirty, "the work stays unsaved");
-            assert_eq!(host.close_question(), None, "the question is closed");
+            assert_eq!(host.close_save_question(), None, "the question is closed");
         }
 
         #[test]
@@ -2825,7 +3195,7 @@ mod tests {
             let n = notes.lock().unwrap();
             assert_eq!((n.saved, n.stopped, n.dirty), (0, 0, true));
             drop(n);
-            assert_eq!(host.close_question(), None);
+            assert_eq!(host.close_save_question(), None);
         }
 
         #[test]
@@ -2834,7 +3204,7 @@ mod tests {
             host.set_enabled("notebook", false);
             host.request_close();
             assert_eq!(host.off_question(), None, "one question at a time");
-            assert!(host.close_question().is_some());
+            assert!(host.close_save_question().is_some());
         }
 
         #[test]

@@ -620,7 +620,7 @@ fn an_item_in_an_installed_apps_folder_links_to_its_row_there() {
     d.scan_with("R:\\", None, move |job| deliver(job, events));
     wait_idle(&d);
     let (settings, sample) = (crate::settings::Settings::default(), Snapshot::default());
-    let owns = |p: &Path| p.starts_with("R:\\Apps\\Tool").then(|| crate::platform::Owner { addon: "installed-apps", page: "Installed Apps", label: "Tool".into() });
+    let owns = std::cell::RefCell::new(|p: &Path| p.starts_with("R:\\Apps\\Tool").then(|| crate::platform::Owner { addon: "installed-apps", page: "Installed Apps", label: "Tool".into() }));
     let mut page = PageContext::new(&settings, &sample);
     page.owners = Some(&owns);
     let tool = nav::Key::File(PathBuf::from("R:\\Apps\\Tool\\tool.exe"));

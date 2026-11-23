@@ -6,7 +6,7 @@
 use super::*;
 
 impl PowerFreq {
-    /// Alerts are offered: their line in [`crate::addons::TIERS`]
+    /// Alerts are offered: their line in [`crate::addons::FEATURE_TIERS`]
     /// ([`alerts::TIER_ID`]) is Free.
     pub fn alerts_offered(&self) -> bool {
         (self.tiers.0)(alerts::TIER_ID) == Tier::Free

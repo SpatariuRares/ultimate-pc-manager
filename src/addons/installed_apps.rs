@@ -9,7 +9,7 @@ pub mod apps;
 /// The Installed Apps page.
 pub mod page;
 
-use crate::addons::{is_default, read_settings, write_settings, Addon, Consumption, Requirements};
+use crate::addons::{is_default, read_settings, write_settings, Addon, Consumption, Asked, Capability, PathOwner, Requirements};
 use crate::platform::{Action, AddonContext, PageContext};
 
 use apps::Hub;
@@ -201,6 +201,15 @@ impl Addon for InstalledApps {
         }
     }
 
+    fn offers(&mut self, asked: Asked) -> Option<Capability<'_>> {
+        match asked {
+            Asked::PathOwner => Some(Capability::PathOwner(self)),
+            _ => None,
+        }
+    }
+}
+
+impl PathOwner for InstalledApps {
     /// The app whose own folder holds `path` (Disk Space links to it).
     /// Only apps already listed count: the list is read when the page
     /// first opens.

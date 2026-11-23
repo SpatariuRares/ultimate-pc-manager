@@ -514,7 +514,7 @@ pub struct PowerFreq {
     fahrenheit: bool,
     /// What Flight Recorder can do now, told by the host before each draw.
     recording: Recording,
-    /// Where its features' tiers are read ([`crate::addons::TIERS`]).
+    /// Where its features' tiers are read ([`crate::addons::FEATURE_TIERS`]).
     tiers: Tiers,
 }
 
@@ -529,7 +529,7 @@ impl Default for Tiers {
     }
 }
 
-/// Said where a feature whose [`crate::addons::TIERS`] line is not Free
+/// Said where a feature whose [`crate::addons::FEATURE_TIERS`] line is not Free
 /// would be: there is no way to buy one yet, so it is simply not offered.
 pub const NOT_INCLUDED: &str = "Not included in this version.";
 
@@ -703,10 +703,6 @@ impl Addon for PowerFreq {
         if !self.page_on {
             self.stats = Default::default();
         }
-    }
-
-    fn recording_shown(&mut self, recording: Recording) {
-        self.recording = recording;
     }
 
     /// The values of the whole PC this PC reads ([`tile_lines`]).
@@ -938,6 +934,7 @@ impl PowerFreq {
     /// records; pressed, it asks the app through the add-on host.
     fn record_row(&mut self, ui: &mut Ui, page: &mut PageContext) {
         let sub = page.sub_text();
+        self.recording = page.recording; // what the host says Flight Recorder can do now
         ui.horizontal(|ui| {
             let pressed = match record_action(self.recording) {
                 RecordAction::Record(reason) => {
@@ -1270,7 +1267,7 @@ mod tests {
         });
     }
 
-    /// Alerts and pins as if their [`crate::addons::TIERS`] lines said Paid.
+    /// Alerts and pins as if their [`crate::addons::FEATURE_TIERS`] lines said Paid.
     fn paid_features(id: &str) -> Tier {
         if id == alerts::TIER_ID || id == PINS_TIER_ID {
             Tier::Paid
@@ -1328,11 +1325,11 @@ mod tests {
     fn pressing_the_action_asks_the_host_to_start_or_stop_the_recording() {
         let mut p = PowerFreq::default();
         assert_eq!(p.record_request(), None, "Flight Recorder is off until the host says otherwise");
-        p.recording_shown(Recording::Ready);
+        p.recording = Recording::Ready;
         assert_eq!(p.record_request(), Some(Action::RecordSensors(true)));
-        p.recording_shown(Recording::Running);
+        p.recording = Recording::Running;
         assert_eq!(p.record_request(), Some(Action::RecordSensors(false)));
-        p.recording_shown(Recording::Locked(crate::addons::flight_recorder::SAVE_OR_DISCARD_FIRST));
+        p.recording = Recording::Locked(crate::addons::flight_recorder::SAVE_OR_DISCARD_FIRST);
         assert_eq!(p.record_request(), None);
     }
 
@@ -2051,9 +2048,6 @@ mod tests {
         fn summary_hidden(&mut self) {
             self.0.lock().unwrap().summary_hidden();
         }
-        fn recording_shown(&mut self, recording: Recording) {
-            self.0.lock().unwrap().recording_shown(recording);
-        }
         fn summary(&mut self, ui: &mut Ui, page: &mut PageContext) {
             self.0.lock().unwrap().summary(ui, page);
         }
@@ -2068,6 +2062,28 @@ mod tests {
         let entries = vec![crate::addons::Entry::Addon(Box::new(Hosted(std::sync::Arc::clone(&power_freq))))];
         let section = serde_json::json!({ "power-freq": { "settings": { "summary_tile": true } } });
         (crate::addons::AddonHost::for_tests_with(entries, &section).0, power_freq)
+    }
+
+    #[test]
+    fn power_freq_is_told_what_the_recorder_can_do_before_its_page_is_drawn() {
+        use crate::addons::Recording;
+        let power_freq = std::sync::Arc::<std::sync::Mutex<PowerFreq>>::default();
+        let entries = vec![
+            crate::addons::Entry::Addon(Box::<crate::addons::flight_recorder::FlightRecorder>::default()),
+            crate::addons::Entry::Addon(Box::new(Hosted(std::sync::Arc::clone(&power_freq)))),
+        ];
+        let mut host = crate::addons::AddonHost::for_tests_with(entries, &serde_json::json!({})).0;
+        let told = |host: &mut crate::addons::AddonHost| {
+            draw_surfaces(host, true, false);
+            power_freq.lock().unwrap().recording
+        };
+        assert_eq!(told(&mut host), Recording::Ready, "the recorder is on and can start");
+        let (settings, snap) = (Settings::default(), Snapshot::default());
+        assert_eq!(host.record_sensors(true, &mut PageContext::new(&settings, &snap)), Ok(()));
+        assert_eq!(told(&mut host), Recording::Running, "told in the frame that draws it");
+        host.set_enabled("flight-recorder", false);
+        host.answer_off(crate::addons::OffAnswer::Discard);
+        assert_eq!(told(&mut host), Recording::Off, "the recorder is off");
     }
 
     #[test]
