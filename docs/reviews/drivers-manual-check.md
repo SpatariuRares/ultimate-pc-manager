@@ -36,3 +36,18 @@ For each step, record: OK / KO, plus the text the page shows. Results go in the 
    - driver not loaded: "Not loaded.".
 10. Try a command that fails, for example an invalid INF.
     - Expected: "Finished with code N. See the output below." and the output in **Output of the last tool**.
+
+## #17: protected elevated runner (cannot be auto-tested)
+
+The automatic tests run the bootstrap with a real, non-elevated PowerShell. These steps check the real UAC path.
+
+11. Run any elevated action (for example **Scan for hardware changes**) → UAC **Yes**.
+    - Expected: it works as before (result shown, no error).
+    - While the UAC prompt is open, look at `%LOCALAPPDATA%\UltimatePCManager\jobs`: only `job-<random>.ps1` is there, no `.json` result.
+12. Script swap: while the UAC prompt is open, open that `job-*.ps1` in Notepad and append a line such as `New-Item C:\Users\Public\swapped.txt`, save, then answer **Yes**.
+    - Expected: the action fails with "PowerShell finished without a result."; `C:\Users\Public\swapped.txt` does not exist.
+13. Result protection: during a long elevated action (for example Install from an INF file), from a normal (non-elevated) PowerShell run `Get-ChildItem $env:windir\Temp\upcm-*` and try `New-Item $env:windir\Temp\upcm-*\envelope.json`.
+    - Expected: the folder can be listed or read, but creating or changing a file in it is denied (Access denied).
+14. Result forgery: a normal process cannot create `envelope.json` there (denied); a result with a wrong or missing token is shown as "The elevated result was rejected: it does not carry this job's token." (covered by an automatic test).
+15. Close UAC with **No**.
+    - Expected: still "Cancelled at the Windows prompt: nothing was changed.". After every step above, no `job-*.ps1` is left in the jobs folder and no `upcm-*` folder in `%windir%\Temp`.

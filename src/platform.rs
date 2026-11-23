@@ -18,6 +18,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+#[cfg(windows)]
+mod elevated;
 pub mod install_queue;
 pub mod series;
 /// Windows notifications (toasts) through the notification area.
@@ -972,11 +974,18 @@ mod imp {
 
     // --------------------------------------------------- PowerShell
 
-    /// Writes `script` to a file, runs it with Windows PowerShell (elevated
-    /// through UAC when asked) and reads the JSON it writes to -Out.
+    /// Runs `script` with Windows PowerShell (elevated through UAC when
+    /// asked) and reads the JSON it writes to -Out.
     pub fn run_script(script: &str, args: &[(&str, &str)], elevated: bool) -> Result<serde_json::Value, String> {
+        if elevated {
+            // The script never reaches the elevated side through a file a
+            // normal process could swap, and its result comes back through
+            // a folder only administrators can write: see `elevated`.
+            let results = std::env::var_os("windir").map(std::path::PathBuf::from).unwrap_or_else(|| "C:\\Windows".into()).join("Temp");
+            return super::elevated::run(&jobs_dir()?, &results, script, args, false, run_elevated);
+        }
         let never = AtomicBool::new(false);
-        run_in(&jobs_dir()?, script, args, |params| if elevated { run_elevated(params) } else { run_hidden(params, &never) })
+        run_in(&jobs_dir()?, script, args, |params| run_hidden(params, &never))
     }
 
     /// Like [`run_script`] without elevation; a set `stop` ends PowerShell
@@ -1049,7 +1058,10 @@ mod imp {
     fn run_elevated(params: &str) -> Result<(), String> {
         unsafe {
             let verb = wide("runas");
-            let file = wide("powershell.exe");
+            // The full path, so a program planted earlier on the search path
+            // is never the one that gets administrator rights.
+            let system = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+            let file = wide(&format!("{system}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
             let p = wide(params);
             let mut info: SHELLEXECUTEINFOW = zeroed();
             info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
