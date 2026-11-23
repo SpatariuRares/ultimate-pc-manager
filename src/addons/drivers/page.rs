@@ -20,7 +20,7 @@ use crate::addons::plural;
 use crate::platform::{csv_field, csv_text_field, Action, AddonContext};
 use crate::theme;
 use crate::widgets::parts::{self, BandArea, Mark, StatusBand};
-use crate::widgets::{long_date, parse_date, separator, short_time, split_version, tick};
+use crate::widgets::{confirm_window, long_date, parse_date, separator, short_time, split_version, tick, ConfirmWindow};
 use crate::page_perf::{display, fit};
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
@@ -771,6 +771,7 @@ impl DriversPage {
         let updates = st.updates.clone();
         let busy = st.busy.clone();
         let message = st.message.clone();
+        let refused = st.busy_refused;
         let output = st.output.clone();
         let reboot = st.reboot_required;
         let listing = st.listing;
@@ -786,7 +787,7 @@ impl DriversPage {
         let signatures = st.signatures.clone();
         drop(st);
         let admin = self.context.is_admin();
-        let idle = busy.is_none();
+        let idle = self.job_free();
         let view = self.derived(&devices, &kernel, &updates, &signatures);
 
         // ------------------------------------------------ actions (the app's header has the title and Refresh)
@@ -820,7 +821,7 @@ impl DriversPage {
         });
         ui.add_space(8.0);
 
-        self.drivers_band(ui, &devices, updates.as_deref(), busy.as_deref(), message.as_ref(), reboot, &checked_at, idle, view.problem_count);
+        self.drivers_band(ui, &devices, updates.as_deref(), busy.as_deref(), message.as_ref(), refused, reboot, &checked_at, idle, view.problem_count);
         if !output.is_empty() {
             egui::CollapsingHeader::new(RichText::new("Output of the last tool").color(th.label)).id_salt("drv-output").show(ui, |ui| {
                 ui.label(RichText::new(&output).monospace().size(11.0));
@@ -979,6 +980,7 @@ impl DriversPage {
         updates: Option<&[DriverUpdate]>,
         busy: Option<&str>,
         message: Option<&(String, bool)>,
+        refused: bool,
         reboot: bool,
         checked_at: &str,
         idle: bool,
@@ -1011,7 +1013,7 @@ impl DriversPage {
         }
         band.show(ui, |ui, area| match area {
             BandArea::Body => {
-                if problem_count > 0 && busy.is_none() {
+                if problem_count > 0 && idle {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(problems::band_text(problem_count)).strong().color(th.red));
                         if ui.link("Show them").clicked() {
@@ -1019,7 +1021,7 @@ impl DriversPage {
                         }
                     });
                 }
-                if busy.is_none() && !newer.is_empty() {
+                if idle && !newer.is_empty() {
                     for u in newer.iter().take(3) {
                         let dev = device(u);
                         ui.horizontal_wrapped(|ui| {
@@ -1051,13 +1053,15 @@ impl DriversPage {
                         );
                     }
                 }
-                if let Some((m, err)) = message.filter(|(m, _)| busy.is_none() != (m == BUSY_TEXT)) {
-                    ui.label(RichText::new(m).size(12.5).color(if *err { th.red } else { th.green }));
+                // While a job runs only the refusal of another one is told; the last outcome comes back when the page is free.
+                let told = if idle { message.map(|(m, err)| (m.as_str(), *err)) } else { refused.then_some((BUSY_TEXT, true)) };
+                if let Some((m, err)) = told {
+                    ui.label(RichText::new(m).size(12.5).color(if err { th.red } else { th.green }));
                 }
                 if reboot {
                     ui.label(RichText::new("Restart Windows to finish installing drivers.").size(12.5).strong().color(th.amber));
                 }
-                if !older.is_empty() && busy.is_none() {
+                if !older.is_empty() && idle {
                     ui.add_space(4.0);
                     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
                     ui.painter().rect_filled(r, CornerRadius::ZERO, th.line);
@@ -1078,7 +1082,7 @@ impl DriversPage {
                 }
             }
             BandArea::Actions => {
-                if updates.is_none() || busy.is_some() {
+                if updates.is_none() || !idle {
                     if parts::primary_button(ui, "Check for updates", idle).clicked() {
                         self.drv.check_updates();
                     }
@@ -1805,27 +1809,21 @@ impl DriversPage {
         }
     }
 
-    /// No job holds the page: what every confirm dialog reads to enable its
-    /// button (the Hub refuses a second job all the same).
+    /// No job holds the page: the one check the page makes to enable a
+    /// button or show a free page (the Hub refuses a second job all the same).
     fn job_free(&self) -> bool {
         self.drv.lock().busy.is_none()
     }
 
     fn drivers_dialogs(&mut self, ui: &mut Ui) {
         let th = theme::of_ui(ui);
+        let ctx = ui.ctx().clone();
+        let idle = self.job_free();
         if let Some(sha) = self.drv_ui.confirm_virustotal.clone() {
-            let mut decided = None;
-            egui::Window::new("Look up on VirusTotal").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+            let spec = ConfirmWindow::new("Look up on VirusTotal", "Send SHA-256");
+            let decided = confirm_window(&ctx, spec, |ui| {
                 ui.label("Send this file's SHA-256 to VirusTotal? The file itself is not uploaded.");
                 ui.label(RichText::new("Asked once. Off by default in Settings \u{203a} Add-ons \u{203a} Drivers.").color(th.label));
-                ui.horizontal(|ui| {
-                    if ui.button("Send SHA-256").clicked() {
-                        decided = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decided = Some(false);
-                    }
-                });
             });
             if decided == Some(true) {
                 self.virustotal_consent = true;
@@ -1836,20 +1834,10 @@ impl DriversPage {
             }
         }
         if let Some(service) = self.drv_ui.confirm_unload.clone() {
-            let idle = self.job_free();
-            let mut decided = None;
-            egui::Window::new("Unload this driver?").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+            let spec = ConfirmWindow { admin: true, busy: Some((BUSY_TEXT, idle)), ..ConfirmWindow::new("Unload this driver?", "Unload") };
+            let decided = confirm_window(&ctx, spec, |ui| {
                 ui.label(format!("Windows will be asked to stop \"{service}\"."));
                 ui.label(RichText::new("Devices that use it stop working until it loads again or Windows restarts.").color(th.label));
-                crate::widgets::busy_note(ui, BUSY_TEXT, idle);
-                ui.horizontal(|ui| {
-                    if parts::admin_button(ui, "Unload", false, idle).clicked() {
-                        decided = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decided = Some(false);
-                    }
-                });
             });
             if decided == Some(true) {
                 self.drv.unload(service);
@@ -1859,21 +1847,11 @@ impl DriversPage {
             }
         }
         if let Some(u) = self.drv_ui.confirm_older.clone() {
-            let idle = self.job_free();
-            let mut decided = None;
-            egui::Window::new("Install an older driver?").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+            let label = format!("Install {}", u.version);
+            let spec = ConfirmWindow { admin: true, restore_point: Some(&mut self.restore_point), busy: Some((BUSY_TEXT, idle)), ..ConfirmWindow::new("Install an older driver?", &label) };
+            let decided = confirm_window(&ctx, spec, |ui| {
                 ui.label(format!("Windows Update offers {} ({}).", u.model, u.version));
                 ui.label(RichText::new("It is not newer than the driver you have. Install it only to go back to that version.").color(th.label));
-                crate::widgets::restore_point_option(ui, &mut self.restore_point);
-                crate::widgets::busy_note(ui, BUSY_TEXT, idle);
-                ui.horizontal(|ui| {
-                    if parts::admin_button(ui, &format!("Install {}", u.version), false, idle).clicked() {
-                        decided = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decided = Some(false);
-                    }
-                });
             });
             if decided == Some(true) {
                 self.drv.install_with(vec![u.id.clone()], self.restore_point);
@@ -1883,28 +1861,18 @@ impl DriversPage {
             }
         }
         if let Some(mut confirm) = self.drv_ui.confirm_device.clone() {
-            let idle = self.job_free();
-            let mut decided = None;
-            egui::Window::new(format!("{} {}?", confirm.action.label().split(' ').next().unwrap_or_default(), confirm.name))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
-                    ui.label(RichText::new(confirm.action.consequence()).color(th.soft));
-                    if let Some(warning) = confirm.warning.clone() {
-                        crate::widgets::strong_confirm(ui, &warning, &mut confirm.understood);
-                    }
-                    crate::widgets::restore_point_option(ui, &mut self.restore_point);
-                    crate::widgets::busy_note(ui, BUSY_TEXT, idle);
-                    ui.horizontal(|ui| {
-                        if parts::admin_button(ui, confirm.action.label(), false, idle && confirm.confirmable()).clicked() {
-                            decided = Some(true);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            decided = Some(false);
-                        }
-                    });
-                });
+            let title = format!("{} {}?", confirm.action.label().split(' ').next().unwrap_or_default(), confirm.name);
+            let spec = ConfirmWindow {
+                admin: true,
+                restore_point: Some(&mut self.restore_point),
+                strong_warning: confirm.warning.as_deref().map(|w| (w, &mut confirm.understood)),
+                busy: Some((BUSY_TEXT, idle)),
+                ..ConfirmWindow::new(&title, confirm.action.label())
+            };
+            let consequence = confirm.action.consequence();
+            let decided = confirm_window(&ctx, spec, |ui| {
+                ui.label(RichText::new(consequence).color(th.soft));
+            });
             match decided {
                 Some(true) => {
                     self.drv.device_action_with(confirm.action, confirm.instance_id.clone(), self.restore_point);
@@ -1922,20 +1890,9 @@ impl DriversPage {
                 // Device actions have their own dialog (`confirm_device`).
                 drivers::Redo::Device(action, _) => (action.label(), action.consequence().to_string(), action.label()),
             };
-            let idle = self.job_free();
-            let mut decided = None;
-            egui::Window::new(title).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+            let spec = ConfirmWindow { admin: true, restore_point: Some(&mut self.restore_point), busy: Some((BUSY_TEXT, idle)), ..ConfirmWindow::new(title, label) };
+            let decided = confirm_window(&ctx, spec, |ui| {
                 ui.label(what);
-                crate::widgets::restore_point_option(ui, &mut self.restore_point);
-                crate::widgets::busy_note(ui, BUSY_TEXT, idle);
-                ui.horizontal(|ui| {
-                    if parts::admin_button(ui, label, false, idle).clicked() {
-                        decided = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decided = Some(false);
-                    }
-                });
             });
             if decided == Some(true) {
                 match job {
@@ -1954,18 +1911,10 @@ impl DriversPage {
         // The restore point could not be made, so nothing was changed yet.
         let prompt = self.drv.lock().restore_prompt.clone();
         if let Some(prompt) = prompt {
-            let mut decided = None;
-            egui::Window::new("Restore point not created").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+            let spec = ConfirmWindow { admin: true, ..ConfirmWindow::new("Restore point not created", "Continue") };
+            let decided = confirm_window(&ctx, spec, |ui| {
                 ui.label(RichText::new(&prompt.reason).color(th.amber));
                 ui.label("Continue without a new restore point?");
-                ui.horizontal(|ui| {
-                    if parts::admin_button(ui, "Continue", false, true).clicked() {
-                        decided = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decided = Some(false);
-                    }
-                });
             });
             match decided {
                 Some(true) => self.drv.continue_without_restore(),
@@ -2001,41 +1950,30 @@ impl DriversPage {
             RemoveKind::Selected => "Remove",
         };
         let idle = self.job_free();
-        let mut decided = None;
         let mut understood = ask.understood;
-        egui::Window::new(title).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+        let name = ask.names.first().map(String::as_str).unwrap_or_default();
+        let users: Vec<&str> = packages.iter().find(|p| p.published == name).map(|p| p.devices.iter().map(|d| d.name.as_str()).collect()).unwrap_or_default();
+        let warning = format!("{} stops working and may not come back until you reinstall its driver.", if users.is_empty() { "A device".to_string() } else { users.join(", ") });
+        let spec = ConfirmWindow {
+            admin: true,
+            restore_point: Some(&mut self.restore_point),
+            strong_warning: (ask.kind == RemoveKind::Forced).then_some((warning.as_str(), &mut understood)),
+            busy: Some((BUSY_TEXT, idle)),
+            ..ConfirmWindow::new(&title, label)
+        };
+        let decided = confirm_window(&ui.ctx().clone(), spec, |ui| {
             for (line, in_use) in &lines {
                 ui.label(line);
                 if *in_use && ask.kind == RemoveKind::Selected {
                     ui.label(RichText::new("In use: will be refused").size(12.0).color(th.amber));
                 }
             }
-            match ask.kind {
-                RemoveKind::Selected => {
-                    ui.label(RichText::new(REMOVE_SELECTED_NOTE).size(12.0).color(th.label));
-                }
-                RemoveKind::Old => {
-                    ui.label(RichText::new(REMOVE_OLD_NOTE).size(12.0).color(th.label));
-                }
-                RemoveKind::Forced => {
-                    let name = ask.names.first().map(String::as_str).unwrap_or_default();
-                    ui.label(RichText::new(format!("Runs pnputil /delete-driver {name} /uninstall /force.")).size(12.0).color(th.label));
-                    let users: Vec<&str> = packages.iter().find(|p| p.published == name).map(|p| p.devices.iter().map(|d| d.name.as_str()).collect()).unwrap_or_default();
-                    ui.label(RichText::new(format!("{} stops working and may not come back until you reinstall its driver.", if users.is_empty() { "A device".to_string() } else { users.join(", ") })).strong().color(th.red));
-                    ui.checkbox(&mut understood, FORCE_UNDERSTOOD);
-                }
-            }
-            crate::widgets::restore_point_option(ui, &mut self.restore_point);
-            crate::widgets::busy_note(ui, BUSY_TEXT, idle);
-            ui.horizontal(|ui| {
-                let enabled = idle && (ask.kind != RemoveKind::Forced || understood);
-                if parts::admin_button(ui, label, false, enabled).clicked() {
-                    decided = Some(true);
-                }
-                if ui.button("Cancel").clicked() {
-                    decided = Some(false);
-                }
-            });
+            let note = match ask.kind {
+                RemoveKind::Selected => REMOVE_SELECTED_NOTE.to_string(),
+                RemoveKind::Old => REMOVE_OLD_NOTE.to_string(),
+                RemoveKind::Forced => format!("Runs pnputil /delete-driver {name} /uninstall /force."),
+            };
+            ui.label(RichText::new(note).size(12.0).color(th.label));
         });
         match decided {
             Some(true) => {
@@ -2071,9 +2009,10 @@ impl DriversPage {
         let title = if ask.names.is_none() { "Back up every third-party driver".to_string() } else { format!("Back up {}", plural(n, "selected package")) };
         let dated = store::backup_folder(ask.folder.trim(), today());
         let idle = self.job_free();
-        let mut decided = None;
         let mut browse = false;
-        egui::Window::new(title).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+        let label = format!("Back up {}", plural(n, "package"));
+        let spec = ConfirmWindow { admin: true, enabled: !ask.folder.trim().is_empty() && n > 0, busy: Some((BUSY_TEXT, idle)), ..ConfirmWindow::new(&title, &label) };
+        let decided = confirm_window(&ui.ctx().clone(), spec, |ui| {
             ui.label(RichText::new("Folder").size(12.0).color(th.label));
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut ask.folder).hint_text("Choose a folder").desired_width(280.0));
@@ -2084,16 +2023,6 @@ impl DriversPage {
             let sub = dated.rsplit('\\').next().unwrap_or_default();
             ui.label(RichText::new(format!("A dated subfolder is created ({sub}).")).size(12.0).color(th.label));
             ui.label(RichText::new(store::BACKUP_RESTORE_NOTE).size(12.0).color(th.label));
-            crate::widgets::busy_note(ui, BUSY_TEXT, idle);
-            ui.horizontal(|ui| {
-                let label = format!("Back up {}", plural(n, "package"));
-                if parts::admin_button(ui, &label, false, idle && !ask.folder.trim().is_empty() && n > 0).clicked() {
-                    decided = Some(true);
-                }
-                if ui.button("Cancel").clicked() {
-                    decided = Some(false);
-                }
-            });
         });
         if browse {
             if let Some(folder) = self.context.pick_folder("Back up drivers to", "Choose") {
@@ -2123,9 +2052,10 @@ impl DriversPage {
 
 /// The CSV text of the export. Text cells are neutralised against spreadsheet
 /// formulas; numbers (load index, kernel memory in bytes) stay plain.
-/// The kernel-only columns come last and are empty on device rows.
+/// The kernel-only columns (Start type to Depends on) are empty on device
+/// rows; Signature and Problem carry both kinds' own values.
 fn drivers_csv(devices: &[DeviceDriver], kernel: &[KernelDriver], updates: Option<&[DriverUpdate]>, signatures: &SignatureBook) -> String {
-    let mut s = String::from("Kind,Name,Class/Type,Provider/Vendor,Version,Date,Status,INF/Service,Windows Update,Instance ID/Path,Start type,Driver kind,Load index,Kernel memory (bytes),Load order group,Depends on,Signature\n");
+    let mut s = String::from("Kind,Name,Class/Type,Provider/Vendor,Version,Date,Status,INF/Service,Windows Update,Instance ID/Path,Start type,Load index,Kernel memory (bytes),Load order group,Depends on,Signature,Problem code,Problem\n");
     for d in devices {
         let u = updates.and_then(|u| u.iter().find(|x| x.device.as_deref() == Some(d.instance_id.as_str())));
         let up = match (updates, u) {
@@ -2136,15 +2066,21 @@ fn drivers_csv(devices: &[DeviceDriver], kernel: &[KernelDriver], updates: Optio
         };
         let f = ["Device", &d.name, &d.class, &d.provider, &d.version, &d.date, &d.status(), &d.inf, &up, &d.instance_id];
         let mut line: Vec<String> = f.iter().map(|x| csv_text_field(x)).collect();
-        line.extend(std::iter::repeat(String::new()).take(7));
+        // The kernel-only columns are empty on a device row.
+        line.extend(std::iter::repeat(String::new()).take(5));
+        // A device with no driver INF has no signature to show.
+        line.push(csv_text_field(&if d.inf.is_empty() { String::new() } else { signature_text(device_signature(d, signatures)) }));
+        let problem = problems::is_problem(d).then(|| problems::explain(d.problem));
+        line.push(csv_field(&problem.map(|p| p.code.to_string()).unwrap_or_default()));
+        line.push(csv_text_field(problem.map_or("", |p| p.explanation)));
         s.push_str(&line.join(","));
         s.push('\n');
     }
     for d in kernel {
         let depends: Vec<String> = d.depends_services.iter().cloned().chain(d.depends_groups.iter().map(|g| format!("group {g}"))).collect();
         let text = [
-            "Kernel driver", &d.display, d.kind.label(), &d.vendor, &d.version, "", if d.running { "Running" } else { "Stopped" },
-            &d.service, "", &d.path, d.start_type, d.kind.label(),
+            "Kernel driver", &d.display, d.kind.label(), &d.vendor, &d.version, "", d.state_label(),
+            &d.service, "", &d.path, d.start_type,
         ];
         let mut cells: Vec<String> = text.iter().map(|x| csv_text_field(x)).collect();
         cells.push(csv_field(&d.load_index.map(|i| i.to_string()).unwrap_or_default()));
@@ -2152,6 +2088,8 @@ fn drivers_csv(devices: &[DeviceDriver], kernel: &[KernelDriver], updates: Optio
         cells.push(csv_text_field(&d.group));
         cells.push(csv_text_field(&depends.join("; ")));
         cells.push(csv_text_field(&signature_text(signatures.of(&d.path))));
+        // A driver service has no problem code.
+        cells.extend([String::new(), String::new()]);
         s.push_str(&cells.join(","));
         s.push('\n');
     }
@@ -2740,11 +2678,11 @@ mod tests {
         let device = DeviceDriver { name: "Dev".into(), ..Default::default() };
         let csv = drivers_csv(&[device], &[k("a", r"C:\d\a.sys"), k("b", r"C:\d\b.sys"), k("c", r"C:\d\c.sys")], None, &signatures);
         let lines: Vec<&str> = csv.lines().collect();
-        assert!(lines[0].ends_with(",Depends on,Signature"));
-        assert!(lines[1].ends_with(",,,,,,,"), "a device row leaves it empty: {}", lines[1]);
-        assert!(lines[2].ends_with(",WHQL"), "{}", lines[2]);
-        assert!(lines[3].ends_with(",\"Could not check: busy, try later\""), "a cell with a comma is quoted: {}", lines[3]);
-        assert!(lines[4].ends_with(",Not checked"), "{}", lines[4]);
+        assert!(lines[0].ends_with(",Depends on,Signature,Problem code,Problem"));
+        assert!(lines[1].ends_with(",,,,,,,,"), "a device row without a driver file leaves it empty: {}", lines[1]);
+        assert!(lines[2].ends_with(",WHQL,,"), "{}", lines[2]);
+        assert!(lines[3].ends_with(",\"Could not check: busy, try later\",,"), "a cell with a comma is quoted: {}", lines[3]);
+        assert!(lines[4].ends_with(",Not checked,,"), "{}", lines[4]);
     }
 }
 
@@ -2762,10 +2700,12 @@ mod kernel_detail_tests {
         let csv = drivers_csv(&[], &[k], None, &SignatureBook::default());
         let mut lines = csv.lines();
         let header: Vec<&str> = lines.next().unwrap().split(',').collect();
-        assert_eq!(&header[10..], ["Start type", "Driver kind", "Load index", "Kernel memory (bytes)", "Load order group", "Depends on", "Signature"]);
+        assert_eq!(&header[10..], ["Start type", "Load index", "Kernel memory (bytes)", "Load order group", "Depends on", "Signature", "Problem code", "Problem"]);
+        assert_eq!(header.iter().filter(|h| h.contains("kind")).count(), 0, "the kind is the Class/Type column");
         let row = lines.next().unwrap();
         assert!(row.contains(",'@Disk,") && row.contains(",'-Acme,") && row.contains(",'=svc,"));
-        assert!(row.ends_with(",Boot,Kernel,7,4096,'+Base,Tcpip; group NDIS,Not checked"), "{row}");
+        assert!(row.ends_with(",Boot,7,4096,'+Base,Tcpip; group NDIS,Not checked,,"), "{row}");
+        assert!(row.contains(",Kernel,"), "the kind sits in Class/Type: {row}");
     }
 
     #[test]
@@ -2774,7 +2714,31 @@ mod kernel_detail_tests {
         let csv = drivers_csv(&[d], &[], None, &SignatureBook::default());
         let row = csv.lines().nth(1).unwrap();
         assert!(row.starts_with("Device,'=Evil,"), "{row}");
-        assert!(row.ends_with(",not checked,PCI-X,,,,,,,"), "{row}");
+        assert!(row.ends_with(",not checked,PCI-X,,,,,,,,"), "{row}");
+    }
+
+    #[test]
+    fn csv_export_device_rows_carry_their_signature_and_problem() {
+        let d = DeviceDriver { name: "Cam".into(), instance_id: "USB-1".into(), inf: "oem9.inf".into(), present: true, problem: 28, ..Default::default() };
+        let signed = Signature::Signed { signer: "=Reincubate".into() };
+        let mut book = SignatureBook::default();
+        book.insert(&d.inf_path(), signed.clone());
+        let row = drivers_csv(&[d.clone()], &[], None, &book).lines().nth(1).unwrap().to_string();
+        let explanation = problems::explain(28).explanation;
+        assert!(row.ends_with(&format!(",{},28,{}", csv_text_field(&signature_text(Some(&signed))), csv_text_field(explanation))), "{row}");
+        let none = DeviceDriver { problem: 0, inf: String::new(), ..d };
+        let row = drivers_csv(&[none], &[], None, &SignatureBook::default()).lines().nth(1).unwrap().to_string();
+        assert!(row.ends_with(",,,"), "no signature, no problem: {row}");
+    }
+
+    #[test]
+    fn csv_export_says_the_same_state_as_the_page() {
+        for (running, code, label) in [(true, None, "Running"), (false, None, "Stopped"), (false, Some(3), "Stop pending"), (true, Some(2), "Start pending")] {
+            let k = KernelDriver { running, state_code: code, ..Default::default() };
+            let csv = drivers_csv(&[], &[k.clone()], None, &SignatureBook::default());
+            assert_eq!(k.state_label(), label);
+            assert!(csv.lines().nth(1).unwrap().contains(&format!(",{label},")), "{label}: {csv}");
+        }
     }
 
     fn sample() -> KernelDriver {
@@ -3792,6 +3756,22 @@ mod store_tests {
         screen.click(&mut page, at);
         let ask = page.drv_ui.confirm_remove.clone().expect("the confirmation opens");
         assert_eq!((ask.kind, ask.names), (RemoveKind::Old, store::old_removable(&page.drv.lock().store)));
+    }
+
+    #[test]
+    fn a_refused_job_is_told_while_the_other_runs_and_the_last_outcome_returns_when_free() {
+        let (mut page, _) = page_with_runner();
+        page.drv.lock().message = Some(("Installed 2 driver updates.".into(), false));
+        page.drv.lock().busy = Some("Scanning\u{2026}".into());
+        page.drv.lock().busy_refused = true;
+        let mut screen = Screen::new();
+        let t = screen.settle(&mut page);
+        assert!(drawn(&t, BUSY_TEXT), "the refusal is told while a job runs");
+        assert!(!drawn(&t, "Installed 2 driver updates."), "the old outcome waits");
+        page.drv.lock().busy = None;
+        let t = screen.settle(&mut page);
+        assert!(!drawn(&t, BUSY_TEXT), "nothing to tell once the page is free");
+        assert!(drawn(&t, "Installed 2 driver updates."), "the last outcome is back");
     }
 
     #[test]

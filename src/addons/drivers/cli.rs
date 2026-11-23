@@ -19,7 +19,7 @@ fn scope_value(args: &[String]) -> Option<&str> {
 /// arguments (a [`KernelScope::name`]); None when the flag is missing or
 /// its value is not a valid scope.
 pub fn kernel_scope(args: &[String]) -> Option<KernelScope> {
-    KernelScope::parse(scope_value(args)?)
+    KernelScope::parse_command_line(scope_value(args)?)
 }
 
 /// What to tell the user when `--drivers-scope` has a value that is not a
@@ -27,7 +27,7 @@ pub fn kernel_scope(args: &[String]) -> Option<KernelScope> {
 /// valid.
 pub fn scope_error(args: &[String]) -> Option<String> {
     let value = scope_value(args)?;
-    if KernelScope::parse(value).is_some() {
+    if KernelScope::parse_command_line(value).is_some() {
         return None;
     }
     let valid: Vec<&str> = KernelScope::ALL.iter().map(|s| s.name()).collect();
@@ -57,6 +57,8 @@ mod tests {
         let valid = "(valid scopes: all, loaded, not-loaded, third-party, file-system)";
         assert_eq!(scope_error(&args(&["--drivers-scope", "kernel"])), Some(format!("kernel {valid}")));
         assert_eq!(scope_error(&args(&["--drivers-scope=bogus"])), Some(format!("bogus {valid}")));
+        assert_eq!(scope_error(&args(&["--drivers-scope", "unsigned"])), Some(format!("unsigned {valid}")), "the page offers Unsigned, the command line does not");
+        assert_eq!(kernel_scope(&args(&["--drivers-scope", "unsigned"])), None);
         assert_eq!(scope_error(&args(&["--drivers-scope", "Loaded"])), None, "valid in any case");
         assert_eq!(scope_error(&args(&["--page", "Drivers"])), None, "no flag, no error");
     }

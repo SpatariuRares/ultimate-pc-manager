@@ -217,7 +217,7 @@ impl KernelDriver {
     }
     /// Whether "Unload" is offered and, if not, why.
     pub fn unload_note(&self, admin: bool) -> (bool, &'static str) {
-        if !self.running {
+        if !self.is_loaded() {
             (false, "Not loaded.")
         } else if self.start_code.is_none() {
             (false, "Not offered: its configuration could not be read.")
@@ -275,6 +275,12 @@ impl KernelScope {
     /// The scope named `name` (case does not matter); None when unknown.
     pub fn parse(name: &str) -> Option<Self> {
         Self::SHOWN.into_iter().find(|s| s.name().eq_ignore_ascii_case(name.trim()))
+    }
+
+    /// The scope a `--drivers-scope` value names: only the five of
+    /// [`KernelScope::ALL`] (the page also offers Unsigned).
+    pub fn parse_command_line(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.name().eq_ignore_ascii_case(name.trim()))
     }
 
     pub fn label(self) -> &'static str {
@@ -462,6 +468,10 @@ pub struct State {
     pub busy: Option<String>,
     /// Last outcome; the flag marks an error.
     pub message: Option<(String, bool)>,
+    /// A job was asked for while another one runs and was refused: the page
+    /// says [`BUSY_TEXT`] while that job runs. Cleared when the next job
+    /// starts.
+    pub busy_refused: bool,
     /// Output of the last pnputil / sc run.
     pub output: String,
     pub reboot_required: bool,
@@ -731,18 +741,14 @@ impl Hub {
         let started = self.series.start_with(
             busy,
             uninterruptible,
-            |st| {
-                // A refusal told while the last job ran is old by now.
-                if st.message.as_ref().is_some_and(|(m, _)| m == BUSY_TEXT) {
-                    st.message = None;
-                }
-            },
+            // A refusal told while the last job ran is old by now.
+            |st| st.busy_refused = false,
             move |run| job(&hub, run),
         );
         if !started && announce && claims {
             if let Some(mut st) = self.live() {
                 if st.busy.is_some() {
-                    st.message = Some((BUSY_TEXT.into(), true));
+                    st.busy_refused = true;
                 }
             }
         }
@@ -901,37 +907,28 @@ impl Hub {
             return;
         }
         let busy = format!("Installing {} \u{2014} confirm the Windows prompt\u{2026}", plural(ids.len(), "driver update"));
-        self.spawn(Some(busy), true, move |hub, run| {
-            let items = ids.iter().map(|id| ("windows-update".to_string(), id.clone())).collect();
-            let Some(turn) = run.queue(hub.ctx.install_queue(), queue_request(items)) else { return };
-            let joined = ids.join(",");
-            let ran = hub.run_job(INSTALL_SCRIPT, "install-updates", &[("Ids", joined.as_str())], &restore_steps(restore_point));
-            drop(turn);
-            let (result, restore_note) = match ran {
-                JobRun::Done { result, note } => (result, note),
-                JobRun::Refused(reason) => {
-                    hub.refuse(run, reason, Redo::Updates(ids));
-                    return;
-                }
-            };
-            let mut outcome = install_outcome(result);
-            outcome.message.0 = with_note(restore_note, outcome.message.0);
+        let items = ids.iter().map(|id| ("windows-update".to_string(), id.clone())).collect();
+        let job = ElevatedJob {
+            busy,
+            uninterruptible: true,
+            script: INSTALL_SCRIPT,
+            name: "install-updates",
+            args: vec![("Ids", ids.join(","))],
+            steps: restore_steps(restore_point),
+            queue: Some(items),
+            redo: Some(Redo::Updates(ids)),
+        };
+        self.elevated(job, |result| {
+            let outcome = install_outcome(result);
             let done = outcome.installed;
-            {
-                let mut st = hub.follow();
-                run.release(&mut st);
-                if outcome.reboot {
-                    st.reboot_required = true;
-                }
-                st.message = Some(outcome.message);
+            let refresh = !done.is_empty();
+            let edit = move |st: &mut State| {
                 if let Some(u) = &st.updates {
                     let left: Vec<DriverUpdate> = u.iter().filter(|x| !done.contains(&x.id)).cloned().collect();
                     st.updates = Some(left.into());
                 }
-            }
-            if !done.is_empty() {
-                hub.refresh_now();
-            }
+            };
+            Finish { message: outcome.message, reboot: outcome.reboot, output: None, refresh, edit: Some(Box::new(edit)) }
         });
     }
 
@@ -986,35 +983,24 @@ impl Hub {
         }
         let busy = format!("Removing {} \u{2014} confirm the Windows prompt\u{2026}", plural(plan.run.len(), "driver package"));
         // The change is uninterruptible: it ends before the add-on turns off.
-        self.spawn(Some(busy), true, move |hub, run| {
-            let joined = plan.run.join(",");
-            let args = [("Mode", "delete"), ("Names", joined.as_str()), ("Folder", ""), ("Force", if force { "1" } else { "0" })];
-            let ran = hub.run_job(STORE_SCRIPT, "delete", &args, &restore_steps(restore_point));
-            let (result, restore_note) = match ran {
-                JobRun::Done { result, note } => (result, note),
-                JobRun::Refused(reason) => {
-                    hub.refuse(run, reason, Redo::Remove { names, force });
-                    return;
-                }
-            };
-            let mut outcome = match result.map(|v| store::parse_runs(&v)) {
+        let job = ElevatedJob {
+            busy,
+            uninterruptible: true,
+            script: STORE_SCRIPT,
+            name: "delete",
+            args: vec![("Mode", "delete".into()), ("Names", plan.run.join(",")), ("Folder", String::new()), ("Force", if force { "1" } else { "0" }.into())],
+            steps: restore_steps(restore_point),
+            queue: None,
+            redo: Some(Redo::Remove { names, force }),
+        };
+        self.elevated(job, move |result| {
+            let outcome = match result.map(|v| store::parse_runs(&v)) {
                 Ok(Ok(runs)) => store::removal_outcome(&plan.refused, &runs, |n| sizes.get(n).copied().flatten()),
                 Ok(Err(e)) => store::RemovalOutcome { message: (format!("Removal failed: {e}"), true), removed: 0, reboot: false },
                 Err(e) => store::RemovalOutcome { message: not_run(e), removed: 0, reboot: false },
             };
-            outcome.message.0 = with_note(restore_note, outcome.message.0);
-            {
-                let Some(mut st) = hub.outcome(true) else { return };
-                run.release(&mut st);
-                if outcome.reboot {
-                    st.reboot_required = true;
-                }
-                st.message = Some(outcome.message);
-            }
             // Only a removal that happened changes what the store holds.
-            if outcome.removed > 0 {
-                hub.refresh_now();
-            }
+            Finish { message: outcome.message, reboot: outcome.reboot, output: None, refresh: outcome.removed > 0, edit: None }
         });
     }
 
@@ -1037,21 +1023,78 @@ impl Hub {
             return;
         }
         let busy = format!("Backing up {} \u{2014} confirm the Windows prompt\u{2026}", plural(names.len(), "driver package"));
-        self.spawn(Some(busy), true, move |hub, run| {
-            let joined = names.join(",");
-            let args = [("Mode", "export"), ("Names", joined.as_str()), ("Folder", folder.as_str()), ("Force", "0")];
-            let result = match hub.run_job(STORE_SCRIPT, "export", &args, &[]) {
-                JobRun::Done { result, .. } => result,
-                JobRun::Refused(_) => return,
-            };
+        let job = ElevatedJob {
+            busy,
+            uninterruptible: true,
+            script: STORE_SCRIPT,
+            name: "export",
+            args: vec![("Mode", "export".into()), ("Names", names.join(",")), ("Folder", folder.clone()), ("Force", "0".into())],
+            steps: Vec::new(),
+            queue: None,
+            redo: None,
+        };
+        self.elevated(job, move |result| {
             let message = match result.map(|v| store::parse_runs(&v)) {
                 Ok(Ok(runs)) => store::backup_outcome(&folder, &runs),
                 Ok(Err(e)) => (format!("Backup failed: {e}"), true),
                 Err(e) => not_run(e),
             };
-            let Some(mut st) = hub.outcome(true) else { return };
-            run.release(&mut st);
-            st.message = Some(message);
+            Finish { message, reboot: false, output: None, refresh: false, edit: None }
+        });
+    }
+
+    /// The one skeleton of every elevated job: one job at a time, the
+    /// optional install queue, the launch with its steps, a restore point
+    /// that was refused (the page asks what to do), then the outcome `finish`
+    /// builds goes into the state. A dismissed UAC prompt changed nothing, so
+    /// no job reads the lists again after it, whatever its kind.
+    fn elevated(&self, job: ElevatedJob, finish: impl FnOnce(Result<serde_json::Value, String>) -> Finish + Send + 'static) {
+        let ElevatedJob { busy, uninterruptible, script, name, args, steps, queue, redo } = job;
+        self.spawn(Some(busy), uninterruptible, move |hub, run| {
+            let turn = match queue {
+                Some(items) => match run.queue(hub.ctx.install_queue(), queue_request(items)) {
+                    Some(turn) => Some(turn),
+                    None => return,
+                },
+                None => None,
+            };
+            let launch: Vec<(&str, &str)> = args.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let ran = hub.run_job(script, name, &launch, &steps);
+            drop(turn);
+            let (result, restore_note) = match ran {
+                JobRun::Done { result, note } => (result, note),
+                JobRun::Refused(reason) => {
+                    match redo {
+                        Some(redo) => hub.refuse(run, reason, redo),
+                        None => {
+                            if let Some(mut st) = hub.outcome(uninterruptible) {
+                                run.release(&mut st);
+                            }
+                        }
+                    }
+                    return;
+                }
+            };
+            let cancelled = matches!(&result, Err(e) if e == crate::platform::ELEVATION_CANCELLED);
+            let mut done = finish(result);
+            done.message.0 = with_note(restore_note, done.message.0);
+            {
+                let Some(mut st) = hub.outcome(uninterruptible) else { return };
+                run.release(&mut st);
+                if done.reboot {
+                    st.reboot_required = true;
+                }
+                if let Some(output) = done.output {
+                    st.output = output;
+                }
+                st.message = Some(done.message);
+                if let Some(edit) = done.edit {
+                    edit(&mut st);
+                }
+            }
+            if done.refresh && !cancelled {
+                hub.refresh_now();
+            }
         });
     }
 
@@ -1129,16 +1172,44 @@ impl Hub {
         self.pnputil("stop", service, false, "Asking the driver to unload \u{2014} confirm the Windows prompt\u{2026}", false);
     }
 
-    /// Reads the file at `path` and hashes it with SHA-256 (no network, no
-    /// administrator rights). The outcome lands in [`State::hashed`]; it is
-    /// dropped when the add-on is turned off meanwhile.
+    /// Reads the file at `path` in pieces and hashes it with SHA-256 (no
+    /// network, no administrator rights). Hashing is a read, not a change:
+    /// it runs on its own thread and neither takes the one-job-at-a-time
+    /// slot nor waits for it. The outcome lands in [`State::hashed`]; it is
+    /// dropped (and the read stops) when the add-on is turned off meanwhile.
     pub fn hash_file(&self, path: String, purpose: HashFor) {
-        self.spawn(Some("Computing the SHA-256\u{2026}".into()), false, move |hub, run| {
-            let result = std::fs::read(&path).map(|bytes| crate::platform::sha256_hex(&bytes)).map_err(|e| format!("Could not read {path}: {e}"));
+        if self.series.stopped() {
+            return;
+        }
+        let hub = self.clone();
+        let _ = std::thread::Builder::new().name("driver-hash".into()).spawn(move || {
+            let Some(result) = hub.sha256_of(&path) else { return };
             let Some(mut st) = hub.live() else { return };
-            run.release(&mut st);
             st.hashed = Some(Hashed { purpose, result });
         });
+    }
+
+    /// The SHA-256 of the file, streamed; `None` once the hub was stopped.
+    fn sha256_of(&self, path: &str) -> Option<Result<String, String>> {
+        use std::io::Read;
+        let cannot = |e: std::io::Error| format!("Could not read {path}: {e}");
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) => return Some(Err(cannot(e))),
+        };
+        let mut hash = crate::platform::Sha256::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            if self.series.stopped() {
+                return None;
+            }
+            match file.read(&mut buffer) {
+                Ok(0) => return Some(Ok(hash.finish())),
+                Ok(n) => hash.update(&buffer[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Some(Err(cannot(e))),
+            }
+        }
     }
 
     /// The finished hash, once: the page takes it and acts on it.
@@ -1149,50 +1220,61 @@ impl Hub {
     /// Installing a package is uninterruptible; scanning and unloading are
     /// not (their outcome is dropped when the add-on is turned off).
     fn pnputil(&self, mode: &'static str, arg: String, uninterruptible: bool, busy: &str, restore_point: bool) {
-        self.spawn(Some(busy.into()), uninterruptible, move |hub, run| {
-            let device = DeviceAction::from_mode(mode);
+        let device = DeviceAction::from_mode(mode);
+        let redo = match (mode, device) {
+            (_, Some(action)) => Some(Redo::Device(action, arg.clone())),
+            ("inf", None) => Some(Redo::Inf(arg.clone())),
+            _ => None,
+        };
+        let job = ElevatedJob {
+            busy: busy.into(),
+            uninterruptible,
+            script: TOOL_SCRIPT,
+            name: mode,
             // Only adding a driver package installs something.
-            let turn = match mode {
-                "inf" => match run.queue(hub.ctx.install_queue(), queue_request(vec![("inf".to_string(), arg.clone())])) {
-                    Some(turn) => Some(turn),
-                    None => return,
-                },
-                _ => None,
-            };
-            let steps = if mode == "inf" || device.is_some() { restore_steps(restore_point) } else { Vec::new() };
-            let ran = hub.run_job(TOOL_SCRIPT, mode, &[("Mode", mode), ("Arg", arg.as_str())], &steps);
-            drop(turn);
-            let (result, restore_note) = match ran {
-                JobRun::Done { result, note } => (result, note),
-                JobRun::Refused(reason) => {
-                    let redo = match device {
-                        Some(action) => Redo::Device(action, arg),
-                        None => Redo::Inf(arg),
-                    };
-                    hub.refuse(run, reason, redo);
-                    return;
-                }
-            };
-            let mut outcome = tool_outcome(mode, result);
-            outcome.message.0 = with_note(restore_note, outcome.message.0);
-            {
-                let Some(mut st) = hub.outcome(uninterruptible) else { return };
-                run.release(&mut st);
-                if outcome.reboot {
-                    st.reboot_required = true;
-                }
-                // A dismissed prompt ran nothing: the last output stays.
-                if !outcome.cancelled {
-                    st.output = outcome.output;
-                }
-                st.message = Some(outcome.message);
-            }
-            // A dismissed prompt changed nothing: the list stays as it was.
-            if !outcome.cancelled || device.is_none() {
-                hub.refresh_now();
-            }
+            queue: (mode == "inf").then(|| vec![("inf".to_string(), arg.clone())]),
+            steps: if mode == "inf" || device.is_some() { restore_steps(restore_point) } else { Vec::new() },
+            args: vec![("Mode", mode.to_string()), ("Arg", arg)],
+            redo,
+        };
+        self.elevated(job, move |result| {
+            let outcome = tool_outcome(mode, result);
+            // A dismissed prompt ran nothing: the last output stays.
+            let output = (!outcome.cancelled).then_some(outcome.output);
+            Finish { message: outcome.message, reboot: outcome.reboot, output, refresh: true, edit: None }
         });
     }
+}
+
+/// One elevated job: what to launch and how to undo a refused start.
+struct ElevatedJob {
+    /// What the page shows while it runs.
+    busy: String,
+    /// It ends before the add-on turns off (see [`Hub::spawn`]).
+    uninterruptible: bool,
+    script: &'static str,
+    /// The change's name in the job's `Steps` argument.
+    name: &'static str,
+    args: Vec<(&'static str, String)>,
+    steps: Vec<&'static Step>,
+    /// Asks the app's install queue for a turn first (an install).
+    queue: Option<Vec<(String, String)>>,
+    /// What "Continue" runs again when the restore point was refused; none
+    /// for a job that has no restore point.
+    redo: Option<Redo>,
+}
+
+/// What a finished elevated job puts into the state.
+struct Finish {
+    message: (String, bool),
+    reboot: bool,
+    /// The tool's text; `None` keeps the last one.
+    output: Option<String>,
+    /// The change may have happened: the lists are read again (never after
+    /// a dismissed prompt).
+    refresh: bool,
+    /// Anything else the outcome changes in the state.
+    edit: Option<Box<dyn FnOnce(&mut State) + Send>>,
 }
 
 /// A step an elevated job runs before its change. Adding one to a job is one
@@ -1671,8 +1753,6 @@ impl SecurityReading {
 pub enum Setting {
     On,
     Off,
-    /// Windows holds no value: the page does not guess.
-    NotSet,
     /// The value could not be read (or holds something unexpected).
     Unreadable,
 }
@@ -1683,20 +1763,38 @@ impl Setting {
         match self {
             Setting::On => "On",
             Setting::Off => "Off",
-            Setting::NotSet => "Not set",
             Setting::Unreadable => "could not be read",
         }
     }
 }
 
-/// A value read becomes a state: 1 is on, 0 is off, a missing value is not
-/// set, and a failed read or any other number is unreadable (never "off").
+/// A value read becomes a state: 1 is on, 0 is off, and a failed read, a
+/// missing value no rule fills in or any other number is unreadable (never
+/// "off"). The band shows only On, Off or "could not be read".
 pub fn setting_of(reading: &Reading) -> Setting {
     match reading {
         Reading::Value(1) => Setting::On,
         Reading::Value(0) => Setting::Off,
-        Reading::NotSet => Setting::NotSet,
-        Reading::Value(_) | Reading::Failed(_) => Setting::Unreadable,
+        Reading::NotSet | Reading::Value(_) | Reading::Failed(_) => Setting::Unreadable,
+    }
+}
+
+/// The first Windows build (11 22H2) on which Microsoft turns the
+/// vulnerable-driver blocklist on by default.
+pub const BLOCKLIST_ON_BY_DEFAULT_FROM_BUILD: u32 = 22621;
+
+/// The blocklist's reading with Windows' own default filled in: a missing
+/// value means On from build 22621 and Off before it. `build` is only asked
+/// when the value is missing; a build that cannot be read leaves the value
+/// unreadable rather than guessed.
+pub fn blocklist_reading(raw: Reading, build: impl FnOnce() -> Result<u32, String>) -> Reading {
+    match raw {
+        Reading::NotSet => match build() {
+            Ok(b) if b >= BLOCKLIST_ON_BY_DEFAULT_FROM_BUILD => Reading::Value(1),
+            Ok(_) => Reading::Value(0),
+            Err(why) => Reading::Failed(format!("The Windows build could not be read: {why}")),
+        },
+        other => other,
     }
 }
 
@@ -1747,7 +1845,6 @@ pub fn security_view(reading: Option<&SecurityReading>) -> SecurityView {
     }
     match blocklist {
         Setting::Off => notes.push("The blocklist is off: Windows does not block known vulnerable drivers.".into()),
-        Setting::NotSet => notes.push("The blocklist has no value in Windows, so we do not say whether it is on.".into()),
         _ => {}
     }
     SecurityView { items: [(MEMORY_INTEGRITY, Some(memory)), (BLOCKLIST, Some(blocklist))], note: notes.join(" ") }
@@ -2073,18 +2170,105 @@ mod tests {
 
 
     #[test]
+    fn a_dismissed_prompt_reads_the_list_again_for_no_elevated_job() {
+        for (name, start, elevated) in every_job().into_iter().filter(|j| j.2) {
+            let (hub, runner, reader) = store_hub();
+            let before = reads(&reader);
+            runner.answer(crate::platform::ELEVATION_CANCELLED);
+            start(&hub);
+            wait_until_idle(&hub);
+            assert!(elevated && !runner.launches().is_empty(), "{name}: it asked for the prompt");
+            assert_eq!(reads(&reader), before, "{name}: the list is not read again");
+            if name != "check" {
+                assert_eq!(hub.lock().message, Some((CANCELLED_TEXT.to_string(), false)), "{name}: told as cancelled, not as a failure");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pending_service_state_is_not_told_as_not_loaded() {
+        for code in 2..=7u32 {
+            let d = KernelDriver { running: false, state_code: Some(code), start_code: Some(3), ..Default::default() };
+            assert_ne!(d.unload_note(true).1, "Not loaded.", "state {code}");
+        }
+        let stopped = KernelDriver { running: false, state_code: Some(1), start_code: Some(3), ..Default::default() };
+        assert_eq!(stopped.unload_note(true), (false, "Not loaded."));
+        let unread = KernelDriver { running: false, state_code: None, ..Default::default() };
+        assert_eq!(unread.unload_note(true), (false, "Not loaded."), "no state read: only a running service is loaded");
+    }
+
+    #[test]
     fn a_second_job_while_one_runs_starts_nothing_and_says_so() {
-        for (name, start, _) in every_job() {
+        for (name, start, _) in every_job().into_iter().filter(|j| j.2) {
             let (hub, runner, _) = store_hub();
             hub.lock().busy = Some("Installing\u{2026}".into());
             start(&hub);
             std::thread::sleep(std::time::Duration::from_millis(30));
             assert!(runner.launches().is_empty(), "{name}: nothing starts while another job holds the page");
             let st = hub.lock();
-            assert_eq!(st.message, Some((BUSY_TEXT.to_string(), true)), "{name}: the user is told");
+            assert!(st.busy_refused, "{name}: the user is told");
+            assert_eq!(st.message, None, "{name}: the last outcome is kept");
             assert_eq!(st.busy.as_deref(), Some("Installing\u{2026}"), "{name}: the running job is not affected");
         }
         assert_eq!(BUSY_TEXT, "Another driver job is running. Wait for it to finish.");
+    }
+
+    /// A file of `size` zero bytes in the temp folder, and its SHA-256.
+    fn zero_file(name: &str, size: usize) -> String {
+        let path = std::env::temp_dir().join(format!("upcm-tfix-{}-{name}", std::process::id()));
+        std::fs::write(&path, vec![0u8; size]).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    fn hashed_within_a_few_seconds(hub: &Hub) -> Option<Hashed> {
+        for _ in 0..200 {
+            if let Some(h) = hub.take_hashed() {
+                return Some(h);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        None
+    }
+
+    #[test]
+    fn hashing_a_file_is_not_a_job_it_neither_waits_for_one_nor_blocks_one() {
+        // Not blocked by a running job, and it does not say another job runs.
+        let (hub, runner, _) = install_hub();
+        hub.lock().busy = Some("Installing\u{2026}".into());
+        hub.hash_file(zero_file("while-busy", 10), HashFor::Copy);
+        let hashed = hashed_within_a_few_seconds(&hub).expect("hashed while a job runs");
+        assert!(hashed.result.is_ok(), "{hashed:?}");
+        assert_eq!(hub.lock().busy.as_deref(), Some("Installing\u{2026}"), "the running job is not affected");
+        assert_eq!(hub.lock().message, None, "no refusal is told");
+        assert!(runner.launches().is_empty());
+
+        // Not blocking: a job asked for while a big file is hashed starts.
+        let (hub, runner, _) = install_hub();
+        hub.hash_file(zero_file("big", 16 * 1024 * 1024), HashFor::VirusTotal);
+        assert_eq!(hub.lock().busy, None, "hashing does not hold the page");
+        hub.scan();
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches().len(), 1, "the scan started");
+        assert!(!hub.lock().busy_refused, "and was not refused");
+        assert!(hashed_within_a_few_seconds(&hub).is_some());
+    }
+
+    #[test]
+    fn a_streamed_hash_is_the_hash_of_the_whole_file() {
+        let (hub, _, _) = install_hub();
+        let path = zero_file("abc", 0);
+        std::fs::write(&path, b"abc").unwrap();
+        hub.hash_file(path, HashFor::Copy);
+        let hashed = hashed_within_a_few_seconds(&hub).unwrap();
+        assert_eq!(hashed.result, Ok("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string()));
+        // More than one 64 KiB piece, and a size that is no multiple of a block.
+        let path = zero_file("long", 200_000);
+        hub.hash_file(path, HashFor::Copy);
+        let streamed = hashed_within_a_few_seconds(&hub).unwrap().result.unwrap();
+        assert_eq!(streamed, crate::platform::sha256_hex(&vec![0u8; 200_000]));
+        hub.hash_file(r"C:\no\such\file.sys".into(), HashFor::Copy);
+        let missing = hashed_within_a_few_seconds(&hub).unwrap().result.unwrap_err();
+        assert!(missing.starts_with(r"Could not read C:\no\such\file.sys: "), "{missing}");
     }
 
     #[test]
@@ -2095,17 +2279,18 @@ mod tests {
         hub.continue_without_restore();
         std::thread::sleep(std::time::Duration::from_millis(30));
         assert!(runner.launches().is_empty());
-        assert_eq!(hub.lock().message, Some((BUSY_TEXT.to_string(), true)));
+        assert!(hub.lock().busy_refused);
     }
 
     #[test]
     fn every_job_still_starts_when_nothing_runs_and_the_busy_notice_goes() {
         for (name, start, launches) in every_job() {
             let (hub, runner, _) = store_hub();
-            hub.lock().message = Some((BUSY_TEXT.to_string(), true));
+            hub.lock().busy_refused = true;
             start(&hub);
             wait_until_idle(&hub);
-            assert_ne!(hub.lock().message, Some((BUSY_TEXT.to_string(), true)), "{name}: an old refusal is not shown for a job that runs");
+            // Hashing is not a job: it leaves the refusal alone.
+            assert_eq!(hub.lock().busy_refused, !launches, "{name}: an old refusal is not shown for a job that runs");
             assert_eq!(!runner.launches().is_empty(), launches, "{name}");
         }
     }
@@ -3282,15 +3467,15 @@ mod security_tests {
     fn a_value_shows_as_on_off_not_set_or_unreadable() {
         assert_eq!(setting_of(&Reading::Value(1)), Setting::On);
         assert_eq!(setting_of(&Reading::Value(0)), Setting::Off);
-        assert_eq!(setting_of(&Reading::NotSet), Setting::NotSet);
+        assert_eq!(setting_of(&Reading::NotSet), Setting::Unreadable, "a missing value is only filled in by a rule that knows the default");
         assert_eq!(setting_of(&Reading::Failed("access is denied".into())), Setting::Unreadable);
         assert_eq!(setting_of(&Reading::Value(7)), Setting::Unreadable, "an unexpected number is not guessed as off");
     }
 
     #[test]
     fn every_state_has_its_own_text() {
-        let texts = [Setting::On, Setting::Off, Setting::NotSet, Setting::Unreadable].map(Setting::text);
-        assert_eq!(texts, ["On", "Off", "Not set", "could not be read"]);
+        let texts = [Setting::On, Setting::Off, Setting::Unreadable].map(Setting::text);
+        assert_eq!(texts, ["On", "Off", "could not be read"]);
     }
 
     fn reading(memory: Reading, blocklist: Reading) -> SecurityReading {
@@ -3341,10 +3526,32 @@ mod security_tests {
     }
 
     #[test]
-    fn a_missing_blocklist_value_stays_not_set_and_is_not_guessed() {
-        let v = security_view(Some(&reading(Reading::Value(1), Reading::NotSet)));
-        assert_eq!(v.items, [(MEMORY_INTEGRITY, Some(Setting::On)), (BLOCKLIST, Some(Setting::NotSet))]);
-        assert_eq!(v.note, "The blocklist has no value in Windows, so we do not say whether it is on.");
+    fn a_missing_blocklist_value_is_on_from_windows_11_22h2_and_off_before() {
+        let missing = |build: Result<u32, String>| blocklist_reading(Reading::NotSet, || build);
+        assert_eq!(setting_of(&missing(Ok(22621))), Setting::On);
+        assert_eq!(setting_of(&missing(Ok(26100))), Setting::On);
+        assert_eq!(setting_of(&missing(Ok(22000))), Setting::Off, "Windows 11 21H2");
+        assert_eq!(setting_of(&missing(Ok(19045))), Setting::Off, "Windows 10");
+        let v = security_view(Some(&reading(Reading::Value(1), missing(Ok(19045)))));
+        assert_eq!(v.items[1], (BLOCKLIST, Some(Setting::Off)));
+        assert_eq!(v.note, "The blocklist is off: Windows does not block known vulnerable drivers.");
+        let v = security_view(Some(&reading(Reading::Value(1), missing(Ok(26100)))));
+        assert_eq!((v.items[1], v.note.as_str()), ((BLOCKLIST, Some(Setting::On)), ""));
+    }
+
+    #[test]
+    fn a_missing_blocklist_value_with_an_unreadable_build_is_not_guessed() {
+        let raw = blocklist_reading(Reading::NotSet, || Err("access is denied".into()));
+        let v = security_view(Some(&reading(Reading::Value(1), raw)));
+        assert_eq!(v.items[1], (BLOCKLIST, Some(Setting::Unreadable)));
+        assert_eq!(v.note, "Windows did not let us read the vulnerable driver blocklist, so we do not guess.");
+    }
+
+    #[test]
+    fn a_blocklist_value_that_exists_never_asks_for_the_build() {
+        for raw in [Reading::Value(1), Reading::Value(0), Reading::Value(7), Reading::Failed("denied".into())] {
+            assert_eq!(blocklist_reading(raw.clone(), || panic!("the build is not needed")), raw);
+        }
     }
 
     #[test]

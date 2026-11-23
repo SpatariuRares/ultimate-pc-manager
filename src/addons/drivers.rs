@@ -1252,8 +1252,10 @@ mod reader_tests {
         let page = shown(&mut host);
         assert!(!page.contains("Not set") && !page.contains("could not be read"), "a missing value is off, as Windows Security shows it: {page}");
 
+        // Nothing on the page says "Not set": a missing value is filled in by the reader.
         let mut host = secure_host(Value(1), NotSet);
-        until("the not-set blocklist is shown", || shown(&mut host).contains("Not set"));
+        until("the strip is read", || shown(&mut host).contains("Memory integrity:"));
+        assert!(!shown(&mut host).contains("Not set"));
     }
 
     /// A reader whose Filter Manager read answers `filters`.

@@ -85,8 +85,18 @@ mod imp {
     pub fn read_security() -> SecurityReading {
         SecurityReading {
             memory_integrity: read_dword(r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity", "Enabled"),
-            blocklist: read_dword(r"SYSTEM\CurrentControlSet\Control\CI\Config", "VulnerableDriverBlocklistEnable"),
+            // Microsoft turns the blocklist on by default from build 22621,
+            // so a missing value is read together with the build.
+            blocklist: blocklist_reading(read_dword(r"SYSTEM\CurrentControlSet\Control\CI\Config", "VulnerableDriverBlocklistEnable"), read_build),
         }
+    }
+
+    /// The Windows build number (`CurrentBuildNumber`), read-only.
+    fn read_build() -> Result<u32, String> {
+        use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+        let key = winreg::RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", KEY_READ).map_err(|e| e.to_string())?;
+        let text: String = key.get_value("CurrentBuildNumber").map_err(|e| e.to_string())?;
+        text.trim().parse().map_err(|_| format!("unexpected build number \"{text}\""))
     }
 
     // ------------------------------------------------------- driver store

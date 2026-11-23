@@ -787,6 +787,69 @@ pub fn strong_confirm(ui: &mut Ui, warning: &str, understood: &mut bool) -> egui
     ui.checkbox(understood, "I understand, continue anyway")
 }
 
+/// What a confirm dialog is made of besides its own content (see
+/// [`confirm_window`]).
+pub struct ConfirmWindow<'a> {
+    pub title: &'a str,
+    /// The confirm button's words.
+    pub confirm: &'a str,
+    /// The confirm button asks Windows for administrator permission (the
+    /// UAC shield before its words).
+    pub admin: bool,
+    /// What the confirm button needs besides a free job and a ticked warning.
+    pub enabled: bool,
+    /// The "Create a restore point first" option, when the change offers one.
+    pub restore_point: Option<&'a mut bool>,
+    /// A stronger warning with the box to tick first, when the action is risky.
+    pub strong_warning: Option<(&'a str, &'a mut bool)>,
+    /// What to say while another job runs and whether none does; the confirm
+    /// button waits for a free job. `None` for a dialog that never waits.
+    pub busy: Option<(&'a str, bool)>,
+}
+
+impl<'a> ConfirmWindow<'a> {
+    /// A dialog with a plain confirm button and nothing else.
+    pub fn new(title: &'a str, confirm: &'a str) -> Self {
+        ConfirmWindow { title, confirm, admin: false, enabled: true, restore_point: None, strong_warning: None, busy: None }
+    }
+}
+
+/// A confirm dialog: a centred window without collapse or resize, its own
+/// `body`, then the stronger warning, the restore point option and the busy
+/// note when the dialog has them, and the Confirm and Cancel buttons.
+/// Gives `Some(true)` on Confirm, `Some(false)` on Cancel and `None` while
+/// the dialog waits for the user's answer.
+pub fn confirm_window(ctx: &egui::Context, spec: ConfirmWindow<'_>, body: impl FnOnce(&mut Ui)) -> Option<bool> {
+    let ConfirmWindow { title, confirm, admin, enabled, restore_point, strong_warning, busy } = spec;
+    let mut decided = None;
+    egui::Window::new(title).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+        body(ui);
+        let mut ticked = true;
+        if let Some((warning, understood)) = strong_warning {
+            strong_confirm(ui, warning, understood);
+            ticked = *understood;
+        }
+        if let Some(on) = restore_point {
+            restore_point_option(ui, on);
+        }
+        let idle = busy.map_or(true, |(text, idle)| {
+            busy_note(ui, text, idle);
+            idle
+        });
+        ui.horizontal(|ui| {
+            let ready = enabled && idle && ticked;
+            let clicked = if admin { parts::admin_button(ui, confirm, false, ready).clicked() } else { ui.add_enabled(ready, egui::Button::new(confirm)).clicked() };
+            if clicked {
+                decided = Some(true);
+            }
+            if ui.button("Cancel").clicked() {
+                decided = Some(false);
+            }
+        });
+    });
+    decided
+}
+
 /// A search field with the magnifier glyph, up to `width` wide. The
 /// magnifier stays on the left in a right-to-left header too.
 pub fn search_field(ui: &mut Ui, text: &mut String, hint: &str, width: f32) -> egui::Response {
