@@ -10,8 +10,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::sources::{run_text, Output, ServiceSource, SourceError};
+use super::sources::{run_text, ControlHost, Output, ServiceSource, SourceError};
+use crate::action_elevation::{self, Spawned};
 use crate::platform::ProcessRunner;
+use crate::system::System;
 use crate::system_lists::ServiceRow;
 
 /// The name this source puts on its rows.
@@ -58,6 +60,44 @@ impl ServiceSource for Systemd {
             rows.extend(user);
         }
         Ok(rows)
+    }
+
+    fn control(&self, host: &ControlHost, scope: &str, name: &str, action: &str) -> Result<(), String> {
+        let scope = if scope == Scope::User.label() { Scope::User } else { Scope::System };
+        control(host, scope, name, action)
+    }
+}
+
+/// What `systemctl` is asked to do for each action of the page.
+const VERBS: [&str; 5] = ["start", "stop", "restart", "enable", "disable"];
+
+/// `systemctl [--user] <verb> <unit>`. The system's units need administrator
+/// rights, asked through `pkexec`; the user's own do not.
+fn control(host: &ControlHost, scope: Scope, name: &str, action: &str) -> Result<(), String> {
+    if !VERBS.contains(&action) {
+        return Err(format!("\"{action}\" is not something a service can be asked to do."));
+    }
+    // The name goes to systemctl as one argument: a name that reads as an
+    // option, or that holds a space, a quote or a control character, is not
+    // a unit name.
+    if name.is_empty() || name.starts_with('-') || name.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\'' || c == '"') {
+        return Err(format!("\"{name}\" is not a service name."));
+    }
+    let argv: Vec<String> = ["systemctl"].into_iter().chain(scope.args(&[action, name])).map(String::from).collect();
+    let elevate = scope == Scope::System;
+    // The elevated command line is split into words again, where a backslash
+    // (instance units hold some) would be read as an escape: the name goes
+    // in single quotes, which keep every character.
+    let launched = if elevate { action_elevation::elevated_argv(System::Linux, &format!("systemctl {action} '{name}'"), host.env)? } else { argv };
+    match (host.launch)(&launched) {
+        // pkexec's own refusals keep their plain wording.
+        Spawned::Exited { code, stderr } if code != 0 && !(elevate && (code == 126 || code == 127)) => {
+            let stderr = stderr.trim();
+            Err(if stderr.is_empty() { format!("systemctl failed (exit code {code}).") } else { stderr.to_string() })
+        }
+        Spawned::NotFound if !elevate => Err("systemctl was not found on this system.".into()),
+        Spawned::Failed(e) if !elevate => Err(format!("systemctl could not be started: {e}")),
+        other => action_elevation::interpret(System::Linux, other),
     }
 }
 
@@ -399,6 +439,85 @@ mod tests {
         runner.prepare(When::Nth(0), 1, "Unknown output 'json'.");
         runner.prepare(When::Nth(1), 5, "Access denied\nmore");
         assert_eq!(list(&runner).err(), Some(SourceError::Failed("Access denied".into())));
+    }
+
+    /// Runs `control` with a launcher that records its argv and answers `answer`.
+    fn controlled(scope: &str, name: &str, action: &str, answer: Spawned) -> (Result<(), String>, Vec<Vec<String>>) {
+        let launched = std::cell::RefCell::new(Vec::new());
+        let launch = |argv: &[String]| {
+            launched.borrow_mut().push(argv.to_vec());
+            answer.clone()
+        };
+        let env = |_: &str| None;
+        let result = Systemd.control(&ControlHost { launch: &launch, env: &env }, scope, name, action);
+        (result, launched.into_inner())
+    }
+
+    fn ok() -> Spawned {
+        Spawned::Exited { code: 0, stderr: String::new() }
+    }
+
+    fn words(line: &str) -> Vec<String> {
+        line.split(' ').map(String::from).collect()
+    }
+
+    #[test]
+    fn a_system_service_is_controlled_through_pkexec() {
+        for action in ["start", "stop", "restart", "enable", "disable"] {
+            let (result, launched) = controlled("System", "ssh.service", action, ok());
+            assert_eq!(result, Ok(()));
+            assert_eq!(launched, [words(&format!("pkexec systemctl {action} ssh.service"))]);
+        }
+    }
+
+    #[test]
+    fn an_instance_unit_with_escapes_reaches_systemctl_unchanged() {
+        let name = "systemd-fsck@dev-disk-by\\x2dlabel-DATA.service";
+        let (result, launched) = controlled("System", name, "restart", ok());
+        assert_eq!(result, Ok(()));
+        assert_eq!(launched, [vec!["pkexec".to_string(), "systemctl".into(), "restart".into(), name.into()]]);
+    }
+
+    #[test]
+    fn a_user_service_is_controlled_without_pkexec() {
+        let (result, launched) = controlled("User", "pipewire.service", "restart", ok());
+        assert_eq!(result, Ok(()));
+        assert_eq!(launched, [words("systemctl --user restart pipewire.service")]);
+    }
+
+    #[test]
+    fn a_system_and_a_user_service_of_one_name_are_told_apart_by_scope() {
+        assert_eq!(controlled("System", "sync.service", "stop", ok()).1, [words("pkexec systemctl stop sync.service")]);
+        assert_eq!(controlled("User", "sync.service", "stop", ok()).1, [words("systemctl --user stop sync.service")]);
+    }
+
+    #[test]
+    fn refusal_dismissal_and_a_missing_pkexec_are_worded_plainly() {
+        let (refused, _) = controlled("System", "ssh.service", "stop", Spawned::Exited { code: 127, stderr: String::new() });
+        assert_eq!(refused, Err(action_elevation::PERMISSION_REFUSED.to_string()));
+        let (dismissed, _) = controlled("System", "ssh.service", "stop", Spawned::Exited { code: 126, stderr: String::new() });
+        assert_eq!(dismissed, Err(action_elevation::PERMISSION_DISMISSED.to_string()));
+        let (missing, _) = controlled("System", "ssh.service", "stop", Spawned::NotFound);
+        assert_eq!(missing, Err(action_elevation::PKEXEC_MISSING.to_string()));
+    }
+
+    #[test]
+    fn what_systemctl_says_is_the_error_and_a_missing_user_systemctl_is_named() {
+        let (failed, _) = controlled("System", "ssh.service", "start", Spawned::Exited { code: 1, stderr: "Failed to start ssh.service: Unit ssh.service not found.\n".into() });
+        assert_eq!(failed, Err("Failed to start ssh.service: Unit ssh.service not found.".to_string()));
+        let (silent, _) = controlled("User", "x.service", "start", Spawned::Exited { code: 5, stderr: String::new() });
+        assert_eq!(silent, Err("systemctl failed (exit code 5).".to_string()));
+        let (missing, _) = controlled("User", "x.service", "start", Spawned::NotFound);
+        assert_eq!(missing, Err("systemctl was not found on this system.".to_string()));
+    }
+
+    #[test]
+    fn an_unknown_action_or_a_name_that_is_not_a_unit_starts_nothing() {
+        for (name, action) in [("ssh.service", "mask"), ("--now", "start"), ("a b.service", "start"), ("", "start"), ("it's.service", "stop")] {
+            let (result, launched) = controlled("System", name, action, ok());
+            assert!(result.is_err(), "{name} {action}");
+            assert!(launched.is_empty(), "nothing is launched for {name} {action}");
+        }
     }
 
     #[test]

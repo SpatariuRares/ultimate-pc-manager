@@ -4,13 +4,14 @@
 
 use std::sync::Mutex;
 
-use super::{ServiceRow, StartupRow, SystemLists};
+use super::{ServiceKey, ServiceRow, StartupRow, SystemLists};
 
 struct State {
     services: Result<Vec<ServiceRow>, String>,
     service_reads: usize,
     service_control: Result<(), String>,
     service_requests: Vec<(String, String)>,
+    service_targets: Vec<ServiceKey>,
 
     startup: Vec<StartupRow>,
     startup_reads: usize,
@@ -31,6 +32,7 @@ impl Default for FakeSystem {
                 service_reads: 0,
                 service_control: Ok(()),
                 service_requests: Vec::new(),
+                service_targets: Vec::new(),
                 startup: Vec::new(),
                 startup_reads: 0,
                 startup_outcome: Ok(()),
@@ -66,6 +68,11 @@ impl FakeSystem {
         self.state.lock().unwrap().service_requests.clone()
     }
 
+    /// The services control was asked for (name, manager and scope), in order.
+    pub fn service_targets(&self) -> Vec<ServiceKey> {
+        self.state.lock().unwrap().service_targets.clone()
+    }
+
     /// The list the next startup reads return.
     pub fn script_startup(&self, rows: Vec<StartupRow>) {
         self.state.lock().unwrap().startup = rows;
@@ -94,9 +101,10 @@ impl SystemLists for FakeSystem {
         s.services.clone()
     }
 
-    fn control_service(&self, name: &str, action: &str) -> Result<(), String> {
+    fn control_service(&self, service: &ServiceKey, action: &str) -> Result<(), String> {
         let mut s = self.state.lock().unwrap();
-        s.service_requests.push((name.into(), action.into()));
+        s.service_requests.push((service.name.clone(), action.into()));
+        s.service_targets.push(service.clone());
         s.service_control.clone()
     }
 

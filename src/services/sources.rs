@@ -4,15 +4,25 @@
 //! Several sources coexist at runtime, so a trait is the right shape here:
 //! each source lists its own services, marks every row with itself and the
 //! scope the service belongs to, and may fail without hiding the others.
-//! Control (start, stop, restart) is added per source, on the same trait, by
-//! the tickets that need it. Every external program goes through the process
-//! runner.
+//! Control (start, stop, restart, enable and disable at boot) is a method of
+//! the same trait that a source implements when it can; the default says it
+//! cannot. Every external program goes through the process runner (listing)
+//! or the launcher (control, which may need administrator rights).
 
 use std::sync::atomic::AtomicBool;
 
+use crate::action_elevation::Spawned;
 use crate::availability::{unavailable_error, Feature};
 use crate::platform::{ProcessRunner, Ran};
-use crate::system_lists::ServiceRow;
+use crate::system_lists::{ServiceKey, ServiceRow};
+
+/// What control needs from the system: how a program is started and waited
+/// for (the one place a launch happens, so tests see command lines and start
+/// nothing) and the environment.
+pub struct ControlHost<'a> {
+    pub launch: &'a dyn Fn(&[String]) -> Spawned,
+    pub env: &'a dyn Fn(&str) -> Option<String>,
+}
 
 /// Why a source gave no list.
 #[derive(Debug, PartialEq, Eq)]
@@ -31,6 +41,22 @@ pub trait ServiceSource {
 
     /// Every service of this source, in every scope it has.
     fn list(&self, runner: &dyn ProcessRunner) -> Result<Vec<ServiceRow>, SourceError>;
+
+    /// Starts, stops or restarts the service `name` of `scope`, or turns it
+    /// on or off at boot (`action` is "start", "stop", "restart", "enable"
+    /// or "disable"). A source that cannot control services keeps this
+    /// default.
+    fn control(&self, _host: &ControlHost, _scope: &str, _name: &str, _action: &str) -> Result<(), String> {
+        Err(format!("Services of {} cannot be started or stopped from here.", self.name()))
+    }
+}
+
+/// Asks the source that lists `service` to do `action` on it.
+pub fn control(sources: &[Box<dyn ServiceSource>], host: &ControlHost, service: &ServiceKey, action: &str) -> Result<(), String> {
+    match sources.iter().find(|s| s.name() == service.source) {
+        Some(source) => source.control(host, &service.scope, &service.name, action),
+        None => Err(format!("\"{}\" belongs to a service manager this app does not know.", service.name)),
+    }
 }
 
 /// The services of every source, sorted by name. A source that is absent is
@@ -108,6 +134,46 @@ mod tests {
                 Err(SourceError::Failed(why)) => Err(SourceError::Failed(why.clone())),
             }
         }
+    }
+
+    struct Controlling;
+
+    impl ServiceSource for Controlling {
+        fn name(&self) -> &'static str {
+            "ctl"
+        }
+        fn list(&self, _: &dyn ProcessRunner) -> Result<Vec<ServiceRow>, SourceError> {
+            Err(SourceError::Absent)
+        }
+        fn control(&self, _: &ControlHost, scope: &str, name: &str, action: &str) -> Result<(), String> {
+            Err(format!("{action} {scope} {name}"))
+        }
+    }
+
+    fn with_host<T>(f: impl FnOnce(&ControlHost) -> T) -> T {
+        f(&ControlHost { launch: &|_| Spawned::Exited { code: 0, stderr: String::new() }, env: &|_| None })
+    }
+
+    fn key(name: &str, source: &str, scope: &str) -> ServiceKey {
+        ServiceKey { name: name.into(), source: source.into(), scope: scope.into() }
+    }
+
+    #[test]
+    fn control_goes_to_the_source_named_by_the_key_with_its_scope() {
+        let sources: Vec<Box<dyn ServiceSource>> = vec![Box::new(Fixed("a", Ok(Vec::new()))), Box::new(Controlling)];
+        let said = with_host(|h| control(&sources, h, &key("x.service", "ctl", "User"), "stop"));
+        assert_eq!(said, Err("stop User x.service".to_string()));
+    }
+
+    #[test]
+    fn a_source_without_control_says_so_and_an_unknown_source_is_refused() {
+        let sources: Vec<Box<dyn ServiceSource>> = vec![Box::new(Fixed("a", Ok(Vec::new())))];
+        let no_control = with_host(|h| control(&sources, h, &key("x", "a", ""), "start")).unwrap_err();
+        assert_eq!(no_control, "Services of a cannot be started or stopped from here.");
+        let unknown = with_host(|h| control(&sources, h, &key("x", "zzz", ""), "start")).unwrap_err();
+        assert!(unknown.contains("does not know"), "{unknown}");
+        let nameless = with_host(|h| control(&sources, h, &ServiceKey::from("x"), "start"));
+        assert!(nameless.is_err(), "a key without a manager reaches no source");
     }
 
     fn boxed(list: Vec<Fixed>) -> Vec<Box<dyn ServiceSource>> {

@@ -46,7 +46,7 @@ features! {
     Notifications,
     /// Listing the services the system runs.
     ServiceListing,
-    /// Starting, stopping and restarting services.
+    /// Starting, stopping and restarting services, and turning them on or off at boot.
     ServiceControl,
     /// Priority, affinity, suspend and efficiency of processes.
     ProcessControl,
@@ -102,9 +102,9 @@ pub(crate) fn system_has(feature: Feature) -> bool {
     };
     // Linux: signals, nice values and affinity work through kill, renice and taskset;
     // the startup entries are read from the XDG autostart folders; the service
-    // list comes from its sources (they say when no service manager is there).
+    // list and its control come from its sources (they say when no service manager is there).
     #[cfg(target_os = "linux")]
-    return matches!(feature, Feature::ProcessControl | Feature::StartupEntries | Feature::ServiceListing);
+    return matches!(feature, Feature::ProcessControl | Feature::StartupEntries | Feature::ServiceListing | Feature::ServiceControl);
     // No current feature has a macOS implementation yet.
     #[cfg(target_os = "macos")]
     return {
@@ -205,9 +205,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn on_linux_process_control_startup_entries_and_the_service_list_are_in_the_system_so_far() {
+    fn on_linux_process_control_startup_entries_and_the_service_list_and_control_are_in_the_system_so_far() {
         for &feature in Feature::ALL {
-            assert_eq!(system_has(feature), matches!(feature, Feature::ProcessControl | Feature::StartupEntries | Feature::ServiceListing), "{feature:?}");
+            assert_eq!(system_has(feature), matches!(feature, Feature::ProcessControl | Feature::StartupEntries | Feature::ServiceListing | Feature::ServiceControl), "{feature:?}");
         }
     }
 

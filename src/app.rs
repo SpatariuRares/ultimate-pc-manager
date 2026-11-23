@@ -1437,16 +1437,16 @@ impl TaskApp {
                 ctx.copy_text(text.clone());
                 self.say(format!("Copied \"{text}\""));
             }
-            Action::Service(name, what) => {
-                match self.system.control_service(&name, what) {
-                    Ok(()) => {
-                        let verb = match what {
-                            "start" => "Started",
-                            "stop" => "Stopped",
-                            _ => "Restarted",
-                        };
-                        self.say(format!("{verb} {name}"))
-                    }
+            Action::Service(service, what) => {
+                let name = &service.name;
+                match self.system.control_service(&service, what) {
+                    Ok(()) => match what {
+                        "start" => self.say(format!("Started {name}")),
+                        "stop" => self.say(format!("Stopped {name}")),
+                        "enable" => self.say(format!("{name} will start at boot")),
+                        "disable" => self.say(format!("{name} will not start at boot")),
+                        _ => self.say(format!("Restarted {name}")),
+                    },
                     Err(e) => self.say(e),
                 }
                 self.reload_services();
@@ -2402,6 +2402,20 @@ mod tests {
             assert_eq!(fake.service_requests(), vec![("Spooler".to_string(), what.to_string())]);
             assert_eq!(said(&app).as_deref(), Some(said_text));
             assert_eq!(fake.service_reads(), 1, "{what} rereads the list");
+        }
+    }
+
+    #[test]
+    fn a_service_control_carries_the_manager_and_scope_and_says_what_changed_at_boot() {
+        let ctx = egui::Context::default();
+        let key = crate::system_lists::ServiceKey { name: "sync.service".into(), source: "systemd".into(), scope: "User".into() };
+        for (what, said_text) in [("enable", "sync.service will start at boot"), ("disable", "sync.service will not start at boot")] {
+            let fake = std::sync::Arc::new(crate::system_lists::fake::FakeSystem::default());
+            let mut app = TaskApp::headless(Settings::default(), Default::default()).on_system(fake.clone());
+            app.run_action(&ctx, Action::Service(key.clone(), what));
+            assert_eq!(fake.service_targets(), vec![key.clone()], "the seam gets the whole key, not the name");
+            assert_eq!(said(&app).as_deref(), Some(said_text));
+            assert_eq!(fake.service_reads(), 1);
         }
     }
 
