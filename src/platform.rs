@@ -364,7 +364,7 @@ impl ProcessRunner for SystemRunner {
         imp::run_and_wait(file, params, stop)
     }
     fn open(&self, target: &str) -> Result<(), String> {
-        crate::winsys::run_new_task(target)
+        crate::run_open::run_new_task(target)
     }
     fn restart_elevated(&self, args: &[&str]) -> Result<(), String> {
         imp::restart_elevated(args)
@@ -977,7 +977,7 @@ mod imp {
     use windows_sys::Win32::UI::Controls::Dialogs::{GetOpenFileNameW, GetSaveFileNameW, OPENFILENAMEW};
     use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 
-    use crate::winsys::wide;
+    use crate::win_ffi::wide;
 
     /// The text of a NUL-terminated UTF-16 buffer.
     fn from_wide(buf: &[u16]) -> String {

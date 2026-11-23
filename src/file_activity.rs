@@ -750,7 +750,7 @@ mod etw {
 
     static NEXT: AtomicU32 = AtomicU32::new(0);
 
-    use crate::winsys::wide;
+    use crate::win_ffi::wide;
 
     /// An EVENT_TRACE_PROPERTIES with room for a session and a file name
     /// after it, aligned for the structure.

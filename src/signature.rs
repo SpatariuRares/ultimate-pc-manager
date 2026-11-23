@@ -102,7 +102,7 @@ pub const NOT_VERIFIED: &str = "Not verified";
 /// (embedded) signature, else a catalog's.
 #[cfg(windows)]
 pub fn verify(path: &str) -> Option<Signature> {
-    let wide = crate::winsys::wide(path);
+    let wide = crate::win_ffi::wide(path);
     // SAFETY: `wide` is a NUL-terminated path that outlives both calls.
     unsafe { win::embedded(&wide).or_else(|| win::catalog(&wide)) }
 }
@@ -198,7 +198,7 @@ mod win {
         }
         let mut sig = None;
         for algorithm in ["SHA256", "SHA1"] {
-            let alg = crate::winsys::wide(algorithm);
+            let alg = crate::win_ffi::wide(algorithm);
             let mut admin = 0isize;
             if CryptCATAdminAcquireContext2(&mut admin, null(), alg.as_ptr(), null(), 0) == 0 {
                 continue;
@@ -212,7 +212,7 @@ mod win {
                     let mut info = CATALOG_INFO { cbStruct: std::mem::size_of::<CATALOG_INFO>() as u32, ..Default::default() };
                     if CryptCATCatalogInfoFromContext(cat, &mut info, 0) != 0 {
                         // The member tag is the hash in upper-case hex.
-                        let tag = crate::winsys::wide(&hash.iter().map(|b| format!("{b:02X}")).collect::<String>());
+                        let tag = crate::win_ffi::wide(&hash.iter().map(|b| format!("{b:02X}")).collect::<String>());
                         let mut member = WINTRUST_CATALOG_INFO {
                             cbStruct: std::mem::size_of::<WINTRUST_CATALOG_INFO>() as u32,
                             pcwszCatalogFilePath: info.wszCatalogFile.as_ptr(),

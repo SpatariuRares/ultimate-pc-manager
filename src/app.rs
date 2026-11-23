@@ -15,7 +15,7 @@ use crate::sampler::{Sampler, Snapshot};
 use crate::settings::{Settings, SPEEDS};
 use crate::widgets::{local_ip, logo, nav_entry_back, nav_heading, push, refresh_button};
 use crate::system_lists::SystemLists;
-use crate::winsys;
+use crate::process_actions;
 
 /// The open page: one of the core pages, or the page of an add-on (by its
 /// registry id; the add-on draws it through the host).
@@ -1335,7 +1335,7 @@ impl TaskApp {
                 });
                 match spawned {
                     Ok(_) => self.pages.processes.watch_dump(rx),
-                    Err(_) => self.say(winsys::DUMP_FAILED),
+                    Err(_) => self.say(process_actions::DUMP_FAILED),
                 }
             }
             Action::UacVirtualization(pids) => {
@@ -2054,9 +2054,9 @@ mod tests {
         let mut app = with_windows_process(false);
         app.message = None;
         let asked = Request::Dump { pid: 4242, name: "Code.exe".into(), dir: std::env::temp_dir() };
-        app.recording().fail(asked.clone(), winsys::DUMP_FAILED);
+        app.recording().fail(asked.clone(), process_actions::DUMP_FAILED);
         app.run_action(&ctx, Action::Dump { pid: 4242, name: "Code.exe".into() });
-        assert_eq!(frames_until_said(&mut app).as_deref(), Some(winsys::DUMP_FAILED));
+        assert_eq!(frames_until_said(&mut app).as_deref(), Some(process_actions::DUMP_FAILED));
         assert_eq!(app.pages.processes.dump_question, None);
         assert_eq!(app.recording().requests(), [asked]);
     }

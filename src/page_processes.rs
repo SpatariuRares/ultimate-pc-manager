@@ -845,7 +845,7 @@ impl ProcessesPage {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                done.push(Err(crate::winsys::DUMP_FAILED.to_string()));
+                done.push(Err(crate::process_actions::DUMP_FAILED.to_string()));
                 false
             }
         });
@@ -2644,7 +2644,7 @@ pub(crate) mod tests {
     }
 
     /// Code.exe's Set affinity submenu read as `affinity`.
-    fn affinity_menu(affinity: Option<crate::winsys::Affinity>, rows: usize) -> Vec<MenuEntry> {
+    fn affinity_menu(affinity: Option<crate::process_actions::Affinity>, rows: usize) -> Vec<MenuEntry> {
         let p = proc(7, "Code.exe", "spata", 0.0, 0);
         let q = proc(8, "node.exe", "spata", 0.0, 0);
         let state = MenuState { affinity, ..no_view_state(&[]) };
@@ -2658,7 +2658,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_process_menu_reads_priority_affinity_and_window_through_the_seam() {
-        use crate::winsys::Affinity;
+        use crate::process_actions::Affinity;
         let app = Shown::headless(crate::settings::Settings::default(), tree_sample());
         let seam = app.system.clone();
         let (p, q) = (proc(4_000_000_001, "a.exe", "spata", 0.0, 0), proc(4_000_000_002, "b.exe", "spata", 0.0, 0));
@@ -2691,7 +2691,7 @@ pub(crate) mod tests {
 
     #[test]
     fn set_affinity_lists_every_logical_cpu_ticked_from_the_mask() {
-        use crate::winsys::Affinity;
+        use crate::process_actions::Affinity;
         // Four logical processors, the process on CPU 0 and CPU 2.
         let sub = affinity_menu(Some(Affinity::Mask { process: 0b0101, system: 0b1111 }), 1);
         assert_eq!(labels(&sub), ["All processors", "", "CPU 0", "CPU 1", "CPU 2", "CPU 3"]);
@@ -2718,13 +2718,13 @@ pub(crate) mod tests {
 
     #[test]
     fn clearing_the_last_cpu_is_refused_with_the_message() {
-        let sub = affinity_menu(Some(crate::winsys::Affinity::Mask { process: 0b0100, system: 0b1111 }), 1);
+        let sub = affinity_menu(Some(crate::process_actions::Affinity::Mask { process: 0b0100, system: 0b1111 }), 1);
         assert_eq!(menu_item(&sub, "CPU 2"), (true, vec![Action::Say("At least one processor must remain selected.".into())]));
     }
 
     #[test]
     fn set_affinity_is_greyed_for_several_processor_groups_and_for_a_process_it_cannot_open() {
-        let sub = affinity_menu(Some(crate::winsys::Affinity::ManyGroups), 1);
+        let sub = affinity_menu(Some(crate::process_actions::Affinity::ManyGroups), 1);
         assert_eq!(labels(&sub), ["Unavailable for this processor-group topology"]);
         assert_eq!(menu_item(&sub, "Unavailable for this processor-group topology"), (false, vec![]));
         let item = affinity_menu(None, 1);

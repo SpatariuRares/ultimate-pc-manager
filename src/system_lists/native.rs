@@ -1,5 +1,5 @@
 //! The Windows adapter: the Service Control Manager and the startup
-//! locations, through [`crate::winsys`].
+//! locations, through the per-concern modules (`crate::services`, `crate::startup_entries`).
 
 use super::{ServiceRow, StartupRow, SystemLists, STARTUP_GONE};
 
@@ -8,15 +8,15 @@ pub struct NativeSystem;
 
 impl SystemLists for NativeSystem {
     fn list_services(&self) -> Result<Vec<ServiceRow>, String> {
-        crate::winsys::list_services()
+        crate::services::list_services()
     }
 
     fn control_service(&self, name: &str, action: &str) -> Result<(), String> {
-        crate::winsys::control_service(name, action)
+        crate::services::control_service(name, action)
     }
 
     fn list_startup(&self) -> Vec<StartupRow> {
-        crate::winsys::list_startup()
+        crate::startup_entries::list_startup()
             .into_iter()
             .map(|e| StartupRow { id: startup_id(&e), name: e.name, command: e.command, location: e.location, enabled: e.enabled })
             .collect()
@@ -25,8 +25,8 @@ impl SystemLists for NativeSystem {
     fn set_startup_enabled(&self, id: &str, enable: bool) -> Result<(), String> {
         // Read the entry again by its identity: where it lives (hive, key)
         // is Windows' business, not the page's.
-        match crate::winsys::list_startup().iter().find(|e| startup_id(e) == id) {
-            Some(entry) => crate::winsys::set_startup_enabled(entry, enable),
+        match crate::startup_entries::list_startup().iter().find(|e| startup_id(e) == id) {
+            Some(entry) => crate::startup_entries::set_startup_enabled(entry, enable),
             None => Err(STARTUP_GONE.into()),
         }
     }
@@ -34,7 +34,7 @@ impl SystemLists for NativeSystem {
 
 /// A startup entry's identity: its location with its name (registry) or its
 /// file (Startup folder).
-fn startup_id(e: &crate::winsys::StartupEntry) -> String {
+fn startup_id(e: &crate::startup_entries::StartupEntry) -> String {
     let key = if e.location == "Startup folder" { &e.command } else { &e.name };
     format!("{}|{key}", e.location)
 }
