@@ -31,6 +31,7 @@ impl Nvml {
 
 /// Whether a PC whose cards are `listed` (by DXCore) is one NVML is for: it
 /// has an NVIDIA card, or its cards are unknown.
+#[cfg_attr(target_os = "linux", allow(dead_code))] // Linux asks the kernel's card list instead
 pub fn for_a_pc_with(listed: &Result<Vec<gpu::Adapter>, String>) -> bool {
     listed.as_ref().map_or(true, |cards| cards.iter().any(|a| a.vendor_id == gpu::NVIDIA))
 }
@@ -42,6 +43,10 @@ impl Provider for Nvml {
 
     /// Only a PC with an NVIDIA card lists NVML.
     fn for_this_pc(&mut self) -> bool {
+        // Linux has no DXCore: the kernel's list of video cards answers.
+        #[cfg(target_os = "linux")]
+        return imp::has_card(&crate::fs_root::FsRoot::system());
+        #[cfg(not(target_os = "linux"))]
         for_a_pc_with(&super::dxcore::adapters())
     }
 
