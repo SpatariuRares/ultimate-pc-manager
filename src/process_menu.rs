@@ -5,6 +5,7 @@
 use egui::{RichText, Ui};
 
 use crate::app::Action;
+use crate::availability::{is_available, Feature};
 use crate::page_processes::ProcView;
 use crate::sampler::ProcRow;
 use crate::process_actions::{self, PRIORITIES};
@@ -113,6 +114,20 @@ pub enum MenuSlot {
     OpenFileLocation,
     SearchOnline,
     CopyName,
+}
+
+impl MenuSlot {
+    /// The system feature the item needs, if it needs one; an item whose
+    /// feature the system lacks is hidden.
+    fn feature(self) -> Option<Feature> {
+        match self {
+            MenuSlot::EfficiencyMode => Some(Feature::ProcessEfficiency),
+            MenuSlot::AnalyzeWaitChain => Some(Feature::ProcessWaitChain),
+            MenuSlot::UacVirtualization => Some(Feature::ProcessUacVirtualization),
+            MenuSlot::CreateDump => Some(Feature::ProcessDump),
+            _ => None,
+        }
+    }
 }
 
 /// A line of a process's menu layout: an item's place or a separator.
@@ -259,6 +274,9 @@ pub fn menu_entries(p: &ProcRow, rows: &[&ProcRow], state: &MenuState) -> Vec<Me
             }
             MenuLine::Item(slot) => *slot,
         };
+        if slot.feature().is_some_and(|f| !is_available(f)) {
+            continue;
+        }
         let entry = match slot {
             MenuSlot::Inspect if single => {
                 MenuEntry::Item { label: INSPECT.into(), bold: true, enabled: true, checked: None, actions: vec![Action::Inspect(p.pid)] }
