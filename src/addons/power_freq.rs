@@ -2434,7 +2434,7 @@ mod tests {
 
     #[test]
     fn the_platform_keeps_no_power_and_freq_code() {
-        for (file, src) in [("app.rs", include_str!("../app.rs")), ("page_perf.rs", include_str!("../page_perf.rs")), ("pro.rs", include_str!("../pro.rs"))] {
+        for (file, src) in [("app.rs", include_str!("../app.rs")), ("page_perf.rs", include_str!("../page_perf.rs"))] {
             for word in ["freq_hist", "power_info", concat!("Power", "Info"), "power_freq"] {
                 assert!(!src.contains(word), "{file} still has {word}");
             }

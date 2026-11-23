@@ -70,7 +70,7 @@ impl History {
         if let Ok(saved) = serde_json::from_str::<Saved>(&text) {
             return (History { path: Some(path), runs: saved.runs }, None);
         }
-        let aside = set_aside_name(&path, crate::pro::local_secs());
+        let aside = set_aside_name(&path, crate::platform::local_secs());
         let history = History { path: Some(path.clone()), runs: Vec::new() };
         let warning = match std::fs::rename(&path, &aside).map_err(|e| e.to_string()).and_then(|_| history.write()) {
             Ok(()) => format!(

@@ -324,7 +324,7 @@ fn history_section(ui: &mut Ui, d: &DiskSpace, running: bool, t: &Theme) -> Hist
     if shelf.entries.is_empty() {
         ui.label(RichText::new(history::EMPTY).size(12.5).color(t.faint));
     }
-    let today = crate::pro::local_secs().div_euclid(86_400);
+    let today = crate::platform::local_secs().div_euclid(86_400);
     for e in &shelf.entries {
         let done = Done::at(e.finished, 0);
         let when = format!("{} {}", text::day_word(done.day, today), done.at);

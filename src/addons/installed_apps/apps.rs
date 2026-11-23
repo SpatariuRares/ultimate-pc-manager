@@ -355,7 +355,7 @@ impl Hub {
             // The `true` of a message marks an error.
             if let Some(why) = unavailable_text(Feature::UninstallRegistry) {
                 st.apps.clear();
-                st.listed_at = crate::pro::clock_now();
+                st.listed_at = crate::platform::clock_now();
                 st.message = Some((why, true));
                 return;
             }
@@ -404,7 +404,7 @@ impl Hub {
         st.apps = apps.to_vec();
         if done {
             st.listing = false;
-            st.listed_at = crate::pro::clock_now();
+            st.listed_at = crate::platform::clock_now();
         }
     }
 
@@ -475,7 +475,7 @@ impl Hub {
                 let State { apps, .. } = &mut *st;
                 match_winget(apps, &rows);
                 st.winget = Some(rows);
-                st.checked_at = crate::pro::clock_now();
+                st.checked_at = crate::platform::clock_now();
                 st.checked_by_hand |= by_hand;
                 st.message = None;
             }
