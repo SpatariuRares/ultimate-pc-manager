@@ -36,8 +36,11 @@ const NAME: &str = "Drivers";
 
 /// The note under its requirements in Settings › Add-ons.
 pub const NEEDS: &str = "Searching for driver updates needs the internet and the Windows Update service. \
-Administrator rights are asked through UAC only to install, scan for hardware changes and unload drivers \
-(with PowerShell, pnputil and sc): do not start this app as administrator. \nThe internet is also used by \"Look up on VirusTotal\", which is off by default and sends only a file's SHA-256.";
+Administrator rights are asked through UAC only to install, scan for hardware changes, unload drivers, \
+remove driver packages, back up drivers, disable, enable, restart or roll back a device, and create a restore point \
+(with PowerShell, pnputil and sc): do not start this app as administrator. \
+Reading the lists, problems, signatures, driver store, security settings and filter drivers needs normal rights only. \
+\nThe internet is also used by \"Look up on VirusTotal\", which is off by default and sends only a file's SHA-256.";
 
 /// Where the add-on reads the installed devices and kernel drivers from:
 /// the Windows reader in the app, a fake in tests. Owned by the add-on, not
@@ -426,6 +429,36 @@ mod tests {
     }
 
     #[test]
+    fn turning_off_during_a_removal_a_backup_or_a_device_action_waits_for_it_and_starts_nothing_more() {
+        use engine::DeviceAction;
+        type Job = Box<dyn Fn(&Hub)>;
+        let jobs: Vec<(&str, Job)> = vec![
+            ("removal", Box::new(|h| h.remove_packages(vec!["oem1.inf".into()], false))),
+            ("removal with a restore point", Box::new(|h| h.remove_packages(vec!["oem1.inf".into()], true))),
+            ("backup", Box::new(|h| h.back_up(None, r"D:\B\Drivers".into()))),
+            ("disable", Box::new(|h| h.device_action_with(DeviceAction::Disable, "PCI\\X".into(), false))),
+            ("restart with a restore point", Box::new(|h| h.device_action_with(DeviceAction::Restart, "PCI\\X".into(), true))),
+            ("rollback", Box::new(|h| h.device_action_with(DeviceAction::Rollback, "PCI\\X".into(), true))),
+        ];
+        for (name, start) in jobs {
+            let (ctx, runner) = AddonContext::recording();
+            let mut addon = on(&ctx);
+            runner.hold();
+            let h = hub(&mut addon);
+            let package = |name: &str| store::StorePackage { published: name.into(), original: "a.inf".into(), provider: "Acme".into(), ..Default::default() };
+            h.lock().store = vec![package("oem1.inf"), package("oem2.inf")].into();
+            start(&h);
+            runner.wait_for(1);
+            addon.stop();
+            assert!(addon.uninterruptible(), "{name}: turning off does not cut the elevated job short");
+            h.remove_packages(vec!["oem2.inf".into()], false);
+            runner.release();
+            until("the job ends", || !addon.uninterruptible());
+            assert_eq!(runner.launches().len(), 1, "{name}: nothing else is started once off");
+        }
+    }
+
+    #[test]
     fn turning_off_stops_checking_windows_update_at_once() {
         let (ctx, runner) = AddonContext::recording();
         let mut addon = on(&ctx);
@@ -562,6 +595,73 @@ mod settings_tests {
         for words in ["Windows Update service", "UAC", "install", "scan", "unload", "not start this app as administrator"] {
             assert!(note.contains(words), "the note says {words:?}: {note}");
         }
+    }
+
+    #[test]
+    fn the_requirements_list_the_new_needs_administrator_for_changes_and_the_network_for_virustotal() {
+        let (host, _) = crate::addons::AddonHost::for_tests(&serde_json::json!({ "drivers": { "enabled": false } }));
+        let note = crate::addons::overview::Overview::of(&host, Some("drivers")).detail.unwrap().note.expect("a note");
+        let (rights, internet) = note.split_once('\n').expect("the internet use of VirusTotal is on its own line");
+        for words in ["remove driver packages", "back up drivers", "disable, enable, restart or roll back a device", "restore point"] {
+            assert!(rights.contains(words), "administrator rights are asked to {words:?}: {rights}");
+        }
+        for words in ["lists", "problems", "signatures", "driver store", "security settings", "filter drivers", "normal rights only"] {
+            assert!(rights.contains(words), "reads need normal rights, {words:?}: {rights}");
+        }
+        for words in ["VirusTotal", "off by default", "only a file's SHA-256"] {
+            assert!(internet.contains(words), "the network line says {words:?}: {internet}");
+        }
+    }
+
+    #[test]
+    fn every_tab_and_kernel_scope_comes_back_after_turning_it_off_and_on() {
+        use super::page::Scope::*;
+        let (ctx, _) = AddonContext::recording();
+        for (scope, name) in [(Hardware, "hardware"), (Builtin, "builtin"), (Problems, "problems"), (Kernel, "kernel"), (Store, "store"), (Filters, "filters")] {
+            let mut addon = Drivers::default();
+            addon.start(&ctx);
+            addon.page().unwrap().drv_ui.scope = scope;
+            addon.stop();
+            let saved = addon.settings();
+            assert_eq!(saved.get("scope").and_then(|s| s.as_str()).unwrap_or("hardware"), name, "saved by name");
+            let mut next_run = Drivers::default();
+            next_run.load_settings(&saved);
+            next_run.start(&ctx);
+            assert!(next_run.page().unwrap().drv_ui.scope == scope, "{name} comes back");
+        }
+        for scope in KernelScope::SHOWN {
+            let mut addon = Drivers::default();
+            addon.start(&ctx);
+            let ui = &mut addon.page().unwrap().drv_ui;
+            ui.scope = Kernel;
+            ui.kernel_filter = scope;
+            addon.stop();
+            let saved = addon.settings();
+            let mut next_run = Drivers::default();
+            next_run.load_settings(&saved);
+            next_run.start(&ctx);
+            assert!(next_run.page().unwrap().drv_ui.kernel_filter == scope, "{} comes back: {saved}", scope.name());
+        }
+    }
+
+    #[test]
+    fn every_new_option_is_saved_together_and_restored_once_on_again() {
+        let (ctx, _) = AddonContext::recording();
+        let mut addon = Drivers::default();
+        addon.load_settings(&serde_json::json!({ "virusTotal": true }));
+        addon.start(&ctx);
+        let page = addon.page().unwrap();
+        page.drv_ui.scope = Scope::Store;
+        page.restore_point = false;
+        page.virustotal_consent = true;
+        addon.stop();
+        let saved = addon.settings();
+        assert_eq!(saved, serde_json::json!({ "scope": "store", "restorePoint": false, "virusTotal": true, "virusTotalConsent": true }));
+        let mut next_run = Drivers::default();
+        next_run.load_settings(&saved);
+        next_run.start(&ctx);
+        let page = next_run.page().unwrap();
+        assert!(page.drv_ui.scope == Scope::Store && !page.restore_point && page.virustotal && page.virustotal_consent);
     }
 
     #[test]
@@ -1078,6 +1178,18 @@ mod reader_tests {
         assert_eq!(shown(&mut host), "", "nothing is drawn");
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!((reader.devices_asked(), reader.kernel_asked()), (0, 0));
+    }
+
+    #[test]
+    fn opening_every_tab_reads_with_normal_rights_and_launches_nothing() {
+        let broken = DeviceDriver { problem: 28, ..device("Broken NIC") };
+        let reader = Fake::devices(vec![Ok(vec![broken, device("Alpha GPU")])]);
+        for scope in ["hardware", "builtin", "problems", "kernel", "store", "filters"] {
+            let (mut host, runner) = host_with(&reader, json!({ "enabled": true, "settings": { "scope": scope } }));
+            until("the page is drawn", || !shown(&mut host).is_empty());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(runner.launches().is_empty(), "{scope}: no PowerShell, no elevation prompt: {:?}", runner.launches());
+        }
     }
 
     #[test]
