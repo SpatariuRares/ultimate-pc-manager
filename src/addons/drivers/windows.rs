@@ -1,5 +1,5 @@
 //! The Windows reader: today's SetupDi, service-manager and file-version
-//! code, moved unchanged. Elsewhere it lists nothing.
+//! code, moved unchanged.
 
 use super::engine::{DeviceDriver, KernelDriver, SecurityReading};
 use super::store::StorePackage;
@@ -8,9 +8,9 @@ use super::ListingReader;
 
 /// The Drivers add-on's reader on a real PC.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct WindowsListing;
+pub struct SystemListing;
 
-impl ListingReader for WindowsListing {
+impl ListingReader for SystemListing {
     fn devices(&self) -> Result<Vec<DeviceDriver>, String> {
         imp::list_devices()
     }
@@ -31,28 +31,6 @@ impl ListingReader for WindowsListing {
     }
 }
 
-#[cfg(not(windows))]
-mod imp {
-    use super::super::engine::*;
-    use crate::availability::{unavailable_error, Feature};
-    pub fn list_devices() -> Result<Vec<DeviceDriver>, String> {
-        Err(unavailable_error(Feature::DeviceSetupApi))
-    }
-    pub fn list_kernel() -> Result<Vec<KernelDriver>, String> {
-        Err(unavailable_error(Feature::DeviceSetupApi))
-    }
-    pub fn read_security() -> SecurityReading {
-        SecurityReading::unreadable(&unavailable_error(Feature::DeviceSetupApi))
-    }
-    pub fn read_store() -> Result<Vec<super::StorePackage>, String> {
-        Err(unavailable_error(Feature::DeviceSetupApi))
-    }
-    pub fn list_filters() -> super::super::filters::FilterRead {
-        super::super::filters::FilterRead::Failed(unavailable_error(Feature::DeviceSetupApi))
-    }
-}
-
-#[cfg(windows)]
 mod imp {
     use super::super::engine::*;
     use super::StorePackage;
@@ -541,7 +519,7 @@ mod imp {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod pc_tests {
     use super::*;
 
@@ -549,7 +527,7 @@ mod pc_tests {
     #[test]
     #[ignore = "reads this PC's service control manager"]
     fn this_pc_reports_states_kinds_groups_and_dependencies() {
-        let list = WindowsListing.kernel().expect("kernel drivers");
+        let list = SystemListing.kernel().expect("kernel drivers");
         assert!(list.iter().all(|d| d.state_code.is_some()), "every state was read");
         assert!(list.iter().any(|d| d.state_label() == "Running"));
         assert!(list.iter().any(|d| d.kind.label() == "File system"));
