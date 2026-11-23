@@ -716,12 +716,25 @@ try {
   $want = $Ids -split ','
   $s = New-Object -ComObject Microsoft.Update.Session
   $s.ClientApplicationID = 'Ultimate PC Manager'
-  $r = $s.CreateUpdateSearcher().Search("IsInstalled=0 and Type='Driver'")
+  $searcher = $s.CreateUpdateSearcher()
   $col = New-Object -ComObject Microsoft.Update.UpdateColl
-  foreach ($u in $r.Updates) {
-    if ($want -contains $u.Identity.UpdateID) {
-      if (-not $u.EulaAccepted) { $u.AcceptEula() }
-      [void]$col.Add($u)
+  $missing = @()
+  foreach ($id in $want) {
+    # The clicked offer's identity is looked up directly.
+    $r = $searcher.Search("UpdateID='$id' and IsInstalled=0")
+    if ($r.Updates.Count -eq 0) { $missing += $id; continue }
+    $u = $r.Updates.Item(0)
+    if (-not $u.EulaAccepted) { $u.AcceptEula() }
+    [void]$col.Add($u)
+  }
+  if ($missing.Count -gt 0) {
+    # Only an identity that is no longer valid searches all driver updates again.
+    $r = $searcher.Search("IsInstalled=0 and Type='Driver'")
+    foreach ($u in $r.Updates) {
+      if ($missing -contains $u.Identity.UpdateID) {
+        if (-not $u.EulaAccepted) { $u.AcceptEula() }
+        [void]$col.Add($u)
+      }
     }
   }
   if ($col.Count -eq 0) { throw 'Windows Update no longer offers the selected updates.' }
@@ -859,6 +872,73 @@ mod tests {
             runner.launches(),
             vec![Launch::PowerShell { script: TOOL_SCRIPT.into(), args: vec![("Mode".into(), "scan".into()), ("Arg".into(), String::new())], elevated: true }]
         );
+    }
+
+    /// A reader that only counts its reads.
+    #[derive(Default)]
+    struct Counting(std::sync::atomic::AtomicUsize);
+
+    impl crate::addons::drivers::ListingReader for Counting {
+        fn devices(&self) -> Result<Vec<DeviceDriver>, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        fn kernel(&self) -> Result<Vec<KernelDriver>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn install_hub() -> (Hub, Arc<crate::platform::RecordingRunner>, Arc<Counting>) {
+        let (ctx, runner) = AddonContext::recording();
+        let reader = Arc::new(Counting::default());
+        let hub = Hub::new(ctx, reader.clone());
+        wait_until_idle(&hub);
+        (hub, runner, reader)
+    }
+
+    fn reads(reader: &Counting) -> usize {
+        reader.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn installing_launches_the_elevated_script_with_the_identity_of_every_clicked_offer() {
+        let (hub, runner, _) = install_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, r#"{"ok":true,"reboot":false,"items":[{"Id":"id-1","Title":"A","Code":2,"HResult":0},{"Id":"id-2","Title":"B","Code":2,"HResult":0}]}"#);
+        hub.install(vec!["id-1".into(), "id-2".into()]);
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches(), vec![Launch::PowerShell { script: INSTALL_SCRIPT.into(), args: vec![("Ids".into(), "id-1,id-2".into())], elevated: true }]);
+        assert_eq!(hub.lock().message, Some(("Installed 2 driver updates.".to_string(), false)), "the outcome message is unchanged");
+    }
+
+    #[test]
+    fn the_install_script_looks_the_identity_up_and_searches_all_again_only_for_one_no_longer_valid() {
+        let direct = INSTALL_SCRIPT.find("UpdateID='$id'").expect("a lookup by identity");
+        let all = INSTALL_SCRIPT.find("Type='Driver'").expect("the full search");
+        assert!(direct < all, "the identity comes first");
+        assert!(INSTALL_SCRIPT.contains("if ($missing.Count -gt 0)"), "the full search only runs for what was not found");
+        assert!(INSTALL_SCRIPT.contains("Windows Update no longer offers the selected updates."), "the failure message is unchanged");
+    }
+
+    #[test]
+    fn a_cancelled_uac_prompt_installs_nothing_and_reads_nothing_again() {
+        let (hub, runner, reader) = install_hub();
+        let before = reads(&reader);
+        runner.answer(crate::platform::ELEVATION_CANCELLED);
+        hub.install(vec!["id-1".into()]);
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches().len(), 1, "one elevated launch and no search");
+        assert_eq!(reads(&reader), before, "the list is not read again");
+        assert_eq!(hub.lock().message, Some((CANCELLED_TEXT.to_string(), false)));
+    }
+
+    #[test]
+    fn a_finished_install_still_reads_the_list_again() {
+        let (hub, runner, reader) = install_hub();
+        let before = reads(&reader);
+        runner.prepare(crate::platform::When::Nth(0), 0, r#"{"ok":true,"reboot":false,"items":[{"Id":"id-1","Title":"A","Code":2,"HResult":0}]}"#);
+        hub.install(vec!["id-1".into()]);
+        wait_until_idle(&hub);
+        assert_eq!(reads(&reader), before + 1);
     }
 
     /// Reads this PC's drivers: `cargo test -- --ignored --nocapture`.
