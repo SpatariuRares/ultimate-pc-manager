@@ -22,7 +22,7 @@ jobs:
         run: |
           # The exe is named as the app, so a shortcut to it reads "Ultimate PC Manager".
           Copy-Item target/release/ultimate-pc-manager.exe "Ultimate PC Manager.exe"
-          Compress-Archive -Path "Ultimate PC Manager.exe", README.md, assets/Michroma-OFL.txt -DestinationPath UltimatePCManager.zip
+          Compress-Archive -Path "Ultimate PC Manager.exe", README.md, assets/Michroma-OFL.txt, assets/Selawik-OFL.txt -DestinationPath UltimatePCManager.zip
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
