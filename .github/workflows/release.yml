@@ -71,6 +71,7 @@ jobs:
           tar -C pkg -czf UltimatePCManager-linux-x86_64.tar.gz UltimatePCManager
       - name: Package the AppImage
         run: |
+          sudo apt-get install -y --no-install-recommends desktop-file-utils
           d=AppDir
           mkdir -p "$d/usr/bin" "$d/usr/share/doc/ultimate-pc-manager"
           cp target/x86_64-unknown-linux-gnu/release/ultimate-pc-manager "$d/usr/bin/"
