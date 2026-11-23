@@ -9,7 +9,7 @@ If you find the app useful, you can support its development on
 [Buy me a coffee](https://buymeacoffee.com/spatariurares). Settings has a
 **GitHub** button (the repository) and a **Buy me a coffee** button too.
 
-Task manager for Windows written in Rust with [egui](https://github.com/emilk/egui).
+Task manager for Windows, Linux and macOS written in Rust with [egui](https://github.com/emilk/egui).
 It includes the Summary, Performance, Processes, System Info, App history,
 Startup apps, Users, Services, Power & Freq, Flight Recorder, Connections,
 Installed Apps, Drivers, Disk Space, Benchmarks, Package Manager, Settings and
@@ -27,15 +27,34 @@ The brand assets (icon, symbol, wordmarks, banner and palette) are in
 Space Grotesk (SIL Open Font License, `assets/brand/OFL-SpaceGrotesk.txt`); the
 app draws the wordmark from PNG files and does not load the font.
 
+## Supported systems
+
+- **Windows 11** (x86_64; ARM64 best effort).
+- **Linux** with glibc 2.17+ and kernel 3.10+, on Wayland and X11 (ARM best
+  effort; musl is not supported).
+- **macOS 13+** on Apple Silicon.
+
+Building on any other system stops with "supported systems: Windows, Linux,
+macOS". The decision is recorded in [ADR 0001](docs/adr/0001-three-supported-systems.md).
+Some pages do not have native data on Linux and macOS yet; the app lists only
+what works on the system it runs on.
+
 ## Requirements
 
-- **Windows 10 or 11, 64-bit.** The pages read Windows data (registry,
-  performance counters, services, drivers); it is the only supported system.
-- **Stable Rust with the MSVC toolchain**, installed with [rustup](https://rustup.rs).
-  Tested with Rust 1.96.0 (`stable-x86_64-pc-windows-msvc`).
-- **Visual Studio Build Tools** with the *Desktop development with C++*
+- **Stable Rust**, installed with [rustup](https://rustup.rs). Tested with
+  Rust 1.96.0.
+- **Windows:** the MSVC toolchain (`stable-x86_64-pc-windows-msvc`) and
+  **Visual Studio Build Tools** with the *Desktop development with C++*
   workload: this provides the MSVC linker and the Windows SDK. The rustup
   installer offers it if it is missing.
+- **Linux:** the system packages the GUI build needs. On Debian and Ubuntu:
+
+  ```bash
+  sudo apt install pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+    libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev libfontconfig1-dev
+  ```
+
+- **macOS:** Rust only; no extra tools or Windows SDK are needed.
 
 Optional, only for some features:
 
@@ -51,7 +70,10 @@ Optional, only for some features:
 cargo build --release
 ```
 
-The executable is `target\release\ultimate-pc-manager.exe`. The first build downloads
+On Linux and macOS the command is the same and the executable is
+`target/release/ultimate-pc-manager`.
+
+On Windows the executable is `target\release\ultimate-pc-manager.exe`. The first build downloads
 the dependencies and takes a few minutes; later builds are incremental.
 
 The debug build (`cargo build`) also opens a console window, useful for reading
