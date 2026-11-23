@@ -50,7 +50,7 @@ impl Provider for IntelDtt {
 
     fn availability(&mut self) -> Result<(), String> {
         #[cfg(windows)]
-        return availability(&cpu_vendor(), crate::winsys::service_running(SERVICE));
+        return availability(&cpu_vendor(), crate::services::service_running(SERVICE));
         #[cfg(not(windows))]
         Err(crate::availability::unavailable_error(crate::availability::Feature::HardwareSensors))
     }

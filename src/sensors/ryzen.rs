@@ -532,7 +532,7 @@ fn driver_running() -> bool {
         return false;
     };
     let names: Vec<String> = services.enum_keys().flatten().filter(|k| k.to_ascii_lowercase().starts_with("amdryzenmasterdriver")).collect();
-    names.iter().any(|name| crate::winsys::service_running(name) == Some(true))
+    names.iter().any(|name| crate::services::service_running(name) == Some(true))
 }
 
 /// The calls into `Platform.dll` (see the module comment for the interface).

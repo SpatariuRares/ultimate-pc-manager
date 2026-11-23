@@ -25,7 +25,7 @@ pub struct RecordingActions {
 #[derive(Default)]
 struct Reads {
     priority: Vec<(u32, &'static str)>,
-    affinity: Vec<(u32, crate::winsys::Affinity)>,
+    affinity: Vec<(u32, crate::process_actions::Affinity)>,
     windowed: Vec<u32>,
     shell: Option<u32>,
 }
@@ -47,7 +47,7 @@ impl RecordingActions {
     }
 
     /// From now on `pid` reads as having `affinity`.
-    pub fn script_affinity(&self, pid: u32, affinity: crate::winsys::Affinity) {
+    pub fn script_affinity(&self, pid: u32, affinity: crate::process_actions::Affinity) {
         self.reads.lock().unwrap_or_else(|e| e.into_inner()).affinity.push((pid, affinity));
     }
 
@@ -147,7 +147,7 @@ impl SystemActions for RecordingActions {
     fn priority_of(&self, pid: u32) -> Option<&'static str> {
         self.reads.lock().unwrap_or_else(|e| e.into_inner()).priority.iter().find(|(p, _)| *p == pid).map(|(_, c)| *c)
     }
-    fn affinity_of(&self, pid: u32) -> Option<crate::winsys::Affinity> {
+    fn affinity_of(&self, pid: u32) -> Option<crate::process_actions::Affinity> {
         self.reads.lock().unwrap_or_else(|e| e.into_inner()).affinity.iter().find(|(p, _)| *p == pid).map(|(_, a)| *a)
     }
     fn has_window(&self, pid: u32) -> bool {

@@ -42,7 +42,14 @@ mod theme;
 mod version_info;
 mod wait_chain;
 mod widgets;
-mod winsys;
+mod file_description;
+mod long_path;
+mod process_actions;
+mod run_open;
+mod services;
+mod startup_entries;
+#[cfg(windows)]
+mod win_ffi;
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();

@@ -64,7 +64,7 @@ pub trait SystemActions: Send + Sync {
     /// The priority class of `pid`; None when it cannot be read.
     fn priority_of(&self, pid: u32) -> Option<&'static str>;
     /// The processor affinity of `pid`; None when it cannot be read.
-    fn affinity_of(&self, pid: u32) -> Option<crate::winsys::Affinity>;
+    fn affinity_of(&self, pid: u32) -> Option<crate::process_actions::Affinity>;
     /// Whether `pid` has any visible top-level window.
     fn has_window(&self, pid: u32) -> bool;
     /// The process of the shell's Windows Explorer (the one that owns the

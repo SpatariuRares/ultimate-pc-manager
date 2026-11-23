@@ -406,7 +406,7 @@ pub fn read() -> Inventory {
     #[cfg(windows)]
     {
         let (tables, ages) = system::tables();
-        return Inventory { ages, services: services_by_pid(crate::winsys::running_service_pids()), ..assemble(tables) };
+        return Inventory { ages, services: services_by_pid(crate::services::running_service_pids()), ..assemble(tables) };
     }
     #[allow(unreachable_code)]
     assemble([Err(TableError), Err(TableError), Err(TableError), Err(TableError)])
@@ -871,7 +871,7 @@ mod tests {
         let inv = read();
         assert!(inv.services.values().flatten().any(|s| s == "RpcSs"), "RpcSs runs in a svchost");
         let svchost = r"C:\Windows\System32\svchost.exe";
-        let description = crate::winsys::file_description(svchost).expect("svchost.exe has a description");
+        let description = crate::file_description::file_description(svchost).expect("svchost.exe has a description");
         println!("{svchost}: {description}; {} processes run services", inv.services.len());
     }
 }

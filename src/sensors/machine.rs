@@ -131,7 +131,7 @@ mod imp {
     use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
 
-    use crate::winsys::wide;
+    use crate::win_ffi::wide;
 
     pub fn static_info() -> StaticInfo {
         StaticInfo { cpu: cpu_info(), mem: mem_info(), disks: disk_info(), gpus: gpu_info() }

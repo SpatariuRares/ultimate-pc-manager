@@ -41,7 +41,7 @@ pub fn description(path: &str) -> Option<String> {
     if path.is_empty() {
         return None;
     }
-    let wide = crate::winsys::wide(path);
+    let wide = crate::win_ffi::wide(path);
     // SAFETY: `wide` is a NUL-terminated path; `data` holds `size` bytes
     // (u32s keep it aligned for the u16 strings inside) and outlives every
     // pointer `query` returns into it.
@@ -101,7 +101,7 @@ fn value_text(data: &[u32], ptr: *const std::ffi::c_void, chars: u32) -> Option<
 #[cfg(windows)]
 unsafe fn query(block: *const std::ffi::c_void, sub: &str) -> Option<(*const std::ffi::c_void, u32)> {
     use windows_sys::Win32::Storage::FileSystem::VerQueryValueW;
-    let sub = crate::winsys::wide(sub);
+    let sub = crate::win_ffi::wide(sub);
     let mut ptr = std::ptr::null_mut();
     let mut len = 0u32;
     let found = VerQueryValueW(block, sub.as_ptr(), &mut ptr, &mut len) != 0;

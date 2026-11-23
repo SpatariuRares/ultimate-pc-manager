@@ -363,7 +363,7 @@ pub fn drive_devices() -> Vec<(String, String)> {
     let mut out = Vec::new();
     for letter in b'A'..=b'Z' {
         let drive = format!("{}:", letter as char);
-        let name = crate::winsys::wide(&drive);
+        let name = crate::win_ffi::wide(&drive);
         let mut target = vec![0u16; 1024];
         // SAFETY: `name` is NUL-terminated and `target` holds 1024 units.
         let n = unsafe { QueryDosDeviceW(name.as_ptr(), target.as_mut_ptr(), target.len() as u32) } as usize;
@@ -524,7 +524,7 @@ mod imp {
     fn query() -> Option<Query> {
         static QUERY: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
         let f = QUERY.get_or_init(|| {
-            let lib = crate::winsys::wide("ntdll.dll");
+            let lib = crate::win_ffi::wide("ntdll.dll");
             // SAFETY: `lib` is a NUL-terminated name; ntdll is loaded in every
             // process, so the module stays valid for the program's life.
             unsafe {
@@ -672,7 +672,7 @@ mod imp {
             if h.is_null() {
                 return ("", 0);
             }
-            let h = crate::winsys::Handle(h);
+            let h = crate::win_ffi::Handle(h);
             let (mut process, mut native) = (0u16, 0u16);
             let arch = if IsWow64Process2(h.0, &mut process, &mut native) == 0 {
                 ""
@@ -697,7 +697,7 @@ mod imp {
     /// The priority class from GetPriorityClass; `None` when the process
     /// cannot be opened.
     pub fn priority_class(pid: u32) -> Option<&'static str> {
-        crate::winsys::get_priority(pid)
+        crate::process_actions::get_priority(pid)
     }
 
     /// The PIDs that own a visible, titled top-level window that is not a
@@ -811,7 +811,7 @@ mod imp {
     }
 
     use super::{Missing, Named, Resource, ResourceKind};
-    use crate::winsys::Handle;
+    use crate::win_ffi::Handle;
     use windows_sys::Win32::Foundation::{DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, HANDLE};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetExitCodeProcess, PROCESS_DUP_HANDLE, PROCESS_VM_READ};
@@ -828,7 +828,7 @@ mod imp {
 
     /// An ntdll export with the `HandleQuery` shape, by name.
     fn ntdll_query(name: &std::ffi::CStr) -> Option<HandleQuery> {
-        let lib = crate::winsys::wide("ntdll.dll");
+        let lib = crate::win_ffi::wide("ntdll.dll");
         // SAFETY: `lib` is NUL-terminated and ntdll is loaded in every
         // process; the export named has the `HandleQuery` signature (the
         // callers name only NtQueryInformationProcess and NtQueryObject).
@@ -1339,7 +1339,7 @@ mod tests {
         assert_eq!(me.arch, arch);
         // CI runners start tests below normal priority, so compare with the
         // class Windows reports for this process rather than a fixed name.
-        let own = crate::winsys::get_priority(std::process::id()).expect("the test can read its own priority");
+        let own = crate::process_actions::get_priority(std::process::id()).expect("the test can read its own priority");
         assert_eq!(me.priority, own);
     }
 
