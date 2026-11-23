@@ -136,6 +136,7 @@ A compact read-only "Security" strip under the status band shows Memory integrit
   - four tiles Drivers / Loaded / Third-party / Kernel memory in the Kernel modules scope instead of the sentence;
   - count on each kernel scope, "%1 shown" and "Updated %1";
   - detail labels (Driver, Service name, State, Kind, Start type, Version, Vendor, Load index with load order group, Kernel memory, Location, Unload) and "Copy service name" also in the panel;
+  - two further detail rows, shown only when the service has the value: "Load order group" (after Load index) and "Depends on" (services, then groups written "Name (group)"); the State row shows the pending states (Start pending, Stop pending, Continue pending, Pause pending, Paused) besides Running and Stopped; the kinds are Kernel, File system, Recognizer and Adapter;
   - the filter text of story 37 in the kernel scope;
   - the reading, error and empty states of stories 51–53; the system part must be able to return a reading error instead of an empty list;
   - a command-line option for the kernel scope, with the values of story 44;
