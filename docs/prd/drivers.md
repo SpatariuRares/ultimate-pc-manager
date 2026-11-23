@@ -92,14 +92,13 @@ It is the last add-on in the migration order proposed by the add-ons document.
 - **Kernel memory**: the sum of the image sizes of the loaded rows, each image file counted once (two services that point to the same file add its size once). When the list of loaded modules could not be read, the tile says "an unknown amount" and a note says why; it is never shown as 0.
 - **Matching modules**: a driver's image is matched to the loaded module by full path (case-insensitive, `\SystemRoot` and `\??\` spelled out); by file name alone only when the image path has no folder and one module has that name.
 
-<<<<<<< HEAD
 #### VirusTotal and SHA-256 (spec #11, #34)
 
 - "Copy SHA-256" on a kernel module hashes its file on this PC and copies the hash.
 - "Look up on VirusTotal" opens `https://www.virustotal.com/gui/file/<sha256>` in the browser: no API key, nothing uploaded; only the hash leaves the PC.
 - It is off by default (Settings, Add-ons, Drivers, "Offer \"Look up on VirusTotal\""). The first lookup asks "Send this file's SHA-256 to VirusTotal? The file itself is not uploaded."; the option and the consent are saved (`virusTotal`, `virusTotalConsent`), and cancelling saves nothing.
 - Both sit under "Advanced" in the kernel module menu and side panel. The hash is computed in the background and dropped if the add-on is turned off meanwhile.
-=======
+
 #### Signatures (spec #11, #25)
 
 - **Column and rows**: Kernel modules has a Signature column, and both detail panels (devices and kernel modules) a Signature row, with a Signer row when the signer's name is known. The values are "WHQL", "Signed", "Unsigned", "Not checked" (not checked yet) and "Could not check: <reason>", which is not "Unsigned".
@@ -109,7 +108,6 @@ It is the last add-on in the migration order proposed by the add-ons document.
 - **Unsigned scope**: a sixth scope on Kernel modules, with its count, lists the modules whose check found no signature (not the ones not checked yet, nor the ones that could not be checked). It is worked out with the other counts in the page's derived data, once per change of data or filter. `--drivers-scope unsigned` opens it.
 - **CSV**: the Signature column is the last one and is filled for kernel modules (empty on device rows).
 - **Add-on off**: the check ends before its next file, nothing is published after that and nothing new starts while the add-on is off.
->>>>>>> spec-11-drivers-v2
 
 ### Other actions (More actions)
 45. As a user, I want "Install from an INF file…" to add a driver package and install it on compatible devices (with UAC), with the outcomes "Driver package installed.", "The package was added, but no device needed it…", "Done. Restart Windows to finish.", so that I can install a driver downloaded from the manufacturer. *(our addition; exists, to be verified end to end)*
@@ -129,7 +127,10 @@ A "Driver store" tab after Kernel modules lists the driver packages Windows keep
 - Read with `pnputil /enum-drivers /devices /format xml` and normal rights (no UAC), parsed from the XML, never from localised text. `/enum-drivers` lists the third-party packages (`oemNN.inf`) only. The read follows the driver listing in the same background job: the other tabs do not wait for it, a refresh re-reads it, and when the add-on is turned off its result is dropped and nothing new starts.
 - **Old**: another package with the same original INF name and provider (case does not matter) has a newer version (numbers compared part by part, missing parts count as 0), then a later date when the versions are equal. **In use**: at least one device. **Inbox**: the provider starts with "Microsoft" (case-insensitive); inbox packages are flagged and never offered for removal.
 - Figures, over the whole store (not the filter): packages, third-party (not inbox), old (old, not in use, not inbox: what "Remove old packages" will remove), disk space used and what can be freed. The size of a package is its folder in `System32\DriverStore\FileRepository`, found through `HKLM\SYSTEM\DriverDatabase\DriverInfFiles\<oemNN.inf>`; a package whose folder is not found has no size, and when none has one the figure says "unknown", never 0.
-- Removal and backup (stories 47-50, 55-58) are later tickets (#28, #29); this tab only reads.
+- Selection: every non-inbox row has a tick box (the shared selection of "Remove N...", "Back up selected"); inbox rows have none. A new read forgets ticked packages that no longer exist.
+- Removal (spec #11, #28; stories 47-52): "Remove..." (ticked packages, or the one selected in the side panel), "Remove old packages" (only Old, not In use, not inbox). Each asks for a confirmation that lists the packages and offers "Create a restore point first". It runs one elevated job through `Hub::run_job` (restore point step, then `pnputil /delete-driver <oemN.inf>` by its absolute System32 path, never `/force`). Packages in use, inbox packages and unknown names are refused before the job starts ("Not removed: <name> (a device uses it)"); when nothing is left to remove no UAC prompt appears. "Remove even if in use..." exists for one package only, behind a stronger warning and "I understand, continue anyway"; it is the only path that runs `/uninstall /force`. Outcome: "Removed N packages, freed X." and one "Not removed: <name> (<reason>)" per package left (the reason is the tool's own "Failed ..." line); the store is read again only when something was removed. A dismissed UAC prompt is "Cancelled at the Windows prompt: nothing was changed." with no re-read.
+- Backup (spec #11, #29; stories 55-58): "Back up drivers..." in the page header (every third-party package) and "Back up selected" (the ticked ones) ask for a folder and export each package with `pnputil /export-driver <oemN.inf> <folder>` into the dated subfolder "Drivers yyyy-mm-dd" of that folder, in one elevated job. A backup changes nothing, so it makes no restore point (stories 59 and 62 list changes only). Outcome: "Backed up N driver packages to <folder>." and one "Not backed up: <name> (<reason>)" per failure. The dialog says the backup is restored with "Install from an INF file...", one INF per package.
+- Both jobs are uninterruptible elevated jobs: turning the add-on off waits for them, and once it is off nothing new starts.
 
 ### Security band (spec #11, #32)
 A compact read-only "Security" strip under the status band shows Memory integrity (`HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled`) and the vulnerable driver blocklist (`HKLM\SYSTEM\CurrentControlSet\Control\CI\Config\VulnerableDriverBlocklistEnable`).
@@ -235,7 +236,7 @@ Modules tested: driver data module, driver page module, `DriversAddon`.
 
 - The add-on platform itself (registry, Add-ons page, licenses, sales): separate PRD.
 - Downloading drivers from manufacturers' websites (NVIDIA, AMD, Intel…): the add-on only opens their page.
-- Uninstalling a driver package from the driver store (listing it is in scope; removal is spec #11, #28), going back to the previous driver (Device Manager rollback), disabling a device.
+- Going back to the previous driver (Device Manager rollback), disabling a device.
 - Restore points before installation.
 - Driver values read through manufacturers' SDKs.
 - Phase 2 of the platform (add-ons in a separate process or WASM).

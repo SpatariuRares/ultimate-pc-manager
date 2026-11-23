@@ -14,7 +14,7 @@ use super::filters::{self, FilterDriver, FilterRead};
 use super::engine::{self as drivers, DeviceDriver, DriverUpdate, HashFor, Hub, KernelDriver, KernelFigures, KernelScope};
 use super::engine::virustotal_url;
 use super::signature::{signature_text, Signature, SignatureBook};
-use super::store::{Flags, StoreFigures, StoreList, StorePackage};
+use super::store::{self, Flags, Selection, StoreFigures, StoreList, StorePackage};
 use crate::addons::plural;
 use crate::platform::{csv_field, csv_text_field, Action, AddonContext};
 use crate::theme;
@@ -76,6 +76,14 @@ pub struct DriversUi {
     pub selected_kernel: Option<String>,
     /// The published name ("oem42.inf") of the selected store package.
     pub selected_store: Option<String>,
+    /// The packages ticked on the Driver store tab.
+    pub ticked: Selection,
+    /// A removal waiting for its confirmation.
+    pub confirm_remove: Option<RemoveAsk>,
+    /// A backup waiting for its folder and confirmation.
+    pub confirm_backup: Option<BackupAsk>,
+    /// The folder the last backup was made in (the dated subfolder goes inside).
+    pub backup_folder: String,
     pub confirm_unload: Option<String>,
     /// The SHA-256 of a file waiting for the first-use consent to be sent
     /// to VirusTotal.
@@ -91,6 +99,34 @@ pub struct DriversUi {
     pub started: bool,
 }
 
+
+/// What a removal waiting for its confirmation removes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoveKind {
+    /// The ticked packages, or the one selected.
+    Selected,
+    /// "Remove old packages".
+    Old,
+    /// "Remove even if in use": one package, forced.
+    Forced,
+}
+
+/// A removal waiting for its confirmation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoveAsk {
+    pub kind: RemoveKind,
+    /// The published names it would remove.
+    pub names: Vec<String>,
+    /// "I understand, continue anyway" (the forced removal only).
+    pub understood: bool,
+}
+
+/// A backup waiting for its folder: the names, or every third-party package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupAsk {
+    pub names: Option<Vec<String>>,
+    pub folder: String,
+}
 
 /// Third-party drivers this many years old or more get "check the maker",
 /// unless the user chose another threshold.
@@ -766,6 +802,10 @@ impl DriversPage {
                         ui.close();
                     }
                 });
+                ui.add_space(8.0);
+                if parts::admin_button(ui, BACKUP_ALL_LABEL, false, idle).clicked() {
+                    self.drv_ui.confirm_backup = Some(BackupAsk { names: None, folder: self.drv_ui.backup_folder.clone() });
+                }
             });
         });
         ui.add_space(8.0);
@@ -849,8 +889,9 @@ impl DriversPage {
             }
             Scope::Store => {
                 let list = self.store_view(&store);
-                self.store_list(&mut list_ui, actions, &list, store_reading, store_error.as_deref());
-                self.store_side(&mut side_ui, actions, &list);
+                self.drv_ui.ticked.keep_only(&store);
+                self.store_list(&mut list_ui, actions, &list, store_reading, store_error.as_deref(), idle);
+                self.store_side(&mut side_ui, actions, &list, idle);
             }
             Scope::Filters => {
                 self.filter_list(&mut list_ui, filter_read.as_deref());
@@ -1537,7 +1578,7 @@ impl DriversPage {
     }
 
     /// The Driver store tab: the figures, then one row per package.
-    fn store_list(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, list: &StoreList, reading: bool, error: Option<&str>) {
+    fn store_list(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, list: &StoreList, reading: bool, error: Option<&str>, idle: bool) {
         let th = theme::of_ui(ui);
         let packages = &list.packages;
         // Reading, failed or nothing reported: no figures to give.
@@ -1546,6 +1587,8 @@ impl DriversPage {
             return;
         }
         store_strip(ui, &list.figures);
+        ui.add_space(8.0);
+        self.store_actions(ui, list, idle);
         ui.add_space(10.0);
         let rows = &list.rows;
         if let Some(note) = list_note(reading, error, packages.len(), rows.len(), !self.drv_ui.search.trim().is_empty()) {
@@ -1555,12 +1598,12 @@ impl DriversPage {
         let w = ui.available_width();
         let fixed = [110.0, 100.0, 90.0];
         let gap = 12.0;
-        let flex = (w - fixed.iter().sum::<f32>() - gap * 6.0 - 20.0).max(300.0);
+        let flex = (w - fixed.iter().sum::<f32>() - gap * 6.0 - 20.0 - STORE_TICK_W).max(300.0);
         // Package, provider, class, version, date, signer, flags.
         let cols = [fixed[0] + 40.0, flex * 0.3, fixed[1], fixed[1] + 20.0, fixed[2], flex * 0.3, flex * 0.4];
         let xs: Vec<f32> = cols
             .iter()
-            .scan(10.0, |x, c| {
+            .scan(10.0 + STORE_TICK_W, |x, c| {
                 let start = *x;
                 *x += c + gap;
                 Some(start)
@@ -1572,14 +1615,23 @@ impl DriversPage {
         }
         ui.painter().rect_filled(Rect::from_min_size(Pos2::new(hr.left(), hr.bottom() - 1.0), vec2(w, 1.0)), CornerRadius::ZERO, th.line);
         let mut clicked = None;
+        let mut toggled = None;
         egui::ScrollArea::vertical().id_salt("drv-store-list").auto_shrink([false, false]).show_rows(ui, STORE_ROW, rows.len(), |ui, range| {
             for &i in &rows[range] {
                 let p = &packages[i];
                 let flags = list.flags[i];
                 let (r, resp) = ui.allocate_exact_size(vec2(w, STORE_ROW), Sense::click());
-                let painter = ui.painter();
                 let selected = self.drv_ui.selected_store.as_deref() == Some(p.published.as_str());
-                parts::row_fill(painter, r, selected, resp.hovered());
+                parts::row_fill(ui.painter(), r, selected, resp.hovered());
+                // Inbox packages get no tick box.
+                if !flags.inbox {
+                    let box_rect = Rect::from_min_size(Pos2::new(r.left() + 4.0, r.top() + 8.0), vec2(24.0, 24.0));
+                    let on = self.drv_ui.ticked.contains(&p.published);
+                    if crate::widgets::tick_box(ui, box_rect, ui.id().with(("store-tick", &p.published)), on).clicked() {
+                        toggled = Some(p.clone());
+                    }
+                }
+                let painter = ui.painter();
                 let cell = |i: usize, s: &str, col: Color32| {
                     let s = fit(painter, s, &text(13.0), cols[i]);
                     painter.text(Pos2::new(r.left() + xs[i], r.top() + 13.0), Align2::LEFT_CENTER, s, text(13.0), col);
@@ -1620,11 +1672,34 @@ impl DriversPage {
         if let Some(name) = clicked {
             self.drv_ui.selected_store = Some(name);
         }
+        if let Some(p) = toggled {
+            self.drv_ui.ticked.toggle(&p);
+        }
+    }
+
+    /// The buttons over the store's list: remove the old packages, remove
+    /// the ticked ones, back the ticked ones up.
+    fn store_actions(&mut self, ui: &mut Ui, list: &StoreList, idle: bool) {
+        let old: Vec<String> = list.packages.iter().zip(&list.flags).filter(|(_, f)| f.removable_old()).map(|(p, _)| p.published.clone()).collect();
+        let n = self.drv_ui.ticked.len();
+        let remove = if n == 0 { STORE_REMOVE_LABEL.to_string() } else { format!("Remove {n}\u{2026}") };
+        ui.horizontal(|ui| {
+            if parts::admin_button(ui, REMOVE_OLD_LABEL, false, idle && !old.is_empty()).clicked() {
+                self.drv_ui.confirm_remove = Some(RemoveAsk { kind: RemoveKind::Old, names: old.clone(), understood: false });
+            }
+            if parts::admin_button(ui, &remove, false, idle && n > 0).clicked() {
+                self.drv_ui.confirm_remove = Some(RemoveAsk { kind: RemoveKind::Selected, names: self.drv_ui.ticked.names(), understood: false });
+            }
+            if parts::admin_button(ui, BACKUP_SELECTED_LABEL, false, idle && n > 0).clicked() {
+                self.drv_ui.confirm_backup = Some(BackupAsk { names: Some(self.drv_ui.ticked.names()), folder: self.drv_ui.backup_folder.clone() });
+            }
+        });
     }
 
     /// The selected package's details and "Copy details".
-    fn store_side(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, list: &StoreList) {
+    fn store_side(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, list: &StoreList, idle: bool) {
         let at = self.drv_ui.selected_store.as_deref().and_then(|name| list.packages.iter().position(|p| p.published == name));
+        let mut ask = None;
         parts::SidePanel::new("drv-store-side").show(ui, at, |ui, at| {
             let th = theme::of_ui(ui);
             let (p, flags) = (&list.packages[at], list.flags[at]);
@@ -1648,8 +1723,24 @@ impl DriversPage {
                 if parts::outline_button(ui, "Copy details", true).clicked() {
                     actions.push(Action::Copy(store_details(p, flags)));
                 }
+                // Inbox packages are never offered for removal.
+                if !flags.inbox {
+                    let one = vec![p.published.clone()];
+                    if parts::admin_button(ui, STORE_REMOVE_LABEL, false, idle).clicked() {
+                        ask = Some(RemoveAsk { kind: RemoveKind::Selected, names: one.clone(), understood: false });
+                    }
+                    if flags.in_use {
+                        ui.label(RichText::new(store::NOT_REMOVED_IN_USE).size(12.0).color(th.faint));
+                        if parts::destructive_button(ui, FORCE_LABEL, idle).clicked() {
+                            ask = Some(RemoveAsk { kind: RemoveKind::Forced, names: one, understood: false });
+                        }
+                    }
+                }
             });
         });
+        if ask.is_some() {
+            self.drv_ui.confirm_remove = ask;
+        }
     }
 
     fn drivers_dialogs(&mut self, ui: &mut Ui) {
@@ -1753,8 +1844,9 @@ impl DriversPage {
                 None => self.drv_ui.confirm_device = Some(confirm),
             }
         }
-        if let Some(job) = self.drv_ui.confirm_job.clone() {
+        if let Some(job) = self.drv_ui.confirm_job.clone().filter(|j| !matches!(j, drivers::Redo::Remove { .. })) {
             let (title, what, label) = match &job {
+                drivers::Redo::Remove { .. } => ("", String::new(), ""),
                 drivers::Redo::Updates(ids) => ("Install driver updates?", format!("Windows Update will download and install {}.", plural(ids.len(), "driver update")), "Install"),
                 drivers::Redo::Inf(path) => ("Install this driver package?", format!("{path} will be added and installed on matching devices."), "Install"),
                 // Device actions have their own dialog (`confirm_device`).
@@ -1777,6 +1869,7 @@ impl DriversPage {
                 match job {
                     drivers::Redo::Updates(ids) => self.drv.install_with(ids, self.restore_point),
                     drivers::Redo::Inf(path) => self.drv.install_inf_with(path, self.restore_point),
+                    drivers::Redo::Remove { .. } => {}
                     drivers::Redo::Device(action, id) => self.drv.device_action_with(action, id, self.restore_point),
                 }
             }
@@ -1784,6 +1877,8 @@ impl DriversPage {
                 self.drv_ui.confirm_job = None;
             }
         }
+        self.remove_dialog(ui);
+        self.backup_dialog(ui);
         // The restore point could not be made, so nothing was changed yet.
         let prompt = self.drv.lock().restore_prompt.clone();
         if let Some(prompt) = prompt {
@@ -1805,6 +1900,138 @@ impl DriversPage {
                 Some(false) => self.drv.cancel_restore(),
                 None => {}
             }
+        }
+    }
+
+    /// The confirmation of a removal: lists the packages, offers the restore
+    /// point, and asks for more before a forced removal.
+    fn remove_dialog(&mut self, ui: &mut Ui) {
+        let Some(ask) = self.drv_ui.confirm_remove.clone() else { return };
+        let th = theme::of_ui(ui);
+        let packages = self.drv.lock().store.clone();
+        let lines: Vec<(String, bool)> = ask
+            .names
+            .iter()
+            .map(|n| match packages.iter().find(|p| &p.published == n) {
+                Some(p) => (format!("{} \u{2014} {}, {} {}", p.published, p.original, p.provider, p.version), p.in_use()),
+                None => (n.clone(), false),
+            })
+            .collect();
+        let title = match (ask.kind, ask.names.as_slice()) {
+            (RemoveKind::Old, names) => format!("Remove {}?", plural(names.len(), "old package")),
+            (RemoveKind::Forced, [one]) => format!("Remove {one} even if in use?"),
+            (_, [one]) => format!("Remove {one}?"),
+            (_, names) => format!("Remove {}?", plural(names.len(), "driver package")),
+        };
+        let label = match ask.kind {
+            RemoveKind::Old => REMOVE_OLD_LABEL,
+            RemoveKind::Forced => "Remove even if in use",
+            RemoveKind::Selected => "Remove",
+        };
+        let mut decided = None;
+        let mut understood = ask.understood;
+        egui::Window::new(title).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+            for (line, in_use) in &lines {
+                ui.label(line);
+                if *in_use && ask.kind == RemoveKind::Selected {
+                    ui.label(RichText::new("In use: will be refused").size(12.0).color(th.amber));
+                }
+            }
+            match ask.kind {
+                RemoveKind::Selected => {
+                    ui.label(RichText::new(REMOVE_SELECTED_NOTE).size(12.0).color(th.label));
+                }
+                RemoveKind::Old => {
+                    ui.label(RichText::new(REMOVE_OLD_NOTE).size(12.0).color(th.label));
+                }
+                RemoveKind::Forced => {
+                    let name = ask.names.first().map(String::as_str).unwrap_or_default();
+                    ui.label(RichText::new(format!("Runs pnputil /delete-driver {name} /uninstall /force.")).size(12.0).color(th.label));
+                    let users: Vec<&str> = packages.iter().find(|p| p.published == name).map(|p| p.devices.iter().map(|d| d.name.as_str()).collect()).unwrap_or_default();
+                    ui.label(RichText::new(format!("{} stops working and may not come back until you reinstall its driver.", if users.is_empty() { "A device".to_string() } else { users.join(", ") })).strong().color(th.red));
+                    ui.checkbox(&mut understood, FORCE_UNDERSTOOD);
+                }
+            }
+            crate::widgets::restore_point_option(ui, &mut self.restore_point);
+            ui.horizontal(|ui| {
+                let enabled = ask.kind != RemoveKind::Forced || understood;
+                if parts::admin_button(ui, label, false, enabled).clicked() {
+                    decided = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    decided = Some(false);
+                }
+            });
+        });
+        match decided {
+            Some(true) => {
+                match ask.kind {
+                    RemoveKind::Selected => self.drv.remove_packages(ask.names, self.restore_point),
+                    RemoveKind::Old => self.drv.remove_old(self.restore_point),
+                    RemoveKind::Forced => {
+                        if let Some(name) = ask.names.into_iter().next() {
+                            self.drv.remove_forced(name, self.restore_point);
+                        }
+                    }
+                }
+                self.drv_ui.ticked.clear();
+                self.drv_ui.confirm_remove = None;
+            }
+            Some(false) => self.drv_ui.confirm_remove = None,
+            None => {
+                if let Some(open) = &mut self.drv_ui.confirm_remove {
+                    open.understood = understood;
+                }
+            }
+        }
+    }
+
+    /// The backup's folder and confirmation, with the note on restoring it.
+    fn backup_dialog(&mut self, ui: &mut Ui) {
+        let Some(mut ask) = self.drv_ui.confirm_backup.clone() else { return };
+        let th = theme::of_ui(ui);
+        let n = match &ask.names {
+            Some(names) => names.len(),
+            None => store::third_party(&self.drv.lock().store).len(),
+        };
+        let title = if ask.names.is_none() { "Back up every third-party driver".to_string() } else { format!("Back up {}", plural(n, "selected package")) };
+        let dated = store::backup_folder(ask.folder.trim(), today());
+        let mut decided = None;
+        let mut browse = false;
+        egui::Window::new(title).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+            ui.label(RichText::new("Folder").size(12.0).color(th.label));
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut ask.folder).hint_text("Choose a folder").desired_width(280.0));
+                if ui.button("Browse\u{2026}").clicked() {
+                    browse = true;
+                }
+            });
+            let sub = dated.rsplit('\\').next().unwrap_or_default();
+            ui.label(RichText::new(format!("A dated subfolder is created ({sub}).")).size(12.0).color(th.label));
+            ui.label(RichText::new(store::BACKUP_RESTORE_NOTE).size(12.0).color(th.label));
+            ui.horizontal(|ui| {
+                let label = format!("Back up {}", plural(n, "package"));
+                if parts::admin_button(ui, &label, false, !ask.folder.trim().is_empty() && n > 0).clicked() {
+                    decided = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    decided = Some(false);
+                }
+            });
+        });
+        if browse {
+            if let Some(folder) = self.context.pick_folder("Back up drivers to", "Choose") {
+                ask.folder = folder;
+            }
+        }
+        match decided {
+            Some(true) => {
+                self.drv_ui.backup_folder = ask.folder.trim().to_string();
+                self.drv.back_up(ask.names, dated);
+                self.drv_ui.confirm_backup = None;
+            }
+            Some(false) => self.drv_ui.confirm_backup = None,
+            None => self.drv_ui.confirm_backup = Some(ask),
         }
     }
 
@@ -1965,6 +2192,18 @@ const STORE_ROW: f32 = 40.0;
 
 /// The filter box's hint on the Driver store tab.
 const STORE_FILTER_HINT: &str = "Package, INF, provider or device";
+
+/// Width of the tick box column of the store's rows.
+const STORE_TICK_W: f32 = 28.0;
+
+const REMOVE_OLD_LABEL: &str = "Remove old packages";
+const STORE_REMOVE_LABEL: &str = "Remove\u{2026}";
+const BACKUP_SELECTED_LABEL: &str = "Back up selected";
+const BACKUP_ALL_LABEL: &str = "Back up drivers\u{2026}";
+const FORCE_LABEL: &str = "Remove even if in use\u{2026}";
+const REMOVE_SELECTED_NOTE: &str = "Never forced. Packages in use are refused.";
+const REMOVE_OLD_NOTE: &str = "Only packages flagged Old and not In use.";
+const FORCE_UNDERSTOOD: &str = "I understand, continue anyway";
 
 /// Said in the side panel of an inbox package.
 const STORE_INBOX_NOTE: &str = "Inbox (Microsoft) package: not offered for removal.";
@@ -3241,5 +3480,287 @@ mod store_tests {
         assert!(serde_json::from_value::<Scope>(serde_json::json!("store")).unwrap() == Scope::Store);
         assert!(serde_json::from_value::<Scope>(serde_json::json!("builtin")).unwrap() == Scope::Builtin);
         assert!(serde_json::from_value::<Scope>(serde_json::json!("kernel")).unwrap() == Scope::Kernel);
+    }
+
+    // ------------------------------------------------ removal and backup (#28, #29)
+
+    use crate::platform::{Launch, RecordingRunner, When};
+
+    fn page_with_runner() -> (DriversPage, Arc<RecordingRunner>) {
+        let mut packages = parse_store(FIXTURE).expect("the recording parses");
+        packages.iter_mut().for_each(|p| p.size = Some(1_048_576));
+        let (ctx, runner) = AddonContext::recording();
+        let hub = Hub::new(ctx.clone(), Arc::new(NoReader));
+        hub.lock().store = packages.into();
+        let mut page = DriversPage::new(hub, ctx);
+        page.drv_ui.started = true;
+        page.drv_ui.scope = Scope::Store;
+        (page, runner)
+    }
+
+    /// One egui context kept over several frames, so clicks reach the page.
+    struct Screen {
+        ctx: egui::Context,
+        time: f64,
+    }
+
+    impl Screen {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            Screen { ctx, time: 0.0 }
+        }
+
+        fn step(&mut self, page: &mut DriversPage, events: Vec<egui::Event>) -> Vec<(Pos2, String)> {
+            fn texts(shape: &egui::Shape, out: &mut Vec<(Pos2, String)>) {
+                match shape {
+                    egui::Shape::Text(t) => out.push((t.pos, t.galley.text().to_string())),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                    _ => {}
+                }
+            }
+            self.time += 0.1;
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))), time: Some(self.time), events, ..Default::default() };
+            let output = self.ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| page.ui(ui, &mut Vec::new()));
+            });
+            let mut out = Vec::new();
+            output.shapes.iter().for_each(|s| texts(&s.shape, &mut out));
+            out
+        }
+
+        fn settle(&mut self, page: &mut DriversPage) -> Vec<(Pos2, String)> {
+            self.step(page, vec![]);
+            self.step(page, vec![])
+        }
+
+        fn click(&mut self, page: &mut DriversPage, at: Pos2) -> Vec<(Pos2, String)> {
+            let m = egui::Modifiers::NONE;
+            let button = egui::PointerButton::Primary;
+            self.step(page, vec![egui::Event::PointerMoved(at)]);
+            self.step(page, vec![egui::Event::PointerButton { pos: at, button, pressed: true, modifiers: m }]);
+            self.step(page, vec![egui::Event::PointerButton { pos: at, button, pressed: false, modifiers: m }]);
+            self.settle(page)
+        }
+    }
+
+    /// Where the last text equal to `what` is drawn (a dialog is drawn after
+    /// the page under it).
+    fn last(texts: &[(Pos2, String)], what: &str) -> Pos2 {
+        texts.iter().rev().find(|(_, t)| t == what).unwrap_or_else(|| panic!("{what:?} is not drawn: {texts:?}")).0 + vec2(8.0, 8.0)
+    }
+
+    fn drawn(texts: &[(Pos2, String)], what: &str) -> bool {
+        texts.iter().any(|(_, t)| t == what)
+    }
+
+    /// The tick box of the row whose package name is drawn at `name`.
+    fn tick_of(name: Pos2) -> Pos2 {
+        Pos2::new(name.x - 8.0 - STORE_TICK_W + 14.0, name.y + 6.0)
+    }
+
+    fn wait_for_the_job(page: &DriversPage) {
+        for _ in 0..1000 {
+            if page.drv.lock().busy.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the job did not finish");
+    }
+
+    fn admin(label: &str) -> String {
+        format!("      {label}")
+    }
+
+    #[test]
+    fn a_tick_box_selects_a_package_and_an_inbox_row_has_none() {
+        let (mut page, _) = page_with_runner();
+        let mut screen = Screen::new();
+        let t = screen.settle(&mut page);
+        assert!(drawn(&t, &admin("Remove\u{2026}")) && !drawn(&t, &admin("Remove 1\u{2026}")), "nothing ticked yet");
+        let name = last(&t, "oem50.inf") - vec2(8.0, 8.0);
+        let t = screen.click(&mut page, tick_of(name));
+        assert_eq!(page.drv_ui.ticked.names(), ["oem50.inf"]);
+        assert!(drawn(&t, &admin("Remove 1\u{2026}")), "the count follows the ticks");
+        assert_eq!(page.drv_ui.selected_store, None, "ticking is not selecting the row");
+        let t = screen.click(&mut page, tick_of(name));
+        assert!(page.drv_ui.ticked.is_empty() && drawn(&t, &admin("Remove\u{2026}")), "a second click unticks");
+
+        let inbox = last(&t, "oem10.inf") - vec2(8.0, 8.0);
+        screen.click(&mut page, tick_of(inbox));
+        assert!(page.drv_ui.ticked.is_empty(), "the inbox package has no tick box");
+    }
+
+    #[test]
+    fn the_buttons_over_the_list_need_a_free_job_and_ticks_where_they_work_on_ticks() {
+        let (mut page, _) = page_with_runner();
+        page.drv.lock().busy = Some("Installing\u{2026}".into());
+        let mut screen = Screen::new();
+        let t = screen.settle(&mut page);
+        for label in ["Remove old packages", "Back up selected", "Back up drivers\u{2026}"] {
+            assert!(drawn(&t, &admin(label)), "{label} is shown even when it cannot be used");
+        }
+        let at = last(&t, &admin("Remove old packages"));
+        screen.click(&mut page, at);
+        assert!(page.drv_ui.confirm_remove.is_none(), "another job holds the busy text");
+        page.drv.lock().busy = None;
+        screen.click(&mut page, at);
+        let ask = page.drv_ui.confirm_remove.clone().expect("the confirmation opens");
+        assert_eq!((ask.kind, ask.names), (RemoveKind::Old, store::old_removable(&page.drv.lock().store)));
+    }
+
+    #[test]
+    fn remove_old_confirms_with_the_list_then_runs_one_elevated_launch_without_force() {
+        let (mut page, runner) = page_with_runner();
+        let old = store::old_removable(&page.drv.lock().store);
+        assert_eq!(old.len(), 5);
+        let mut screen = Screen::new();
+        screen.settle(&mut page);
+        page.drv_ui.confirm_remove = Some(RemoveAsk { kind: RemoveKind::Old, names: old.clone(), understood: false });
+        let t = screen.settle(&mut page);
+        assert!(drawn(&t, "Remove 5 old packages?") && drawn(&t, REMOVE_OLD_NOTE), "{t:?}");
+        for name in &old {
+            assert!(t.iter().any(|(_, x)| x.starts_with(name.as_str())), "{name} is listed");
+        }
+        assert!(drawn(&t, "Create a restore point first"));
+        let items: Vec<String> = old.iter().map(|n| format!(r#"{{"name":"{n}","code":0,"output":""}}"#)).collect();
+        runner.prepare(When::Nth(0), 0, &format!(r#"{{"ok":true,"items":[{}],"steps":{{"restore-point":{{"state":"created","drive":"C:"}}}}}}"#, items.join(",")));
+        let at = last(&t, &admin(REMOVE_OLD_LABEL));
+        screen.click(&mut page, at);
+        wait_for_the_job(&page);
+        let launches = runner.launches();
+        let Launch::PowerShell { args, elevated, .. } = &launches[0] else { panic!("a PowerShell launch") };
+        assert!(*elevated);
+        let arg = |k: &str| args.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!((arg("Mode"), arg("Names"), arg("Force"), arg("Steps")), (Some("delete"), Some(old.join(",").as_str()), Some("0"), Some("restore-point,delete")));
+        assert!(page.drv_ui.confirm_remove.is_none());
+        assert_eq!(page.drv.lock().message.as_ref().map(|m| m.0.as_str()), Some("Restore point created. Removed 5 packages, freed 5.0 MB."));
+    }
+
+    #[test]
+    fn cancel_in_the_removal_dialog_runs_nothing() {
+        let (mut page, runner) = page_with_runner();
+        let mut screen = Screen::new();
+        page.drv_ui.confirm_remove = Some(RemoveAsk { kind: RemoveKind::Selected, names: vec!["oem50.inf".into(), store::old_removable(&page.drv.lock().store).remove(0)], understood: false });
+        let t = screen.settle(&mut page);
+        assert!(drawn(&t, "Remove 2 driver packages?") && drawn(&t, REMOVE_SELECTED_NOTE), "{t:?}");
+        assert!(drawn(&t, "In use: will be refused"), "a ticked package in use is marked in the list");
+        let at = last(&t, "Cancel");
+        screen.click(&mut page, at);
+        assert!(page.drv_ui.confirm_remove.is_none());
+        assert!(runner.launches().is_empty());
+    }
+
+    #[test]
+    fn a_package_in_use_says_a_plain_removal_is_refused_and_offers_the_forced_one() {
+        let (mut page, _) = page_with_runner();
+        let mut screen = Screen::new();
+        page.drv_ui.selected_store = Some("oem50.inf".into());
+        let t = screen.settle(&mut page);
+        assert!(drawn(&t, store::NOT_REMOVED_IN_USE) && drawn(&t, FORCE_LABEL) && drawn(&t, &admin("Remove\u{2026}")), "{t:?}");
+        let free = store::old_removable(&page.drv.lock().store).remove(0);
+        page.drv_ui.selected_store = Some(free);
+        let t = screen.settle(&mut page);
+        assert!(!drawn(&t, store::NOT_REMOVED_IN_USE) && !drawn(&t, FORCE_LABEL), "a package no device uses has no forced removal");
+        page.drv_ui.selected_store = Some("oem10.inf".into());
+        let t = screen.settle(&mut page);
+        assert!(drawn(&t, STORE_INBOX_NOTE) && !drawn(&t, FORCE_LABEL), "an inbox package is not offered");
+        assert_eq!(t.iter().filter(|(_, x)| *x == admin("Remove\u{2026}")).count(), 1, "only the list's button is left: none in the panel");
+    }
+
+    #[test]
+    fn the_forced_removal_asks_twice_and_is_the_only_one_that_sends_force() {
+        let (mut page, runner) = page_with_runner();
+        let mut screen = Screen::new();
+        page.drv_ui.selected_store = Some("oem50.inf".into());
+        let t = screen.settle(&mut page);
+        let at = last(&t, FORCE_LABEL);
+        let t = screen.click(&mut page, at);
+        let ask = page.drv_ui.confirm_remove.clone().expect("the stronger confirmation opens");
+        assert_eq!((ask.kind, ask.names.as_slice()), (RemoveKind::Forced, ["oem50.inf".to_string()].as_slice()));
+        assert!(drawn(&t, "Remove oem50.inf even if in use?") && drawn(&t, FORCE_UNDERSTOOD), "{t:?}");
+        assert!(t.iter().any(|(_, x)| x.starts_with("Runs pnputil /delete-driver oem50.inf /uninstall /force")));
+        assert!(t.iter().any(|(_, x)| x.contains("stops working and may not come back")), "the stronger warning names the consequence");
+        // The button does nothing until the user says they understand.
+        let button = last(&t, &admin("Remove even if in use"));
+        screen.click(&mut page, button);
+        assert!(runner.launches().is_empty() && page.drv_ui.confirm_remove.is_some());
+        let check = last(&t, FORCE_UNDERSTOOD);
+        screen.click(&mut page, check);
+        assert!(page.drv_ui.confirm_remove.as_ref().is_some_and(|a| a.understood));
+        runner.prepare(When::Nth(0), 0, r#"{"ok":true,"items":[{"name":"oem50.inf","code":0,"output":""}],"steps":{"restore-point":{"state":"created","drive":"C:"}}}"#);
+        let t = screen.settle(&mut page);
+        let button = last(&t, &admin("Remove even if in use"));
+        screen.click(&mut page, button);
+        wait_for_the_job(&page);
+        let Launch::PowerShell { args, .. } = &runner.launches()[0] else { panic!("a PowerShell launch") };
+        assert!(args.contains(&("Force".into(), "1".into())) && args.contains(&("Names".into(), "oem50.inf".into())), "{args:?}");
+    }
+
+    #[test]
+    fn a_plain_removal_of_a_package_in_use_is_refused_with_the_stated_words_and_runs_nothing() {
+        let (mut page, runner) = page_with_runner();
+        let mut screen = Screen::new();
+        page.drv_ui.confirm_remove = Some(RemoveAsk { kind: RemoveKind::Selected, names: vec!["oem50.inf".into()], understood: false });
+        let t = screen.settle(&mut page);
+        let at = last(&t, &admin("Remove"));
+        screen.click(&mut page, at);
+        assert!(runner.launches().is_empty(), "no UAC prompt for a refusal");
+        assert_eq!(page.drv.lock().message.as_ref().map(|m| m.0.as_str()), Some("Not removed: oem50.inf (a device uses it)"));
+    }
+
+    #[test]
+    fn the_header_button_and_back_up_selected_open_the_backup_dialog_with_the_note() {
+        let (mut page, runner) = page_with_runner();
+        let mut screen = Screen::new();
+        let t = screen.settle(&mut page);
+        let at = last(&t, &admin("Back up drivers\u{2026}"));
+        let t = screen.click(&mut page, at);
+        assert_eq!(page.drv_ui.confirm_backup.as_ref().map(|a| a.names.clone()), Some(None), "every third-party package");
+        assert!(drawn(&t, "Back up every third-party driver") && drawn(&t, store::BACKUP_RESTORE_NOTE), "{t:?}");
+        assert!(drawn(&t, &format!("A dated subfolder is created (Drivers {}).", store::backup_folder("", today()).trim_start_matches("\\Drivers "))));
+        assert!(drawn(&t, &admin("Back up 12 packages")), "twelve third-party packages: {t:?}");
+        // No folder yet: the button does nothing.
+        let go = last(&t, &admin("Back up 12 packages"));
+        screen.click(&mut page, go);
+        assert!(runner.launches().is_empty() && page.drv_ui.confirm_backup.is_some());
+        let cancel = last(&t, "Cancel");
+        screen.click(&mut page, cancel);
+        assert!(page.drv_ui.confirm_backup.is_none());
+
+        // Back up selected names the ticked packages.
+        let free = store::old_removable(&page.drv.lock().store).remove(0);
+        let package = page.drv.lock().store.iter().find(|p| p.published == free).unwrap().clone();
+        page.drv_ui.ticked.toggle(&package);
+        let t = screen.settle(&mut page);
+        let at = last(&t, &admin(BACKUP_SELECTED_LABEL));
+        let t = screen.click(&mut page, at);
+        assert_eq!(page.drv_ui.confirm_backup.as_ref().and_then(|a| a.names.clone()), Some(vec![free.clone()]));
+        assert!(drawn(&t, "Back up 1 selected package") && drawn(&t, &admin("Back up 1 package")), "{t:?}");
+    }
+
+    #[test]
+    fn confirming_the_backup_runs_one_elevated_export_into_the_dated_subfolder_without_a_restore_point() {
+        let (mut page, runner) = page_with_runner();
+        let mut screen = Screen::new();
+        page.drv_ui.confirm_backup = Some(BackupAsk { names: None, folder: r"D:\Backups".into() });
+        let t = screen.settle(&mut page);
+        let all = store::third_party(&page.drv.lock().store);
+        let items: Vec<String> = all.iter().map(|n| format!(r#"{{"name":"{n}","code":0,"output":""}}"#)).collect();
+        runner.prepare(When::Nth(0), 0, &format!(r#"{{"ok":true,"items":[{}]}}"#, items.join(",")));
+        let go = last(&t, &admin("Back up 12 packages"));
+        screen.click(&mut page, go);
+        wait_for_the_job(&page);
+        let folder = store::backup_folder(r"D:\Backups", today());
+        let Launch::PowerShell { args, elevated, script } = &runner.launches()[0] else { panic!("a PowerShell launch") };
+        assert!(*elevated && script.as_str() == drivers::STORE_SCRIPT, "the store script, no restore point step");
+        assert_eq!(
+            args,
+            &[("Mode".to_string(), "export".to_string()), ("Names".into(), all.join(",")), ("Folder".into(), folder.clone()), ("Force".into(), "0".into())]
+        );
+        assert_eq!(page.drv.lock().message.as_ref().map(|m| m.0.clone()), Some(format!("Backed up 12 driver packages to {folder}.")));
+        assert_eq!(page.drv_ui.backup_folder, r"D:\Backups", "the folder is remembered for the next backup");
+        assert!(page.drv_ui.confirm_backup.is_none());
     }
 }

@@ -252,6 +252,188 @@ impl StoreList {
     }
 }
 
+// ------------------------------------------------- selection and removal
+
+/// The packages ticked on the Driver store tab, by published name. One model
+/// for every action that works on "the selected packages". Inbox packages
+/// cannot be ticked.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Selection(std::collections::BTreeSet<String>);
+
+impl Selection {
+    /// Ticks or unticks `p`; an inbox package is never ticked.
+    pub fn toggle(&mut self, p: &StorePackage) {
+        if self.0.remove(&p.published) || p.inbox() {
+            return;
+        }
+        self.0.insert(p.published.clone());
+    }
+
+    pub fn contains(&self, published: &str) -> bool {
+        self.0.contains(published)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The ticked names, in name order.
+    pub fn names(&self) -> Vec<String> {
+        self.0.iter().cloned().collect()
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Forgets what a new read of the store no longer holds.
+    pub fn keep_only(&mut self, packages: &[StorePackage]) {
+        self.0.retain(|name| packages.iter().any(|p| &p.published == name));
+    }
+}
+
+/// The names "Remove old packages" removes: old, not in use, not inbox, in
+/// the packages' order.
+pub fn old_removable(packages: &[StorePackage]) -> Vec<String> {
+    let flags = classify(packages);
+    packages.iter().zip(flags).filter(|(_, f)| f.removable_old()).map(|(p, _)| p.published.clone()).collect()
+}
+
+/// The names "Back up drivers…" exports: every third-party package.
+pub fn third_party(packages: &[StorePackage]) -> Vec<String> {
+    packages.iter().filter(|p| !p.inbox()).map(|p| p.published.clone()).collect()
+}
+
+/// Why a plain removal is refused, in the words of the outcome.
+pub const IN_USE_REASON: &str = "a device uses it";
+/// Said where a package in use is shown: what a plain removal answers.
+pub const NOT_REMOVED_IN_USE: &str = "Not removed: a device uses it.";
+
+/// What a removal will run and what it refuses before running anything.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemovalPlan {
+    /// The packages to hand to `pnputil /delete-driver`, in the asked order.
+    pub run: Vec<String>,
+    /// The packages never sent to the tool, with the reason.
+    pub refused: Vec<(String, String)>,
+}
+
+/// Which of `names` may be removed. Inbox packages are never removed, a
+/// package in use is refused unless `force` is asked; `force` counts for a
+/// single package only.
+pub fn plan_removal(packages: &[StorePackage], names: &[String], force: bool) -> RemovalPlan {
+    let force = force && names.len() == 1;
+    let mut plan = RemovalPlan::default();
+    let mut seen = std::collections::HashSet::new();
+    for name in names.iter().filter(|n| seen.insert(n.as_str())) {
+        match packages.iter().find(|p| &p.published == name) {
+            None => plan.refused.push((name.clone(), "it is not in the driver store".into())),
+            Some(p) if p.inbox() => plan.refused.push((name.clone(), "it ships with Windows".into())),
+            Some(p) if p.in_use() && !force => plan.refused.push((name.clone(), IN_USE_REASON.into())),
+            Some(_) => plan.run.push(name.clone()),
+        }
+    }
+    plan
+}
+
+/// What the tool did with one package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageRun {
+    pub name: String,
+    /// The tool's exit code: 0 done, 3010 done but restart needed.
+    pub code: i64,
+    pub output: String,
+}
+
+impl PackageRun {
+    fn done(&self) -> bool {
+        matches!(self.code, 0 | 3010)
+    }
+
+    /// The tool's own words for a failure: its "Failed …" line, else the last
+    /// line it wrote.
+    fn reason(&self) -> String {
+        let lines: Vec<&str> = self.output.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let line = lines.iter().find(|l| l.to_lowercase().starts_with("failed")).or(lines.last());
+        match line {
+            Some(l) => l.split_once(": ").filter(|(head, _)| head.to_lowercase().starts_with("failed")).map_or(*l, |(_, rest)| rest).trim_end_matches('.').to_string(),
+            None => format!("pnputil returned code {}", self.code),
+        }
+    }
+}
+
+/// Reads a store job's result: one entry per package, in the order run.
+pub fn parse_runs(v: &serde_json::Value) -> Result<Vec<PackageRun>, String> {
+    if v["ok"].as_bool() != Some(true) {
+        return Err(v["error"].as_str().filter(|e| !e.is_empty()).unwrap_or("unknown error").to_string());
+    }
+    Ok(v["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|i| PackageRun { name: i["name"].as_str().unwrap_or_default().to_string(), code: i["code"].as_i64().unwrap_or(-1), output: i["output"].as_str().unwrap_or_default().to_string() })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// What a removal reported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovalOutcome {
+    /// The page's message; the flag marks an error.
+    pub message: (String, bool),
+    pub removed: usize,
+    pub reboot: bool,
+}
+
+/// "Removed N packages, freed X." and one "Not removed: <name> (<reason>)"
+/// per package left. `size_of` gives a package's measured size.
+pub fn removal_outcome(refused: &[(String, String)], runs: &[PackageRun], size_of: impl Fn(&str) -> Option<u64>) -> RemovalOutcome {
+    let removed: Vec<&PackageRun> = runs.iter().filter(|r| r.done()).collect();
+    let mut lines = Vec::new();
+    if !removed.is_empty() {
+        let sizes: Vec<u64> = removed.iter().filter_map(|r| size_of(&r.name)).collect();
+        let mut line = format!("Removed {}", crate::addons::plural(removed.len(), "package"));
+        if !sizes.is_empty() {
+            line.push_str(&format!(", freed {}", crate::widgets::fmt_bytes(sizes.iter().sum())));
+        }
+        lines.push(line + ".");
+    }
+    let failures = refused.iter().cloned().chain(runs.iter().filter(|r| !r.done()).map(|r| (r.name.clone(), r.reason())));
+    let mut any_left = false;
+    for (name, why) in failures {
+        any_left = true;
+        lines.push(format!("Not removed: {name} ({why})"));
+    }
+    RemovalOutcome { message: (lines.join("\n"), removed.is_empty() && any_left), removed: removed.len(), reboot: removed.iter().any(|r| r.code == 3010) }
+}
+
+/// The dated subfolder of the folder the user picked: "<folder>\Drivers
+/// 2026-11-23".
+pub fn backup_folder(picked: &str, (year, month, day): (i64, u32, u32)) -> String {
+    format!("{}\\Drivers {year:04}-{month:02}-{day:02}", picked.trim_end_matches(['\\', '/']))
+}
+
+/// The note on how a backup is used again.
+pub const BACKUP_RESTORE_NOTE: &str = "Restore a backup with \u{201c}Install from an INF file\u{2026}\u{201d}, one INF per package.";
+
+/// "Backed up N driver packages to <folder>." and one "Not backed up:
+/// <name> (<reason>)" per failure.
+pub fn backup_outcome(folder: &str, runs: &[PackageRun]) -> (String, bool) {
+    let done = runs.iter().filter(|r| r.done()).count();
+    let mut lines = Vec::new();
+    if done > 0 {
+        lines.push(format!("Backed up {} to {folder}.", crate::addons::plural(done, "driver package")));
+    }
+    lines.extend(runs.iter().filter(|r| !r.done()).map(|r| format!("Not backed up: {} ({})", r.name, r.reason())));
+    (lines.join("\n"), done == 0)
+}
+
 // ------------------------------------------------------------------- XML
 
 /// An element of the tool's XML: the part of the format the tool writes.
@@ -578,5 +760,132 @@ mod tests {
         assert_eq!(split_version("garbage"), (String::new(), "garbage".into()));
         assert_eq!(split_version("13/40/2024 1.0"), (String::new(), "13/40/2024 1.0".into()));
         assert_eq!(split_version(""), (String::new(), String::new()));
+    }
+}
+
+#[cfg(test)]
+mod removal_tests {
+    use super::*;
+
+    fn pkg(published: &str, original: &str, provider: &str, version: &str, devices: usize) -> StorePackage {
+        StorePackage {
+            published: published.into(),
+            original: original.into(),
+            provider: provider.into(),
+            version: version.into(),
+            devices: (0..devices).map(|i| StoreDevice { instance_id: format!("D{i}"), name: format!("Device {i}") }).collect(),
+            size: Some(1_048_576),
+            ..Default::default()
+        }
+    }
+
+    /// oem1 old, oem2 its newer one, oem3 old but in use, oem4 inbox old, oem5 newest and in use.
+    fn store() -> Vec<StorePackage> {
+        vec![
+            pkg("oem1.inf", "a.inf", "Acme", "1.0.0.0", 0),
+            pkg("oem2.inf", "a.inf", "Acme", "3.0.0.0", 0),
+            pkg("oem3.inf", "b.inf", "Beta", "1.0.0.0", 1),
+            pkg("oem4.inf", "c.inf", "Microsoft", "1.0.0.0", 0),
+            pkg("oem5.inf", "b.inf", "Beta", "2.0.0.0", 2),
+            pkg("oem6.inf", "c.inf", "Microsoft", "2.0.0.0", 0),
+        ]
+    }
+
+    fn names(l: &[&str]) -> Vec<String> {
+        l.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn remove_old_picks_only_old_packages_that_no_device_uses_and_are_not_inbox() {
+        assert_eq!(old_removable(&store()), ["oem1.inf"], "oem3 is in use, oem4 is inbox, the rest are newest");
+        assert!(old_removable(&[]).is_empty());
+    }
+
+    #[test]
+    fn back_up_everything_means_every_third_party_package() {
+        assert_eq!(third_party(&store()), ["oem1.inf", "oem2.inf", "oem3.inf", "oem5.inf"]);
+    }
+
+    #[test]
+    fn ticking_toggles_a_package_and_never_ticks_an_inbox_one() {
+        let s = store();
+        let mut sel = Selection::default();
+        sel.toggle(&s[0]);
+        sel.toggle(&s[3]);
+        assert_eq!(sel.names(), ["oem1.inf"], "the inbox package gets no tick");
+        sel.toggle(&s[1]);
+        assert_eq!((sel.len(), sel.contains("oem2.inf")), (2, true));
+        sel.toggle(&s[0]);
+        assert_eq!(sel.names(), ["oem2.inf"]);
+        sel.keep_only(&s[..1]);
+        assert!(sel.is_empty(), "a package a new read no longer holds is forgotten");
+    }
+
+    #[test]
+    fn a_plain_removal_refuses_in_use_inbox_and_unknown_packages_and_runs_the_rest() {
+        let plan = plan_removal(&store(), &names(&["oem1.inf", "oem3.inf", "oem4.inf", "oem9.inf", "oem1.inf"]), false);
+        assert_eq!(plan.run, ["oem1.inf"], "listed twice, run once");
+        assert_eq!(
+            plan.refused,
+            [
+                ("oem3.inf".to_string(), "a device uses it".to_string()),
+                ("oem4.inf".to_string(), "it ships with Windows".to_string()),
+                ("oem9.inf".to_string(), "it is not in the driver store".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn force_counts_for_one_package_only_and_never_for_an_inbox_one() {
+        assert_eq!(plan_removal(&store(), &names(&["oem3.inf"]), true).run, ["oem3.inf"]);
+        let many = plan_removal(&store(), &names(&["oem3.inf", "oem1.inf"]), true);
+        assert_eq!((many.run, many.refused.len()), (names(&["oem1.inf"]), 1), "two packages: no force");
+        assert!(plan_removal(&store(), &names(&["oem4.inf"]), true).run.is_empty());
+    }
+
+    fn run(name: &str, code: i64, output: &str) -> PackageRun {
+        PackageRun { name: name.into(), code, output: output.into() }
+    }
+
+    #[test]
+    fn the_outcome_says_how_many_were_removed_how_much_was_freed_and_what_stayed() {
+        let size = |n: &str| (n != "oem2.inf").then_some(3 * 1_048_576);
+        let out = removal_outcome(&[("oem3.inf".into(), IN_USE_REASON.into())], &[run("oem1.inf", 0, ""), run("oem2.inf", 0, "")], size);
+        assert_eq!(out.message, ("Removed 2 packages, freed 3.0 MB.\nNot removed: oem3.inf (a device uses it)".to_string(), false));
+        assert_eq!((out.removed, out.reboot), (2, false));
+    }
+
+    #[test]
+    fn nothing_removed_is_an_error_and_a_restart_is_reported() {
+        let out = removal_outcome(&[], &[run("oem1.inf", 1, "Microsoft PnP Utility\n\nDeleting driver package: oem1.inf\nFailed to delete driver package: The package is in use.\n")], |_| None);
+        assert_eq!(out.message, ("Not removed: oem1.inf (The package is in use)".to_string(), true));
+        let out = removal_outcome(&[], &[run("oem1.inf", 3010, "")], |_| None);
+        assert_eq!((out.message.0.as_str(), out.reboot), ("Removed 1 package.", true), "no size known: nothing is said about it");
+        let out = removal_outcome(&[], &[run("oem1.inf", 5, "")], |_| None);
+        assert_eq!(out.message.0, "Not removed: oem1.inf (pnputil returned code 5)");
+    }
+
+    #[test]
+    fn a_job_result_is_read_into_one_run_per_package() {
+        let v = serde_json::json!({"ok": true, "items": [{"name": "oem1.inf", "code": 0, "output": "x"}, {"name": "oem2.inf", "code": 1, "output": "y"}]});
+        assert_eq!(parse_runs(&v).unwrap(), [run("oem1.inf", 0, "x"), run("oem2.inf", 1, "y")]);
+        assert_eq!(parse_runs(&serde_json::json!({"ok": false, "error": "no folder"})), Err("no folder".to_string()));
+    }
+
+    #[test]
+    fn the_backup_goes_into_a_dated_subfolder_of_the_picked_folder() {
+        assert_eq!(backup_folder(r"D:\Backups", (2026, 11, 3)), r"D:\Backups\Drivers 2026-11-03");
+        assert_eq!(backup_folder(r"D:\Backups\", (2026, 11, 23)), r"D:\Backups\Drivers 2026-11-23");
+    }
+
+    #[test]
+    fn the_backup_outcome_counts_what_was_exported_and_lists_the_failures() {
+        let folder = r"D:\B\Drivers 2026-11-23";
+        assert_eq!(backup_outcome(folder, &[run("oem1.inf", 0, ""), run("oem2.inf", 0, "")]), (format!("Backed up 2 driver packages to {folder}."), false));
+        assert_eq!(backup_outcome(folder, &[run("oem1.inf", 0, "")]).0, format!("Backed up 1 driver package to {folder}."));
+        let (text, error) = backup_outcome(folder, &[run("oem1.inf", 0, ""), run("oem2.inf", 2, "Failed to export driver package: The system cannot find the file specified.")]);
+        assert_eq!(text, format!("Backed up 1 driver package to {folder}.\nNot backed up: oem2.inf (The system cannot find the file specified)"));
+        assert!(!error);
+        assert!(backup_outcome(folder, &[run("oem2.inf", 2, "")]).1, "all failed: an error");
     }
 }
