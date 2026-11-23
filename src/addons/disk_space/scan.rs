@@ -950,6 +950,8 @@ pub(super) mod tests {
         let listed = Arc::new(AtomicUsize::new(0));
         let (s, l) = (stop.clone(), listed.clone());
         let (s2, l2) = (stop.clone(), listed.clone());
+        let at_stop = Arc::new(AtomicUsize::new(0));
+        let at_stop2 = at_stop.clone();
         let mut first = true;
         walk_in_time(
             t.0.clone(),
@@ -959,11 +961,15 @@ pub(super) mod tests {
             },
             move |_| {
                 if std::mem::take(&mut first) {
-                    settled(&l2);
+                    at_stop2.store(settled(&l2), SeqCst);
                     s2.store(true, SeqCst);
                 }
             },
         );
-        assert!(listed.load(SeqCst) < SMALL, "a stopped walk lists no more folders");
+        // How many folders were listed before the stop depends on thread
+        // timing; what counts is that no lister takes up more than the one
+        // folder it was about to, once the stop is set.
+        let extra = listed.load(SeqCst) - at_stop.load(SeqCst);
+        assert!(extra <= WORKERS, "a stopped walk lists no more folders ({extra} more after the stop)");
     }
 }
