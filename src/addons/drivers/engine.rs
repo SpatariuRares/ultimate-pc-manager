@@ -22,7 +22,7 @@ use crate::platform::series::{Run, Series};
 use crate::platform::{AddonContext, Generation};
 
 use super::signature::{Signature, SignatureBook};
-use super::store::StorePackage;
+use super::store::{self, StorePackage};
 use super::ListingReader;
 
 #[derive(Clone, Debug, Default)]
@@ -520,6 +520,9 @@ pub struct RestorePrompt {
 pub enum Redo {
     Updates(Vec<String>),
     Inf(String),
+    /// Driver store packages (their published names) and whether `/force`
+    /// was chosen for the single one.
+    Remove { names: Vec<String>, force: bool },
 }
 
 #[derive(Clone)]
@@ -832,6 +835,114 @@ impl Hub {
         self.pnputil("inf", path, true, "Installing the driver package \u{2014} confirm the Windows prompt\u{2026}", restore_point);
     }
 
+    /// Removes the driver store packages `names` with `pnputil /delete-driver`,
+    /// never forced; a package in use, an inbox one or an unknown one is
+    /// refused and told in the outcome. `restore_point` makes the same
+    /// elevated job create a restore point first.
+    pub fn remove_packages(&self, names: Vec<String>, restore_point: bool) {
+        self.remove_with(names, false, restore_point);
+    }
+
+    /// "Remove old packages": the packages the store flags Old that no device
+    /// uses (see [`store::old_removable`]).
+    pub fn remove_old(&self, restore_point: bool) {
+        let names = store::old_removable(&self.lock().store);
+        self.remove_with(names, false, restore_point);
+    }
+
+    /// "Remove even if in use": one package, `/uninstall /force`.
+    pub fn remove_forced(&self, name: String, restore_point: bool) {
+        self.remove_with(vec![name], true, restore_point);
+    }
+
+    fn remove_with(&self, names: Vec<String>, force: bool, restore_point: bool) {
+        let (plan, sizes) = {
+            let Some(st) = self.live() else { return };
+            let plan = store::plan_removal(&st.store, &names, force);
+            let sizes: HashMap<String, Option<u64>> = st.store.iter().map(|p| (p.published.clone(), p.size)).collect();
+            (plan, sizes)
+        };
+        let force = force && names.len() == 1;
+        if plan.run.is_empty() {
+            // Nothing to send to the tool: the refusals are the outcome.
+            if names.is_empty() {
+                return;
+            }
+            let Some(mut st) = self.live() else { return };
+            st.message = Some(store::removal_outcome(&plan.refused, &[], |_| None).message);
+            return;
+        }
+        let busy = format!("Removing {} \u{2014} confirm the Windows prompt\u{2026}", plural(plan.run.len(), "driver package"));
+        // The change is uninterruptible: it ends before the add-on turns off.
+        self.spawn(Some(busy), true, move |hub, run| {
+            let joined = plan.run.join(",");
+            let args = [("Mode", "delete"), ("Names", joined.as_str()), ("Folder", ""), ("Force", if force { "1" } else { "0" })];
+            let ran = hub.run_job(STORE_SCRIPT, "delete", &args, &restore_steps(restore_point));
+            let (result, restore_note) = match ran {
+                JobRun::Done { result, note } => (result, note),
+                JobRun::Refused(reason) => {
+                    hub.refuse(run, reason, Redo::Remove { names, force });
+                    return;
+                }
+            };
+            let mut outcome = match result.map(|v| store::parse_runs(&v)) {
+                Ok(Ok(runs)) => store::removal_outcome(&plan.refused, &runs, |n| sizes.get(n).copied().flatten()),
+                Ok(Err(e)) => store::RemovalOutcome { message: (format!("Removal failed: {e}"), true), removed: 0, reboot: false },
+                Err(e) => store::RemovalOutcome { message: not_run(e), removed: 0, reboot: false },
+            };
+            outcome.message.0 = with_note(restore_note, outcome.message.0);
+            {
+                let Some(mut st) = hub.outcome(true) else { return };
+                run.release(&mut st);
+                if outcome.reboot {
+                    st.reboot_required = true;
+                }
+                st.message = Some(outcome.message);
+            }
+            // Only a removal that happened changes what the store holds.
+            if outcome.removed > 0 {
+                hub.refresh_now();
+            }
+        });
+    }
+
+    /// Exports the driver store packages `names` (all the third-party ones
+    /// when `None`) with `pnputil /export-driver` into `folder`, which the
+    /// job creates. A backup changes nothing, so it makes no restore point.
+    pub fn back_up(&self, names: Option<Vec<String>>, folder: String) {
+        let names = {
+            let Some(st) = self.live() else { return };
+            let third = store::third_party(&st.store);
+            match names {
+                None => third,
+                Some(wanted) => third.into_iter().filter(|n| wanted.contains(n)).collect(),
+            }
+        };
+        if names.is_empty() {
+            if let Some(mut st) = self.live() {
+                st.message = Some(("There is no third-party driver package to back up.".into(), true));
+            }
+            return;
+        }
+        let busy = format!("Backing up {} \u{2014} confirm the Windows prompt\u{2026}", plural(names.len(), "driver package"));
+        self.spawn(Some(busy), true, move |hub, run| {
+            let joined = names.join(",");
+            let args = [("Mode", "export"), ("Names", joined.as_str()), ("Folder", folder.as_str()), ("Force", "0")];
+            let result = match hub.run_job(STORE_SCRIPT, "export", &args, &[]) {
+                JobRun::Done { result, .. } => result,
+                JobRun::Refused(_) => return,
+            };
+            let message = match result.map(|v| store::parse_runs(&v)) {
+                Ok(Ok(runs)) => store::backup_outcome(&folder, &runs),
+                Ok(Err(e)) => (format!("Backup failed: {e}"), true),
+                Err(e) => not_run(e),
+            };
+            let Some(mut st) = hub.outcome(true) else { return };
+            run.release(&mut st);
+            st.message = Some(message);
+        });
+    }
+
     /// Runs `change` in one elevated job, the `steps` before it. A step that
     /// refuses the change (a restore point that could not be made) stops the
     /// job before anything is changed. With no steps the launch is the
@@ -869,6 +980,7 @@ impl Hub {
         match prompt.map(|p| p.redo) {
             Some(Redo::Updates(ids)) => self.install_with(ids, false),
             Some(Redo::Inf(path)) => self.install_inf_with(path, false),
+            Some(Redo::Remove { names, force }) => self.remove_with(names, force, false),
             None => {}
         }
     }
@@ -1304,6 +1416,30 @@ try {
 ConvertTo-Json -InputObject $res -Depth 5 | Out-File -FilePath $Out -Encoding utf8
 "#;
 
+/// The driver store jobs: `Mode` is `delete` (`pnputil /delete-driver`, with
+/// `/uninstall /force` only when `Force` is `1`) or `export`
+/// (`pnputil /export-driver` into `Folder`, created first). `Names` are the
+/// packages' published names, comma separated. pnputil is called by its
+/// absolute System32 path; one entry per package comes back.
+pub const STORE_SCRIPT: &str = r#"param([string]$Out, [string]$Mode, [string]$Names, [string]$Folder, [string]$Force)
+$pnputil = Join-Path ([Environment]::SystemDirectory) 'pnputil.exe'
+$res = [ordered]@{ ok = $false; error = ''; items = @() }
+try {
+  if ($Mode -notin 'delete', 'export') { throw "Unknown mode $Mode" }
+  if ($Mode -eq 'export') { [void](New-Item -ItemType Directory -Path $Folder -Force) }
+  $items = @()
+  foreach ($name in ($Names -split ',')) {
+    if ($Mode -eq 'export') { $o = & $pnputil /export-driver $name $Folder 2>&1 }
+    elseif ($Force -eq '1') { $o = & $pnputil /delete-driver $name /uninstall /force 2>&1 }
+    else { $o = & $pnputil /delete-driver $name 2>&1 }
+    $items += [ordered]@{ name = $name; code = [int]$LASTEXITCODE; output = ($o | Out-String).Trim() }
+  }
+  $res.items = $items
+  $res.ok = $true
+} catch { $res.error = $_.Exception.Message }
+ConvertTo-Json -InputObject $res -Depth 5 | Out-File -FilePath $Out -Encoding utf8
+"#;
+
 /// One registry value of the security band, as read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reading {
@@ -1718,6 +1854,205 @@ mod tests {
         assert!(script.contains("-RestorePointType DEVICE_DRIVER_INSTALL"));
         assert!(step < script.find("CreateUpdateSearcher").expect("the change"), "the step runs first");
         assert!(script.contains("$res['steps'] = $stepResults; ConvertTo-Json -InputObject $res"));
+    }
+
+    fn store_pkg(published: &str, original: &str, version: &str, devices: usize) -> StorePackage {
+        StorePackage {
+            published: published.into(),
+            original: original.into(),
+            provider: "Acme".into(),
+            version: version.into(),
+            devices: (0..devices).map(|i| super::store::StoreDevice { instance_id: format!("D{i}"), name: format!("Device {i}") }).collect(),
+            size: Some(1_048_576),
+            ..Default::default()
+        }
+    }
+
+    /// oem1 old, oem2 its newer one, oem3 in use, oem4 a Microsoft package.
+    fn store_hub() -> (Hub, Arc<crate::platform::RecordingRunner>, Arc<Counting>) {
+        let (hub, runner, reader) = install_hub();
+        let mut ms = store_pkg("oem4.inf", "m.inf", "1.0", 0);
+        ms.provider = "Microsoft".into();
+        hub.lock().store = vec![store_pkg("oem1.inf", "a.inf", "1.0", 0), store_pkg("oem2.inf", "a.inf", "2.0", 0), store_pkg("oem3.inf", "b.inf", "1.0", 1), ms].into();
+        (hub, runner, reader)
+    }
+
+    fn store_launch(mode: &str, names: &str, folder: &str, force: &str, steps: &[&Step], change: &str) -> Launch {
+        let mut args: Vec<(String, String)> = [("Mode", mode), ("Names", names), ("Folder", folder), ("Force", force)].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let script = if steps.is_empty() { STORE_SCRIPT.to_string() } else { with_steps(STORE_SCRIPT, steps) };
+        if !steps.is_empty() {
+            let names = steps.iter().map(|s| s.name).chain([change]).collect::<Vec<_>>().join(",");
+            args.push(("Steps".into(), names));
+        }
+        Launch::PowerShell { script, args, elevated: true }
+    }
+
+    const DONE_1: &str = r#"{"ok":true,"items":[{"name":"oem1.inf","code":0,"output":""}]}"#;
+
+    #[test]
+    fn removing_runs_one_elevated_launch_without_force_and_reads_the_store_again() {
+        let (hub, runner, reader) = store_hub();
+        let before = reads(&reader);
+        runner.prepare(crate::platform::When::Nth(0), 0, DONE_1);
+        hub.remove_packages(vec!["oem1.inf".into()], false);
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches(), vec![store_launch("delete", "oem1.inf", "", "0", &[], "delete")]);
+        assert_eq!(hub.lock().message, Some(("Removed 1 package, freed 1.0 MB.".to_string(), false)));
+        assert_eq!(reads(&reader), before + 1, "the store is read again");
+    }
+
+    #[test]
+    fn removing_with_a_restore_point_is_one_launch_with_the_ordered_steps() {
+        let (hub, runner, _) = store_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, r#"{"ok":true,"items":[{"name":"oem1.inf","code":0,"output":""}],"steps":{"restore-point":{"state":"created","drive":"C:"}}}"#);
+        hub.remove_packages(vec!["oem1.inf".into()], true);
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches(), vec![store_launch("delete", "oem1.inf", "", "0", &[&RESTORE_POINT], "delete")]);
+        assert_eq!(hub.lock().message, Some(("Restore point created. Removed 1 package, freed 1.0 MB.".to_string(), false)));
+    }
+
+    #[test]
+    fn a_package_in_use_an_inbox_one_and_an_unknown_one_are_refused_without_a_launch() {
+        let (hub, runner, reader) = store_hub();
+        let before = reads(&reader);
+        hub.remove_packages(vec!["oem3.inf".into(), "oem4.inf".into(), "oem9.inf".into()], true);
+        wait_until_idle(&hub);
+        assert!(runner.launches().is_empty(), "nothing to remove, so no UAC prompt");
+        let (text, error) = hub.lock().message.clone().unwrap();
+        assert!(error);
+        assert_eq!(text, "Not removed: oem3.inf (a device uses it)\nNot removed: oem4.inf (it ships with Windows)\nNot removed: oem9.inf (it is not in the driver store)");
+        assert_eq!(reads(&reader), before);
+    }
+
+    #[test]
+    fn what_is_in_use_is_left_out_of_the_launch_and_named_in_the_outcome() {
+        let (hub, runner, _) = store_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, DONE_1);
+        hub.remove_packages(vec!["oem1.inf".into(), "oem3.inf".into()], false);
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches(), vec![store_launch("delete", "oem1.inf", "", "0", &[], "delete")]);
+        assert_eq!(hub.lock().message, Some(("Removed 1 package, freed 1.0 MB.\nNot removed: oem3.inf (a device uses it)".to_string(), false)));
+    }
+
+    #[test]
+    fn only_the_explicit_single_package_option_uses_force() {
+        let (hub, runner, _) = store_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, r#"{"ok":true,"items":[{"name":"oem3.inf","code":0,"output":""}]}"#);
+        hub.remove_forced("oem3.inf".into(), false);
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches(), vec![store_launch("delete", "oem3.inf", "", "1", &[], "delete")]);
+
+        let (hub, runner, _) = store_hub();
+        hub.remove_packages(vec!["oem3.inf".into()], false);
+        wait_until_idle(&hub);
+        assert!(runner.launches().is_empty(), "a plain removal of a package in use never reaches the tool");
+    }
+
+    #[test]
+    fn the_script_forces_only_when_asked_and_calls_pnputil_by_its_system_path() {
+        let plain = STORE_SCRIPT.find("/delete-driver $name 2>&1").expect("the plain removal");
+        let forced = STORE_SCRIPT.find("/delete-driver $name /uninstall /force").expect("the forced removal");
+        assert!(STORE_SCRIPT.find("$Force -eq '1'").unwrap() < forced && forced < plain, "force sits behind its own condition");
+        assert_eq!(STORE_SCRIPT.matches("/force").count(), 1);
+        assert!(STORE_SCRIPT.contains("[Environment]::SystemDirectory") && STORE_SCRIPT.contains("pnputil.exe"));
+        assert!(STORE_SCRIPT.contains("/export-driver $name $Folder"));
+    }
+
+    #[test]
+    fn remove_old_runs_only_the_old_packages_no_device_uses() {
+        let (hub, runner, _) = store_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, DONE_1);
+        hub.remove_old(false);
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches(), vec![store_launch("delete", "oem1.inf", "", "0", &[], "delete")]);
+
+        let (hub, runner, _) = store_hub();
+        hub.lock().store = vec![store_pkg("oem2.inf", "a.inf", "2.0", 0)].into();
+        hub.remove_old(false);
+        wait_until_idle(&hub);
+        assert!(runner.launches().is_empty(), "nothing is old");
+    }
+
+    #[test]
+    fn a_failed_package_is_named_with_the_tools_reason_and_a_dismissed_prompt_is_a_cancel() {
+        let (hub, runner, reader) = store_hub();
+        let before = reads(&reader);
+        runner.prepare(crate::platform::When::Nth(0), 0, r#"{"ok":true,"items":[{"name":"oem1.inf","code":1,"output":"Failed to delete driver package: Access is denied."}]}"#);
+        hub.remove_packages(vec!["oem1.inf".into()], false);
+        wait_until_idle(&hub);
+        assert_eq!(hub.lock().message, Some(("Not removed: oem1.inf (Access is denied)".to_string(), true)));
+        assert_eq!(reads(&reader), before, "nothing was removed, so no re-read");
+
+        let (hub, runner, reader) = store_hub();
+        let before = reads(&reader);
+        runner.answer(crate::platform::ELEVATION_CANCELLED);
+        hub.remove_packages(vec!["oem1.inf".into()], true);
+        wait_until_idle(&hub);
+        assert_eq!(hub.lock().message, Some((CANCELLED_TEXT.to_string(), false)));
+        assert!(hub.lock().restore_prompt.is_none());
+        assert_eq!(reads(&reader), before);
+    }
+
+    #[test]
+    fn a_failed_restore_point_stops_the_removal_and_continuing_runs_it_without_one() {
+        let (hub, runner, _) = store_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, &refused("recent"));
+        runner.prepare(crate::platform::When::Nth(1), 0, DONE_1);
+        hub.remove_packages(vec!["oem1.inf".into()], true);
+        wait_until_idle(&hub);
+        assert_eq!(hub.lock().restore_prompt.as_ref().map(|p| p.reason.as_str()), Some("Windows already created a restore point in the last 24 hours."));
+        hub.continue_without_restore();
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches()[1], store_launch("delete", "oem1.inf", "", "0", &[], "delete"));
+        assert_eq!(hub.lock().message, Some(("Removed 1 package, freed 1.0 MB.".to_string(), false)));
+    }
+
+    #[test]
+    fn a_stopped_hub_starts_no_removal_and_no_backup() {
+        let (hub, runner, _) = store_hub();
+        hub.stop();
+        hub.remove_packages(vec!["oem1.inf".into()], false);
+        hub.back_up(None, r"D:\B\Drivers 2026-11-23".into());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(runner.launches().is_empty());
+    }
+
+    #[test]
+    fn backing_up_everything_exports_every_third_party_package_without_a_restore_point() {
+        let (hub, runner, reader) = store_hub();
+        let before = reads(&reader);
+        let folder = r"D:\B\Drivers 2026-11-23";
+        runner.prepare(crate::platform::When::Nth(0), 0, r#"{"ok":true,"items":[{"name":"oem1.inf","code":0,"output":""},{"name":"oem2.inf","code":0,"output":""},{"name":"oem3.inf","code":0,"output":""}]}"#);
+        hub.back_up(None, folder.into());
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches(), vec![store_launch("export", "oem1.inf,oem2.inf,oem3.inf", folder, "0", &[], "export")], "the inbox package is not exported and there is no restore point step");
+        assert_eq!(hub.lock().message, Some((format!("Backed up 3 driver packages to {folder}."), false)));
+        assert_eq!(reads(&reader), before, "a backup changes nothing, so no re-read");
+    }
+
+    #[test]
+    fn backing_up_the_selected_exports_only_those_and_lists_failures() {
+        let (hub, runner, _) = store_hub();
+        let folder = r"D:\B\Drivers 2026-11-23";
+        runner.prepare(crate::platform::When::Nth(0), 0, r#"{"ok":true,"items":[{"name":"oem2.inf","code":0,"output":""},{"name":"oem3.inf","code":2,"output":"Failed to export driver package: Not found."}]}"#);
+        hub.back_up(Some(vec!["oem3.inf".into(), "oem2.inf".into(), "oem4.inf".into()]), folder.into());
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches(), vec![store_launch("export", "oem2.inf,oem3.inf", folder, "0", &[], "export")], "the inbox package is dropped");
+        assert_eq!(hub.lock().message, Some((format!("Backed up 1 driver package to {folder}.\nNot backed up: oem3.inf (Not found)"), false)));
+    }
+
+    #[test]
+    fn a_backup_that_could_not_run_says_why_and_a_dismissed_prompt_is_a_cancel() {
+        let (hub, runner, _) = store_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, r#"{"ok":false,"error":"Access to the path is denied."}"#);
+        hub.back_up(None, r"D:\B".into());
+        wait_until_idle(&hub);
+        assert_eq!(hub.lock().message, Some(("Backup failed: Access to the path is denied.".to_string(), true)));
+        let (hub, runner, _) = store_hub();
+        runner.answer(crate::platform::ELEVATION_CANCELLED);
+        hub.back_up(None, r"D:\B".into());
+        wait_until_idle(&hub);
+        assert_eq!(hub.lock().message, Some((CANCELLED_TEXT.to_string(), false)));
     }
 
     /// Reads this PC's drivers: `cargo test -- --ignored --nocapture`.

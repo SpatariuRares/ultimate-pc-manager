@@ -64,3 +64,27 @@ The automatic tests run the bootstrap with a real, non-elevated PowerShell. Thes
 4. Uncheck the option, confirm, and restart the app.
    - Expected: no restore point step, the same single prompt as before, and the option stays unchecked next time.
 5. Same for "Install update" (Windows Update) and "Install ... anyway".
+
+## #28: remove driver store packages (needs UAC; use a spare old package)
+
+1. Driver store tab: tick one old package that no device uses, click "Remove 1...". The dialog lists it with "Never forced. Packages in use are refused." and "Create a restore point first" (checked). Remove.
+   - Expected: one UAC prompt (restore point and removal together), then "Restore point created. Removed 1 package, freed X." and the package is gone from the list (the store is read again).
+2. Tick an in-use package and an old one and remove both.
+   - Expected: the in-use one is marked "In use: will be refused"; the outcome is "Removed 1 package, freed X." and "Not removed: oemN.inf (a device uses it)". Tick only an in-use package: no UAC prompt, only the "Not removed" line.
+3. "Remove old packages": the dialog lists only packages flagged Old and not In use. Remove.
+   - Expected: one UAC prompt, those packages removed, nothing else.
+4. Select an in-use package: the side panel says "Not removed: a device uses it." and offers "Remove even if in use...". Open it: a stronger warning, and the button stays disabled until "I understand, continue anyway" is ticked. Only use a device you can reinstall.
+   - Expected: `pnputil /delete-driver oemN.inf /uninstall /force` runs elevated; the device loses its driver.
+5. An inbox (Microsoft) package has no tick box and no Remove button.
+6. Dismiss the UAC prompt in any of the above.
+   - Expected: "Cancelled at the Windows prompt: nothing was changed." and the list is not read again.
+
+## #29: back up driver packages (needs UAC)
+
+1. "Back up drivers..." (header). Pick a folder (or type one). The dialog says a dated subfolder "Drivers yyyy-mm-dd" is created and "Restore a backup with "Install from an INF file...", one INF per package."
+   - Expected: one UAC prompt (no restore point: a backup changes nothing), then "Backed up N driver packages to <folder>\Drivers yyyy-mm-dd." with one subfolder per package holding its INF and files.
+2. Tick two packages on the Driver store tab and click "Back up selected".
+   - Expected: only those two are exported; the message says "Backed up 2 driver packages to ...".
+3. Pick a folder you cannot write to (for example a read-only drive).
+   - Expected: "Backup failed: <reason>" or "Not backed up: oemN.inf (<reason>)" per package.
+4. Restore one package from the backup with "More actions > Install from an INF file...".
