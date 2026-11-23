@@ -1,15 +1,23 @@
 name: Release
 
-# Runs only when a v* tag is pushed: one build, no tests (CI ran them on the PR).
+# A v* tag builds the Windows zip, a Linux AppImage and a Linux tarball, and
+# publishes them as one GitHub release. One build, no tests (CI ran them on the
+# PR). A manual run (workflow_dispatch) builds and packages the same files and
+# keeps them as workflow artifacts, but never publishes a release.
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  # Newest glibc the Linux binary may need.
+  MAX_GLIBC: '2.17'
 
 jobs:
-  release:
+  windows:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -23,7 +31,91 @@ jobs:
           # The exe is named as the app, so a shortcut to it reads "Ultimate PC Manager".
           Copy-Item target/release/ultimate-pc-manager.exe "Ultimate PC Manager.exe"
           Compress-Archive -Path "Ultimate PC Manager.exe", README.md, assets/Michroma-OFL.txt, assets/Selawik-OFL.txt -DestinationPath UltimatePCManager.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: UltimatePCManager.zip
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup toolchain install && rustc --version
+      - name: Install zig and cargo-zigbuild
+        run: |
+          # zig is the linker: it builds against glibc 2.17 whatever the runner has.
+          pip3 install --user cargo-zigbuild ziglang
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: zigbuild-glibc-${{ env.MAX_GLIBC }}
+      - name: Build against glibc ${{ env.MAX_GLIBC }}
+        run: cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.${MAX_GLIBC}
+      - name: Check the glibc the binary needs
+        run: |
+          bin=target/x86_64-unknown-linux-gnu/release/ultimate-pc-manager
+          objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tee glibc-versions.txt
+          newest=$(sed 's/^GLIBC_//' glibc-versions.txt | sort -V | tail -1)
+          echo "newest glibc symbol: ${newest:-none}"
+          if [ -n "$newest" ] && [ "$(printf '%s\n%s\n' "$newest" "$MAX_GLIBC" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
+            echo "::error::the binary needs glibc $newest, newer than $MAX_GLIBC"
+            exit 1
+          fi
+      - name: Package the tarball
+        run: |
+          mkdir -p pkg/UltimatePCManager
+          cp target/x86_64-unknown-linux-gnu/release/ultimate-pc-manager README.md assets/*-OFL.txt pkg/UltimatePCManager/
+          tar -C pkg -czf UltimatePCManager-linux-x86_64.tar.gz UltimatePCManager
+      - name: Package the AppImage
+        run: |
+          sudo apt-get install -y --no-install-recommends desktop-file-utils
+          d=AppDir
+          mkdir -p "$d/usr/bin" "$d/usr/share/doc/ultimate-pc-manager"
+          cp target/x86_64-unknown-linux-gnu/release/ultimate-pc-manager "$d/usr/bin/"
+          cp README.md assets/*-OFL.txt "$d/usr/share/doc/ultimate-pc-manager/"
+          cp assets/brand/icon-256.png "$d/ultimate-pc-manager.png"
+          cat > "$d/ultimate-pc-manager.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=Ultimate PC Manager
+          Comment=Monitor and maintain your PC
+          Exec=ultimate-pc-manager
+          Icon=ultimate-pc-manager
+          Categories=System;Monitor;
+          Terminal=false
+          DESKTOP
+          ln -s usr/bin/ultimate-pc-manager "$d/AppRun"
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/1.9.0/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run "$d" UltimatePCManager-x86_64.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            UltimatePCManager-linux-x86_64.tar.gz
+            UltimatePCManager-x86_64.AppImage
+            glibc-versions.txt
+          if-no-files-found: error
+
+  publish:
+    # Only a pushed v* tag creates a release; manual runs stop at the artifacts.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: UltimatePCManager.zip
+          files: |
+            dist/UltimatePCManager.zip
+            dist/UltimatePCManager-x86_64.AppImage
+            dist/UltimatePCManager-linux-x86_64.tar.gz
