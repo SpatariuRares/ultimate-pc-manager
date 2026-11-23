@@ -26,11 +26,18 @@ fn boot_action(s: &ServiceRow) -> Option<(&'static str, &'static str)> {
     if s.source.is_empty() {
         return None;
     }
-    match s.start_type.as_str() {
-        "Enabled" => Some(("Disable at boot", "disable")),
-        "Disabled" => Some(("Enable at boot", "enable")),
-        _ => None,
-    }
+    let offered = match s.start_type.as_str() {
+        "Enabled" => ("Disable at boot", "disable"),
+        "Disabled" => ("Enable at boot", "enable"),
+        _ => return None,
+    };
+    // Hidden, not shown and failing, where the row's manager cannot do it.
+    s.can(offered.1).then_some(offered)
+}
+
+/// The buttons of Start, Stop and Restart the row's manager supports.
+fn offered_actions(s: Option<&ServiceRow>) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
+    SERVICE_ACTIONS.into_iter().filter(move |(_, what)| s.is_none_or(|s| s.can(what)))
 }
 
 /// Is `row` the service `key` names? A key made of a name alone (from Go to
@@ -92,7 +99,12 @@ impl CorePage for ServicesPage {
                 });
                 // Control is hidden, not disabled, where the system has none.
                 if is_available(Feature::ServiceControl) {
-                    for (label, what) in SERVICE_ACTIONS.into_iter().rev() {
+                    let chosen = match (&sel, self.list.as_ref()) {
+                        (Some(k), Some(Ok(list))) => list.iter().find(|s| names(k, s)),
+                        _ => None,
+                    };
+                    let shown: Vec<_> = offered_actions(chosen).collect();
+                    for (label, what) in shown.into_iter().rev() {
                         if parts::header_button(ui, label, sel.is_some()).clicked() {
                             if let Some(n) = &sel {
                                 actions.push(Action::Service(n.clone(), what));
@@ -188,19 +200,17 @@ impl CorePage for ServicesPage {
                                 }
                                 r.context_menu(|ui| {
                                     if is_available(Feature::ServiceControl) {
-                                        for (label, what) in SERVICE_ACTIONS {
+                                        let mut any = false;
+                                        for (label, what) in offered_actions(Some(s)).chain(boot_action(s)) {
+                                            any = true;
                                             if ui.button(label).clicked() {
                                                 actions.push(Action::Service(s.key(), what));
                                                 ui.close();
                                             }
                                         }
-                                        if let Some((label, what)) = boot_action(s) {
-                                            if ui.button(label).clicked() {
-                                                actions.push(Action::Service(s.key(), what));
-                                                ui.close();
-                                            }
+                                        if any {
+                                            ui.separator();
                                         }
-                                        ui.separator();
                                     }
                                     if has_process_jump(s) && ui.button(GO_TO_PROCESS).clicked() {
                                         actions.push(Action::GoToProcess(s.pid));
@@ -255,12 +265,7 @@ fn service_detail(ui: &mut Ui, s: &ServiceRow) -> Option<&'static str> {
     let mut clicked = None;
     ui.horizontal(|ui| {
         if is_available(Feature::ServiceControl) {
-            for (label, what) in SERVICE_ACTIONS {
-                if parts::outline_button(ui, label, true).clicked() {
-                    clicked = Some(what);
-                }
-            }
-            if let Some((label, what)) = boot_action(s) {
+            for (label, what) in offered_actions(Some(s)).chain(boot_action(s)) {
                 if parts::outline_button(ui, label, true).clicked() {
                     clicked = Some(what);
                 }
@@ -348,7 +353,7 @@ mod tests {
     }
 
     fn systemd_row(name: &str, scope: &str, pid: u32) -> ServiceRow {
-        ServiceRow { name: name.into(), display: "A daemon".into(), pid, status: "Running".into(), start_type: "Enabled".into(), source: "systemd".into(), scope: scope.into() }
+        ServiceRow { name: name.into(), display: "A daemon".into(), pid, status: "Running".into(), start_type: "Enabled".into(), source: "systemd".into(), scope: scope.into(), actions: None }
     }
 
     #[test]
@@ -380,6 +385,39 @@ mod tests {
         assert!(!has(&words(|ui| {
             service_detail(ui, &windows);
         }), GO_TO_PROCESS), "the Windows panel is unchanged");
+    }
+
+    #[test]
+    fn an_action_the_rows_manager_cannot_do_is_not_offered() {
+        let limited = ServiceRow { actions: Some(&["start", "stop", "restart"]), ..systemd_row("cron", "System", 0) };
+        let shown = words(|ui| {
+            service_detail(ui, &limited);
+        });
+        for w in ["Start", "Stop", "Restart"] {
+            assert!(has(&shown, w), "{w} in {shown:?}");
+        }
+        assert!(!has(&shown, "Disable at boot") && !has(&shown, "Enable at boot"), "{shown:?}");
+        let none = ServiceRow { actions: Some(&[]), ..systemd_row("cron", "System", 0) };
+        let shown = words(|ui| {
+            service_detail(ui, &none);
+        });
+        for w in ["Start", "Stop", "Restart", "Disable at boot"] {
+            assert!(!has(&shown, w), "{w} hidden: {shown:?}");
+        }
+        // A row that does not say (Windows) keeps every button.
+        let windows = words(|ui| {
+            service_detail(ui, &service("Running"));
+        });
+        assert!(has(&windows, "Start") && has(&windows, "Restart"), "{windows:?}");
+        // The header offers what the chosen row's manager can do.
+        let env = Env::new();
+        env.system.script_services(vec![none]);
+        let mut page = ServicesPage::default();
+        page.show(Some("cron".into()), String::new());
+        let header = texts(&ui_ctx(), &mut page, &env.ctx());
+        for w in ["Start", "Stop", "Restart"] {
+            assert!(!has(&header, w), "{w} hidden in the header: {header:?}");
+        }
     }
 
     #[test]

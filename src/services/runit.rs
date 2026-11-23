@@ -7,9 +7,10 @@
 //! `/etc/runit/runsvdir/current`, depending on the distribution) holds a
 //! link to it. The folders say which services exist and which are enabled;
 //! only `sv status` says whether one runs and with which process id, so it
-//! is asked once for all the enabled ones. This source lists only; start,
-//! stop and restart for it come with the control ticket.
-use super::sources::{run_text, Output, ServiceSource, SourceError};
+//! is asked once for all the enabled ones. Start, stop and restart go to
+//! `sv`; enabling a service at boot links its folder into the supervised
+//! folder, disabling removes the link.
+use super::sources::{check_name, run_elevated, run_text, ControlHost, Output, ServiceSource, SourceError, ALL_ACTIONS};
 use crate::fs_root::FsRoot;
 use crate::platform::ProcessRunner;
 use crate::system_lists::ServiceRow;
@@ -82,9 +83,44 @@ impl ServiceSource for Runit {
                     name,
                     source: SOURCE.into(),
                     scope: "System".into(),
+                    actions: None,
                 }
             })
             .collect())
+    }
+
+    /// `sv up|down|restart <supervised folder>/<service>`; at boot, a link
+    /// from the supervised folder to the service's folder is made (`ln -s`)
+    /// or removed (`rm`). runit's services are the machine's, so every action
+    /// goes through `pkexec`.
+    fn control(&self, host: &ControlHost, _scope: &str, name: &str, action: &str) -> Result<(), String> {
+        check_name(name)?;
+        if name.contains('/') || name == "." || name == ".." {
+            return Err(format!("\"{name}\" is not a service name."));
+        }
+        if !ALL_ACTIONS.contains(&action) {
+            return Err(format!("\"{action}\" is not something a service can be asked to do."));
+        }
+        let Some(supervised) = SUPERVISED.iter().find(|d| self.root.probe(d)) else {
+            return Err("The folder runit supervises its services from was not found.".into());
+        };
+        let link = format!("/{supervised}/{name}");
+        match action {
+            "start" => run_elevated(host, "sv", &["up", &link]),
+            "stop" => run_elevated(host, "sv", &["down", &link]),
+            "restart" => run_elevated(host, "sv", &["restart", &link]),
+            "enable" => {
+                let Some(available) = AVAILABLE.iter().find(|d| self.root.probe(&format!("{d}/{name}"))) else {
+                    return Err(format!("\"{name}\" has no service folder to link to."));
+                };
+                run_elevated(host, "ln", &["-s", &format!("/{available}/{name}"), &link])
+            }
+            _ => run_elevated(host, "rm", &[&link]),
+        }
+    }
+
+    fn actions(&self, _scope: &str) -> &'static [&'static str] {
+        ALL_ACTIONS
     }
 }
 
@@ -121,6 +157,7 @@ fn parse_status(text: &str) -> Vec<State> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action_elevation::{self, Spawned};
     use crate::fs_root::fixture;
     use crate::platform::{Launch, RecordingRunner, When};
 
@@ -155,6 +192,78 @@ mod tests {
         let dhcpcd = by_name(&rows, "dhcpcd");
         assert_eq!((dhcpcd.status.as_str(), dhcpcd.start_type.as_str()), ("Stopped", "Disabled"), "available but not linked");
         assert_eq!(rows.len(), 3);
+    }
+
+    fn controlled(root: &str, name: &str, action: &str, answer: Spawned) -> (Result<(), String>, Vec<Vec<String>>) {
+        let launched = std::cell::RefCell::new(Vec::new());
+        let launch = |argv: &[String]| {
+            launched.borrow_mut().push(argv.to_vec());
+            answer.clone()
+        };
+        let env = |_: &str| None;
+        let result = Runit::new(fixture(root)).control(&ControlHost { launch: &launch, env: &env }, "System", name, action);
+        (result, launched.into_inner())
+    }
+
+    fn ok() -> Spawned {
+        Spawned::Exited { code: 0, stderr: String::new() }
+    }
+
+    fn words(line: &str) -> Vec<String> {
+        line.split(' ').map(String::from).collect()
+    }
+
+    #[test]
+    fn each_action_runs_its_runit_command_through_pkexec() {
+        for (name, action, line) in [
+            ("sshd", "start", "pkexec sv up /var/service/sshd"),
+            ("sshd", "stop", "pkexec sv down /var/service/sshd"),
+            ("sshd", "restart", "pkexec sv restart /var/service/sshd"),
+            ("dhcpcd", "enable", "pkexec ln -s /etc/sv/dhcpcd /var/service/dhcpcd"),
+            ("sshd", "disable", "pkexec rm /var/service/sshd"),
+        ] {
+            let (result, launched) = controlled("runit", name, action, ok());
+            assert_eq!(result, Ok(()), "{action}");
+            assert_eq!(launched, [words(line)], "{action}");
+        }
+    }
+
+    #[test]
+    fn refusal_and_a_missing_pkexec_are_worded_plainly_and_a_silent_failure_names_the_exit_code() {
+        let (refused, _) = controlled("runit", "sshd", "stop", Spawned::Exited { code: 127, stderr: String::new() });
+        assert_eq!(refused, Err(action_elevation::PERMISSION_REFUSED.to_string()));
+        let (dismissed, _) = controlled("runit", "sshd", "stop", Spawned::Exited { code: 126, stderr: String::new() });
+        assert_eq!(dismissed, Err(action_elevation::PERMISSION_DISMISSED.to_string()));
+        let (missing, _) = controlled("runit", "sshd", "stop", Spawned::NotFound);
+        assert_eq!(missing, Err(action_elevation::PKEXEC_MISSING.to_string()));
+        let (silent, _) = controlled("runit", "sshd", "start", Spawned::Exited { code: 1, stderr: String::new() });
+        assert_eq!(silent, Err("sv failed (exit code 1).".to_string()));
+    }
+
+    #[test]
+    fn a_bad_name_an_unknown_action_or_missing_folders_start_nothing() {
+        for (root, name, action) in [
+            ("runit", "sshd", "mask"),
+            ("runit", "-x", "start"),
+            ("runit", "../etc", "start"),
+            ("runit", "a b", "stop"),
+            ("runit", "ghost", "enable"),
+            ("runit-none", "sshd", "start"),
+        ] {
+            let (result, launched) = controlled(root, name, action, ok());
+            assert!(result.is_err(), "{root} {name} {action}");
+            assert!(launched.is_empty(), "{root} {name} {action}");
+        }
+    }
+
+    #[test]
+    fn rows_of_runit_offer_every_action() {
+        use crate::services::sources::list_all;
+        let runner = RecordingRunner::default();
+        runner.prepare(When::Nth(0), 1, STATUS);
+        let sources: Vec<Box<dyn ServiceSource>> = vec![Box::new(Runit::new(fixture("runit")))];
+        let rows = list_all(&sources, &runner).unwrap();
+        assert!(rows.iter().all(|r| ["start", "stop", "restart", "enable", "disable"].into_iter().all(|a| r.can(a))));
     }
 
     #[test]
