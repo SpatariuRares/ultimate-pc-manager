@@ -78,8 +78,8 @@ pub struct KernelDriver {
     pub display: String,
     pub running: bool,
     pub start_type: &'static str,
-    /// 0 boot, 1 system, 2 automatic, 3 manual, 4 disabled
-    pub start_code: u32,
+    /// 0 boot, 1 system, 2 automatic, 3 manual, 4 disabled; `None` when Windows did not return the configuration.
+    pub start_code: Option<u32>,
     pub kind: KernelKind,
     pub path: String,
     pub version: String,
@@ -87,6 +87,18 @@ pub struct KernelDriver {
     pub group: String,
     pub image_size: Option<u64>,
     pub load_index: Option<u32>,
+}
+
+/// The start type shown for a service start code; "Unknown" when the configuration was not read.
+pub fn start_type_name(code: Option<u32>) -> &'static str {
+    match code {
+        Some(0) => "Boot",
+        Some(1) => "System",
+        Some(2) => "Automatic",
+        Some(3) => "Manual",
+        Some(4) => "Disabled",
+        _ => "Unknown",
+    }
 }
 
 impl KernelDriver {
@@ -97,7 +109,9 @@ impl KernelDriver {
     pub fn unload_note(&self, admin: bool) -> (bool, &'static str) {
         if !self.running {
             (false, "Not loaded.")
-        } else if self.start_code <= 1 {
+        } else if self.start_code.is_none() {
+            (false, "Not offered: its configuration could not be read.")
+        } else if self.start_code <= Some(1) {
             (false, "Not offered: Windows loaded it at boot, and the kernel refuses to stop a driver it started itself.")
         } else if !admin {
             (true, "Needs administrator rights (Windows will ask); most drivers refuse the request while the system runs.")
@@ -1323,13 +1337,25 @@ mod outcome_tests {
     }
 
     fn kernel(running: bool, start_code: u32) -> KernelDriver {
-        KernelDriver { running, start_code, ..Default::default() }
+        KernelDriver { running, start_code: Some(start_code), ..Default::default() }
     }
 
     #[test]
     fn unload_is_not_offered_for_a_driver_that_is_not_loaded() {
         assert_eq!(kernel(false, 3).unload_note(true), (false, "Not loaded."));
         assert_eq!(kernel(false, 0).unload_note(false), (false, "Not loaded."));
+    }
+
+    #[test]
+    fn an_unread_configuration_shows_unknown_and_offers_no_unload() {
+        assert_eq!(start_type_name(None), "Unknown");
+        assert_eq!(start_type_name(Some(3)), "Manual");
+        assert_eq!(start_type_name(Some(2)), "Automatic");
+        let unread = KernelDriver { running: true, start_code: None, ..Default::default() };
+        let note = (false, "Not offered: its configuration could not be read.");
+        assert_eq!(unread.unload_note(true), note);
+        assert_eq!(unread.unload_note(false), note);
+        assert_eq!(KernelDriver::default().unload_note(true), (false, "Not loaded."));
     }
 
     #[test]

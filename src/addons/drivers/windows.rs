@@ -342,8 +342,7 @@ mod imp {
                         t if t & 4 != 0 => KernelKind::Adapter,
                         _ => KernelKind::Kernel,
                     },
-                    start_type: "",
-                    start_code: 3,
+                    start_code: None,
                     ..Default::default()
                 };
                 let mut raw_path = String::new();
@@ -352,20 +351,13 @@ mod imp {
                     let mut need = 0u32;
                     if QueryServiceConfigW(h, cfg.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW, (cfg.len() * 8) as u32, &mut need) != 0 {
                         let c = &*(cfg.as_ptr() as *const QUERY_SERVICE_CONFIGW);
-                        d.start_code = c.dwStartType;
+                        d.start_code = Some(c.dwStartType);
                         raw_path = from_wide(c.lpBinaryPathName);
                         d.group = from_wide(c.lpLoadOrderGroup);
                     }
                     CloseServiceHandle(h);
                 }
-                d.start_type = match d.start_code {
-                    0 => "Boot",
-                    1 => "System",
-                    2 => "Automatic",
-                    3 => "Manual",
-                    4 => "Disabled",
-                    _ => "",
-                };
+                d.start_type = start_type_name(d.start_code);
                 d.path = resolve_image(&raw_path, &service);
                 if std::path::Path::new(&d.path).exists() {
                     let (v, c) = file_version(&d.path);
