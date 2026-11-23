@@ -65,6 +65,28 @@ pub fn colours(out: &egui::FullOutput) -> Vec<egui::Color32> {
     all
 }
 
+/// Every text `draw` shows in one frame of a page, a line each, and the actions it asked for.
+pub fn drawn_text<R>(mut draw: impl FnMut(&mut Ui, &mut crate::platform::PageContext) -> R) -> (String, Vec<crate::platform::Action>) {
+    let (settings, sample) = (crate::settings::Settings::default(), crate::sampler::Snapshot::default());
+    let ctx = egui::Context::default();
+    // The app's faces, as at start-up: pages draw in them.
+    theme::install_fonts(&ctx);
+    let mut actions = Vec::new();
+    let output = ctx.run(RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let mut page = crate::platform::PageContext::new(&settings, &sample);
+            draw(ui, &mut page);
+            actions = std::mem::take(&mut page.actions);
+        });
+    });
+    (texts(&output).join("\n"), actions)
+}
+
+/// Every text `draw` shows in one frame of a page, a line each.
+pub fn page_text<R>(draw: impl FnMut(&mut Ui, &mut crate::platform::PageContext) -> R) -> String {
+    drawn_text(draw).0
+}
+
 /// Settings whose CPU colour is the user's own, and that colour.
 pub fn custom_cpu() -> (crate::settings::Settings, egui::Color32) {
     let chosen = [0x12, 0x34, 0x56];
