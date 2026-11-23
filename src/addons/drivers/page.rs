@@ -1024,7 +1024,7 @@ impl DriversPage {
                 let vals = [
                     d.display.as_str(),
                     d.service.as_str(),
-                    if d.running { "Running" } else { "Stopped" },
+                    d.state_label(),
                     d.start_type,
                     d.kind.label(),
                     if d.version.is_empty() { "\u{2014}" } else { d.version.as_str() },
@@ -1293,19 +1293,30 @@ fn kernel_detail_rows(d: &KernelDriver, admin: bool) -> Vec<(&'static str, Strin
         (Some(i), false) => format!("{i} ({})", d.group),
         (None, _) => dash(),
     };
-    vec![
+    let mut rows = vec![
         ("Driver", d.display.clone()),
         ("Service name", d.service.clone()),
-        ("State", if d.running { "Running" } else { "Stopped" }.into()),
+        ("State", d.state_label().into()),
         ("Kind", d.kind.label().into()),
         ("Start type", d.start_type.into()),
         ("Version", or_dash(&d.version)),
         ("Vendor", or_dash(&d.vendor)),
         ("Load index", load_index),
+    ];
+    // Rows that exist only when the service has the value.
+    if !d.group.is_empty() {
+        rows.push(("Load order group", d.group.clone()));
+    }
+    let depends = d.depends_on_text();
+    if !depends.is_empty() {
+        rows.push(("Depends on", depends));
+    }
+    rows.extend([
         ("Kernel memory", d.image_size.map(fmt_size).unwrap_or_else(dash)),
         ("Location", d.path.clone()),
         ("Unload", d.unload_note(admin).1.into()),
-    ]
+    ]);
+    rows
 }
 
 fn kernel_details(d: &KernelDriver, admin: bool) -> String {
@@ -1468,7 +1479,7 @@ mod kernel_detail_tests {
             display: "Microsoft ACPIEx Driver".into(),
             running: true,
             start_type: "Boot",
-            start_code: 0,
+            start_code: Some(0),
             kind: drivers::KernelKind::Kernel,
             path: r"C:\Windows\System32\Drivers\acpiex.sys".into(),
             version: "10.0.26100.1".into(),
@@ -1476,6 +1487,7 @@ mod kernel_detail_tests {
             group: "Boot Bus Extender".into(),
             image_size: Some(155_648),
             load_index: Some(7),
+            ..Default::default()
         }
     }
 
@@ -1489,6 +1501,7 @@ Start type: Boot\n\
 Version: 10.0.26100.1\n\
 Vendor: Microsoft Corporation\n\
 Load index: 7 (Boot Bus Extender)\n\
+Load order group: Boot Bus Extender\n\
 Kernel memory: 152.0 KB\n\
 Location: C:\\Windows\\System32\\Drivers\\acpiex.sys\n\
 Unload: Not offered: Windows loaded it at boot, and the kernel refuses to stop a driver it started itself.\n";
@@ -1505,6 +1518,23 @@ Unload: Not offered: Windows loaded it at boot, and the kernel refuses to stop a
         assert!(text.contains("Load index: \u{2014}\n"));
         assert!(text.contains("Kernel memory: \u{2014}\n"));
         assert!(text.contains("Unload: Not loaded.\n"));
+    }
+
+    #[test]
+    fn group_and_dependencies_rows_appear_only_when_present_and_in_order() {
+        let d = KernelDriver { depends_services: vec!["Tcpip".into()], depends_groups: vec!["NDIS".into()], ..sample() };
+        let text = kernel_details(&d, true);
+        assert!(text.contains("Load index: 7 (Boot Bus Extender)\nLoad order group: Boot Bus Extender\nDepends on: Tcpip, NDIS (group)\nKernel memory: "), "{text}");
+        let bare = kernel_details(&KernelDriver { group: String::new(), ..sample() }, true);
+        assert!(!bare.contains("Load order group") && !bare.contains("Depends on"), "{bare}");
+        assert!(kernel_details(&sample(), true).contains("Load order group: Boot Bus Extender\n"));
+        assert!(!kernel_details(&sample(), true).contains("Depends on"));
+    }
+
+    #[test]
+    fn pending_states_show_in_the_state_row() {
+        let d = KernelDriver { running: false, state_code: Some(6), ..sample() };
+        assert!(kernel_details(&d, true).contains("State: Pause pending\n"));
     }
 
     #[test]

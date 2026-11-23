@@ -335,15 +335,9 @@ mod imp {
                 let mut d = KernelDriver {
                     display: indirect(&from_wide(it.lpDisplayName), &service),
                     running: st.dwCurrentState == SERVICE_RUNNING,
-                    kind: match st.dwServiceType {
-                        t if t & SERVICE_FILE_SYSTEM_DRIVER != 0 => KernelKind::FileSystem,
-                        t if t & SERVICE_KERNEL_DRIVER != 0 => KernelKind::Kernel,
-                        t if t & 8 != 0 => KernelKind::Recognizer,
-                        t if t & 4 != 0 => KernelKind::Adapter,
-                        _ => KernelKind::Kernel,
-                    },
-                    start_type: "",
-                    start_code: 3,
+                    state_code: Some(st.dwCurrentState),
+                    kind: kernel_kind_from_type(st.dwServiceType),
+                    start_code: None,
                     ..Default::default()
                 };
                 let mut raw_path = String::new();
@@ -352,20 +346,21 @@ mod imp {
                     let mut need = 0u32;
                     if QueryServiceConfigW(h, cfg.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW, (cfg.len() * 8) as u32, &mut need) != 0 {
                         let c = &*(cfg.as_ptr() as *const QUERY_SERVICE_CONFIGW);
-                        d.start_code = c.dwStartType;
+                        d.start_code = Some(c.dwStartType);
                         raw_path = from_wide(c.lpBinaryPathName);
                         d.group = from_wide(c.lpLoadOrderGroup);
+                        if !c.lpDependencies.is_null() {
+                            // A list of nul-ended strings ended by an empty one: read up to the double nul.
+                            let mut n = 0;
+                            while !(*c.lpDependencies.add(n) == 0 && *c.lpDependencies.add(n + 1) == 0) {
+                                n += 1;
+                            }
+                            (d.depends_services, d.depends_groups) = parse_dependencies(std::slice::from_raw_parts(c.lpDependencies, n + 2));
+                        }
                     }
                     CloseServiceHandle(h);
                 }
-                d.start_type = match d.start_code {
-                    0 => "Boot",
-                    1 => "System",
-                    2 => "Automatic",
-                    3 => "Manual",
-                    4 => "Disabled",
-                    _ => "",
-                };
+                d.start_type = start_type_name(d.start_code);
                 d.path = resolve_image(&raw_path, &service);
                 if std::path::Path::new(&d.path).exists() {
                     let (v, c) = file_version(&d.path);
@@ -386,5 +381,24 @@ mod imp {
         }
         out.sort_by_key(|d| d.display.to_lowercase());
         Ok(out)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod pc_tests {
+    use super::*;
+
+    /// Reads this PC's kernel drivers: states, kinds and dependencies are plausible.
+    #[test]
+    #[ignore = "reads this PC's service control manager"]
+    fn this_pc_reports_states_kinds_groups_and_dependencies() {
+        let list = WindowsListing.kernel().expect("kernel drivers");
+        assert!(list.iter().all(|d| d.state_code.is_some()), "every state was read");
+        assert!(list.iter().any(|d| d.state_label() == "Running"));
+        assert!(list.iter().any(|d| d.kind.label() == "File system"));
+        assert!(list.iter().any(|d| !d.group.is_empty()), "some service has a load order group");
+        let with_deps: Vec<_> = list.iter().filter(|d| !d.depends_on_text().is_empty()).collect();
+        assert!(!with_deps.is_empty(), "some driver depends on a service or group");
+        println!("{} drivers, {} with dependencies", list.len(), with_deps.len());
     }
 }

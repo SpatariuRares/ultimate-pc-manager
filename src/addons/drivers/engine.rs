@@ -78,8 +78,10 @@ pub struct KernelDriver {
     pub display: String,
     pub running: bool,
     pub start_type: &'static str,
-    /// 0 boot, 1 system, 2 automatic, 3 manual, 4 disabled
-    pub start_code: u32,
+    /// 0 boot, 1 system, 2 automatic, 3 manual, 4 disabled; `None` when Windows did not return the configuration.
+    pub start_code: Option<u32>,
+    /// The SCM state code (1 stopped ... 7 paused); `None` when it was not read.
+    pub state_code: Option<u32>,
     pub kind: KernelKind,
     pub path: String,
     pub version: String,
@@ -87,9 +89,77 @@ pub struct KernelDriver {
     pub group: String,
     pub image_size: Option<u64>,
     pub load_index: Option<u32>,
+    /// Services this driver depends on (the configuration's dependency list).
+    pub depends_services: Vec<String>,
+    /// Load order groups this driver depends on.
+    pub depends_groups: Vec<String>,
+}
+
+/// The SCM state shown for a state code; `None` when the state was not read.
+pub fn service_state_name(code: Option<u32>) -> Option<&'static str> {
+    match code? {
+        1 => Some("Stopped"),
+        2 => Some("Start pending"),
+        3 => Some("Stop pending"),
+        4 => Some("Running"),
+        5 => Some("Continue pending"),
+        6 => Some("Pause pending"),
+        7 => Some("Paused"),
+        _ => None,
+    }
+}
+
+/// The kind of a driver service from its service type bits.
+pub fn kernel_kind_from_type(service_type: u32) -> KernelKind {
+    match service_type {
+        t if t & 2 != 0 => KernelKind::FileSystem,
+        t if t & 1 != 0 => KernelKind::Kernel,
+        t if t & 8 != 0 => KernelKind::Recognizer,
+        t if t & 4 != 0 => KernelKind::Adapter,
+        _ => KernelKind::Kernel,
+    }
+}
+
+/// Splits a service's dependency list (UTF-16 strings, each ended by a nul, the list
+/// ended by an empty string) into (services, load order groups). A group
+/// is written with the prefix '+' (SC_GROUP_IDENTIFIER).
+pub fn parse_dependencies(units: &[u16]) -> (Vec<String>, Vec<String>) {
+    let (mut services, mut groups) = (Vec::new(), Vec::new());
+    for entry in units.split(|&u| u == 0) {
+        if entry.is_empty() {
+            break;
+        }
+        let text = String::from_utf16_lossy(entry);
+        match text.strip_prefix('+') {
+            Some(group) => groups.push(group.to_string()),
+            None => services.push(text),
+        }
+    }
+    (services, groups)
+}
+
+/// The start type shown for a service start code; "Unknown" when the configuration was not read.
+pub fn start_type_name(code: Option<u32>) -> &'static str {
+    match code {
+        Some(0) => "Boot",
+        Some(1) => "System",
+        Some(2) => "Automatic",
+        Some(3) => "Manual",
+        Some(4) => "Disabled",
+        _ => "Unknown",
+    }
 }
 
 impl KernelDriver {
+    /// The state label: the SCM state when read (pending states included), else Running/Stopped.
+    pub fn state_label(&self) -> &'static str {
+        service_state_name(self.state_code).unwrap_or(if self.running { "Running" } else { "Stopped" })
+    }
+    /// The services then the groups this driver depends on, comma-separated; empty when none.
+    pub fn depends_on_text(&self) -> String {
+        let groups = self.depends_groups.iter().map(|g| format!("{g} (group)"));
+        self.depends_services.iter().cloned().chain(groups).collect::<Vec<_>>().join(", ")
+    }
     pub fn third_party(&self) -> bool {
         !self.vendor.is_empty() && !self.vendor.to_lowercase().starts_with("microsoft")
     }
@@ -97,7 +167,9 @@ impl KernelDriver {
     pub fn unload_note(&self, admin: bool) -> (bool, &'static str) {
         if !self.running {
             (false, "Not loaded.")
-        } else if self.start_code <= 1 {
+        } else if self.start_code.is_none() {
+            (false, "Not offered: its configuration could not be read.")
+        } else if self.start_code <= Some(1) {
             (false, "Not offered: Windows loaded it at boot, and the kernel refuses to stop a driver it started itself.")
         } else if !admin {
             (true, "Needs administrator rights (Windows will ask); most drivers refuse the request while the system runs.")
@@ -1340,13 +1412,63 @@ mod outcome_tests {
     }
 
     fn kernel(running: bool, start_code: u32) -> KernelDriver {
-        KernelDriver { running, start_code, ..Default::default() }
+        KernelDriver { running, start_code: Some(start_code), ..Default::default() }
     }
 
     #[test]
     fn unload_is_not_offered_for_a_driver_that_is_not_loaded() {
         assert_eq!(kernel(false, 3).unload_note(true), (false, "Not loaded."));
         assert_eq!(kernel(false, 0).unload_note(false), (false, "Not loaded."));
+    }
+
+    #[test]
+    fn an_unread_configuration_shows_unknown_and_offers_no_unload() {
+        assert_eq!(start_type_name(None), "Unknown");
+        assert_eq!(start_type_name(Some(3)), "Manual");
+        assert_eq!(start_type_name(Some(2)), "Automatic");
+        let unread = KernelDriver { running: true, start_code: None, ..Default::default() };
+        let note = (false, "Not offered: its configuration could not be read.");
+        assert_eq!(unread.unload_note(true), note);
+        assert_eq!(unread.unload_note(false), note);
+        assert_eq!(KernelDriver::default().unload_note(true), (false, "Not loaded."));
+    }
+
+    #[test]
+    fn every_service_state_has_its_own_label() {
+        let names: Vec<_> = (1..=7).map(|c| service_state_name(Some(c)).unwrap()).collect();
+        assert_eq!(names, ["Stopped", "Start pending", "Stop pending", "Running", "Continue pending", "Pause pending", "Paused"]);
+        assert_eq!(service_state_name(None), None);
+        assert_eq!(service_state_name(Some(0)), None);
+        assert_eq!(KernelDriver { running: true, ..Default::default() }.state_label(), "Running");
+        assert_eq!(KernelDriver { running: false, ..Default::default() }.state_label(), "Stopped");
+        assert_eq!(KernelDriver { running: false, state_code: Some(3), ..Default::default() }.state_label(), "Stop pending");
+    }
+
+    #[test]
+    fn every_service_type_has_its_own_kind() {
+        assert_eq!(kernel_kind_from_type(1).label(), "Kernel");
+        assert_eq!(kernel_kind_from_type(2).label(), "File system");
+        assert_eq!(kernel_kind_from_type(8).label(), "Recognizer");
+        assert_eq!(kernel_kind_from_type(4).label(), "Adapter");
+        assert_eq!(kernel_kind_from_type(2 | 8).label(), "File system");
+    }
+
+    #[test]
+    fn dependencies_split_into_services_and_groups() {
+        // '#' stands for the nul that ends each string; the list ends with an empty string.
+        let units: Vec<u16> = "+Base#Tcpip#Ndis##".encode_utf16().map(|u| if u == 0x23 { 0 } else { u }).collect();
+        let (s, g) = parse_dependencies(&units);
+        assert_eq!(s, ["Tcpip", "Ndis"]);
+        assert_eq!(g, ["Base"]);
+        assert_eq!(parse_dependencies(&[0, 0]), (vec![], vec![]));
+        assert_eq!(parse_dependencies(&[]), (vec![], vec![]));
+    }
+
+    #[test]
+    fn depends_on_text_lists_services_then_groups() {
+        let d = KernelDriver { depends_services: vec!["Tcpip".into(), "Ndis".into()], depends_groups: vec!["Base".into()], ..Default::default() };
+        assert_eq!(d.depends_on_text(), "Tcpip, Ndis, Base (group)");
+        assert_eq!(KernelDriver::default().depends_on_text(), "");
     }
 
     #[test]
