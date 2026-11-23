@@ -1,6 +1,7 @@
 //! The Disk Space add-on's tests (scan, History, settings, menu).
 
 use super::*;
+use crate::test_paths::{host, host_owned};
 use crate::addons::Addon;
 use crate::platform::AddonContext;
 use history::tests::TempStore;
@@ -159,7 +160,7 @@ fn a_folder_deeper_than_260_characters_is_measured_shown_and_copied() {
 fn the_status_strip_gives_the_last_scans_time_or_not_scanned() {
     assert_eq!(View::default().strip_last(), "Not scanned");
     let d = DiskSpace::default();
-    d.scan_with("R:\\", None, |job| deliver(job, vec![file("R:\\a", 10)]));
+    d.scan_with(host("R:\\"), None, |job| deliver(job, vec![file(host("R:\\a"), 10)]));
     let last = wait_idle(&d).strip_last();
     assert!(last.starts_with("Done today at "), "{last}");
     assert_eq!(last.len(), "Done today at 14:03".len(), "{last}");
@@ -198,7 +199,7 @@ fn the_status_strip_names_each_state() {
 fn drive_scan_at(d: &DiskSpace, root: &str, expected: Option<u64>, bytes: u64) -> std::sync::mpsc::Sender<()> {
     let (go, wait_go) = channel::<()>();
     let (delivered, wait_delivered) = channel();
-    let at = format!("{}\\a", root.trim_end_matches('\\'));
+    let at = Path::new(root).join("a").display().to_string();
     d.scan_with(root, expected, move |job| {
         deliver(job, vec![file(&at, bytes)]);
         delivered.send(()).unwrap();
@@ -211,7 +212,7 @@ fn drive_scan_at(d: &DiskSpace, root: &str, expected: Option<u64>, bytes: u64) -
 #[test]
 fn a_drive_scan_half_way_after_n_seconds_has_about_n_seconds_left() {
     let d = DiskSpace::default();
-    let go = drive_scan_at(&d, "C:\\", Some(1000), 500);
+    let go = drive_scan_at(&d, host("C:\\"), Some(1000), 500);
     d.advance_clock(Duration::from_secs(40));
     assert_eq!(d.view().left.as_deref(), Some("about 40 s left"));
     d.advance_clock(Duration::from_secs(140));
@@ -223,14 +224,14 @@ fn a_drive_scan_half_way_after_n_seconds_has_about_n_seconds_left() {
 #[test]
 fn no_time_left_in_the_first_seconds_nor_for_a_folder_without_a_size() {
     let d = DiskSpace::default();
-    let go = drive_scan_at(&d, "C:\\", Some(1000), 500);
+    let go = drive_scan_at(&d, host("C:\\"), Some(1000), 500);
     d.advance_clock(Duration::from_secs(2));
     assert_eq!(d.view().left, None, "too early to tell");
     go.send(()).unwrap();
     wait_idle(&d);
 
     let d = DiskSpace::default();
-    let go = drive_scan_at(&d, "R:\\folder", None, 500);
+    let go = drive_scan_at(&d, host("R:\\folder"), None, 500);
     d.advance_clock(Duration::from_secs(40));
     assert_eq!(d.view().left, None, "a folder has no expected size");
     go.send(()).unwrap();
@@ -239,7 +240,7 @@ fn no_time_left_in_the_first_seconds_nor_for_a_folder_without_a_size() {
 #[test]
 fn time_spent_paused_does_not_count_toward_the_time_left() {
     let d = DiskSpace::default();
-    let go = drive_scan_at(&d, "C:\\", Some(1000), 500);
+    let go = drive_scan_at(&d, host("C:\\"), Some(1000), 500);
     d.advance_clock(Duration::from_secs(20));
     d.pause_scan();
     d.advance_clock(Duration::from_secs(600));
@@ -284,7 +285,7 @@ fn the_disk_space_menu_offers_what_the_scan_allows_and_its_commands_act() {
     let tree = TempTree::new("addon-menu");
     tree.file("a/movie.mkv", 5_000);
     let folder = tree.0.display().to_string();
-    let disks = vec![DiskRow { mount: "C:\\".into(), total: 1000, free: 400, ..Default::default() }];
+    let disks = vec![DiskRow { mount: host("C:\\").into(), total: 1000, free: 400, ..Default::default() }];
     let mut d = with_history(&store);
 
     d.target = Some(Target::Drive("F:\\".into()));
@@ -362,21 +363,21 @@ fn a_drive_scan_shows_its_progress_against_the_used_space() {
     let d = DiskSpace::default();
     let (go, wait_go) = channel::<()>();
     let (delivered, wait_delivered) = channel();
-    d.scan_with("C:\\", Some(1000), move |job| {
-        deliver(job, vec![file("C:\\a\\x", 600), file("C:\\b\\y", 40)]);
+    d.scan_with(host("C:\\"), Some(1000), move |job| {
+        deliver(job, vec![file(host("C:\\a\\x"), 600), file(host("C:\\b\\y"), 40)]);
         delivered.send(()).unwrap();
         let _ = wait_go.recv();
     });
     wait_delivered.recv().unwrap();
     let v = d.view();
-    assert_eq!(v.running.as_deref(), Some("C:\\"));
+    assert_eq!(v.running.as_deref(), Some(host("C:\\")));
     assert_eq!(v.progress, Some(0.64));
     assert_eq!(text::progress(v.progress, v.files, v.bytes), "64% \u{00b7} 2 files \u{00b7} 640 B so far");
     assert_eq!(v.finished, None, "no result line while running");
     go.send(()).unwrap();
     let v = wait_idle(&d);
     assert_eq!(v.progress, None);
-    assert_eq!(v.where_it_goes.as_deref(), Some("a holds 600 B, most of what the scan counted on C:\\."));
+    assert_eq!(v.where_it_goes.as_deref(), Some(format!("a holds 600 B, most of what the scan counted on {}.", host("C:\\")).as_str()));
 }
 
 fn args(list: &[&str]) -> Vec<String> {
@@ -409,7 +410,7 @@ fn the_scan_flag_on_a_drive_no_longer_connected_measures_nothing() {
     d.load_settings(&serde_json::json!({ "target": "F:\\" }));
     d.start(&ctx);
     d.command_line(&args(&["--scan"]));
-    let sample = crate::sampler::Snapshot { disks: vec![DiskRow { mount: "C:\\".into(), total: 10, ..Default::default() }], ..Default::default() };
+    let sample = crate::sampler::Snapshot { disks: vec![DiskRow { mount: host("C:\\").into(), total: 10, ..Default::default() }], ..Default::default() };
     d.on_sample(&sample);
     std::thread::sleep(Duration::from_millis(20));
     assert_eq!(d.view(), View::default());
@@ -443,7 +444,7 @@ fn its_page_opens_by_id_and_by_its_alias() {
 fn nothing_is_scanned_until_start() {
     let (ctx, runner) = AddonContext::recording();
     let mut d = DiskSpace::default();
-    d.load_settings(&serde_json::json!({ "target": "C:\\" }));
+    d.load_settings(&serde_json::json!({ "target": host("C:\\") }));
     d.start(&ctx);
     std::thread::sleep(Duration::from_millis(20));
     assert_eq!(d.view(), View::default());
@@ -457,19 +458,19 @@ fn turning_disk_space_off_during_a_scan_stops_it_and_its_results_never_show() {
     d.start(&ctx);
     let (started, wait_started) = channel();
     let (finished, wait_finished) = channel();
-    d.scan_with("C:\\", None, move |job| {
-        deliver(job, vec![file("C:\\a", 10)]);
+    d.scan_with(host("C:\\"), None, move |job| {
+        deliver(job, vec![file(host("C:\\a"), 10)]);
         started.send(()).unwrap();
         let t = Instant::now();
         while !job.cancelled() && t.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(Duration::from_millis(1));
         }
         let stopped = job.cancelled();
-        deliver(job, vec![file("C:\\b", 999)]);
+        deliver(job, vec![file(host("C:\\b"), 999)]);
         finished.send(stopped).unwrap();
     });
     wait_started.recv().unwrap();
-    assert_eq!(d.view().running.as_deref(), Some("C:\\"));
+    assert_eq!(d.view().running.as_deref(), Some(host("C:\\")));
 
     d.stop();
     assert!(wait_finished.recv_timeout(Duration::from_secs(2)).unwrap(), "the scan saw it was stopped");
@@ -487,11 +488,11 @@ fn the_chosen_target_is_its_setting_and_survives_turning_off_and_on() {
     d.load_settings(&serde_json::json!({ "drive": "D:\\", "newer": 1 }));
     d.start(&ctx);
     assert_eq!(d.target, Some(Target::Drive("D:\\".into())), "the setting saved before #81 is read");
-    d.target = Some(Target::Folder("E:\\Games".into())); // a folder picked with Choose Folder…
-    assert_eq!(d.settings(), serde_json::json!({ "target": "E:\\Games", "newer": 1 }), "keeps what it does not know");
+    d.target = Some(Target::Folder(host("E:\\Games").into())); // a folder picked with Choose Folder…
+    assert_eq!(d.settings(), serde_json::json!({ "target": host("E:\\Games"), "newer": 1 }), "keeps what it does not know");
     d.stop();
     d.start(&ctx);
-    assert_eq!(d.settings(), serde_json::json!({ "target": "E:\\Games", "newer": 1 }));
+    assert_eq!(d.settings(), serde_json::json!({ "target": host("E:\\Games"), "newer": 1 }));
     d.load_settings(&serde_json::json!("garbage"));
     assert_eq!(d.target, None, "unreadable settings give the default");
     d.load_settings(&serde_json::json!({ "target": "all" }));
@@ -501,13 +502,13 @@ fn the_chosen_target_is_its_setting_and_survives_turning_off_and_on() {
 
 fn finished_scan(events: Vec<Event>) -> View {
     let d = DiskSpace::default();
-    d.scan_with("R:\\", None, move |job| deliver(job, events));
+    d.scan_with(host("R:\\"), None, move |job| deliver(job, events));
     wait_idle(&d)
 }
 
 #[test]
 fn the_file_type_legend_counts_every_category_in_a_fixed_order() {
-    let v = finished_scan(vec![file("R:\\v\\a.MP4", 3000), file("R:\\v\\b.jpg", 1000), file("R:\\d\\c.pdf", 50), file("R:\\setup.exe", 400)]);
+    let v = finished_scan(vec![file(host("R:\\v\\a.MP4"), 3000), file(host("R:\\v\\b.jpg"), 1000), file(host("R:\\d\\c.pdf"), 50), file(host("R:\\setup.exe"), 400)]);
     let legend: Vec<_> = v.types.iter().map(|t| (t.category.name(), t.files, t.bytes)).collect();
     assert_eq!(
         legend,
@@ -520,11 +521,11 @@ fn the_file_type_legend_counts_every_category_in_a_fixed_order() {
 #[test]
 fn the_lists_follow_the_group_chosen() {
     let v = finished_scan(vec![
-        file("R:\\v\\a.mp4", 3000),
-        file("R:\\v\\b.mp4", 1000),
-        file("R:\\d\\c.pdf", 50),
-        file("R:\\d\\e\\f.zip", 2500),
-        file("R:\\setup.exe", 400),
+        file(host("R:\\v\\a.mp4"), 3000),
+        file(host("R:\\v\\b.mp4"), 1000),
+        file(host("R:\\d\\c.pdf"), 50),
+        file(host("R:\\d\\e\\f.zip"), 2500),
+        file(host("R:\\setup.exe"), 400),
     ]);
     let rows = |g: Group| v.rows(g).into_iter().map(|r| (r.label, r.bytes)).collect::<Vec<_>>();
     let names = |g: Group| v.rows(g).into_iter().map(|r| (name(&r.label).to_string(), r.bytes)).collect::<Vec<_>>();
@@ -542,13 +543,13 @@ fn the_lists_follow_the_group_chosen() {
 #[test]
 fn the_lists_and_the_legend_follow_the_level_entered() {
     let mut d = DiskSpace::default();
-    let events = vec![file("R:\\v\\a.mp4", 3000), file("R:\\d\\c.pdf", 50), file("R:\\d\\e\\f.zip", 2500), file("R:\\setup.exe", 400)];
-    d.scan_with("R:\\", None, move |job| deliver(job, events));
+    let events = vec![file(host("R:\\v\\a.mp4"), 3000), file(host("R:\\d\\c.pdf"), 50), file(host("R:\\d\\e\\f.zip"), 2500), file(host("R:\\setup.exe"), 400)];
+    d.scan_with(host("R:\\"), None, move |job| deliver(job, events));
     wait_idle(&d);
-    d.navigate(nav::Move::Crumb(PathBuf::from("R:\\d")));
+    d.navigate(nav::Move::Crumb(PathBuf::from(host("R:\\d"))));
     let v = d.view();
     let crumbs: Vec<_> = v.crumbs.iter().map(|c| c.label.as_str()).collect();
-    assert_eq!(crumbs, ["R:\\", "d"]);
+    assert_eq!(crumbs, [host("R:\\"), "d"]);
     let names = |g: Group| v.rows(g).into_iter().map(|r| (name(&r.label).to_string(), r.bytes)).collect::<Vec<_>>();
     assert_eq!(names(Group::FileSize), [("f.zip".to_string(), 2500), ("c.pdf".to_string(), 50)]);
     assert_eq!(names(Group::FolderSize), [("e".to_string(), 2500)]);
@@ -616,32 +617,32 @@ fn the_item_actions_show_open_or_copy_the_item_or_say_why_not() {
 #[test]
 fn an_item_in_an_installed_apps_folder_links_to_its_row_there() {
     let d = DiskSpace::default();
-    let events = vec![file("R:\\Apps\\Tool\\tool.exe", 2500), file("R:\\setup.exe", 400)];
-    d.scan_with("R:\\", None, move |job| deliver(job, events));
+    let events = vec![file(host("R:\\Apps\\Tool\\tool.exe"), 2500), file(host("R:\\setup.exe"), 400)];
+    d.scan_with(host("R:\\"), None, move |job| deliver(job, events));
     wait_idle(&d);
     let (settings, sample) = (crate::settings::Settings::default(), Snapshot::default());
-    let owns = std::cell::RefCell::new(|p: &Path| p.starts_with("R:\\Apps\\Tool").then(|| crate::platform::Owner { addon: "installed-apps", page: "Installed Apps", label: "Tool".into() }));
+    let owns = std::cell::RefCell::new(|p: &Path| p.starts_with(host("R:\\Apps\\Tool")).then(|| crate::platform::Owner { addon: "installed-apps", page: "Installed Apps", label: "Tool".into() }));
     let mut page = PageContext::new(&settings, &sample);
     page.owners = Some(&owns);
-    let tool = nav::Key::File(PathBuf::from("R:\\Apps\\Tool\\tool.exe"));
+    let tool = nav::Key::File(PathBuf::from(host("R:\\Apps\\Tool\\tool.exe")));
     assert_eq!(d.owner(&tool, &page).map(|o| o.label), Some("Tool".into()));
-    assert_eq!(d.owner(&nav::Key::File(PathBuf::from("R:\\setup.exe")), &page), None);
+    assert_eq!(d.owner(&nav::Key::File(PathBuf::from(host("R:\\setup.exe"))), &page), None);
     assert_eq!(d.owner(&tool, &PageContext::new(&settings, &sample)), None, "Installed Apps off: no link");
     d.show_owner(&tool, &mut page);
-    assert!(matches!(&page.actions[..], [Action::ShowIn { addon: "installed-apps", path }] if *path == PathBuf::from("R:\\Apps\\Tool\\tool.exe")));
+    assert!(matches!(&page.actions[..], [Action::ShowIn { addon: "installed-apps", path }] if *path == PathBuf::from(host("R:\\Apps\\Tool\\tool.exe"))));
 }
 
 #[test]
 fn navigating_moves_through_the_measured_tree() {
     let mut d = DiskSpace::default();
-    d.navigate(nav::Move::Crumb(PathBuf::from("R:\\d")));
+    d.navigate(nav::Move::Crumb(PathBuf::from(host("R:\\d"))));
     assert!(d.view().crumbs.is_empty(), "nothing measured, nowhere to go");
-    let events = vec![file("R:\\d\\e\\f.zip", 2500), file("R:\\setup.exe", 400)];
-    d.scan_with("R:\\", None, move |job| deliver(job, events));
+    let events = vec![file(host("R:\\d\\e\\f.zip"), 2500), file(host("R:\\setup.exe"), 400)];
+    d.scan_with(host("R:\\"), None, move |job| deliver(job, events));
     wait_idle(&d);
-    d.navigate(nav::Move::Open(PathBuf::from("R:\\d\\e\\f.zip")));
+    d.navigate(nav::Move::Open(PathBuf::from(host("R:\\d\\e\\f.zip"))));
     let crumbs: Vec<_> = d.view().crumbs.into_iter().map(|c| c.label).collect();
-    assert_eq!(crumbs, ["R:\\", "d", "e"]);
+    assert_eq!(crumbs, [host("R:\\"), "d", "e"]);
     d.navigate(nav::Move::Parent);
     assert_eq!(d.view().crumbs.len(), 2);
 }
@@ -651,10 +652,10 @@ fn the_group_chosen_is_remembered() {
     let (ctx, _) = AddonContext::recording();
     let mut d = DiskSpace::default();
     assert_eq!(d.group, Group::FileSize, "the page opens on File Size");
-    d.load_settings(&serde_json::json!({ "target": "C:\\", "newer": 1 }));
+    d.load_settings(&serde_json::json!({ "target": host("C:\\"), "newer": 1 }));
     d.group = Group::FolderSize;
     let saved = d.settings();
-    assert_eq!(saved, serde_json::json!({ "target": "C:\\", "group": "folder-size", "newer": 1 }));
+    assert_eq!(saved, serde_json::json!({ "target": host("C:\\"), "group": "folder-size", "newer": 1 }));
     let mut again = DiskSpace::default();
     again.load_settings(&saved);
     again.start(&ctx);
@@ -670,15 +671,15 @@ fn the_group_chosen_is_remembered() {
 fn the_view_chosen_is_remembered() {
     let mut d = DiskSpace::default();
     assert_eq!(d.drawing, Drawing::Balls, "the page opens on Balls");
-    d.load_settings(&serde_json::json!({ "target": "C:\\", "newer": 1 }));
+    d.load_settings(&serde_json::json!({ "target": host("C:\\"), "newer": 1 }));
     d.drawing = Drawing::Block;
     let saved = d.settings();
-    assert_eq!(saved, serde_json::json!({ "target": "C:\\", "view": "block", "newer": 1 }));
+    assert_eq!(saved, serde_json::json!({ "target": host("C:\\"), "view": "block", "newer": 1 }));
     let mut again = DiskSpace::default();
     again.load_settings(&saved);
     assert_eq!(again.drawing, Drawing::Block);
     again.drawing = Drawing::Balls;
-    assert_eq!(again.settings(), serde_json::json!({ "target": "C:\\", "newer": 1 }), "the default is not written");
+    assert_eq!(again.settings(), serde_json::json!({ "target": host("C:\\"), "newer": 1 }), "the default is not written");
     let mut fresh = DiskSpace::default();
     fresh.drawing = Drawing::Block;
     assert_eq!(fresh.settings(), serde_json::json!({ "view": "block" }), "remembered even before a target is chosen");
@@ -690,20 +691,20 @@ fn the_view_chosen_is_remembered() {
 fn stopping_a_scan_keeps_what_it_measured_so_far_without_a_result_line() {
     let d = DiskSpace::default();
     let (started, wait_started) = channel();
-    d.scan_with("D:\\", None, move |job| {
-        deliver(job, vec![file("D:\\x\\a", 10)]);
+    d.scan_with(host("D:\\"), None, move |job| {
+        deliver(job, vec![file(host("D:\\x\\a"), 10)]);
         started.send(()).unwrap();
         while !job.cancelled() {
             std::thread::sleep(Duration::from_millis(1));
         }
-        deliver(job, vec![file("D:\\x\\b", 999)]);
+        deliver(job, vec![file(host("D:\\x\\b"), 999)]);
     });
     wait_started.recv().unwrap();
     d.stop_scan();
     std::thread::sleep(Duration::from_millis(20));
     let v = wait_phase(&d, Phase::Stopped);
     assert_eq!((v.running, v.files, v.bytes), (None, 1, 10));
-    assert_eq!(v.root.as_deref(), Some("D:\\"));
+    assert_eq!(v.root.as_deref(), Some(host("D:\\")));
     assert_eq!((v.finished, v.where_it_goes), (None, None));
 }
 
@@ -721,13 +722,13 @@ fn two_step_scan(d: &DiskSpace) -> (std::sync::mpsc::Sender<()>, std::sync::mpsc
     let (go, wait_go) = channel::<()>();
     let (started, wait_started) = channel();
     let (kept_going, wait_kept_going) = channel();
-    d.scan_with("C:\\", Some(1000), move |job| {
-        deliver(job, vec![file("C:\\a\\x", 100)]);
+    d.scan_with(host("C:\\"), Some(1000), move |job| {
+        deliver(job, vec![file(host("C:\\a\\x"), 100)]);
         started.send(()).unwrap();
         let _ = wait_go.recv();
         let go_on = checkpoint(job);
         if go_on {
-            deliver(job, vec![file("C:\\b\\y", 50)]);
+            deliver(job, vec![file(host("C:\\b\\y"), 50)]);
         }
         kept_going.send(go_on).unwrap();
     });
@@ -774,7 +775,7 @@ fn stop_asks_first_and_keep_scanning_leaves_the_scan_alone() {
     let (go, _kept_going) = two_step_scan(d);
     d.ask_stop(None);
     let ask = d.confirm.clone().expect("a question");
-    assert_eq!(ask.title, "Stop scanning C:\\?");
+    assert_eq!(ask.title, format!("Stop scanning {}?", host("C:\\")));
     assert!(ask.text.starts_with("The scan is 10% through. "), "{}", ask.text);
     d.answer_stop(false, true);
     assert_eq!(d.confirm, None);
@@ -823,8 +824,8 @@ fn the_stop_confirmation_can_be_turned_back_on_from_settings() {
 fn the_list_length_setting_sets_how_many_items_the_largest_lists_show() {
     let mut d = DiskSpace::default();
     d.load_settings(&serde_json::json!({ "listLength": 3 }));
-    let events = (1..=5).map(|i| file(&format!("R:\\f{i}.bin"), i * 100)).collect::<Vec<_>>();
-    d.scan_with("R:\\", None, move |job| deliver(job, events));
+    let events = (1..=5).map(|i| file(&host_owned(&format!("R:\\f{i}.bin")), i * 100)).collect::<Vec<_>>();
+    d.scan_with(host("R:\\"), None, move |job| deliver(job, events));
     let v = wait_idle(&d);
     assert_eq!(v.largest.iter().map(|(p, _)| name(p)).collect::<Vec<_>>(), ["f5.bin", "f4.bin", "f3.bin"]);
     assert_eq!(d.settings(), serde_json::json!({ "listLength": 3 }));
@@ -840,7 +841,7 @@ fn history_keeps_only_as_many_scans_as_the_setting_says() {
     let mut d = with_history(&store);
     d.load_settings(&serde_json::json!({ "keepScans": 2 }));
     for n in 1..=3 {
-        d.scan_with("R:\\", None, r_scan);
+        d.scan_with(host("R:\\"), None, r_scan);
         wait_saved(&d, n.min(2));
         wait_no_thread(&d);
     }
@@ -884,7 +885,7 @@ fn the_summary_tile_is_off_until_turned_on() {
 
 fn long_finished_scan(d: &mut DiskSpace) {
     d.long_after = Some(0);
-    d.scan_with("R:\\", None, r_scan);
+    d.scan_with(host("R:\\"), None, r_scan);
     wait_idle(d);
     wait_phase(d, Phase::Finished);
 }
@@ -895,7 +896,7 @@ fn a_long_scan_that_ends_while_its_page_is_hidden_is_announced_once() {
     d.page_seen();
     d.page_hidden();
     long_finished_scan(&mut d);
-    assert_eq!(d.notice().as_deref(), Some("Disk Space finished measuring R:\\: 5 KB in 2 files."));
+    assert_eq!(d.notice().as_deref(), Some(format!("Disk Space finished measuring {}: 5 KB in 2 files.", host("R:\\")).as_str()));
     assert_eq!(d.notice(), None, "once");
 }
 
@@ -909,7 +910,7 @@ fn a_scan_that_ends_on_its_page_or_quickly_is_not_announced() {
     assert_eq!(d.notice(), None, "seen on its page");
 
     let mut quick = DiskSpace::default();
-    quick.scan_with("R:\\", None, r_scan);
+    quick.scan_with(host("R:\\"), None, r_scan);
     wait_idle(&quick);
     wait_phase(&quick, Phase::Finished);
     assert_eq!(quick.notice(), None, "a short scan");
@@ -927,7 +928,7 @@ fn the_scan_flag_does_nothing_while_disk_space_is_off() {
 fn its_settings_survive_turning_it_off_and_on() {
     let (ctx, _) = AddonContext::recording();
     let mut d = DiskSpace::default();
-    let saved = serde_json::json!({ "target": "D:\\", "group": "file-type", "view": "block", "diskSpaceSuppressStopConfirm": true, "listLength": 12, "keepScans": 5, "summaryTile": true });
+    let saved = serde_json::json!({ "target": host("D:\\"), "group": "file-type", "view": "block", "diskSpaceSuppressStopConfirm": true, "listLength": 12, "keepScans": 5, "summaryTile": true });
     d.load_settings(&saved);
     d.start(&ctx);
     d.stop();
@@ -975,7 +976,7 @@ fn with_history(store: &TempStore) -> DiskSpace {
 }
 
 fn r_scan(job: &Job) {
-    deliver(job, vec![file("R:\\big\\movie.mkv", 5000), file("R:\\small\\note.txt", 100), Event::Unreadable(PathBuf::from("R:\\locked"))]);
+    deliver(job, vec![file(host("R:\\big\\movie.mkv"), 5000), file(host("R:\\small\\note.txt"), 100), Event::Unreadable(PathBuf::from(host("R:\\locked")))]);
 }
 
 #[test]
@@ -983,15 +984,15 @@ fn a_finished_scan_is_saved_to_history_and_a_stopped_one_is_not() {
     let store = TempStore::new("addon-save");
     let d = with_history(&store);
     assert_eq!(d.history(), history::Shelf::default());
-    d.scan_with("R:\\", None, r_scan);
+    d.scan_with(host("R:\\"), None, r_scan);
     let shelf = wait_saved(&d, 1);
     assert_eq!(shelf.entries.len(), 1);
     let e = &shelf.entries[0];
-    assert_eq!((e.root_path.as_str(), e.total_bytes, e.file_count, e.unreadable_count), ("R:\\", 5100, 2, 1));
+    assert_eq!((e.root_path.as_str(), e.total_bytes, e.file_count, e.unreadable_count), (host("R:\\"), 5100, 2, 1));
     assert_eq!(store.0.list(), shelf, "it is on disk");
 
     let (stopped, wait_stopped) = channel();
-    d.scan_with("R:\\", None, move |job| {
+    d.scan_with(host("R:\\"), None, move |job| {
         r_scan(job);
         while !job.cancelled() {
             std::thread::sleep(Duration::from_millis(1));
@@ -1025,10 +1026,10 @@ fn wait_threads_down_to(d: &DiskSpace, n: usize) {
 /// measures a second one.
 fn s_scan_waiting(d: &DiskSpace) -> std::sync::mpsc::Sender<()> {
     let (go, wait_go) = channel::<()>();
-    d.scan_with("S:\\", None, move |job| {
-        deliver(job, vec![file("S:\\new\\a.bin", 7)]);
+    d.scan_with(host("S:\\"), None, move |job| {
+        deliver(job, vec![file(host("S:\\new\\a.bin"), 7)]);
         let _ = wait_go.recv();
-        deliver(job, vec![file("S:\\new\\b.bin", 3)]);
+        deliver(job, vec![file(host("S:\\new\\b.bin"), 3)]);
     });
     wait_files(d, 1);
     go
@@ -1044,7 +1045,7 @@ fn a_scan_started_while_the_last_one_is_finishing_is_finished_and_saved_only_by_
         ending.send(()).unwrap();
         let _ = held.recv();
     });
-    d.scan_with("R:\\", None, r_scan);
+    d.scan_with(host("R:\\"), None, r_scan);
     wait_ending.recv().unwrap();
 
     let go = s_scan_waiting(&d);
@@ -1052,23 +1053,23 @@ fn a_scan_started_while_the_last_one_is_finishing_is_finished_and_saved_only_by_
     let shelf = wait_saved(&d, 1);
     wait_threads_down_to(&d, 1);
     let v = d.view();
-    assert_eq!((v.phase, v.running.as_deref(), v.root.as_deref(), v.files, v.bytes), (Phase::Running, Some("S:\\"), Some("S:\\"), 1, 7), "the new scan is still running");
+    assert_eq!((v.phase, v.running.as_deref(), v.root.as_deref(), v.files, v.bytes), (Phase::Running, Some(host("S:\\")), Some(host("S:\\")), 1, 7), "the new scan is still running");
     let saved: Vec<_> = shelf.entries.iter().map(|e| (e.root_path.as_str(), e.total_bytes)).collect();
-    assert_eq!(saved, [("R:\\", 5100)], "only the old scan, which really finished, is saved");
+    assert_eq!(saved, [(host("R:\\"), 5100)], "only the old scan, which really finished, is saved");
 
     go.send(()).unwrap();
     let shelf = wait_saved(&d, 2);
     let v = wait_idle(&d);
     assert_eq!((v.phase, v.files, v.bytes), (Phase::Finished, 2, 10), "the new scan finishes itself");
     let saved: Vec<_> = shelf.entries.iter().map(|e| (e.root_path.as_str(), e.total_bytes)).collect();
-    assert_eq!(saved, [("S:\\", 10), ("R:\\", 5100)]);
+    assert_eq!(saved, [(host("S:\\"), 10), (host("R:\\"), 5100)]);
 }
 
 #[test]
 fn results_an_old_scan_publishes_after_a_new_start_are_ignored() {
     let d = DiskSpace::default();
     let (leak, leaked) = channel();
-    d.scan_with("R:\\", None, move |job| {
+    d.scan_with(host("R:\\"), None, move |job| {
         r_scan(job);
         leak.send(job.clone()).unwrap();
     });
@@ -1077,9 +1078,9 @@ fn results_an_old_scan_publishes_after_a_new_start_are_ignored() {
     wait_no_thread(&d);
 
     let go = s_scan_waiting(&d);
-    deliver(&old, vec![file("S:\\new\\late.bin", 999)]);
+    deliver(&old, vec![file(host("S:\\new\\late.bin"), 999)]);
     let v = d.view();
-    assert_eq!((v.phase, v.root.as_deref(), v.files, v.bytes), (Phase::Running, Some("S:\\"), 1, 7), "the old job's results do not land on the new scan");
+    assert_eq!((v.phase, v.root.as_deref(), v.files, v.bytes), (Phase::Running, Some(host("S:\\")), 1, 7), "the old job's results do not land on the new scan");
     assert!(old.cancelled(), "a new Start cancels every older job");
 
     go.send(()).unwrap();
@@ -1091,7 +1092,7 @@ fn results_an_old_scan_publishes_after_a_new_start_are_ignored() {
 fn turning_off_during_a_scan_ends_its_thread_and_saves_nothing() {
     let store = TempStore::new("addon-off");
     let mut d = with_history(&store);
-    d.scan_with("R:\\", None, |job| {
+    d.scan_with(host("R:\\"), None, |job| {
         r_scan(job);
         while checkpoint(job) {
             std::thread::sleep(Duration::from_millis(1));
@@ -1109,11 +1110,11 @@ fn turning_off_during_a_scan_ends_its_thread_and_saves_nothing() {
 fn a_saved_scan_loads_into_the_page() {
     let store = TempStore::new("addon-open");
     let d = with_history(&store);
-    d.scan_with("R:\\", None, r_scan);
+    d.scan_with(host("R:\\"), None, r_scan);
     let id = wait_saved(&d, 1).entries[0].id.clone();
     let measured = d.view();
-    d.scan_with("Q:\\", None, |job| deliver(job, vec![file("Q:\\x", 1)]));
-    assert_eq!(wait_idle(&d).root.as_deref(), Some("Q:\\"));
+    d.scan_with(host("Q:\\"), None, |job| deliver(job, vec![file(host("Q:\\x"), 1)]));
+    assert_eq!(wait_idle(&d).root.as_deref(), Some(host("Q:\\")));
 
     d.open_saved(&id);
     wait_no_thread(&d);
@@ -1126,9 +1127,9 @@ fn a_saved_scan_loads_into_the_page() {
 fn a_saved_scan_opens_at_its_root_with_nothing_selected() {
     let store = TempStore::new("addon-open-nav");
     let mut d = with_history(&store);
-    d.scan_with("R:\\", None, r_scan);
+    d.scan_with(host("R:\\"), None, r_scan);
     let id = wait_saved(&d, 1).entries[0].id.clone();
-    let big = PathBuf::from("R:\\big");
+    let big = PathBuf::from(host("R:\\big"));
     d.navigate(nav::Move::Crumb(big.clone()));
     d.navigate(nav::Move::Pick(nav::Key::ThisFolder, [10.0, 10.0]));
     let v = d.view();
@@ -1137,7 +1138,7 @@ fn a_saved_scan_opens_at_its_root_with_nothing_selected() {
     d.open_saved(&id);
     wait_no_thread(&d);
     let v = d.view();
-    assert_eq!(v.crumbs.iter().map(|c| c.path.clone()).collect::<Vec<_>>(), [PathBuf::from("R:\\")], "back at the root, as a fresh open");
+    assert_eq!(v.crumbs.iter().map(|c| c.path.clone()).collect::<Vec<_>>(), [PathBuf::from(host("R:\\"))], "back at the root, as a fresh open");
     assert_eq!(v.chip, None, "nothing selected");
 }
 
@@ -1177,7 +1178,7 @@ fn deep_folders_show_and_act_on_their_full_paths_live_and_from_history() {
         d.navigate(nav::Move::Crumb(root.clone()));
     };
     check(&mut d, "live");
-    d.scan_with("Q:\\", None, |job| deliver(job, vec![file("Q:\\x", 1)]));
+    d.scan_with(host("Q:\\"), None, |job| deliver(job, vec![file(host("Q:\\x"), 1)]));
     wait_idle(&d);
     d.open_saved(&id);
     wait_no_thread(&d);
@@ -1189,8 +1190,8 @@ fn a_saved_scan_shows_as_many_items_as_the_list_length_setting() {
     let store = TempStore::new("addon-open-length");
     let mut d = with_history(&store);
     d.load_settings(&serde_json::json!({ "listLength": 12 }));
-    let events = (1..=12).map(|i| file(&format!("R:\\f{i:02}.bin"), i * 100)).collect::<Vec<_>>();
-    d.scan_with("R:\\", None, move |job| deliver(job, events));
+    let events = (1..=12).map(|i| file(&host_owned(&format!("R:\\f{i:02}.bin")), i * 100)).collect::<Vec<_>>();
+    d.scan_with(host("R:\\"), None, move |job| deliver(job, events));
     let id = wait_saved(&d, 1).entries[0].id.clone();
     d.open_saved(&id);
     wait_no_thread(&d);
@@ -1201,15 +1202,15 @@ fn a_saved_scan_shows_as_many_items_as_the_list_length_setting() {
 fn the_history_folder_setting_moves_history_and_survives_turning_off_and_on() {
     let (first, second) = (TempStore::new("addon-folder-a"), TempStore::new("addon-folder-b"));
     let dir = |s: &TempStore| s.0.dir.display().to_string();
-    let mut there = SpaceTree::new("Q:\\", LARGEST);
-    there.add_file(Path::new("Q:\\f"), 30);
+    let mut there = SpaceTree::new(host("Q:\\"), LARGEST);
+    there.add_file(Path::new(host("Q:\\f")), 30);
     second.0.save(&history::Snapshot::of(&there, &history::new_id(), 0, 60, history::LIMIT)).unwrap();
     let (ctx, _) = AddonContext::recording();
     let mut d = DiskSpace::default();
     d.load_settings(&serde_json::json!({ "historyFolder": dir(&first) }));
     d.start(&ctx);
     assert_eq!(d.history(), history::Shelf::default(), "listed from the folder chosen");
-    d.scan_with("R:\\", None, r_scan);
+    d.scan_with(host("R:\\"), None, r_scan);
     wait_saved(&d, 1);
     wait_no_thread(&d);
     assert_eq!(first.0.list().entries.len(), 1, "saved in the folder chosen");
@@ -1230,7 +1231,7 @@ fn the_history_folder_setting_moves_history_and_survives_turning_off_and_on() {
 fn a_saved_scan_without_an_unreadable_count_says_some_items_could_not_be_read() {
     let store = TempStore::new("addon-open-unknown");
     let d = with_history(&store);
-    d.scan_with("R:\\", None, |job| deliver(job, vec![file("R:\\a\\f", 5)]));
+    d.scan_with(host("R:\\"), None, |job| deliver(job, vec![file(host("R:\\a\\f"), 5)]));
     let id = wait_saved(&d, 1).entries[0].id.clone();
     let path = store.0.dir.join(format!("{id}.json"));
     let mut saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -1239,7 +1240,7 @@ fn a_saved_scan_without_an_unreadable_count_says_some_items_could_not_be_read() 
     d.open_saved(&id);
     wait_no_thread(&d);
     let v = d.view();
-    assert_eq!(v.root.as_deref(), Some("R:\\"), "it still loads");
+    assert_eq!(v.root.as_deref(), Some(host("R:\\")), "it still loads");
     assert_eq!(v.skipped.map(|s| s.sentence), Some(text::unreadable_unknown()));
 }
 
@@ -1247,14 +1248,14 @@ fn a_saved_scan_without_an_unreadable_count_says_some_items_could_not_be_read() 
 fn a_saved_scan_that_cannot_be_read_is_left_out() {
     let store = TempStore::new("addon-corrupt");
     let d = with_history(&store);
-    d.scan_with("R:\\", None, r_scan);
+    d.scan_with(host("R:\\"), None, r_scan);
     let id = wait_saved(&d, 1).entries[0].id.clone();
     std::fs::write(store.0.dir.join(format!("{id}.json")), "garbage").unwrap();
     d.open_saved(&id);
     wait_no_thread(&d);
     let shelf = d.history();
     assert_eq!((shelf.entries.len(), shelf.left_out), (0, 1));
-    assert_eq!(d.view().root.as_deref(), Some("R:\\"), "what was on screen stays");
+    assert_eq!(d.view().root.as_deref(), Some(host("R:\\")), "what was on screen stays");
 }
 
 #[test]
@@ -1267,7 +1268,7 @@ fn the_view_can_be_read_while_a_finished_scan_is_being_saved() {
         ending.send(()).unwrap();
         let _ = held.recv();
     });
-    d.scan_with("R:\\", None, r_scan);
+    d.scan_with(host("R:\\"), None, r_scan);
     wait_ending.recv().unwrap();
     let v = d.view();
     assert_eq!((v.phase, v.running.as_deref(), v.files, v.bytes), (Phase::Finished, None, 2, 5100), "the finished scan stays on screen while it is saved");
@@ -1279,10 +1280,10 @@ fn the_view_can_be_read_while_a_finished_scan_is_being_saved() {
 fn opening_a_saved_scan_keeps_the_page_until_it_is_read() {
     let store = TempStore::new("addon-open-async");
     let d = with_history(&store);
-    d.scan_with("R:\\", None, r_scan);
+    d.scan_with(host("R:\\"), None, r_scan);
     let id = wait_saved(&d, 1).entries[0].id.clone();
     let measured = d.view();
-    d.scan_with("Q:\\", None, |job| deliver(job, vec![file("Q:\\x", 1)]));
+    d.scan_with(host("Q:\\"), None, |job| deliver(job, vec![file(host("Q:\\x"), 1)]));
     let shown = wait_idle(&d);
     wait_no_thread(&d);
 
@@ -1304,7 +1305,7 @@ fn opening_a_saved_scan_keeps_the_page_until_it_is_read() {
 fn a_saved_scan_read_after_a_new_start_never_replaces_it() {
     let store = TempStore::new("addon-open-late");
     let d = with_history(&store);
-    d.scan_with("R:\\", None, r_scan);
+    d.scan_with(host("R:\\"), None, r_scan);
     let id = wait_saved(&d, 1).entries[0].id.clone();
     wait_no_thread(&d);
 
@@ -1320,7 +1321,7 @@ fn a_saved_scan_read_after_a_new_start_never_replaces_it() {
     release.send(()).unwrap();
     wait_threads_down_to(&d, 1);
     let v = d.view();
-    assert_eq!((v.phase, v.root.as_deref(), v.files), (Phase::Running, Some("S:\\"), 1), "the scan started meanwhile stays");
+    assert_eq!((v.phase, v.root.as_deref(), v.files), (Phase::Running, Some(host("S:\\")), 1), "the scan started meanwhile stays");
     go.send(()).unwrap();
     wait_idle(&d);
 }
@@ -1328,10 +1329,10 @@ fn a_saved_scan_read_after_a_new_start_never_replaces_it() {
 #[test]
 fn a_size_capped_saved_scan_loads_and_can_be_navigated() {
     let store = TempStore::new("addon-open-capped");
-    let mut t = SpaceTree::new("R:\\", LARGEST);
+    let mut t = SpaceTree::new(host("R:\\"), LARGEST);
     for i in 0..20u64 {
         for j in 0..20u64 {
-            t.add_file(Path::new(&format!("R:\\top{i:02}\\sub{j:02}\\deep\\file.bin")), 1000 + i * 100 + j);
+            t.add_file(Path::new(&host_owned(&format!("R:\\top{i:02}\\sub{j:02}\\deep\\file.bin"))), 1000 + i * 100 + j);
         }
     }
     let full = history::encode(&history::Snapshot::of(&t, &history::new_id(), 0, 60, history::LIMIT)).unwrap().len();
@@ -1342,13 +1343,13 @@ fn a_size_capped_saved_scan_loads_and_can_be_navigated() {
     wait_no_thread(&d);
     assert_eq!((d.view().bytes, d.view().files), (t.bytes(SpaceTree::ROOT), 400), "the totals stay whole");
 
-    d.navigate(nav::Move::Open(PathBuf::from("R:\\top19")));
+    d.navigate(nav::Move::Open(PathBuf::from(host("R:\\top19"))));
     let v = d.view();
-    assert_eq!(v.level.first(), Some(&("R:\\top19\\sub19".to_string(), 2919)));
-    d.navigate(nav::Move::Open(PathBuf::from("R:\\top19\\sub19")));
+    assert_eq!(v.level.first(), Some(&(host("R:\\top19\\sub19").to_string(), 2919)));
+    d.navigate(nav::Move::Open(PathBuf::from(host("R:\\top19\\sub19"))));
     let v = d.view();
     let crumbs: Vec<_> = v.crumbs.iter().map(|c| c.label.as_str()).collect();
-    assert_eq!(crumbs, ["R:\\", "top19", "sub19"]);
+    assert_eq!(crumbs, [host("R:\\"), "top19", "sub19"]);
     assert!(v.level.is_empty(), "its sub-folders were not saved");
     assert_eq!(v.types.iter().map(|r| r.bytes).sum::<u64>(), 2919, "its files are still counted");
 }
@@ -1361,24 +1362,24 @@ fn opening_the_page_shows_the_last_finished_scan_of_the_target() {
         t.add_file(&Path::new(root).join("f"), size);
         t
     };
-    for (root, size, finished) in [("R:\\", 10, 100), ("R:\\", 20, 300), ("Q:\\", 30, 400)] {
+    for (root, size, finished) in [(host("R:\\"), 10, 100), (host("R:\\"), 20, 300), (host("Q:\\"), 30, 400)] {
         store.0.save(&history::Snapshot::of(&tree(root, size), &history::new_id(), finished - 60, finished, history::LIMIT)).unwrap();
     }
     let mut d = DiskSpace::default();
-    d.load_settings(&serde_json::json!({ "target": "R:\\" }));
+    d.load_settings(&serde_json::json!({ "target": host("R:\\") }));
     d.use_history(store.0.clone());
     assert_eq!(d.view(), View::default(), "nothing shown before the page opens");
     d.show_last_of_target();
     wait_no_thread(&d);
     let v = d.view();
-    assert_eq!((v.root.as_deref(), v.bytes), (Some("R:\\"), 20));
+    assert_eq!((v.root.as_deref(), v.bytes), (Some(host("R:\\")), 20));
     assert!(v.finished.is_some(), "with its result line");
 
-    d.choose_target(Some(Target::Drive("Z:\\".into())));
+    d.choose_target(Some(Target::Drive(host("Z:\\").into())));
     d.show_last_of_target();
     wait_no_thread(&d);
-    assert_eq!(d.view().root.as_deref(), Some("R:\\"), "a target never measured keeps what is shown");
-    d.choose_target(Some(Target::Folder("Q:\\".into())));
+    assert_eq!(d.view().root.as_deref(), Some(host("R:\\")), "a target never measured keeps what is shown");
+    d.choose_target(Some(Target::Folder(host("Q:\\").into())));
     d.show_last_of_target();
     wait_no_thread(&d);
     assert_eq!(d.view().bytes, 30);
@@ -1390,7 +1391,7 @@ fn clear_history_asks_first_and_removes_every_saved_scan() {
     let mut d = with_history(&store);
     d.ask_clear();
     assert_eq!(d.clear_question(), None, "nothing to clear, nothing asked");
-    d.scan_with("R:\\", None, r_scan);
+    d.scan_with(host("R:\\"), None, r_scan);
     wait_saved(&d, 1);
     d.ask_clear();
     assert_eq!(d.clear_question(), Some((history::CLEAR_TITLE, "One saved scan will be removed. This cannot be undone.".to_string())));
@@ -1418,7 +1419,7 @@ fn scans_real_folders_of_this_pc() {
     println!("{:?}", v.rows(Group::FileType).iter().map(|r| (&r.label, text::size(r.bytes))).collect::<Vec<_>>());
     assert!(v.types.iter().any(|t| t.category == Category::Code && t.files > 0), "the project's sources count as Code");
 
-    let profile = Path::new("C:\\Users\\Default");
+    let profile = Path::new(host("C:\\Users\\Default"));
     let d = DiskSpace::default();
     d.scan(profile, None);
     let v = wait_idle(&d);
@@ -1520,7 +1521,7 @@ impl Held {
     fn start(d: &DiskSpace, first: Vec<Event>) -> Held {
         let (batches, incoming) = channel::<Vec<Event>>();
         let (done, delivered) = channel();
-        d.scan_with("R:\\", None, move |job| {
+        d.scan_with(host("R:\\"), None, move |job| {
             deliver(job, first);
             let _ = done.send(());
             for batch in incoming {
@@ -1541,21 +1542,21 @@ impl Held {
 #[test]
 fn the_view_is_computed_once_per_delivery_not_once_per_ask() {
     let mut d = DiskSpace::default();
-    let scan = Held::start(&d, vec![file("R:\\d\\a.mp4", 3000), file("R:\\d\\e\\b.zip", 2000), file("R:\\c.pdf", 50)]);
+    let scan = Held::start(&d, vec![file(host("R:\\d\\a.mp4"), 3000), file(host("R:\\d\\e\\b.zip"), 2000), file(host("R:\\c.pdf"), 50)]);
     let first = d.view();
     let computed = d.view_computations();
     assert_eq!(d.view(), first);
     let _menu = d.menu(&[]);
     assert_eq!(d.view_computations(), computed, "asking again without a delivery reuses the view");
 
-    scan.deliver(vec![file("R:\\d\\e\\f.bin", 9000)]);
-    assert_eq!(d.view().largest[0].0, "R:\\d\\e\\f.bin");
+    scan.deliver(vec![file(host("R:\\d\\e\\f.bin"), 9000)]);
+    assert_eq!(d.view().largest[0].0, host("R:\\d\\e\\f.bin"));
     let after = d.view_computations();
     assert_eq!(after, computed + 1, "a delivery makes one new view");
     d.view();
     assert_eq!(d.view_computations(), after);
 
-    d.navigate(nav::Move::Crumb(PathBuf::from("R:\\d")));
+    d.navigate(nav::Move::Crumb(PathBuf::from(host("R:\\d"))));
     assert_eq!(d.view().crumbs.len(), 2, "entering a level makes its view");
     d.navigate(nav::Move::ThisFolderOnly(true));
     assert!(d.view().this_folder_only, "so does This Folder Only");
@@ -1572,19 +1573,19 @@ fn the_view_is_computed_once_per_delivery_not_once_per_ask() {
 #[test]
 fn the_largest_files_of_a_level_are_those_of_its_whole_subtree_during_and_after_a_scan() {
     let mut d = DiskSpace::default();
-    let scan = Held::start(&d, vec![file("R:\\d\\a.mp4", 300), file("R:\\d\\e\\deep\\b.zip", 200), file("R:\\x\\c.pdf", 5000)]);
-    d.navigate(nav::Move::Crumb(PathBuf::from("R:\\d")));
+    let scan = Held::start(&d, vec![file(host("R:\\d\\a.mp4"), 300), file(host("R:\\d\\e\\deep\\b.zip"), 200), file(host("R:\\x\\c.pdf"), 5000)]);
+    d.navigate(nav::Move::Crumb(PathBuf::from(host("R:\\d"))));
     let largest = |v: View| v.largest;
     let s = |l: &[(&str, u64)]| l.iter().map(|(n, b)| (n.to_string(), *b)).collect::<Vec<_>>();
-    assert_eq!(largest(d.view()), s(&[("R:\\d\\a.mp4", 300), ("R:\\d\\e\\deep\\b.zip", 200)]));
+    assert_eq!(largest(d.view()), s(&[(host("R:\\d\\a.mp4"), 300), (host("R:\\d\\e\\deep\\b.zip"), 200)]));
 
-    scan.deliver(vec![file("R:\\d\\e\\deep\\er\\z.iso", 900), file("R:\\x\\y.bin", 10_000), file("R:\\d\\e\\small.txt", 1)]);
-    assert_eq!(largest(d.view()), s(&[("R:\\d\\e\\deep\\er\\z.iso", 900), ("R:\\d\\a.mp4", 300), ("R:\\d\\e\\deep\\b.zip", 200), ("R:\\d\\e\\small.txt", 1)]));
+    scan.deliver(vec![file(host("R:\\d\\e\\deep\\er\\z.iso"), 900), file(host("R:\\x\\y.bin"), 10_000), file(host("R:\\d\\e\\small.txt"), 1)]);
+    assert_eq!(largest(d.view()), s(&[(host("R:\\d\\e\\deep\\er\\z.iso"), 900), (host("R:\\d\\a.mp4"), 300), (host("R:\\d\\e\\deep\\b.zip"), 200), (host("R:\\d\\e\\small.txt"), 1)]));
 
     drop(scan);
     wait_idle(&d);
-    d.navigate(nav::Move::Crumb(PathBuf::from("R:\\d\\e")));
-    assert_eq!(largest(d.view()), s(&[("R:\\d\\e\\deep\\er\\z.iso", 900), ("R:\\d\\e\\deep\\b.zip", 200), ("R:\\d\\e\\small.txt", 1)]));
+    d.navigate(nav::Move::Crumb(PathBuf::from(host("R:\\d\\e"))));
+    assert_eq!(largest(d.view()), s(&[(host("R:\\d\\e\\deep\\er\\z.iso"), 900), (host("R:\\d\\e\\deep\\b.zip"), 200), (host("R:\\d\\e\\small.txt"), 1)]));
 }
 
 #[test]
@@ -1594,48 +1595,46 @@ fn entering_a_large_level_during_a_scan_stays_fast() {
     let mut events = Vec::new();
     for i in 0..600u64 {
         for j in 0..500u64 {
-            events.push(file(&format!("R:\\big\\d{i:03}\\s{j:03}\\f.bin"), 1 + i * 1000 + j));
+            events.push(file(&host_owned(&format!("R:\\big\\d{i:03}\\s{j:03}\\f.bin")), 1 + i * 1000 + j));
         }
     }
     let mut d = DiskSpace::default();
     let scan = Held::start(&d, events);
-    d.navigate(nav::Move::Crumb(PathBuf::from("R:\\big")));
-    // The fastest of five views, so a busy machine does not fail it.
-    let mut fastest = Duration::MAX;
+    d.navigate(nav::Move::Crumb(PathBuf::from(host("R:\\big"))));
+    // Counted in folders read, not in time, so a busy machine cannot fail it:
+    // a view reads the lists kept as files arrive, it never walks the level.
+    let reads = || tree::LOOSE_FILES_READS.with(|c| c.get());
+    let mut most = 0;
     for k in 0..5u64 {
-        scan.deliver(vec![file(&format!("R:\\big\\d000\\new{k}.bin"), 10)]);
-        let t = Instant::now();
+        scan.deliver(vec![file(&host_owned(&format!("R:\\big\\d000\\new{k}.bin")), 10)]);
+        let before = reads();
         let v = d.view();
-        fastest = fastest.min(t.elapsed());
-        assert_eq!(v.largest[0].0, "R:\\big\\d599\\s499\\f.bin");
+        most = most.max(reads() - before);
+        assert_eq!(v.largest[0].0, host("R:\\big\\d599\\s499\\f.bin"));
     }
-    // Measured against what a view cost when it walked the whole level
-    // (each folder's files, merged), on the same machine and moment, so a
-    // busy machine slows both: the view must take a small part of it.
+    // What a view cost when it walked the whole level (each folder's files,
+    // merged): the count shows the measure sees such a walk.
     let tree = lock_state(&d.state).tree.clone().unwrap();
-    let mut walk = Duration::MAX;
-    for _ in 0..3 {
-        let t = Instant::now();
-        let mut largest = Vec::new();
-        let mut folders = vec![tree.find(Path::new("R:\\big")).unwrap()];
-        while let Some(n) = folders.pop() {
-            largest.extend(tree.loose_files(n).into_iter().take(LARGEST));
-            folders.extend(tree.children(n));
-        }
-        largest.sort_by(|a, b| b.1.cmp(&a.1));
-        largest.truncate(LARGEST);
-        walk = walk.min(t.elapsed());
-        assert_eq!(largest[0].0, PathBuf::from("R:\\big\\d599\\s499\\f.bin"));
+    let before = reads();
+    let mut largest = Vec::new();
+    let mut folders = vec![tree.find(Path::new(host("R:\\big"))).unwrap()];
+    while let Some(n) = folders.pop() {
+        largest.extend(tree.loose_files(n).into_iter().take(LARGEST));
+        folders.extend(tree.children(n));
     }
-    println!("a view of R:\\big: {fastest:?}; a walk of it: {walk:?}");
-    assert!(fastest * 10 < walk, "a view of R:\\big took {fastest:?}, a tenth of a walk of the level is {:?}", walk / 10);
+    largest.sort_by(|a, b| b.1.cmp(&a.1));
+    largest.truncate(LARGEST);
+    assert_eq!(largest[0].0, PathBuf::from(host("R:\\big\\d599\\s499\\f.bin")));
+    let walk = reads() - before;
+    assert!(walk >= 300_000, "a walk of the level reads every folder: {walk}");
+    assert!(most < 1000, "a view of R:\\big read {most} folders, a walk of the level reads {walk}");
 }
 
 /// A finished scan of R:\ with a folder of two videos and a file at the root.
 fn chip_scan() -> DiskSpace {
     let d = DiskSpace::default();
-    let events = vec![file("R:\\v\\a.mp4", 3000), file("R:\\v\\b.mp4", 1000), file("R:\\setup.exe", 400)];
-    d.scan_with("R:\\", None, move |job| deliver(job, events));
+    let events = vec![file(host("R:\\v\\a.mp4"), 3000), file(host("R:\\v\\b.mp4"), 1000), file(host("R:\\setup.exe"), 400)];
+    d.scan_with(host("R:\\"), None, move |job| deliver(job, events));
     wait_idle(&d);
     d
 }
@@ -1655,23 +1654,23 @@ fn words(name: &str, detail: &str, bytes: u64, path: Option<&str>) -> ChipWords 
 fn clicking_a_piece_shows_its_chip_at_the_click_point_with_name_files_or_type_size_and_path() {
     let mut d = chip_scan();
     assert_eq!(d.view().chip, None, "nothing clicked yet");
-    let v = nav::Key::Folder(PathBuf::from("R:\\v"));
+    let v = nav::Key::Folder(PathBuf::from(host("R:\\v")));
     d.navigate(nav::Move::Pick(v.clone(), [120.0, 80.0]));
     let chip = d.view().chip.expect("a chip");
     assert_eq!((chip.key, chip.at), (v.clone(), Some([120.0, 80.0])), "at the click point");
-    assert_eq!(chip_words(&d), words("v", "2 files", 4000, Some("R:\\v")));
+    assert_eq!(chip_words(&d), words("v", "2 files", 4000, Some(host("R:\\v"))));
     d.navigate(nav::Move::Pick(nav::Key::ThisFolder, [10.0, 20.0]));
-    assert_eq!(chip_words(&d), words("this folder", "1 file", 400, Some("R:\\")), "this folder is the level's folder");
+    assert_eq!(chip_words(&d), words("this folder", "1 file", 400, Some(host("R:\\"))), "this folder is the level's folder");
     d.navigate(nav::Move::Activate(v.clone()));
     d.navigate(nav::Move::ThisFolderOnly(true));
-    d.navigate(nav::Move::Pick(nav::Key::File(PathBuf::from("R:\\v\\a.mp4")), [5.0, 5.0]));
-    assert_eq!(chip_words(&d), words("a.mp4", "Media", 3000, Some("R:\\v\\a.mp4")), "a file says its type");
+    d.navigate(nav::Move::Pick(nav::Key::File(PathBuf::from(host("R:\\v\\a.mp4"))), [5.0, 5.0]));
+    assert_eq!(chip_words(&d), words("a.mp4", "Media", 3000, Some(host("R:\\v\\a.mp4"))), "a file says its type");
 }
 
 #[test]
 fn the_chip_goes_on_a_click_on_empty_canvas_and_on_another_level() {
     let mut d = chip_scan();
-    let v = nav::Key::Folder(PathBuf::from("R:\\v"));
+    let v = nav::Key::Folder(PathBuf::from(host("R:\\v")));
     let pick = |d: &mut DiskSpace, key: &nav::Key| {
         d.navigate(nav::Move::Pick(key.clone(), [50.0, 50.0]));
         assert!(d.view().chip.is_some(), "{key:?}");
@@ -1685,12 +1684,12 @@ fn the_chip_goes_on_a_click_on_empty_canvas_and_on_another_level() {
     pick(&mut d, &nav::Key::ThisFolder);
     d.navigate(nav::Move::ThisFolderOnly(true));
     assert_eq!(d.view().chip, None, "This Folder Only");
-    pick(&mut d, &nav::Key::File(PathBuf::from("R:\\v\\a.mp4")));
+    pick(&mut d, &nav::Key::File(PathBuf::from(host("R:\\v\\a.mp4"))));
     d.navigate(nav::Move::Parent);
     assert_eq!(d.view().chip, None, "Parent");
     d.navigate(nav::Move::Parent);
     pick(&mut d, &nav::Key::ThisFolder);
-    d.navigate(nav::Move::Crumb(PathBuf::from("R:\\")));
+    d.navigate(nav::Move::Crumb(PathBuf::from(host("R:\\"))));
     assert_eq!(d.view().chip, None, "a breadcrumb");
 }
 
@@ -1715,12 +1714,12 @@ fn start_clears_the_chip() {
 #[test]
 fn the_selected_item_shows_its_chip_on_its_piece_for_the_keyboard() {
     let mut d = chip_scan();
-    let v = nav::Key::Folder(PathBuf::from("R:\\v"));
+    let v = nav::Key::Folder(PathBuf::from(host("R:\\v")));
     d.navigate(nav::Move::Select(Some(v.clone())));
     let chip = d.view().chip.expect("the selection's chip");
     assert_eq!((chip.key, chip.at), (v, None), "no click point: drawn on its piece");
-    assert_eq!(chip_words(&d), words("v", "2 files", 4000, Some("R:\\v")));
-    d.navigate(nav::Move::Select(Some(nav::Key::Folder(PathBuf::from("R:\\elsewhere")))));
+    assert_eq!(chip_words(&d), words("v", "2 files", 4000, Some(host("R:\\v"))));
+    d.navigate(nav::Move::Select(Some(nav::Key::Folder(PathBuf::from(host("R:\\elsewhere"))))));
     assert_eq!(d.view().chip, None, "an item that is no piece of the level has no chip");
 }
 

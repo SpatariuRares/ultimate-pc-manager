@@ -376,6 +376,8 @@ mod tests {
         }
     }
 
+    // Windows only: the list is read through the registry and PowerShell.
+    #[cfg(windows)]
     #[test]
     fn checking_for_updates_when_the_page_opens_is_off_by_default() {
         let asks_winget = |runner: &crate::platform::RecordingRunner| runner.launches().iter().any(|l| matches!(l, Launch::Winget(_)));
@@ -469,6 +471,8 @@ mod tests {
         (root, apps)
     }
 
+    // Windows only: an app folder is a registry location on a drive.
+    #[cfg(windows)]
     #[test]
     fn turning_off_stops_a_slow_folder_measure_and_drops_its_results() {
         let (root, apps) = two_app_folders("stop");
@@ -520,6 +524,8 @@ mod tests {
         assert!(addon.summary_lines().is_none());
     }
 
+    // Windows only: an app folder is a registry location on a drive.
+    #[cfg(windows)]
     #[test]
     fn a_file_in_an_apps_folder_is_owned_by_that_app_and_revealed_on_its_row() {
         // An app's folder counts only when it exists.
@@ -639,6 +645,8 @@ mod tests {
         assert!(st.message.is_none() && st.winget.is_none(), "the late winget answer is dropped");
     }
 
+    // Windows only: Store apps are listed through PowerShell.
+    #[cfg(windows)]
     #[test]
     fn turning_off_stops_reading_the_list_at_once() {
         let (ctx, runner) = AddonContext::recording();

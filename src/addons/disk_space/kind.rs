@@ -20,9 +20,9 @@ const CODE: &str = "swift c h cpp cc hpp m mm rs go py rb js ts jsx tsx java kt 
 const ARCHIVES: &str = "zip tar gz bz2 xz 7z rar dmg iso pkg jar war aar cab zst";
 /// Includes .exe/.msi (owner decision on #80).
 const APPLICATIONS: &str = "app framework bundle xcappdata exe msi";
-/// Includes .dll/.sys (owner decision on #80) and .etl/.pf (trace logs
-/// and prefetch files).
-const SYSTEM: &str = "dylib so a o kext log cache db sqlite sqlite3 shm wal swp tmp dll sys etl pf";
+/// Includes .dll/.sys (owner decision on #80) and .etl (trace logs); .pf
+/// (prefetch files) is Other, as the PRD says.
+const SYSTEM: &str = "dylib so a o kext log cache db sqlite sqlite3 shm wal swp tmp dll sys etl";
 
 impl Category {
     /// Every category, in the legend's order.
@@ -105,6 +105,14 @@ mod tests {
         assert_eq!(of("tool.msi"), Category::Applications);
         assert_eq!(of("kernel32.dll"), Category::System);
         assert_eq!(of("ntfs.sys"), Category::System);
+    }
+
+    #[test]
+    fn trace_logs_are_system_but_prefetch_files_are_other() {
+        // The PRD's decision on #80.
+        assert_eq!(of("boot.etl"), Category::System);
+        assert_eq!(of("APP.EXE-1A2B3C4D.pf"), Category::Other);
+        assert_eq!(of("layout.pf"), Category::Other);
     }
 
     #[test]

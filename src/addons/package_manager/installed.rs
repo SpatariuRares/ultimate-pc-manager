@@ -855,6 +855,8 @@ mod tests {
         Launch::Program { file: "MsiExec.exe".into(), params: format!("/X{FZF_CODE} /passive /promptrestart") }
     }
 
+    // Windows only: a registry entry and msiexec.
+    #[cfg(windows)]
     #[test]
     fn a_machine_wide_msi_winget_cannot_uninstall_without_admin_rights_runs_its_own_installer_which_asks() {
         let mut page = Page::new("msi-fallback", fzf_entry);

@@ -17,6 +17,7 @@
 //!   folder, and writes the result wrapped with the job token. The caller
 //!   rejects a result whose token is missing or wrong.
 
+use super::sha256_hex;
 use std::path::Path;
 
 /// Exit codes of the bootstrap that name a refusal (0 is a finished job).
@@ -178,103 +179,6 @@ pub fn open_envelope(text: &str, token: &str) -> Result<serde_json::Value, Strin
     Ok(v["result"].take())
 }
 
-const SHA256_K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-    0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-    0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-];
-
-/// SHA-256 fed in pieces, so a big file is hashed without being held in
-/// memory: [`Sha256::update`] as often as needed, then [`Sha256::finish`].
-pub struct Sha256 {
-    h: [u32; 8],
-    /// The bytes of the block not complete yet.
-    block: [u8; 64],
-    filled: usize,
-    /// The bytes fed so far.
-    len: u64,
-}
-
-impl Default for Sha256 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Sha256 {
-    pub fn new() -> Self {
-        Sha256 { h: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19], block: [0; 64], filled: 0, len: 0 }
-    }
-
-    pub fn update(&mut self, mut data: &[u8]) {
-        self.len += data.len() as u64;
-        if self.filled > 0 {
-            let take = (64 - self.filled).min(data.len());
-            self.block[self.filled..self.filled + take].copy_from_slice(&data[..take]);
-            self.filled += take;
-            data = &data[take..];
-            if self.filled < 64 {
-                return;
-            }
-            let block = self.block;
-            self.compress(&block);
-            self.filled = 0;
-        }
-        let mut blocks = data.chunks_exact(64);
-        for block in &mut blocks {
-            self.compress(block);
-        }
-        let rest = blocks.remainder();
-        self.block[..rest.len()].copy_from_slice(rest);
-        self.filled = rest.len();
-    }
-
-    /// The digest as lowercase hex.
-    pub fn finish(mut self) -> String {
-        let bits = self.len * 8;
-        let mut tail = vec![0x80u8];
-        while (self.filled + tail.len()) % 64 != 56 {
-            tail.push(0);
-        }
-        tail.extend_from_slice(&bits.to_be_bytes());
-        self.update(&tail);
-        self.h.iter().map(|x| format!("{x:08x}")).collect()
-    }
-
-    fn compress(&mut self, block: &[u8]) {
-        let mut w = [0u32; 64];
-        for (i, word) in block.chunks(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-        let mut v = self.h;
-        for i in 0..64 {
-            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
-            let ch = (v[4] & v[5]) ^ (!v[4] & v[6]);
-            let t1 = v[7].wrapping_add(s1).wrapping_add(ch).wrapping_add(SHA256_K[i]).wrapping_add(w[i]);
-            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
-            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
-            let t2 = s0.wrapping_add(maj);
-            v = [t1.wrapping_add(t2), v[0], v[1], v[2], v[3].wrapping_add(t1), v[4], v[5], v[6]];
-        }
-        for i in 0..8 {
-            self.h[i] = self.h[i].wrapping_add(v[i]);
-        }
-    }
-}
-
-/// SHA-256 of `data` as lowercase hex.
-pub fn sha256_hex(data: &[u8]) -> String {
-    let mut hash = Sha256::new();
-    hash.update(data);
-    hash.finish()
-}
-
 /// 16 random bytes from the system generator, as 32 hex characters.
 pub fn random_hex() -> Result<String, String> {
     use windows_sys::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
@@ -326,39 +230,6 @@ pub fn run(jobs: &Path, result_base: &Path, script: &str, args: &[(&str, &str)],
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sha256_matches_known_vectors() {
-        assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-        assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-        let long = vec![b'a'; 1000];
-        assert_eq!(sha256_hex(&long).len(), 64);
-    }
-
-    #[test]
-    fn sha256_in_pieces_equals_sha256_in_one_go() {
-        let data: Vec<u8> = (0..1000u32).map(|i| (i * 7 + 3) as u8).collect();
-        let whole = sha256_hex(&data);
-        for piece in [1usize, 3, 63, 64, 65, 200, 999, 1000] {
-            let mut hash = Sha256::new();
-            for chunk in data.chunks(piece) {
-                hash.update(chunk);
-            }
-            assert_eq!(hash.finish(), whole, "pieces of {piece}");
-        }
-        // The lengths around the padding boundary (55, 56, 63, 64 bytes).
-        for n in [0usize, 55, 56, 63, 64, 119, 120] {
-            let mut hash = Sha256::new();
-            let (a, b) = data[..n].split_at(n / 2);
-            hash.update(a);
-            hash.update(b);
-            assert_eq!(hash.finish(), sha256_hex(&data[..n]), "{n} bytes");
-        }
-        let mut abc = Sha256::new();
-        abc.update(b"a");
-        abc.update(b"bc");
-        assert_eq!(abc.finish(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-    }
 
     #[test]
     fn encoded_command_is_utf16_base64() {
