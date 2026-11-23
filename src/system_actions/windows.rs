@@ -56,6 +56,12 @@ impl SystemActions for WindowsActions {
     fn run_new_task(&self, cmdline: &str) -> Result<(), String> {
         run_open::run_new_task(cmdline)
     }
+    fn run_new_task_as_admin(&self, cmdline: &str) -> Result<(), String> {
+        crate::platform::open_elevated(cmdline)
+    }
+    fn offers_run_as_admin(&self) -> bool {
+        crate::app_folders::System::current() != crate::app_folders::System::Windows
+    }
     fn open_power_options(&self) -> Result<(), String> {
         run_open::open_power_options()
     }

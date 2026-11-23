@@ -310,6 +310,10 @@ pub enum Launch {
     Elevated(Vec<String>),
     /// A Windows notification (toast) with this title and text.
     Notify { title: String, body: String },
+    /// One program started with administrator rights for this one action
+    /// (the launcher and its arguments: `pkexec ...` on Linux, `osascript ...`
+    /// on macOS).
+    ElevatedProgram(Vec<String>),
 }
 
 /// The error an elevated launch returns when the UAC prompt was dismissed
@@ -340,6 +344,27 @@ pub trait ProcessRunner: Send + Sync {
     /// Starts this app again as administrator (UAC asks) with `args`,
     /// without waiting. The caller then closes this instance.
     fn restart_elevated(&self, args: &[&str]) -> Result<(), String>;
+    /// Runs the launcher `argv` (an elevated start of one program, see
+    /// [`crate::action_elevation`]) and waits for it to end.
+    fn run_elevated_launcher(&self, argv: &[String]) -> crate::action_elevation::Spawned {
+        crate::action_elevation::spawn_and_wait(argv)
+    }
+    /// The system whose way of asking for administrator rights is used.
+    fn elevation_system(&self) -> crate::app_folders::System {
+        crate::app_folders::System::current()
+    }
+    /// The value of an environment variable, if set.
+    fn env_var(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
+    /// Starts the one program in `cmdline` with administrator rights for
+    /// this action only (the app itself stays as it is): through `pkexec`
+    /// on Linux, the administrator authorisation prompt on macOS. Waits until
+    /// the permission is answered and, for a program that runs in the
+    /// foreground, until it ends, so call it from a worker thread.
+    fn open_elevated(&self, cmdline: &str) -> Result<(), String> {
+        crate::action_elevation::run(self.elevation_system(), cmdline, &|name| self.env_var(name), &|argv| self.run_elevated_launcher(argv))
+    }
     /// Shows a Windows notification (toast) without waiting for it.
     fn notify(&self, title: &str, body: &str) -> Result<(), String>;
 }
@@ -374,6 +399,12 @@ impl ProcessRunner for SystemRunner {
     }
 }
 
+/// Starts the program in `cmdline` with administrator rights for this one
+/// action (see [`ProcessRunner::open_elevated`]).
+pub fn open_elevated(cmdline: &str) -> Result<(), String> {
+    SystemRunner.open_elevated(cmdline)
+}
+
 /// An executor that records every request and launches nothing.
 #[cfg(test)]
 #[derive(Default)]
@@ -391,10 +422,24 @@ pub struct RecordingRunner {
     /// Held runs ended early because their `stop` was set (a real
     /// executor would have ended the program).
     stopped: std::sync::atomic::AtomicUsize,
+    /// The system an elevated launch is built for (the running one unless
+    /// a test says so) and how its launcher ends.
+    elevation: std::sync::Mutex<Option<(crate::app_folders::System, crate::action_elevation::Spawned)>>,
+    /// The environment variables an elevated launch can read.
+    env: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 #[cfg(test)]
 impl RecordingRunner {
+    /// Elevated launches are built for `system` and their launcher ends as
+    /// `spawned` (without it: the running system, exit code 0).
+    pub fn elevate_as(&self, system: crate::app_folders::System, spawned: crate::action_elevation::Spawned) {
+        *self.elevation.lock().unwrap_or_else(|e| e.into_inner()) = Some((system, spawned));
+    }
+    /// Sets an environment variable elevated launches can read.
+    pub fn set_env(&self, name: &str, value: &str) {
+        self.env.lock().unwrap_or_else(|e| e.into_inner()).push((name.into(), value.into()));
+    }
     /// The requests so far, in order.
     pub fn launches(&self) -> Vec<Launch> {
         self.launches.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -588,6 +633,19 @@ impl ProcessRunner for RecordingRunner {
     }
     fn notify(&self, title: &str, body: &str) -> Result<(), String> {
         Err(self.record(Launch::Notify { title: title.into(), body: body.into() }))
+    }
+    fn run_elevated_launcher(&self, argv: &[String]) -> crate::action_elevation::Spawned {
+        self.launches.lock().unwrap_or_else(|e| e.into_inner()).push(Launch::ElevatedProgram(argv.to_vec()));
+        match &*self.elevation.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some((_, spawned)) => spawned.clone(),
+            None => crate::action_elevation::Spawned::Exited { code: 0, stderr: String::new() },
+        }
+    }
+    fn elevation_system(&self) -> crate::app_folders::System {
+        self.elevation.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(s, _)| *s).unwrap_or_else(crate::app_folders::System::current)
+    }
+    fn env_var(&self, name: &str) -> Option<String> {
+        self.env.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
     }
 }
 
@@ -1437,6 +1495,56 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action_elevation::{Spawned, PERMISSION_DISMISSED, PERMISSION_REFUSED, PKEXEC_MISSING};
+    use crate::app_folders::System;
+
+    // ---- Per-action elevation ----
+
+    #[test]
+    fn linux_starts_one_program_through_pkexec_with_separate_arguments() {
+        let (_, runner) = AddonContext::recording();
+        runner.elevate_as(System::Linux, Spawned::Exited { code: 0, stderr: String::new() });
+        runner.set_env("DISPLAY", ":1");
+        assert_eq!(runner.open_elevated("gparted \"/dev/sda 1\" ; id"), Ok(()));
+        let expected: Vec<String> = ["pkexec", "env", "DISPLAY=:1", "gparted", "/dev/sda 1", ";", "id"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(runner.launches(), vec![Launch::ElevatedProgram(expected)]);
+    }
+
+    #[test]
+    fn linux_without_pkexec_says_what_is_needed() {
+        let (_, runner) = AddonContext::recording();
+        runner.elevate_as(System::Linux, Spawned::NotFound);
+        assert_eq!(runner.open_elevated("gparted"), Err(PKEXEC_MISSING.to_string()));
+        assert!(PKEXEC_MISSING.contains("polkit"));
+    }
+
+    #[test]
+    fn linux_refused_or_dismissed_permission_says_so() {
+        let (_, runner) = AddonContext::recording();
+        runner.elevate_as(System::Linux, Spawned::Exited { code: 126, stderr: String::new() });
+        assert_eq!(runner.open_elevated("gparted"), Err(PERMISSION_DISMISSED.to_string()));
+        runner.elevate_as(System::Linux, Spawned::Exited { code: 127, stderr: String::new() });
+        assert_eq!(runner.open_elevated("gparted"), Err(PERMISSION_REFUSED.to_string()));
+    }
+
+    #[test]
+    fn macos_asks_through_the_authorisation_prompt_and_launches_nothing_without_a_command() {
+        let (_, runner) = AddonContext::recording();
+        runner.elevate_as(System::MacOs, Spawned::Exited { code: 1, stderr: "User canceled. (-128)".into() });
+        assert_eq!(runner.open_elevated("open -a Console"), Err(PERMISSION_DISMISSED.to_string()));
+        assert!(matches!(&runner.launches()[..], [Launch::ElevatedProgram(argv)] if argv[0] == "osascript" && argv[7] == "'open' '-a' 'Console' >/dev/null 2>&1 &"));
+        assert_eq!(runner.open_elevated("  "), Err("Type the name of a program, folder or document.".to_string()));
+        assert_eq!(runner.launches().len(), 1, "an empty command asks for nothing");
+    }
+
+    #[test]
+    fn windows_never_goes_through_the_per_action_launchers() {
+        let (_, runner) = AddonContext::recording();
+        runner.elevate_as(System::Windows, Spawned::Exited { code: 0, stderr: String::new() });
+        assert!(runner.open_elevated("notepad").is_err(), "Windows asks through UAC where an action needs it");
+        assert!(runner.launches().is_empty(), "no pkexec or osascript launch on Windows");
+        assert_eq!(SystemRunner.elevation_system(), System::current());
+    }
     use std::sync::atomic::AtomicBool;
 
     #[test]

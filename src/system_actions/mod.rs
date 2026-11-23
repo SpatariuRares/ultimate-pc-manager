@@ -54,6 +54,13 @@ pub trait SystemActions: Send + Sync {
     fn reveal_in_explorer(&self, path: &std::path::Path) -> Result<(), String>;
     /// Runs the command line `cmdline` (Run new task).
     fn run_new_task(&self, cmdline: &str) -> Result<(), String>;
+    /// Runs `cmdline` with administrator rights for this one action
+    /// (Run new task, "Create this task with administrator privileges").
+    /// Waits for the permission to be answered: call it off the UI thread.
+    fn run_new_task_as_admin(&self, cmdline: &str) -> Result<(), String>;
+    /// Whether Run new task offers the administrator option here: not on
+    /// Windows, where UAC asks for the actions that need it.
+    fn offers_run_as_admin(&self) -> bool;
     fn open_power_options(&self) -> Result<(), String>;
 
 
@@ -93,6 +100,7 @@ pub enum Request {
     OpenFileLocation(String),
     RevealInExplorer(std::path::PathBuf),
     RunNewTask(String),
+    RunNewTaskAsAdmin(String),
     OpenPowerOptions,
 
     // ---- Priority and reads ----
