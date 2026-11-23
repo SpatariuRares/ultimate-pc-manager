@@ -364,7 +364,7 @@ impl ProcessRunner for SystemRunner {
         system::run_and_wait(file, params, stop)
     }
     fn open(&self, target: &str) -> Result<(), String> {
-        crate::winsys::run_new_task(target)
+        crate::run_open::run_new_task(target)
     }
     fn restart_elevated(&self, args: &[&str]) -> Result<(), String> {
         system::restart_elevated(args)

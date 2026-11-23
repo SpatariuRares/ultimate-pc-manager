@@ -74,7 +74,7 @@ impl Query {
                 .filter_map(|i| {
                     let it = &*items.add(i);
                     // 0 = valid data, 1 = new data.
-                    (it.FmtValue.CStatus <= 1).then(|| (crate::winsys::from_wide(it.szName), it.FmtValue.Anonymous.doubleValue))
+                    (it.FmtValue.CStatus <= 1).then(|| (crate::win_ffi::from_wide(it.szName), it.FmtValue.Anonymous.doubleValue))
                 })
                 .collect()
         }
@@ -117,7 +117,7 @@ impl Query {
             (0..count as usize)
                 .filter_map(|i| {
                     let it = &*items.add(i);
-                    (it.RawValue.CStatus <= 1).then(|| (crate::winsys::from_wide(it.szName), it.RawValue.FirstValue))
+                    (it.RawValue.CStatus <= 1).then(|| (crate::win_ffi::from_wide(it.szName), it.RawValue.FirstValue))
                 })
                 .collect()
         }

@@ -182,7 +182,7 @@ impl Links {
 /// denied (readable only by the system), else [`Event::Unreadable`]. Asked
 /// once more only for such a folder, so the walk does not slow down.
 fn unreadable(dir: PathBuf) -> Event {
-    match std::fs::read_dir(crate::winsys::long_path(&dir)) {
+    match std::fs::read_dir(crate::long_path::long_path(&dir)) {
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Event::Denied(dir),
         _ => Event::Unreadable(dir),
     }

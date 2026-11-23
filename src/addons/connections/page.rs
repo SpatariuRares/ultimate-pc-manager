@@ -64,7 +64,7 @@ pub struct AppNames {
 impl Default for AppNames {
     /// Names from the files' version resources.
     fn default() -> Self {
-        Self::new(crate::winsys::file_description)
+        Self::new(crate::file_description::file_description)
     }
 }
 

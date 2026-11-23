@@ -13,7 +13,7 @@ type Table = Result<Vec<(Row, Option<Duration>)>, TableError>;
 /// Reads the four tables of this PC, and the services each process runs.
 pub fn read() -> Inventory {
     let (tables, ages) = tables();
-    Inventory { ages, services: services_by_pid(crate::winsys::running_service_pids()), ..assemble(tables) }
+    Inventory { ages, services: services_by_pid(crate::services::running_service_pids()), ..assemble(tables) }
 }
 
 /// TCP4, TCP6, UDP4, UDP6 (the "owner module" tables, which carry each

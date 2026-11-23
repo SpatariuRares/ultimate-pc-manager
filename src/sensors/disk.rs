@@ -71,7 +71,7 @@ pub fn blocked<T>(ata: bool, admin: bool, consent: bool) -> Option<Probe<T>> {
 /// `\\.\PhysicalDrive{n}`, open for read and write (both S.M.A.R.T.
 /// queries need it); closed when dropped.
 #[cfg(windows)]
-pub(super) struct Drive(crate::winsys::Handle);
+pub(super) struct Drive(crate::win_ffi::Handle);
 
 #[cfg(windows)]
 impl Drive {
@@ -79,14 +79,14 @@ impl Drive {
     pub(super) fn open(n: u32) -> Result<Drive, String> {
         use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
-        let path = crate::winsys::wide_path(std::path::Path::new(&format!(r"\\.\PhysicalDrive{n}")));
+        let path = crate::win_ffi::wide_path(std::path::Path::new(&format!(r"\\.\PhysicalDrive{n}")));
         // SAFETY: `path` is NUL-terminated and outlives the call; no
         // security attributes or template handle are passed.
         let h = unsafe { CreateFileW(path.as_ptr(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut()) };
         if h == INVALID_HANDLE_VALUE {
             Err("the disk cannot be opened".into())
         } else {
-            Ok(Drive(crate::winsys::Handle(h)))
+            Ok(Drive(crate::win_ffi::Handle(h)))
         }
     }
 

@@ -107,7 +107,7 @@ impl Links {
 /// Whether the item is still on disk (a broken link counts: it is there),
 /// however long its path.
 pub fn on_disk(path: &Path) -> bool {
-    std::fs::symlink_metadata(crate::winsys::long_path(path)).is_ok()
+    std::fs::symlink_metadata(crate::long_path::long_path(path)).is_ok()
 }
 
 #[cfg(test)]

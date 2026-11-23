@@ -27,7 +27,7 @@ pub fn list(dir: &Path, through: bool, links: bool, buf: &mut Vec<u64>, fail_aft
         FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
-    let wide = crate::winsys::wide_path(&crate::winsys::long_path(dir));
+    let wide = crate::win_ffi::wide_path(&crate::long_path::long_path(dir));
     let flags = if through { FILE_FLAG_BACKUP_SEMANTICS } else { FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT };
     // SAFETY: `wide` is NUL-terminated and outlives the call; no security
     // attributes or template handle are passed.
@@ -46,7 +46,7 @@ pub fn list(dir: &Path, through: bool, links: bool, buf: &mut Vec<u64>, fail_aft
         return Listing::default();
     }
     // Closes the folder handle on every way out.
-    let handle = crate::winsys::Handle(handle);
+    let handle = crate::win_ffi::Handle(handle);
     // u64 elements keep the buffer 8-byte aligned, as the records need.
     buf.resize(64 * 1024 / 8, 0);
     let mut out = Vec::new();
