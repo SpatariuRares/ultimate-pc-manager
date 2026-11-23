@@ -22,7 +22,6 @@ mod page_processes;
 mod perfdata;
 mod path_cache;
 mod platform;
-mod pro;
 mod proc_info;
 mod process_view;
 mod sampler;

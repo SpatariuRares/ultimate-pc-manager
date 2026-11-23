@@ -93,7 +93,7 @@ impl Header {
         let digits = |a: usize, b: usize| r.get(a..b).filter(|d| d.iter().all(u8::is_ascii_digit)).map(|d| String::from_utf8_lossy(d).into_owned());
         match (digits(0, 4), digits(5, 7), digits(8, 10), digits(11, 13), digits(14, 16)) {
             (Some(y), Some(mo), Some(d), Some(h), Some(mi)) => format!("{NAME_PREFIX}_{y}{mo}{d}_{h}{mi}.{TRACE_EXTENSION}"),
-            _ => default_file_name(crate::pro::local_secs()),
+            _ => default_file_name(crate::platform::local_secs()),
         }
     }
 }
@@ -171,7 +171,7 @@ struct Civil {
 }
 
 /// Splits `local_secs` (seconds since 1970-01-01 in local time, as
-/// [`crate::pro::local_secs`] gives) into date and time (proleptic Gregorian).
+/// [`crate::platform::local_secs`] gives) into date and time (proleptic Gregorian).
 fn civil(local_secs: i64) -> Civil {
     let days = local_secs.div_euclid(86_400);
     let secs = local_secs.rem_euclid(86_400);
