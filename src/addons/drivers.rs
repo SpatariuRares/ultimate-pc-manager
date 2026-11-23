@@ -570,7 +570,7 @@ mod settings_tests {
 
         let h = addon.page().unwrap().drv.clone();
         let mut st = h.lock();
-        st.updates = Some(vec![engine::DriverUpdate::default()]);
+        st.updates = Some(vec![engine::DriverUpdate::default()].into());
         st.checked_at = "09:00".into();
         drop(st);
         assert_eq!(addon.summary_lines(), None, "a check made when the page opened does not count");
