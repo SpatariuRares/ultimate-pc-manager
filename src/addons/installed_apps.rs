@@ -9,7 +9,7 @@ pub mod apps;
 /// The Installed Apps page.
 pub mod page;
 
-use crate::addons::{is_default, read_settings, write_settings, Addon, Consumption, Offers, PathOwner, Requirements};
+use crate::addons::{is_default, read_settings, write_settings, Addon, Consumption, Asked, Capability, PathOwner, Requirements};
 use crate::platform::{Action, AddonContext, PageContext};
 
 use apps::Hub;
@@ -201,8 +201,11 @@ impl Addon for InstalledApps {
         }
     }
 
-    fn offers(&mut self) -> Offers<'_> {
-        Offers { path_owner: Some(self), ..Offers::default() }
+    fn offers(&mut self, asked: Asked) -> Option<Capability<'_>> {
+        match asked {
+            Asked::PathOwner => Some(Capability::PathOwner(self)),
+            _ => None,
+        }
     }
 }
 

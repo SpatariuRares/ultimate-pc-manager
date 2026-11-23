@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use egui::{RichText, Ui};
 
-use crate::addons::{is_default, is_true, plural, read_settings, write_settings, Addon, Consumption, Offers, ProcessColumn, ProcessColumnProvider, Requirements};
+use crate::addons::{is_default, is_true, plural, read_settings, write_settings, Addon, Consumption, Asked, Capability, ProcessColumn, ProcessColumnProvider, Requirements};
 use crate::platform::{Action, PageContext};
 use crate::widgets::parts;
 
@@ -379,8 +379,11 @@ impl Addon for Connections {
         self.hidden();
     }
 
-    fn offers(&mut self) -> Offers<'_> {
-        Offers { process_column: Some(self), ..Offers::default() }
+    fn offers(&mut self, asked: Asked) -> Option<Capability<'_>> {
+        match asked {
+            Asked::ProcessColumn => Some(Capability::ProcessColumn(self)),
+            _ => None,
+        }
     }
 
     /// The default scope, grouping, sort, the System traffic tile and the
