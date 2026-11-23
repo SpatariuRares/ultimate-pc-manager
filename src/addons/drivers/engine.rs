@@ -2049,6 +2049,6 @@ mod store_tests {
         println!("{measured} with a size");
         println!("{:?}", StoreFigures::of(&list, &classify(&list)));
         assert!(!list.is_empty());
-        assert!(measured > 0, "the packages' folders are found");
+        assert!(measured * 10 >= list.len() * 9, "the packages' folders are found: {measured} of {}", list.len());
     }
 }

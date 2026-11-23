@@ -83,12 +83,29 @@ mod imp {
 
     /// The folder of a package in the driver store, from the registry's
     /// driver database ("oem42.inf" -> `nv_dispi.inf_amd64_0123456789abcdef`).
-    fn store_folder(published: &str) -> Option<String> {
+    fn registered_folder(published: &str) -> Option<String> {
         use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
         let key = winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
             .open_subkey_with_flags(format!(r"SYSTEM\DriverDatabase\DriverInfFiles\{published}"), KEY_READ)
             .ok()?;
         key.get_value::<Vec<String>, _>("").ok().and_then(|v| v.into_iter().find(|s| !s.is_empty())).or_else(|| key.get_value::<String, _>("").ok().filter(|s| !s.is_empty()))
+    }
+
+    /// The folder of a package: the registry's answer when it has one (it
+    /// does not for every package), else the only folder of that INF, else
+    /// the one whose INF is the very file Windows keeps as `INF\oemNN.inf`.
+    fn store_folder(published: &str, original: &str, folders: &[String], windir: &std::path::Path, repository: &std::path::Path) -> Option<String> {
+        if let Some(f) = registered_folder(published) {
+            return Some(f);
+        }
+        let prefix = format!("{}_", original.to_lowercase());
+        let mut same = folders.iter().filter(|f| f.to_lowercase().starts_with(&prefix));
+        let (first, second) = (same.next()?, same.next());
+        if second.is_none() {
+            return Some(first.clone());
+        }
+        let kept = std::fs::read(windir.join("INF").join(published)).ok()?;
+        folders.iter().filter(|f| f.to_lowercase().starts_with(&prefix)).find(|f| std::fs::read(repository.join(f).join(original)).is_ok_and(|b| b == kept)).cloned()
     }
 
     /// The bytes of the files under `dir`.
@@ -121,8 +138,9 @@ mod imp {
             Some(code) => format!("{e}; pnputil exited with code {code}"),
         })?;
         let repository = std::path::Path::new(&root).join(r"System32\DriverStore\FileRepository");
+        let folders: Vec<String> = std::fs::read_dir(&repository).into_iter().flatten().flatten().filter(|e| e.path().is_dir()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         for p in &mut packages {
-            p.size = store_folder(&p.published).map(|f| folder_size(&repository.join(f)));
+            p.size = store_folder(&p.published, &p.original, &folders, std::path::Path::new(&root), &repository).map(|f| folder_size(&repository.join(f)));
         }
         Ok(packages)
     }
