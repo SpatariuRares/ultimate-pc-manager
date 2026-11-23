@@ -67,6 +67,8 @@ thread_local! {
     /// How many folders' own files were read on this thread: lets a test
     /// tell a view that walks a level from one that reads kept lists.
     pub static LOOSE_FILES_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// How many times a folder's sub-folders were sorted on this thread.
+    pub static CHILDREN_SORTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Where tree revisions come from: unique across trees, so a revision
@@ -353,6 +355,8 @@ impl SpaceTree {
 
     /// The folder's sub-folders, largest first (ties by path).
     pub fn children(&self, n: NodeId) -> Vec<NodeId> {
+        #[cfg(test)]
+        CHILDREN_SORTS.with(|c| c.set(c.get() + 1));
         let mut c = self.nodes[n].children.clone();
         c.sort_by(|&a, &b| self.nodes[b].bytes.cmp(&self.nodes[a].bytes).then_with(|| self.by_name(a, b)));
         c
@@ -678,31 +682,17 @@ pub(super) mod tests {
         t.add_file(&p("R/even/b/x"), 5);
         t.add_file(&p("R/even/a/x"), 5);
         assert_eq!(t.dominant_folder().map(|n| t.path(n).to_path_buf()), Some(p("R/big/0")));
-        // Timed against sorting the crowded folder in the same run, so a
-        // loaded machine slows both sides; the best of a few rounds drops
-        // the rounds another process interrupted (#149).
-        let big = t.find(&p("R/big")).unwrap();
-        let best_of = |f: &dyn Fn()| {
-            (0..5)
-                .map(|_| {
-                    let started = std::time::Instant::now();
-                    f();
-                    started.elapsed()
-                })
-                .min()
-                .unwrap()
-        };
-        let lookups = best_of(&|| {
-            for _ in 0..20 {
-                std::hint::black_box(t.dominant_folder());
-            }
-        });
-        let sorts = best_of(&|| {
-            for _ in 0..20 {
-                std::hint::black_box(t.children(big).first().copied());
-            }
-        });
-        assert!(lookups * 3 < sorts, "20 lookups took {lookups:?}, as long as sorting the crowded folder 20 times ({sorts:?})");
+        // Counted, not timed: a timing depends on the machine's load. Asking
+        // for the dominant or the largest folder must sort no folder's
+        // sub-folders, however crowded (each sort is of the whole folder).
+        let sorts_before = CHILDREN_SORTS.with(|c| c.get());
+        for _ in 0..20 {
+            std::hint::black_box(t.dominant_folder());
+            std::hint::black_box(t.largest_folder());
+        }
+        assert_eq!(CHILDREN_SORTS.with(|c| c.get()), sorts_before, "the lookups sorted a crowded folder's sub-folders");
+        assert_eq!(t.children(t.find(&p("R/big")).unwrap()).len(), 60_000, "sorting the crowded folder is what the count would show");
+        assert_eq!(CHILDREN_SORTS.with(|c| c.get()), sorts_before + 1);
 
         let mut tie = SpaceTree::new("R", 8);
         tie.add_file(&p("R/b/x"), 5);
