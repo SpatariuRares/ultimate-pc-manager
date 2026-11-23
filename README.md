@@ -69,7 +69,8 @@ Command-line options:
 
 | Option | Effect |
 |---|---|
-| `--page "<name>"` | Opens the given page, for example `--page "Installed Apps"` or `--page "Power & Freq"`. The names are those of the side menu, plus `Settings` and `Colors`. |
+| `--page "<name>"` | Opens the given page, for example `--page "Installed Apps"` or `--page "Power & Freq"`. The names are those of the side menu, plus `Settings` and `Colors`. Names are matched in any case; Drivers also answers to `drivers`, `kernel-modules` and `modules`. |
+| `--drivers-scope <scope>` | Opens Drivers on Kernel modules with that scope (`all`, `loaded`, `not-loaded`, `third-party` or `file-system`; `--drivers-scope=<scope>` works too), without saving it. `--page` wins. An invalid value is reported in the status line as "<value> (valid scopes: all, loaded, not-loaded, third-party, file-system)" and the page opens on its saved scope. |
 | `--screenshot <file.png>` | Waits for the first two performance samples, saves an image of the window to the given file and closes the app. It does not wait for the lists that load in the background (drivers, installed apps): on those pages the capture may show "Reading…". |
 | `--theme dark\|light` | Uses the dark or light theme only for this run, without changing the saved one (useful with `--screenshot`). A theme chosen in Settings while the app is running is saved. |
 

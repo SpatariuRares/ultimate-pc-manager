@@ -186,6 +186,12 @@ pub trait Addon {
     fn command_line(&mut self, _args: &[String]) -> bool {
         false
     }
+    /// A problem with its flags worth telling the user (e.g. an invalid
+    /// value), asked right after [`Addon::command_line`]; the app puts it
+    /// in the status line. None by default.
+    fn command_line_error(&mut self) -> Option<String> {
+        None
+    }
     /// "Packages changed": a job of the install queue (see
     /// [`AddonContext::install_queue`]) ended; `by` is the id of the add-on
     /// that ran it (it may be this one). Told only while it is on, once per
@@ -648,6 +654,9 @@ pub struct CommandLine {
     /// The first add-on whose flags ask for its page (e.g. Drivers'
     /// `--drivers-scope`), opened when no `--page` is given.
     pub page: Option<&'static str>,
+    /// What the add-ons that are on told about their flags (e.g. an invalid
+    /// value), for the status line.
+    pub errors: Vec<String>,
 }
 
 /// Where a page request leads.
@@ -1123,7 +1132,7 @@ impl AddonHost {
     /// The id of the page named by `s`: its id, or the shown name older
     /// versions saved.
     fn find(&self, s: &str) -> Option<&'static str> {
-        self.slots.iter().map(|s| &s.entry).find(|e| e.id() == s || e.name() == s || e.aliases().contains(&s)).map(|e| e.id())
+        self.slots.iter().map(|s| &s.entry).find(|e| e.id().eq_ignore_ascii_case(s) || e.name().eq_ignore_ascii_case(s) || e.aliases().iter().any(|a| a.eq_ignore_ascii_case(s))).map(|e| e.id())
     }
 
     /// A saved page (start page, last page, or the page open now) as a page
@@ -1412,6 +1421,7 @@ impl AddonHost {
             if addon.command_line(args) && out.page.is_none() {
                 out.page = Some(addon.id());
             }
+            out.errors.extend(addon.command_line_error());
             out.reached.push(addon.id());
         }
         out
@@ -2215,7 +2225,7 @@ mod tests {
         assert!(host.command_line(&args).reached.is_empty());
         assert!(calls.lock().unwrap().is_empty(), "an add-on that is off ignores its flags");
         host.set_enabled("spy", true);
-        assert_eq!(host.command_line(&args), CommandLine { reached: vec!["spy"], page: None });
+        assert_eq!(host.command_line(&args), CommandLine { reached: vec!["spy"], page: None, errors: vec![] });
         assert_eq!(*calls.lock().unwrap(), vec!["--scan"]);
     }
 
