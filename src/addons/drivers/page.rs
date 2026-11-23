@@ -43,6 +43,8 @@ pub struct DriversUi {
     pub confirm_unload: Option<String>,
     /// An offered driver that is not newer, waiting for "Install anyway".
     pub confirm_older: Option<DriverUpdate>,
+    /// An install waiting for its confirm dialog (with the restore point option).
+    pub confirm_job: Option<drivers::Redo>,
     /// Bring the selected row into view on the next frame.
     pub scroll_to_selected: bool,
     pub started: bool,
@@ -439,6 +441,8 @@ pub struct DriversPage {
     pub said: Vec<String>,
     /// "Check Windows Update when the page opens".
     pub check_on_open: bool,
+    /// "Create a restore point first": on by default, remembered.
+    pub restore_point: bool,
     /// Third-party drivers this many years old get "check the maker".
     pub old_years: i64,
     /// The data worked out from the lists and the filter, reused until
@@ -456,6 +460,7 @@ impl DriversPage {
             context,
             said: Vec::new(),
             check_on_open: false,
+            restore_point: true,
             old_years: DEFAULT_OLD_YEARS,
             derived: None,
             derived_builds: 0,
@@ -548,7 +553,7 @@ impl DriversPage {
                     ui.set_min_width(260.0);
                     if parts::admin_button(ui, "Install from an INF file\u{2026}", false, idle).clicked() {
                         if let Some(p) = self.context.pick_open_file(&[drivers::INF_FILE, crate::platform::ANY_FILE], None) {
-                            self.drv.install_inf(p);
+                            self.drv_ui.confirm_job = Some(drivers::Redo::Inf(p));
                         }
                         ui.close();
                     }
@@ -791,7 +796,7 @@ impl DriversPage {
                     if !newer.is_empty() {
                         let label = if newer.len() == 1 { "Install update".to_string() } else { format!("Install {} updates", newer.len()) };
                         if parts::admin_button(ui, &label, true, idle).clicked() {
-                            self.drv.install(newer.iter().map(|u| u.id.clone()).collect());
+                            self.drv_ui.confirm_job = Some(drivers::Redo::Updates(newer.iter().map(|u| u.id.clone()).collect()));
                         }
                         ui.label(RichText::new("Windows asks for administrator permission").size(11.5).color(th.label));
                         ui.add_space(6.0);
@@ -993,7 +998,7 @@ impl DriversPage {
                     compare(ui, d, u);
                     ui.add_space(6.0);
                     if parts::admin_button(ui, "Install update", true, idle).clicked() {
-                        self.drv.install(vec![u.id.clone()]);
+                        self.drv_ui.confirm_job = Some(drivers::Redo::Updates(vec![u.id.clone()]));
                     }
                     ui.label(RichText::new("Windows asks for administrator permission. Some drivers need a restart.").size(11.5).color(th.label));
                 }
@@ -1194,6 +1199,7 @@ impl DriversPage {
             egui::Window::new("Install an older driver?").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
                 ui.label(format!("Windows Update offers {} ({}).", u.model, u.version));
                 ui.label(RichText::new("It is not newer than the driver you have. Install it only to go back to that version.").color(th.label));
+                crate::widgets::restore_point_option(ui, &mut self.restore_point);
                 ui.horizontal(|ui| {
                     if parts::admin_button(ui, &format!("Install {}", u.version), false, true).clicked() {
                         decided = Some(true);
@@ -1204,10 +1210,60 @@ impl DriversPage {
                 });
             });
             if decided == Some(true) {
-                self.drv.install(vec![u.id.clone()]);
+                self.drv.install_with(vec![u.id.clone()], self.restore_point);
             }
             if decided.is_some() {
                 self.drv_ui.confirm_older = None;
+            }
+        }
+        if let Some(job) = self.drv_ui.confirm_job.clone() {
+            let (title, what, label) = match &job {
+                drivers::Redo::Updates(ids) => ("Install driver updates?", format!("Windows Update will download and install {}.", plural(ids.len(), "driver update")), "Install"),
+                drivers::Redo::Inf(path) => ("Install this driver package?", format!("{path} will be added and installed on matching devices."), "Install"),
+            };
+            let mut decided = None;
+            egui::Window::new(title).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+                ui.label(what);
+                crate::widgets::restore_point_option(ui, &mut self.restore_point);
+                ui.horizontal(|ui| {
+                    if parts::admin_button(ui, label, false, true).clicked() {
+                        decided = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decided = Some(false);
+                    }
+                });
+            });
+            if decided == Some(true) {
+                match job {
+                    drivers::Redo::Updates(ids) => self.drv.install_with(ids, self.restore_point),
+                    drivers::Redo::Inf(path) => self.drv.install_inf_with(path, self.restore_point),
+                }
+            }
+            if decided.is_some() {
+                self.drv_ui.confirm_job = None;
+            }
+        }
+        // The restore point could not be made, so nothing was changed yet.
+        let prompt = self.drv.lock().restore_prompt.clone();
+        if let Some(prompt) = prompt {
+            let mut decided = None;
+            egui::Window::new("Restore point not created").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+                ui.label(RichText::new(&prompt.reason).color(th.amber));
+                ui.label("Continue without a new restore point?");
+                ui.horizontal(|ui| {
+                    if parts::admin_button(ui, "Continue", false, true).clicked() {
+                        decided = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decided = Some(false);
+                    }
+                });
+            });
+            match decided {
+                Some(true) => self.drv.continue_without_restore(),
+                Some(false) => self.drv.cancel_restore(),
+                None => {}
             }
         }
     }

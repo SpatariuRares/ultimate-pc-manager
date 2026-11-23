@@ -109,6 +109,13 @@ A compact read-only "Security" strip under the status band shows Memory integrit
 - The values are read with normal rights, in process, in the same read as the driver listing; nothing is written and no elevated job is added. When the add-on is turned off the read is dropped and nothing new starts.
 - "Open Windows Security" opens `windowsdefender://coreisolation`; the strip says "Read-only: change them in Windows Security."
 
+### Restore point (spec #11, #27)
+Windows Update installs and INF installs offer "Create a restore point first" in their confirm dialog: on by default, remembered (setting `restorePoint`, saved only when turned off).
+- The restore point is a **step** of the same elevated job as the change, so the user sees one UAC prompt. The job script takes an ordered `Steps` argument (`restore-point,install-updates` or `restore-point,inf`); the step's PowerShell runs before the change and stores its result under `steps` in the job result. A later change adds its step by passing one more `Step` to `Hub::run_job`. With the option off the launch has no steps and is exactly the change's own script and arguments.
+- The step uses `Checkpoint-Computer` with the `DEVICE_DRIVER_INSTALL` type and reports "Restore point created.", "System Restore is off on drive C:." or "Windows already created a restore point in the last 24 hours." (any other failure: "The restore point could not be created: <reason>").
+- When it is not created, the job stops before the change (nothing was changed) and the page asks "Continue without a new restore point?" with Continue and Cancel. Continue runs the change again without a restore point (a second UAC prompt, only on this path); Cancel says "Cancelled: nothing was changed.". When it is created its message leads the outcome message.
+- Unload and Scan make no restore point. The job is an uninterruptible elevated job like the others: turning the add-on off waits for it.
+
 ### Behavior as an add-on
 54. As a user, I want to turn Drivers on or off from the Add-ons page in Settings, so that I keep the app light if I do not need it. *(our addition)*
 55. As a user, I want the add-on, when off, not to appear in the side menu nor be reachable with `--page "Drivers"`, so that it is truly absent. *(our addition)*
