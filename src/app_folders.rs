@@ -155,7 +155,10 @@ mod tests {
     }
 
     fn at(system: System, kind: Folder, pairs: &[(&str, &str)]) -> Option<PathBuf> {
-        resolve(system, kind, &env_of(pairs))
+        // A Linux or macOS path joined on a Windows host gets a `\` between
+        // parts: compare the paths as they read on their own system.
+        let path = resolve(system, kind, &env_of(pairs))?;
+        Some(if system == System::Windows { path } else { PathBuf::from(path.to_string_lossy().replace('\\', "/")) })
     }
 
     #[test]
