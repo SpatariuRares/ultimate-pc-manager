@@ -2,12 +2,12 @@
 
 use egui::Ui;
 
-use crate::app::{status_parts, ProviderState};
+use crate::app::{health_colour, status_parts, ProviderState};
 use crate::core_page::{CorePage, PageCtx};
 use crate::platform::Action;
 use crate::theme;
 use crate::widgets::parts::{self, Mark, StatusBand};
-use crate::widgets::{cpu_brand, fmt_bytes, fmt_uptime, health_colour, local_ip};
+use crate::widgets::{cpu_brand, fmt_bytes, fmt_uptime, local_ip};
 
 /// System Info has no state of its own: every fact comes from the snapshot.
 #[derive(Default)]

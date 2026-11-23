@@ -13,7 +13,7 @@ use crate::page_processes::{ProcView, ProcessInputs, ProcessesChange};
 use crate::platform::PageContext;
 use crate::sampler::{Sampler, Snapshot};
 use crate::settings::{Settings, SPEEDS};
-use crate::widgets::{health_colour, local_ip, logo, nav_entry_back, nav_heading, push, refresh_button};
+use crate::widgets::{local_ip, logo, nav_entry_back, nav_heading, push, refresh_button};
 use crate::system_lists::SystemLists;
 use crate::winsys;
 
@@ -96,6 +96,19 @@ impl ProviderState {
             n if n == crate::perfdata::sources().count() => ProviderState::Unavailable,
             _ => ProviderState::Degraded,
         }
+    }
+}
+
+/// The colour of the status bar's health dot: amber while updates are
+/// paused or some counters failed, green when every counter answered, red
+/// when none did, faint while starting.
+pub fn health_colour(t: &crate::theme::Theme, paused: bool, providers: ProviderState) -> Color32 {
+    match providers {
+        _ if paused => t.amber,
+        ProviderState::Healthy => t.green,
+        ProviderState::Degraded => t.amber,
+        ProviderState::Unavailable => t.red,
+        ProviderState::Waiting => t.faint,
     }
 }
 
@@ -2266,100 +2279,6 @@ mod tests {
         assert_eq!(fake.service_reads(), 1);
     }
 
-    /// `src` without its test-only items: every `#[cfg(test)]` attribute and the
-    /// item, field or statement it marks, wherever it sits in the file.
-    fn non_test_code(src: &str) -> String {
-        const MARKER: &str = "#[cfg(test)]";
-        let mut out = String::new();
-        let mut rest = src;
-        while let Some(at) = rest.find(MARKER) {
-            out.push_str(&rest[..at]);
-            let after = &rest[at + MARKER.len()..];
-            rest = &after[item_end(after)..];
-        }
-        out.push_str(rest);
-        out
-    }
-
-    /// Skips a string literal whose opening quote is at `i`; the index of its closing quote.
-    fn skip_string(bytes: &[u8], mut i: usize) -> usize {
-        i += 1;
-        while i < bytes.len() && bytes[i] != b'"' {
-            i += if bytes[i] == b'\\' { 2 } else { 1 };
-        }
-        i
-    }
-
-    /// Where the item that starts `text` ends: past its closing brace, its `;`,
-    /// or (for a field) its `,`.
-    fn item_end(text: &str) -> usize {
-        let head = text.trim_start();
-        let name = head.split(':').next().unwrap_or("").trim();
-        let name = name.strip_prefix("pub").map_or(name, str::trim);
-        let is_field = head.contains(':')
-            && !name.is_empty()
-            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
-            && !head[name.len()..].trim_start().starts_with("::");
-        let bytes = text.as_bytes();
-        let (mut depth, mut i) = (0usize, 0usize);
-        while i < bytes.len() {
-            match bytes[i] {
-                b'"' => i = skip_string(bytes, i),
-                b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                    while i < bytes.len() && bytes[i] != b'\n' {
-                        i += 1;
-                    }
-                }
-                b'(' | b'[' => depth += 1,
-                b')' | b']' => depth = depth.saturating_sub(1),
-                b'{' if depth == 0 => {
-                    let mut braces = 0usize;
-                    while i < bytes.len() {
-                        match bytes[i] {
-                            b'"' => i = skip_string(bytes, i),
-                            b'{' => braces += 1,
-                            b'}' => {
-                                braces -= 1;
-                                if braces == 0 {
-                                    return i + 1;
-                                }
-                            }
-                            _ => {}
-                        }
-                        i += 1;
-                    }
-                    return bytes.len();
-                }
-                b';' if depth == 0 => return i + 1,
-                b',' if depth == 0 && is_field => return i + 1,
-                _ => {}
-            }
-            i += 1;
-        }
-        bytes.len()
-    }
-
-    #[test]
-    fn the_scan_drops_every_test_only_item_and_keeps_the_code_after_them() {
-        let sample = "fn a() { one }\n#[cfg(test)]\nmod early { fn t() { \"Zed\" } }\nfn b() { two }\n\
-                      struct S {\n    #[cfg(test)]\n    recording: Option<Arc<Foo>>,\n    kept: u8,\n}\n\
-                      #[cfg(test)]\nuse zed::Zed;\n#[cfg(test)]\npub fn helper<A, B>(x: A, y: B) -> u8 { 1 }\nfn c() { three }\n";
-        let code = non_test_code(sample);
-        for kept in ["one", "two", "three", "kept: u8"] {
-            assert!(code.contains(kept), "{kept} survives: {code}");
-        }
-        for dropped in ["Zed", "zed", "recording", "helper"] {
-            assert!(!code.contains(dropped), "{dropped} is test-only: {code}");
-        }
-    }
-
-    #[test]
-    fn the_scan_finds_an_addon_name_placed_after_an_early_test_marker() {
-        let sample = "fn a() {}\n#[cfg(test)]\nmod early {}\nfn leak() { \"Disk Space\" }\n";
-        assert!(!sample.split("#[cfg(test)]").next().unwrap().contains("Disk Space"), "the old cut-at-first-marker scan was blind to it");
-        assert!(non_test_code(sample).contains("Disk Space"), "the whole-file scan sees it");
-    }
-
     #[test]
     fn the_app_names_no_addon() {
         let sources = [
@@ -2380,7 +2299,7 @@ mod tests {
         ];
         let host = AddonHost::standard();
         for (file, src) in sources {
-            let code = non_test_code(src);
+            let code = crate::test_ui::non_test_code(src);
             for (addon, _) in host.addons() {
                 for word in [addon.id(), addon.name()] {
                     assert!(!code.contains(word), "{file} names the {} add-on ({word})", addon.name());
@@ -2391,7 +2310,7 @@ mod tests {
 
     #[test]
     fn the_registry_is_the_only_list_of_core_ids_and_names() {
-        let code = include_str!("app.rs").split("#[cfg(test)]").next().unwrap();
+        let code = crate::test_ui::non_test_code(include_str!("app.rs"));
         let host = AddonHost::standard();
         for (entry, _) in host.entries().filter(|(e, _)| host.is_core(e.id())) {
             assert!(!code.contains(&format!("\"{}\"", entry.id())), "app.rs repeats the core id {}", entry.id());

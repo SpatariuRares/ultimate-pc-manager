@@ -930,20 +930,6 @@ pub fn nav_entry_back(ui: &Ui, rect: Rect, selected: bool, hovered: bool) -> Col
     }
 }
 
-/// The colour of the status bar's health dot: amber while updates are
-/// paused or some counters failed, green when every counter answered, red
-/// when none did, faint while starting.
-pub fn health_colour(t: &crate::theme::Theme, paused: bool, providers: crate::app::ProviderState) -> Color32 {
-    use crate::app::ProviderState;
-    match providers {
-        _ if paused => t.amber,
-        ProviderState::Healthy => t.green,
-        ProviderState::Degraded => t.amber,
-        ProviderState::Unavailable => t.red,
-        ProviderState::Waiting => t.faint,
-    }
-}
-
 #[cfg(test)]
 mod shell_tests {
     use super::*;
