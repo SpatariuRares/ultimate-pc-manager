@@ -11,6 +11,8 @@ pub mod cli;
 pub mod engine;
 /// The Drivers page.
 pub mod page;
+/// Driver signatures: WinVerifyTrust, catalogs and WHQL.
+pub mod signature;
 /// The Windows reader of the listing.
 pub mod windows;
 
@@ -43,6 +45,11 @@ pub trait ListingReader: Send + Sync {
     /// with normal rights. A reader that cannot read them says so.
     fn security(&self) -> engine::SecurityReading {
         engine::SecurityReading::unreadable("this reader does not read the security settings")
+    }
+    /// The signature of the driver file at `path`, read with normal rights.
+    /// Called on a background thread, one file at a time.
+    fn signature(&self, _path: &str) -> signature::Signature {
+        signature::Signature::CouldNotCheck("this reader does not check signatures".into())
     }
 }
 

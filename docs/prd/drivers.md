@@ -90,6 +90,16 @@ It is the last add-on in the migration order proposed by the add-ons document.
 - **Kernel memory**: the sum of the image sizes of the loaded rows, each image file counted once (two services that point to the same file add its size once). When the list of loaded modules could not be read, the tile says "an unknown amount" and a note says why; it is never shown as 0.
 - **Matching modules**: a driver's image is matched to the loaded module by full path (case-insensitive, `\SystemRoot` and `\??\` spelled out); by file name alone only when the image path has no folder and one module has that name.
 
+#### Signatures (spec #11, #25)
+
+- **Column and rows**: Kernel modules has a Signature column, and both detail panels (devices and kernel modules) a Signature row, with a Signer row when the signer's name is known. The values are "WHQL", "Signed", "Unsigned", "Not checked" (not checked yet) and "Could not check: <reason>", which is not "Unsigned".
+- **Check**: `WinVerifyTrust` with the driver policy, first on the file's own signature, then on the catalog that lists the file's hash (`CryptCATAdmin*`), so a driver signed through its package's catalog is not called unsigned. It reads the driver image of a kernel module and the INF of a device, with normal rights (no UAC).
+- **WHQL**: the signer chain has "Microsoft Windows Hardware Compatibility Publisher". The signer shown is the first certificate of the chain.
+- **When**: on a background thread after the list is shown; results arrive while the page is open. Results are cached in memory by path, size and modification time; a file that changed is checked again, and a failed check is tried again at the next reading.
+- **Unsigned scope**: a sixth scope on Kernel modules, with its count, lists the modules whose check found no signature (not the ones not checked yet, nor the ones that could not be checked). It is worked out with the other counts in the page's derived data, once per change of data or filter. `--drivers-scope unsigned` opens it.
+- **CSV**: the Signature column is the last one and is filled for kernel modules (empty on device rows).
+- **Add-on off**: the check ends before its next file, nothing is published after that and nothing new starts while the add-on is off.
+
 ### Other actions (More actions)
 45. As a user, I want "Install from an INF file…" to add a driver package and install it on compatible devices (with UAC), with the outcomes "Driver package installed.", "The package was added, but no device needed it…", "Done. Restart Windows to finish.", so that I can install a driver downloaded from the manufacturer. *(our addition; exists, to be verified end to end)*
 46. As a user, I want "Scan for hardware changes" (with UAC) and the outcome "Hardware scan finished.", so that Windows detects a device I just connected. *(our addition; exists, to be verified end to end)*

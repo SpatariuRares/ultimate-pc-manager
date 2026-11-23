@@ -11,6 +11,7 @@
 //!   for hardware changes and stopping a driver need administrator rights:
 //!   they run in an elevated PowerShell, so Windows asks through UAC.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -20,6 +21,7 @@ use crate::platform::install_queue::{Request, Work};
 use crate::platform::series::{Run, Series};
 use crate::platform::{AddonContext, Generation};
 
+use super::signature::{Signature, SignatureBook};
 use super::ListingReader;
 
 #[derive(Clone, Debug, Default)]
@@ -237,11 +239,19 @@ pub enum KernelScope {
     NotLoaded,
     ThirdParty,
     FileSystem,
+    /// Modules whose signature check found no signature (a failed check
+    /// does not count, and nor does one not done yet).
+    Unsigned,
 }
 
 impl KernelScope {
-    /// In display order.
+    /// The scopes saved by older versions, in their order (a saved index
+    /// points here); the command line's error lists these.
     pub const ALL: [KernelScope; 5] = [Self::All, Self::Loaded, Self::NotLoaded, Self::ThirdParty, Self::FileSystem];
+
+    /// The scopes the page offers, in display order: [`KernelScope::ALL`]
+    /// then Unsigned.
+    pub const SHOWN: [KernelScope; 6] = [Self::All, Self::Loaded, Self::NotLoaded, Self::ThirdParty, Self::FileSystem, Self::Unsigned];
 
     /// The scope saved by older versions as an index into
     /// [`KernelScope::ALL`]; All when unknown.
@@ -257,12 +267,13 @@ impl KernelScope {
             Self::NotLoaded => "not-loaded",
             Self::ThirdParty => "third-party",
             Self::FileSystem => "file-system",
+            Self::Unsigned => "unsigned",
         }
     }
 
     /// The scope named `name` (case does not matter); None when unknown.
     pub fn parse(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|s| s.name().eq_ignore_ascii_case(name.trim()))
+        Self::SHOWN.into_iter().find(|s| s.name().eq_ignore_ascii_case(name.trim()))
     }
 
     pub fn label(self) -> &'static str {
@@ -272,22 +283,25 @@ impl KernelScope {
             Self::NotLoaded => "Not loaded",
             Self::ThirdParty => "Third-party",
             Self::FileSystem => "File system",
+            Self::Unsigned => "Unsigned",
         }
     }
 
-    pub fn matches(self, d: &KernelDriver) -> bool {
+    /// `signature` is what the signature check found for this driver's file.
+    pub fn matches(self, d: &KernelDriver, signature: Option<&Signature>) -> bool {
         match self {
             Self::All => true,
             Self::Loaded => d.is_loaded(),
             Self::NotLoaded => !d.is_loaded(),
             Self::ThirdParty => d.third_party(),
             Self::FileSystem => d.kind == KernelKind::FileSystem,
+            Self::Unsigned => matches!(signature, Some(Signature::Unsigned)),
         }
     }
 
     /// How many drivers of the list fall in this scope.
-    pub fn count(self, list: &[KernelDriver]) -> usize {
-        list.iter().filter(|d| self.matches(d)).count()
+    pub fn count(self, list: &[KernelDriver], signatures: &SignatureBook) -> usize {
+        list.iter().filter(|d| self.matches(d, signatures.of(&d.path))).count()
     }
 }
 
@@ -357,7 +371,7 @@ impl KernelFigures {
         let mut images = std::collections::HashSet::new();
         for d in rows {
             f.drivers += 1;
-            if KernelScope::Loaded.matches(d) {
+            if KernelScope::Loaded.matches(d, None) {
                 f.loaded += 1;
                 if d.modules_unread {
                     f.memory = None;
@@ -368,7 +382,7 @@ impl KernelFigures {
                     }
                 }
             }
-            f.third_party += KernelScope::ThirdParty.matches(d) as usize;
+            f.third_party += KernelScope::ThirdParty.matches(d, None) as usize;
         }
         f
     }
@@ -447,6 +461,9 @@ pub struct State {
     /// The last read of the security settings; `None` until the first
     /// listing has read them.
     pub security: Option<SecurityReading>,
+    /// What the signature checks found so far, by file path. A snapshot
+    /// replaced as results arrive, so the page can tell when it changed.
+    pub signatures: Arc<SignatureBook>,
 }
 
 #[derive(Clone)]
@@ -462,13 +479,51 @@ pub struct Hub {
     series: Series<State>,
     /// Set by [`Hub::stop`]: ends a running Windows Update search's PowerShell.
     halt: Arc<AtomicBool>,
+    /// The signature checks: their cache and whether a pass is running.
+    signing: Arc<Signing>,
+}
+
+/// How many results the signature pass publishes at a time.
+const SIGNATURE_BATCH: usize = 16;
+
+/// A file as the signature cache knows it: its path, size and modification
+/// time. A file that changed is checked again.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Stamp {
+    path: String,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl Stamp {
+    fn of(path: &str) -> Stamp {
+        let meta = std::fs::metadata(path).ok();
+        Stamp { path: path.trim().to_lowercase(), size: meta.as_ref().map_or(0, |m| m.len()), modified: meta.and_then(|m| m.modified().ok()) }
+    }
+}
+
+#[derive(Default)]
+struct Signing {
+    /// The results worth keeping; a failed check is tried again later.
+    cache: Mutex<HashMap<Stamp, Signature>>,
+    /// A pass runs on its background thread.
+    running: AtomicBool,
+}
+
+/// The driver files whose signature the page shows: each kernel driver's
+/// image and each device's INF, once each.
+fn signed_files(st: &State) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let kernel = st.kernel.iter().map(|d| d.path.clone());
+    let devices = st.devices.iter().filter(|d| !d.inf.is_empty()).map(|d| d.inf_path());
+    kernel.chain(devices).filter(|p| !p.trim().is_empty() && seen.insert(p.trim().to_lowercase())).collect()
 }
 
 impl Hub {
     pub fn new(ctx: AddonContext, reader: Arc<dyn ListingReader>) -> Self {
         let st = Arc::new(Mutex::new(State::default()));
         let series = Series::new(&st, &Generation::default(), |s: &mut State| &mut s.busy);
-        Hub { st, ctx, reader, series, halt: Default::default() }
+        Hub { st, ctx, reader, series, halt: Default::default(), signing: Default::default() }
     }
 
     pub fn lock(&self) -> MutexGuard<'_, State> {
@@ -555,6 +610,70 @@ impl Hub {
         publish_listing(&mut st, devices, kernel);
         st.security = Some(security);
         st.listed_at = crate::platform::clock_now();
+        drop(st);
+        self.check_signatures();
+    }
+
+    /// Checks the signatures of the listed driver files on a background
+    /// thread, after the list is shown. Each file is checked with normal
+    /// rights, at most once while its path, size and modification time stay
+    /// the same. Nothing starts once the hub was stopped, and a running pass
+    /// ends before its next file.
+    fn check_signatures(&self) {
+        if self.series.stopped() || self.signing.running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let hub = self.clone();
+        if std::thread::Builder::new().name("driver-signatures".into()).spawn(move || hub.signature_pass()).is_err() {
+            self.signing.running.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// The files of the current list not checked yet, with their stamps.
+    fn unchecked(&self) -> Option<Vec<(String, Stamp)>> {
+        let files = signed_files(&*self.live()?);
+        let cache = self.signing.cache.lock().unwrap_or_else(|e| e.into_inner());
+        Some(files.into_iter().map(|f| { let stamp = Stamp::of(&f); (f, stamp) }).filter(|(_, stamp)| !cache.contains_key(stamp)).collect())
+    }
+
+    fn signature_pass(&self) {
+        let mut tried = std::collections::HashSet::new();
+        loop {
+            let todo: Vec<(String, Stamp)> = self.unchecked().unwrap_or_default().into_iter().filter(|(f, _)| !tried.contains(f)).collect();
+            if todo.is_empty() {
+                self.signing.running.store(false, Ordering::SeqCst);
+                // A list may have landed while the last look was being made.
+                let more = self.unchecked().is_some_and(|t| t.iter().any(|(f, _)| !tried.contains(f)));
+                if more && !self.signing.running.swap(true, Ordering::SeqCst) {
+                    continue;
+                }
+                return;
+            }
+            for batch in todo.chunks(SIGNATURE_BATCH) {
+                let mut found = Vec::new();
+                for (file, stamp) in batch {
+                    if self.series.stopped() {
+                        self.signing.running.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                    tried.insert(file.clone());
+                    let signature = self.reader.signature(file);
+                    if !matches!(signature, Signature::CouldNotCheck(_)) {
+                        self.signing.cache.lock().unwrap_or_else(|e| e.into_inner()).insert(stamp.clone(), signature.clone());
+                    }
+                    found.push((file.clone(), signature));
+                }
+                let Some(mut st) = self.live() else {
+                    self.signing.running.store(false, Ordering::SeqCst);
+                    return;
+                };
+                let mut book = (*st.signatures).clone();
+                for (file, signature) in found {
+                    book.insert(&file, signature);
+                }
+                st.signatures = Arc::new(book);
+            }
+        }
     }
 
     /// Searches Windows Update for driver updates (takes 10–60 s).
@@ -1262,7 +1381,7 @@ mod kernel_scope_tests {
     }
 
     fn services(scope: KernelScope, list: &[KernelDriver]) -> Vec<&str> {
-        list.iter().filter(|d| scope.matches(d)).map(|d| d.service.as_str()).collect()
+        list.iter().filter(|d| scope.matches(d, None)).map(|d| d.service.as_str()).collect()
     }
 
     #[test]
@@ -1285,7 +1404,7 @@ mod kernel_scope_tests {
     #[test]
     fn scope_counts_match_the_sample() {
         let list = sample();
-        let counts: Vec<usize> = KernelScope::ALL.iter().map(|s| s.count(&list)).collect();
+        let counts: Vec<usize> = KernelScope::ALL.iter().map(|s| s.count(&list, &SignatureBook::default())).collect();
         assert_eq!(counts, [6, 3, 3, 2, 2]);
     }
 
@@ -1319,11 +1438,11 @@ mod kernel_scope_tests {
     fn a_service_in_a_pending_state_counts_as_loaded() {
         for code in [2, 3, 4, 5, 6, 7] {
             let d = KernelDriver { running: code == 4, state_code: Some(code), ..Default::default() };
-            assert!(KernelScope::Loaded.matches(&d), "state {code}");
-            assert!(!KernelScope::NotLoaded.matches(&d), "state {code}");
+            assert!(KernelScope::Loaded.matches(&d, None), "state {code}");
+            assert!(!KernelScope::NotLoaded.matches(&d, None), "state {code}");
         }
         let stopped = KernelDriver { state_code: Some(1), ..Default::default() };
-        assert!(KernelScope::NotLoaded.matches(&stopped) && !KernelScope::Loaded.matches(&stopped));
+        assert!(KernelScope::NotLoaded.matches(&stopped, None) && !KernelScope::Loaded.matches(&stopped, None));
     }
 
     #[test]
@@ -1386,9 +1505,186 @@ mod kernel_scope_tests {
     #[test]
     fn the_file_system_scope_follows_the_service_type_not_its_label() {
         let fs = KernelDriver { kind: KernelKind::FileSystem, ..Default::default() };
-        assert!(KernelScope::FileSystem.matches(&fs));
+        assert!(KernelScope::FileSystem.matches(&fs, None));
         assert_eq!(KernelKind::FileSystem.label(), "File system");
-        assert!(!KernelScope::FileSystem.matches(&KernelDriver::default()), "a plain kernel driver");
+        assert!(!KernelScope::FileSystem.matches(&KernelDriver::default(), None), "a plain kernel driver");
+    }
+
+    #[test]
+    fn the_unsigned_scope_lists_only_modules_whose_check_found_no_signature() {
+        let mut list = sample();
+        let mut book = SignatureBook::default();
+        for d in list.iter_mut() {
+            d.path = format!(r"C:\drivers\{}.sys", d.service);
+        }
+        book.insert(r"C:\drivers\nvlddmkm.sys", Signature::Whql { signer: "x".into() });
+        book.insert(r"C:\DRIVERS\vbox.sys", Signature::Unsigned);
+        book.insert(r"C:\drivers\beep.sys", Signature::CouldNotCheck("busy".into()));
+        // ntfs, disk and fastfat were not checked yet.
+        let unsigned: Vec<&str> = list.iter().filter(|d| KernelScope::Unsigned.matches(d, book.of(&d.path))).map(|d| d.service.as_str()).collect();
+        assert_eq!(unsigned, ["vbox"], "not checked and could not check are not unsigned");
+        assert_eq!(KernelScope::Unsigned.count(&list, &book), 1);
+        assert_eq!(KernelScope::SHOWN.map(|s| s.label()), ["All", "Loaded", "Not loaded", "Third-party", "File system", "Unsigned"]);
+        assert_eq!(KernelScope::Unsigned.count(&list, &SignatureBook::default()), 0, "nothing is unsigned before a check says so");
+        assert_eq!(KernelScope::parse("Unsigned"), Some(KernelScope::Unsigned));
+        assert_eq!(serde_json::to_value(KernelScope::Unsigned).unwrap(), "unsigned");
+        assert_eq!(serde_json::from_value::<KernelScope>(serde_json::json!("unsigned")).unwrap(), KernelScope::Unsigned, "it is saved by its name");
+        assert_eq!(KernelScope::from_index(4), KernelScope::FileSystem, "saved indexes keep their meaning");
+    }
+}
+
+/// Signature checks in the hub (#25): background, cached and stopped with
+/// the add-on.
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+    use crate::addons::until;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A reader of two kernel drivers and one device, whose signature
+    /// checks are counted and can be held.
+    struct Reader {
+        kernel: Vec<KernelDriver>,
+        devices: Vec<DeviceDriver>,
+        checks: AtomicUsize,
+        gate: Mutex<()>,
+        verdict: fn(&str) -> Signature,
+    }
+
+    impl ListingReader for Reader {
+        fn devices(&self) -> Result<Vec<DeviceDriver>, String> {
+            Ok(self.devices.clone())
+        }
+        fn kernel(&self) -> Result<Vec<KernelDriver>, String> {
+            Ok(self.kernel.clone())
+        }
+        fn signature(&self, path: &str) -> Signature {
+            let _held = self.gate.lock().unwrap();
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            (self.verdict)(path)
+        }
+    }
+
+    fn driver(service: &str, path: &str) -> KernelDriver {
+        KernelDriver { service: service.into(), path: path.into(), ..Default::default() }
+    }
+
+    fn by_name(path: &str) -> Signature {
+        if path.ends_with("bad.sys") {
+            Signature::Unsigned
+        } else if path.ends_with("camo.inf") {
+            Signature::Signed { signer: "Reincubate Ltd".into() }
+        } else {
+            Signature::Whql { signer: crate::addons::drivers::signature::WHQL_PUBLISHER.into() }
+        }
+    }
+
+    fn reader(kernel: &[(&str, &str)], verdict: fn(&str) -> Signature) -> Arc<Reader> {
+        Arc::new(Reader {
+            kernel: kernel.iter().map(|(s, p)| driver(s, p)).collect(),
+            devices: vec![DeviceDriver { inf: "camo.inf".into(), ..Default::default() }],
+            checks: AtomicUsize::new(0),
+            gate: Mutex::new(()),
+            verdict,
+        })
+    }
+
+    fn hub(reader: &Arc<Reader>) -> Hub {
+        let (ctx, _) = AddonContext::recording();
+        Hub::new(ctx, reader.clone())
+    }
+
+    fn settled(hub: &Hub) {
+        until("the signature pass ends", || !hub.signing.running.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn the_list_is_shown_before_the_signatures_are_known_and_they_arrive_later() {
+        let r = reader(&[("good", r"C:\d\good.sys"), ("bad", r"C:\d\bad.sys")], by_name);
+        let hub = hub(&r);
+        let held = r.gate.lock().unwrap();
+        hub.refresh_now();
+        assert_eq!(hub.lock().kernel.len(), 2, "the list is there");
+        assert!(hub.lock().signatures.is_empty(), "no signature while the check is held");
+        drop(held);
+        until("the signatures arrive", || hub.lock().signatures.len() == 3);
+        let st = hub.lock();
+        assert!(matches!(st.signatures.of(r"C:\d\good.sys"), Some(Signature::Whql { .. })));
+        assert_eq!(st.signatures.of(r"c:\d\BAD.sys"), Some(&Signature::Unsigned));
+        let inf = st.devices[0].inf_path();
+        assert!(matches!(st.signatures.of(&inf), Some(Signature::Signed { .. })), "a device's driver is its INF");
+    }
+
+    #[test]
+    fn a_file_is_checked_once_while_its_path_size_and_time_stay_the_same() {
+        let dir = std::env::temp_dir().join(format!("upm-sig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("one.sys");
+        std::fs::write(&file, b"v1").unwrap();
+        let path = file.to_string_lossy().to_string();
+        let r = reader(&[("one", &path)], by_name);
+        let hub = hub(&r);
+
+        hub.refresh_now();
+        settled(&hub);
+        let first = r.checks.load(Ordering::SeqCst);
+        assert_eq!(first, 2, "the driver and the device's INF");
+        hub.refresh_now();
+        settled(&hub);
+        assert_eq!(r.checks.load(Ordering::SeqCst), first, "a second listing asks nothing again");
+
+        std::fs::write(&file, b"version two").unwrap();
+        hub.refresh_now();
+        settled(&hub);
+        assert_eq!(r.checks.load(Ordering::SeqCst), first + 1, "a changed file is checked again, the INF is not");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_check_is_told_and_tried_again_on_the_next_listing() {
+        let r = reader(&[("busy", r"C:\d\busy.sys")], |p| if p.ends_with("busy.sys") { Signature::CouldNotCheck("in use".into()) } else { Signature::Unsigned });
+        let hub = hub(&r);
+        hub.refresh_now();
+        settled(&hub);
+        assert_eq!(hub.lock().signatures.of(r"C:\d\busy.sys"), Some(&Signature::CouldNotCheck("in use".into())));
+        let before = r.checks.load(Ordering::SeqCst);
+        hub.refresh_now();
+        settled(&hub);
+        assert_eq!(r.checks.load(Ordering::SeqCst), before + 1, "only the failed one is tried again");
+    }
+
+    #[test]
+    fn turning_the_add_on_off_ends_the_pass_and_starts_nothing() {
+        let many: Vec<(String, String)> = (0..40).map(|i| (format!("s{i}"), format!(r"C:\d\s{i}.sys"))).collect();
+        let pairs: Vec<(&str, &str)> = many.iter().map(|(s, p)| (s.as_str(), p.as_str())).collect();
+        let r = reader(&pairs, by_name);
+        let hub = hub(&r);
+        let held = r.gate.lock().unwrap();
+        hub.refresh_now();
+        until("the first check waits at the gate", || !hub.signing.running.load(Ordering::SeqCst) || r.checks.load(Ordering::SeqCst) == 0);
+        hub.stop();
+        drop(held);
+        settled(&hub);
+        let done = r.checks.load(Ordering::SeqCst);
+        assert!(done <= 1, "at most the check under way ends, not the other {} files: {done}", pairs.len());
+        assert!(hub.lock().signatures.is_empty(), "nothing is published once off");
+
+        hub.refresh();
+        hub.refresh_now();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(r.checks.load(Ordering::SeqCst), done, "no new check starts while off");
+        assert!(!hub.signing.running.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn checking_signatures_runs_no_program_and_asks_for_no_elevation() {
+        let r = reader(&[("good", r"C:\d\good.sys")], by_name);
+        let (ctx, runner) = AddonContext::recording();
+        let hub = Hub::new(ctx, r.clone());
+        hub.refresh_now();
+        settled(&hub);
+        assert_eq!(hub.lock().signatures.len(), 2);
+        assert!(runner.launches().is_empty(), "WinVerifyTrust is called in the app: no PowerShell, no UAC");
     }
 }
 

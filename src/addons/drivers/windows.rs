@@ -18,6 +18,9 @@ impl ListingReader for WindowsListing {
     fn security(&self) -> SecurityReading {
         imp::read_security()
     }
+    fn signature(&self, path: &str) -> super::signature::Signature {
+        super::signature::check(path)
+    }
 }
 
 #[cfg(not(windows))]
