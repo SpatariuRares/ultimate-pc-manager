@@ -44,6 +44,8 @@ pub struct DriversUi {
     pub confirm_unload: Option<String>,
     /// An offered driver that is not newer, waiting for "Install anyway".
     pub confirm_older: Option<DriverUpdate>,
+    /// An install waiting for its confirm dialog (with the restore point option).
+    pub confirm_job: Option<drivers::Redo>,
     /// Bring the selected row into view on the next frame.
     pub scroll_to_selected: bool,
     pub started: bool,
@@ -192,6 +194,35 @@ fn list_note(listing: bool, error: Option<&str>, total: usize, shown: usize, sea
 }
 
 /// Draws the note in place of a list's rows.
+/// The filter hints of the two lists.
+const DEVICE_FILTER_HINT: &str = "Find a driver or maker";
+const KERNEL_FILTER_HINT: &str = "Driver name, service or vendor";
+
+/// What the side panel says while nothing is selected.
+const DEVICE_EMPTY: &str = "Select a driver to see its details and what Windows Update offers for it.";
+const KERNEL_EMPTY: &str = "Select a kernel module to see where it lives, how much memory it holds and whether it can be unloaded.";
+
+fn empty_panel(ui: &mut Ui, text: &str) {
+    let th = theme::of_ui(ui);
+    parts::SidePanel::new("drv-side").show(ui, Some(()), |ui, ()| {
+        ui.add(egui::Label::new(RichText::new(text).color(th.label)).wrap());
+    });
+}
+
+/// What "Open file location" does for `path`: File Explorer selects the
+/// file, or the status bar says why it cannot.
+fn reveal(path: &str, exists: impl Fn(&std::path::Path) -> bool) -> Action {
+    if path.trim().is_empty() {
+        return Action::Say("The executable path is not available for this item.".into());
+    }
+    let file = std::path::PathBuf::from(path);
+    if exists(&file) {
+        Action::ShowInExplorer(file)
+    } else {
+        Action::Say(format!("The file {path} was not found."))
+    }
+}
+
 fn show_note(ui: &mut Ui, note: &ListNote, scope: Scope) {
     let th = theme::of_ui(ui);
     let (title, detail) = note.texts(scope);
@@ -443,6 +474,8 @@ pub struct DriversPage {
     pub said: Vec<String>,
     /// "Check Windows Update when the page opens".
     pub check_on_open: bool,
+    /// "Create a restore point first": on by default, remembered.
+    pub restore_point: bool,
     /// Third-party drivers this many years old get "check the maker".
     pub old_years: i64,
     /// The data worked out from the lists and the filter, reused until
@@ -460,6 +493,7 @@ impl DriversPage {
             context,
             said: Vec::new(),
             check_on_open: false,
+            restore_point: true,
             old_years: DEFAULT_OLD_YEARS,
             derived: None,
             derived_builds: 0,
@@ -553,7 +587,7 @@ impl DriversPage {
                     ui.set_min_width(260.0);
                     if parts::admin_button(ui, "Install from an INF file\u{2026}", false, idle).clicked() {
                         if let Some(p) = self.context.pick_open_file(&[drivers::INF_FILE, crate::platform::ANY_FILE], None) {
-                            self.drv.install_inf(p);
+                            self.drv_ui.confirm_job = Some(drivers::Redo::Inf(p));
                         }
                         ui.close();
                     }
@@ -595,7 +629,8 @@ impl DriversPage {
                     ui.checkbox(&mut self.drv_ui.show_disconnected, "Show disconnected");
                     ui.add_space(8.0);
                 }
-                crate::widgets::search_field(ui, &mut self.drv_ui.search, "Find a driver or maker", 240.0);
+                let hint = if self.drv_ui.scope == Scope::Kernel { KERNEL_FILTER_HINT } else { DEVICE_FILTER_HINT };
+                crate::widgets::search_field(ui, &mut self.drv_ui.search, hint, 240.0);
             });
         });
         if self.drv_ui.scope == Scope::Kernel {
@@ -796,7 +831,7 @@ impl DriversPage {
                     if !newer.is_empty() {
                         let label = if newer.len() == 1 { "Install update".to_string() } else { format!("Install {} updates", newer.len()) };
                         if parts::admin_button(ui, &label, true, idle).clicked() {
-                            self.drv.install(newer.iter().map(|u| u.id.clone()).collect());
+                            self.drv_ui.confirm_job = Some(drivers::Redo::Updates(newer.iter().map(|u| u.id.clone()).collect()));
                         }
                         ui.label(RichText::new("Windows asks for administrator permission").size(11.5).color(th.label));
                         ui.add_space(6.0);
@@ -961,6 +996,10 @@ impl DriversPage {
     #[allow(clippy::too_many_arguments)]
     fn device_side(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, devices: &[DeviceDriver], updates: Option<&[DriverUpdate]>, signatures: &SignatureBook, idle: bool) {
         let chosen = self.drv_ui.selected_device.clone().and_then(|id| devices.iter().find(|d| d.instance_id == id));
+        if chosen.is_none() {
+            empty_panel(ui, DEVICE_EMPTY);
+            return;
+        }
         parts::SidePanel::new("drv-side").show(ui, chosen, |ui, d| {
             let th = theme::of_ui(ui);
             let upd = updates.and_then(|u| u.iter().find(|x| x.device.as_deref() == Some(d.instance_id.as_str())));
@@ -1003,7 +1042,7 @@ impl DriversPage {
                     compare(ui, d, u);
                     ui.add_space(6.0);
                     if parts::admin_button(ui, "Install update", true, idle).clicked() {
-                        self.drv.install(vec![u.id.clone()]);
+                        self.drv_ui.confirm_job = Some(drivers::Redo::Updates(vec![u.id.clone()]));
                     }
                     ui.label(RichText::new("Windows asks for administrator permission. Some drivers need a restart.").size(11.5).color(th.label));
                 }
@@ -1090,6 +1129,7 @@ impl DriversPage {
         }
         ui.painter().rect_filled(Rect::from_min_size(Pos2::new(hr.left(), hr.bottom() - 1.0), vec2(w, 1.0)), CornerRadius::ZERO, th.line);
         let mut clicked = None;
+        let (mut open_manager, mut unload) = (false, None);
         egui::ScrollArea::vertical().id_salt("drv-kernel-list").auto_shrink([false, false]).show_rows(ui, 28.0, rows.len(), |ui, range| {
             for &i in &rows[range] {
                 let d = &kernel[i];
@@ -1127,17 +1167,29 @@ impl DriversPage {
                     clicked = Some(d.service.clone());
                 }
                 let (path, service, details) = (d.path.clone(), d.service.clone(), kernel_details(d, admin, signature));
+                let unloadable = d.unload_note(admin).0;
                 resp.context_menu(|ui| {
                     if ui.button("Open file location").clicked() {
-                        actions.push(Action::OpenLocation(path.clone()));
+                        actions.push(reveal(&path, |p| p.exists()));
                         ui.close();
                     }
+                    if ui.button("Open Device Manager").clicked() {
+                        open_manager = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Copy details").clicked() {
+                        actions.push(Action::Copy(details.clone()));
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("Advanced").size(11.5).color(th.faint));
                     if ui.button("Copy service name").clicked() {
                         actions.push(Action::Copy(service.clone()));
                         ui.close();
                     }
-                    if ui.button("Copy details").clicked() {
-                        actions.push(Action::Copy(details.clone()));
+                    if unloadable && ui.button("Unload\u{2026}").clicked() {
+                        unload = Some(service.clone());
                         ui.close();
                     }
                 });
@@ -1146,10 +1198,20 @@ impl DriversPage {
         if let Some(s) = clicked {
             self.drv_ui.selected_kernel = Some(s);
         }
+        if open_manager {
+            self.open_device_manager();
+        }
+        if unload.is_some() {
+            self.drv_ui.confirm_unload = unload;
+        }
     }
 
     fn kernel_side(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, kernel: &[KernelDriver], signatures: &SignatureBook, admin: bool, idle: bool) {
         let chosen = self.drv_ui.selected_kernel.clone().and_then(|s| kernel.iter().find(|d| d.service == s));
+        if chosen.is_none() {
+            empty_panel(ui, KERNEL_EMPTY);
+            return;
+        }
         parts::SidePanel::new("drv-side").show(ui, chosen, |ui, d| {
             let th = theme::of_ui(ui);
             let (offered, _) = d.unload_note(admin);
@@ -1168,7 +1230,7 @@ impl DriversPage {
             ui.add_space(10.0);
             ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
                 if parts::outline_button(ui, "Open file location", true).clicked() {
-                    actions.push(Action::OpenLocation(d.path.clone()));
+                    actions.push(reveal(&d.path, |p| p.exists()));
                 }
                 if parts::outline_button(ui, "Open in Device Manager", true).clicked() {
                     self.open_device_manager();
@@ -1179,8 +1241,11 @@ impl DriversPage {
                 if parts::outline_button(ui, "Copy details", true).clicked() {
                     actions.push(Action::Copy(kernel_details(d, admin, signature)));
                 }
-                if offered && parts::admin_button(ui, "Unload\u{2026}", false, idle).clicked() {
-                    self.drv_ui.confirm_unload = Some(d.service.clone());
+                if offered {
+                    ui.label(RichText::new("Advanced").size(11.5).color(th.faint));
+                    if parts::admin_button(ui, "Unload\u{2026}", false, idle).clicked() {
+                        self.drv_ui.confirm_unload = Some(d.service.clone());
+                    }
                 }
             });
         });
@@ -1214,6 +1279,7 @@ impl DriversPage {
             egui::Window::new("Install an older driver?").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
                 ui.label(format!("Windows Update offers {} ({}).", u.model, u.version));
                 ui.label(RichText::new("It is not newer than the driver you have. Install it only to go back to that version.").color(th.label));
+                crate::widgets::restore_point_option(ui, &mut self.restore_point);
                 ui.horizontal(|ui| {
                     if parts::admin_button(ui, &format!("Install {}", u.version), false, true).clicked() {
                         decided = Some(true);
@@ -1224,10 +1290,60 @@ impl DriversPage {
                 });
             });
             if decided == Some(true) {
-                self.drv.install(vec![u.id.clone()]);
+                self.drv.install_with(vec![u.id.clone()], self.restore_point);
             }
             if decided.is_some() {
                 self.drv_ui.confirm_older = None;
+            }
+        }
+        if let Some(job) = self.drv_ui.confirm_job.clone() {
+            let (title, what, label) = match &job {
+                drivers::Redo::Updates(ids) => ("Install driver updates?", format!("Windows Update will download and install {}.", plural(ids.len(), "driver update")), "Install"),
+                drivers::Redo::Inf(path) => ("Install this driver package?", format!("{path} will be added and installed on matching devices."), "Install"),
+            };
+            let mut decided = None;
+            egui::Window::new(title).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+                ui.label(what);
+                crate::widgets::restore_point_option(ui, &mut self.restore_point);
+                ui.horizontal(|ui| {
+                    if parts::admin_button(ui, label, false, true).clicked() {
+                        decided = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decided = Some(false);
+                    }
+                });
+            });
+            if decided == Some(true) {
+                match job {
+                    drivers::Redo::Updates(ids) => self.drv.install_with(ids, self.restore_point),
+                    drivers::Redo::Inf(path) => self.drv.install_inf_with(path, self.restore_point),
+                }
+            }
+            if decided.is_some() {
+                self.drv_ui.confirm_job = None;
+            }
+        }
+        // The restore point could not be made, so nothing was changed yet.
+        let prompt = self.drv.lock().restore_prompt.clone();
+        if let Some(prompt) = prompt {
+            let mut decided = None;
+            egui::Window::new("Restore point not created").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+                ui.label(RichText::new(&prompt.reason).color(th.amber));
+                ui.label("Continue without a new restore point?");
+                ui.horizontal(|ui| {
+                    if parts::admin_button(ui, "Continue", false, true).clicked() {
+                        decided = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decided = Some(false);
+                    }
+                });
+            });
+            match decided {
+                Some(true) => self.drv.continue_without_restore(),
+                Some(false) => self.drv.cancel_restore(),
+                None => {}
             }
         }
     }
@@ -1476,8 +1592,12 @@ mod tests {
         }
     }
 
-    fn page_with(devices: Vec<DeviceDriver>, kernel: Vec<KernelDriver>) -> DriversPage {
-        let (ctx, _) = AddonContext::recording();
+    pub(super) fn page_with(devices: Vec<DeviceDriver>, kernel: Vec<KernelDriver>) -> DriversPage {
+        page_and_runner(devices, kernel).0
+    }
+
+    pub(super) fn page_and_runner(devices: Vec<DeviceDriver>, kernel: Vec<KernelDriver>) -> (DriversPage, Arc<crate::platform::RecordingRunner>) {
+        let (ctx, runner) = AddonContext::recording();
         let hub = Hub::new(ctx.clone(), Arc::new(NoReader));
         {
             let mut st = hub.lock();
@@ -1486,10 +1606,10 @@ mod tests {
         }
         let mut page = DriversPage::new(hub, ctx);
         page.drv_ui.started = true;
-        page
+        (page, runner)
     }
 
-    fn gpu(name: &str) -> DeviceDriver {
+    pub(super) fn gpu(name: &str) -> DeviceDriver {
         DeviceDriver {
             instance_id: name.into(),
             name: name.into(),
@@ -1867,7 +1987,8 @@ Unload: Not offered: Windows loaded it at boot, and the kernel refuses to stop a
 
 #[cfg(test)]
 mod list_note_tests {
-    use super::*;
+use super::*;
+use super::tests::{gpu, page_and_runner, page_with};
 
     /// The note for an empty list (`shown` 0) with these inputs.
     fn note(listing: bool, error: Option<&str>, total: usize, searching: bool) -> Option<ListNote> {
@@ -1925,6 +2046,181 @@ mod list_note_tests {
     #[test]
     fn a_new_read_over_older_rows_shows_the_filter_state() {
         assert_eq!(note(true, None, 40, false), Some(ListNote::FilteredOut));
+    }
+
+    /// One persistent egui context: the tests click through several frames.
+    struct Screen {
+        ctx: egui::Context,
+        time: f64,
+        actions: Vec<Action>,
+    }
+
+    impl Screen {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            Screen { ctx, time: 0.0, actions: Vec::new() }
+        }
+
+        /// One frame with `events`; the texts drawn, with their positions.
+        fn step(&mut self, page: &mut DriversPage, events: Vec<egui::Event>) -> Vec<(Pos2, String)> {
+            fn texts(shape: &egui::Shape, out: &mut Vec<(Pos2, String)>) {
+                match shape {
+                    egui::Shape::Text(t) => out.push((t.pos, t.galley.text().to_string())),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                    _ => {}
+                }
+            }
+            self.time += 0.1;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 800.0))),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            let mut mine = Vec::new();
+            let output = self.ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| page.ui(ui, &mut mine));
+            });
+            self.actions.extend(mine);
+            let mut out = Vec::new();
+            output.shapes.iter().for_each(|s| texts(&s.shape, &mut out));
+            out
+        }
+
+        fn settle(&mut self, page: &mut DriversPage) -> Vec<(Pos2, String)> {
+            self.step(page, vec![]);
+            self.step(page, vec![])
+        }
+
+        fn click(&mut self, page: &mut DriversPage, at: Pos2, button: egui::PointerButton) -> Vec<(Pos2, String)> {
+            let m = egui::Modifiers::NONE;
+            self.step(page, vec![egui::Event::PointerMoved(at)]);
+            self.step(page, vec![egui::Event::PointerButton { pos: at, button, pressed: true, modifiers: m }]);
+            self.step(page, vec![egui::Event::PointerButton { pos: at, button, pressed: false, modifiers: m }]);
+            self.settle(page)
+        }
+    }
+
+    fn at(texts: &[(Pos2, String)], what: &str) -> Pos2 {
+        texts.iter().find(|(_, t)| t == what).unwrap_or_else(|| panic!("{what:?} is not drawn: {texts:?}")).0 + vec2(4.0, 4.0)
+    }
+
+    fn module(path: &str) -> KernelDriver {
+        KernelDriver { service: "acme".into(), display: "Acme Kernel".into(), running: true, start_code: Some(3), path: path.into(), ..Default::default() }
+    }
+
+    /// The page on Kernel modules with a right click on the only row; the
+    /// menu items, top to bottom, with their heights.
+    fn opened_menu(screen: &mut Screen, page: &mut DriversPage) -> (Pos2, Vec<(f32, String)>) {
+        page.drv_ui.scope = Scope::Kernel;
+        screen.settle(page);
+        let row = at(&screen.settle(page), "Acme Kernel");
+        let after = screen.click(page, row, egui::PointerButton::Secondary);
+        let mut items: Vec<(f32, String)> = after
+            .into_iter()
+            .filter(|(p, t)| p.y > row.y + 2.0 && p.x >= row.x && p.x < row.x + 300.0 && !t.is_empty())
+            .map(|(p, t)| (p.y, t))
+            .collect();
+        items.sort_by(|a, b| a.0.total_cmp(&b.0));
+        (row, items)
+    }
+
+    #[test]
+    fn the_kernel_menu_lists_common_actions_first_then_the_advanced_ones() {
+        let (mut page, mut screen) = (page_with(vec![], vec![module(r"C:\x\acme.sys")]), Screen::new());
+        let (_, items) = opened_menu(&mut screen, &mut page);
+        let labels: Vec<&str> = items.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Open file location", "Open Device Manager", "Copy details", "Advanced", "Copy service name", "Unload\u{2026}"],
+            "Unload sits among the advanced actions, under their caption"
+        );
+        let gap = |a: usize, b: usize| items[b].0 - items[a].0;
+        assert!(gap(1, 2) > gap(0, 1), "a separator sits between Open Device Manager and Copy details");
+    }
+
+    #[test]
+    fn the_menu_hides_unload_where_it_is_not_offered() {
+        let boot = KernelDriver { start_code: Some(0), ..module(r"C:\x\acme.sys") };
+        let (mut page, mut screen) = (page_with(vec![], vec![boot]), Screen::new());
+        let (_, items) = opened_menu(&mut screen, &mut page);
+        assert!(!items.iter().any(|(_, t)| t.starts_with("Unload")), "{items:?}");
+        assert!(items.iter().any(|(_, t)| t == "Copy service name"));
+    }
+
+    #[test]
+    fn the_menu_entries_still_copy_and_open_device_manager() {
+        let ((mut page, runner), mut screen) = (page_and_runner(vec![], vec![module(r"C:\x\acme.sys")]), Screen::new());
+        let (row, items) = opened_menu(&mut screen, &mut page);
+        let y = items.iter().find(|(_, t)| t == "Copy service name").unwrap().0;
+        screen.click(&mut page, Pos2::new(row.x + 10.0, y + 4.0), egui::PointerButton::Primary);
+        assert_eq!(screen.actions, vec![Action::Copy("acme".into())]);
+        let (_, items) = opened_menu(&mut screen, &mut page);
+        let y = items.iter().find(|(_, t)| t == "Open Device Manager").unwrap().0;
+        screen.click(&mut page, Pos2::new(row.x + 10.0, y + 4.0), egui::PointerButton::Primary);
+        assert_eq!(runner.launches(), vec![crate::platform::Launch::Open("devmgmt.msc".into())]);
+    }
+
+    #[test]
+    fn unload_from_the_menu_asks_for_the_confirmation() {
+        let (mut page, mut screen) = (page_with(vec![], vec![module(r"C:\x\acme.sys")]), Screen::new());
+        let (row, items) = opened_menu(&mut screen, &mut page);
+        let y = items.iter().find(|(_, t)| t.starts_with("Unload")).unwrap().0;
+        screen.click(&mut page, Pos2::new(row.x + 10.0, y + 4.0), egui::PointerButton::Primary);
+        assert_eq!(page.drv_ui.confirm_unload.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn open_file_location_selects_the_file_or_says_why_not() {
+        let there = |_: &std::path::Path| true;
+        let gone = |_: &std::path::Path| false;
+        assert_eq!(reveal(r"C:\x\acme.sys", there), Action::ShowInExplorer(std::path::PathBuf::from(r"C:\x\acme.sys")));
+        assert_eq!(reveal("", there), Action::Say("The executable path is not available for this item.".into()));
+        assert_eq!(reveal(r"C:\x\acme.sys", gone), Action::Say(r"The file C:\x\acme.sys was not found.".into()));
+    }
+
+    #[test]
+    fn open_file_location_in_the_menu_reveals_a_file_that_exists() {
+        let here = std::env::current_exe().unwrap().to_string_lossy().to_string();
+        let (mut page, mut screen) = (page_with(vec![], vec![module(&here)]), Screen::new());
+        let (row, items) = opened_menu(&mut screen, &mut page);
+        screen.click(&mut page, Pos2::new(row.x + 10.0, items[0].0 + 4.0), egui::PointerButton::Primary);
+        assert_eq!(screen.actions, vec![Action::ShowInExplorer(std::path::PathBuf::from(here))]);
+    }
+
+    #[test]
+    fn open_file_location_in_the_menu_explains_a_missing_file() {
+        let (mut page, mut screen) = (page_with(vec![], vec![module(r"C:\no\such\acme.sys")]), Screen::new());
+        let (row, items) = opened_menu(&mut screen, &mut page);
+        screen.click(&mut page, Pos2::new(row.x + 10.0, items[0].0 + 4.0), egui::PointerButton::Primary);
+        assert_eq!(screen.actions, vec![Action::Say(r"The file C:\no\such\acme.sys was not found.".into())]);
+    }
+
+    #[test]
+    fn each_tab_shows_its_own_filter_hint() {
+        let (mut page, mut screen) = (page_with(vec![gpu("Alpha GPU")], vec![module(r"C:\x\acme.sys")]), Screen::new());
+        let shown = |t: &[(Pos2, String)], s: &str| t.iter().any(|(_, x)| x == s);
+        let devices = screen.settle(&mut page);
+        assert!(shown(&devices, "Find a driver or maker"), "Device drivers hint unchanged");
+        assert!(!shown(&devices, "Driver name, service or vendor"));
+        page.drv_ui.scope = Scope::Kernel;
+        let kernel = screen.settle(&mut page);
+        assert!(shown(&kernel, "Driver name, service or vendor"));
+        assert!(!shown(&kernel, "Find a driver or maker"));
+    }
+
+    #[test]
+    fn each_tab_shows_its_own_empty_panel_text() {
+        let (mut page, mut screen) = (page_with(vec![gpu("Alpha GPU")], vec![module(r"C:\x\acme.sys")]), Screen::new());
+        let shown = |t: &[(Pos2, String)], s: &str| t.iter().any(|(_, x)| x == s);
+        let drivers = "Select a driver to see its details and what Windows Update offers for it.";
+        let kernel_text = "Select a kernel module to see where it lives, how much memory it holds and whether it can be unloaded.";
+        let devices = screen.settle(&mut page);
+        assert!(shown(&devices, drivers) && !shown(&devices, kernel_text));
+        page.drv_ui.scope = Scope::Kernel;
+        let kernel = screen.settle(&mut page);
+        assert!(shown(&kernel, kernel_text) && !shown(&kernel, drivers));
     }
 }
 

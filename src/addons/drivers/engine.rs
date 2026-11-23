@@ -464,6 +464,25 @@ pub struct State {
     /// What the signature checks found so far, by file path. A snapshot
     /// replaced as results arrive, so the page can tell when it changed.
     pub signatures: Arc<SignatureBook>,
+    /// A restore point could not be created, so the change did not run: the
+    /// page asks whether to continue without one.
+    pub restore_prompt: Option<RestorePrompt>,
+}
+
+/// What waits for the user's answer after a restore point failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestorePrompt {
+    /// Why there is no restore point (one of the honest messages).
+    pub reason: String,
+    /// The change to run again, without a restore point, on "Continue".
+    pub redo: Redo,
+}
+
+/// A change that can be run again without its restore point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Redo {
+    Updates(Vec<String>),
+    Inf(String),
 }
 
 #[derive(Clone)]
@@ -700,6 +719,12 @@ impl Hub {
 
     /// Downloads and installs the given Windows Update driver updates.
     pub fn install(&self, ids: Vec<String>) {
+        self.install_with(ids, false);
+    }
+
+    /// Like [`Hub::install`]; `restore_point` makes the same elevated job
+    /// create a restore point first.
+    pub fn install_with(&self, ids: Vec<String>, restore_point: bool) {
         if ids.is_empty() {
             return;
         }
@@ -708,8 +733,17 @@ impl Hub {
             let items = ids.iter().map(|id| ("windows-update".to_string(), id.clone())).collect();
             let Some(turn) = run.queue(hub.ctx.install_queue(), queue_request(items)) else { return };
             let joined = ids.join(",");
-            let outcome = install_outcome(hub.ctx.powershell(INSTALL_SCRIPT, &[("Ids", joined.as_str())], true));
+            let ran = hub.run_job(INSTALL_SCRIPT, "install-updates", &[("Ids", joined.as_str())], &restore_steps(restore_point));
             drop(turn);
+            let (result, restore_note) = match ran {
+                JobRun::Done { result, note } => (result, note),
+                JobRun::Refused(reason) => {
+                    hub.refuse(run, reason, Redo::Updates(ids));
+                    return;
+                }
+            };
+            let mut outcome = install_outcome(result);
+            outcome.message.0 = with_note(restore_note, outcome.message.0);
             let done = outcome.installed;
             {
                 let mut st = hub.follow();
@@ -732,22 +766,77 @@ impl Hub {
     /// Adds a driver package and installs it on matching devices
     /// (pnputil /add-driver … /install). A folder installs every INF in it.
     pub fn install_inf(&self, path: String) {
-        self.pnputil("inf", path, true, "Installing the driver package \u{2014} confirm the Windows prompt\u{2026}");
+        self.install_inf_with(path, false);
+    }
+
+    /// Like [`Hub::install_inf`]; `restore_point` makes the same elevated job
+    /// create a restore point first.
+    pub fn install_inf_with(&self, path: String, restore_point: bool) {
+        self.pnputil("inf", path, true, "Installing the driver package \u{2014} confirm the Windows prompt\u{2026}", restore_point);
+    }
+
+    /// Runs `change` in one elevated job, the `steps` before it. A step that
+    /// refuses the change (a restore point that could not be made) stops the
+    /// job before anything is changed. With no steps the launch is the
+    /// change's own script and arguments, as before.
+    fn run_job(&self, change: &str, change_name: &str, args: &[(&str, &str)], steps: &[&Step]) -> JobRun {
+        if steps.is_empty() {
+            return JobRun::Done { result: self.ctx.powershell(change, args, true), note: None };
+        }
+        let script = with_steps(change, steps);
+        let names = steps.iter().map(|s| s.name).chain([change_name]).collect::<Vec<_>>().join(",");
+        let mut all = args.to_vec();
+        all.push(("Steps", names.as_str()));
+        match self.ctx.powershell(&script, &all, true) {
+            Ok(v) if v["ran"].as_bool() == Some(false) => JobRun::Refused(restore_text(&v["steps"][RESTORE_POINT.name])),
+            Ok(v) => {
+                let note = v["steps"].get(RESTORE_POINT.name).map(restore_text);
+                JobRun::Done { result: Ok(v), note }
+            }
+            Err(e) => JobRun::Done { result: Err(e), note: None },
+        }
+    }
+
+    /// The job stopped before its change: the page asks what to do.
+    fn refuse(&self, run: &Run<State>, reason: String, redo: Redo) {
+        let mut st = self.follow();
+        run.release(&mut st);
+        st.restore_prompt = Some(RestorePrompt { reason, redo });
+    }
+
+    /// "Continue" after a restore point failed: the change runs again
+    /// without one. Windows asks again, because the first job ended before
+    /// it changed anything.
+    pub fn continue_without_restore(&self) {
+        let prompt = self.follow().restore_prompt.take();
+        match prompt.map(|p| p.redo) {
+            Some(Redo::Updates(ids)) => self.install_with(ids, false),
+            Some(Redo::Inf(path)) => self.install_inf_with(path, false),
+            None => {}
+        }
+    }
+
+    /// "Cancel" after a restore point failed: nothing was changed.
+    pub fn cancel_restore(&self) {
+        let mut st = self.follow();
+        if st.restore_prompt.take().is_some() {
+            st.message = Some(("Cancelled: nothing was changed.".into(), false));
+        }
     }
 
     /// Asks Windows to look for new or removed hardware (pnputil /scan-devices).
     pub fn scan(&self) {
-        self.pnputil("scan", String::new(), false, "Scanning for hardware changes \u{2014} confirm the Windows prompt\u{2026}");
+        self.pnputil("scan", String::new(), false, "Scanning for hardware changes \u{2014} confirm the Windows prompt\u{2026}", false);
     }
 
     /// Stops (unloads) a kernel driver service (sc stop).
     pub fn unload(&self, service: String) {
-        self.pnputil("stop", service, false, "Asking the driver to unload \u{2014} confirm the Windows prompt\u{2026}");
+        self.pnputil("stop", service, false, "Asking the driver to unload \u{2014} confirm the Windows prompt\u{2026}", false);
     }
 
     /// Installing a package is uninterruptible; scanning and unloading are
     /// not (their outcome is dropped when the add-on is turned off).
-    fn pnputil(&self, mode: &'static str, arg: String, uninterruptible: bool, busy: &str) {
+    fn pnputil(&self, mode: &'static str, arg: String, uninterruptible: bool, busy: &str, restore_point: bool) {
         self.spawn(Some(busy.into()), uninterruptible, move |hub, run| {
             // Only adding a driver package installs something.
             let turn = match mode {
@@ -757,8 +846,18 @@ impl Hub {
                 },
                 _ => None,
             };
-            let outcome = tool_outcome(mode, hub.ctx.powershell(TOOL_SCRIPT, &[("Mode", mode), ("Arg", arg.as_str())], true));
+            let steps = if mode == "inf" { restore_steps(restore_point) } else { Vec::new() };
+            let ran = hub.run_job(TOOL_SCRIPT, "inf", &[("Mode", mode), ("Arg", arg.as_str())], &steps);
             drop(turn);
+            let (result, restore_note) = match ran {
+                JobRun::Done { result, note } => (result, note),
+                JobRun::Refused(reason) => {
+                    hub.refuse(run, reason, Redo::Inf(arg));
+                    return;
+                }
+            };
+            let mut outcome = tool_outcome(mode, result);
+            outcome.message.0 = with_note(restore_note, outcome.message.0);
             {
                 let Some(mut st) = hub.outcome(uninterruptible) else { return };
                 run.release(&mut st);
@@ -773,6 +872,74 @@ impl Hub {
             }
             hub.refresh_now();
         });
+    }
+}
+
+/// A step an elevated job runs before its change. Adding one to a job is one
+/// entry in the `steps` of [`Hub::run_job`]: the step's PowerShell is put in
+/// front of the change, its result is stored under its name in the job's
+/// result (`steps`), and it may end the job early with `ran = false` so that
+/// nothing is changed.
+pub struct Step {
+    /// The name in the job's `Steps` argument and in its result.
+    pub name: &'static str,
+    /// PowerShell run after the `param` line; sees `$Steps`, `$Out` and `$stepResults`.
+    snippet: &'static str,
+}
+
+/// Creates a restore point of the device-driver-install type.
+pub const RESTORE_POINT: Step = Step { name: "restore-point", snippet: RESTORE_STEP };
+
+fn restore_steps(restore_point: bool) -> Vec<&'static Step> {
+    if restore_point {
+        vec![&RESTORE_POINT]
+    } else {
+        Vec::new()
+    }
+}
+
+/// What an elevated job came back with.
+enum JobRun {
+    /// The change ran (or the job did not start: a dismissed prompt).
+    /// `note` is the restore point's message when one was asked for.
+    Done { result: Result<serde_json::Value, String>, note: Option<String> },
+    /// The restore point was not made and the change did not run: why.
+    Refused(String),
+}
+
+/// `change` with `steps` in front: the `Steps` parameter is added and every
+/// step's result lands in the result's `steps`.
+pub fn with_steps(change: &str, steps: &[&Step]) -> String {
+    let (param, rest) = change.split_once('\n').unwrap_or((change, ""));
+    let param = param.replacen("param([string]$Out,", "param([string]$Out, [string]$Steps,", 1);
+    let mut out = format!("{param}\n$stepResults = [ordered]@{{}}\n");
+    for step in steps {
+        out.push_str(step.snippet);
+        out.push('\n');
+    }
+    out.push_str(&rest.replacen("ConvertTo-Json -InputObject $res", "$res['steps'] = $stepResults; ConvertTo-Json -InputObject $res", 1));
+    out
+}
+
+/// The honest message for a restore point step's result.
+pub fn restore_text(step: &serde_json::Value) -> String {
+    let drive = step["drive"].as_str().filter(|d| !d.is_empty()).unwrap_or("C:");
+    match step["state"].as_str() {
+        Some("created") => "Restore point created.".into(),
+        Some("off") => format!("System Restore is off on drive {drive}."),
+        Some("recent") => "Windows already created a restore point in the last 24 hours.".into(),
+        _ => match step["error"].as_str().filter(|e| !e.is_empty()) {
+            Some(e) => format!("The restore point could not be created: {e}"),
+            None => "The restore point could not be created.".into(),
+        },
+    }
+}
+
+/// The restore point's note in front of the change's own message.
+fn with_note(note: Option<String>, message: String) -> String {
+    match note {
+        Some(note) => format!("{note} {message}"),
+        None => message,
     }
 }
 
@@ -1018,6 +1185,26 @@ try {
 } catch { $res.error = $_.Exception.Message }
 ConvertTo-Json -InputObject $res -Depth 5 | Out-File -FilePath $Out -Encoding utf8
 "#;
+
+const RESTORE_STEP: &str = r#"if (($Steps -split ',') -contains 'restore-point') {
+  $rp = [ordered]@{ state = 'failed'; drive = $env:SystemDrive; error = '' }
+  try {
+    $since = (Get-Date).AddMinutes(-1)
+    Checkpoint-Computer -Description 'Ultimate PC Manager: driver change' -RestorePointType DEVICE_DRIVER_INSTALL -WarningAction SilentlyContinue -WarningVariable rpWarn -ErrorAction Stop
+    $made = @(Get-ComputerRestorePoint | Where-Object { $_.ConvertToDateTime($_.CreationTime) -ge $since }).Count -gt 0
+    if ($made) { $rp.state = 'created' }
+    elseif (($rpWarn | Out-String) -match '1440|already been created|within the past') { $rp.state = 'recent' }
+    else { $rp.error = 'Windows reported no new restore point.' }
+  } catch {
+    $m = $_.Exception.Message
+    if ($m -match 'disabled|turned off|not enabled') { $rp.state = 'off' } else { $rp.error = $m }
+  }
+  $stepResults['restore-point'] = $rp
+  if ($rp.state -ne 'created') {
+    ConvertTo-Json -InputObject ([ordered]@{ ok = $true; ran = $false; steps = $stepResults }) -Depth 5 | Out-File -FilePath $Out -Encoding utf8
+    return
+  }
+}"#;
 
 const TOOL_SCRIPT: &str = r#"param([string]$Out, [string]$Mode, [string]$Arg)
 $pnputil = Join-Path ([Environment]::SystemDirectory) 'pnputil.exe'
@@ -1317,6 +1504,128 @@ mod tests {
         hub.install(vec!["id-1".into()]);
         wait_until_idle(&hub);
         assert_eq!(reads(&reader), before + 1);
+    }
+
+    const RP_CREATED: &str = r#"{"ok":true,"reboot":false,"items":[{"Id":"id-1","Title":"A","Code":2,"HResult":0}],"steps":{"restore-point":{"state":"created","drive":"C:","error":""}}}"#;
+
+    fn refused(state: &str) -> String {
+        format!(r#"{{"ok":true,"ran":false,"steps":{{"restore-point":{{"state":"{state}","drive":"C:","error":"boom"}}}}}}"#)
+    }
+
+    #[test]
+    fn installing_with_a_restore_point_is_one_elevated_launch_with_the_ordered_steps() {
+        let (hub, runner, _) = install_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, RP_CREATED);
+        hub.install_with(vec!["id-1".into()], true);
+        wait_until_idle(&hub);
+        assert_eq!(
+            runner.launches(),
+            vec![Launch::PowerShell {
+                script: with_steps(INSTALL_SCRIPT, &[&RESTORE_POINT]),
+                args: vec![("Ids".into(), "id-1".into()), ("Steps".into(), "restore-point,install-updates".into())],
+                elevated: true
+            }]
+        );
+        assert_eq!(hub.lock().message, Some(("Restore point created. Installed 1 driver update.".to_string(), false)));
+        assert!(hub.lock().restore_prompt.is_none());
+    }
+
+    #[test]
+    fn an_inf_install_with_a_restore_point_is_one_elevated_launch_and_without_it_is_as_before() {
+        let (hub, runner, _) = install_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, r#"{"ok":true,"code":0,"output":"","steps":{"restore-point":{"state":"created","drive":"C:"}}}"#);
+        hub.install_inf_with(r"C:\pkg\a.inf".into(), true);
+        wait_until_idle(&hub);
+        assert_eq!(
+            runner.launches(),
+            vec![Launch::PowerShell {
+                script: with_steps(TOOL_SCRIPT, &[&RESTORE_POINT]),
+                args: vec![("Mode".into(), "inf".into()), ("Arg".into(), r"C:\pkg\a.inf".into()), ("Steps".into(), "restore-point,inf".into())],
+                elevated: true
+            }]
+        );
+        assert_eq!(hub.lock().message, Some(("Restore point created. Driver package installed.".to_string(), false)));
+
+        let (hub, runner, _) = install_hub();
+        hub.install_inf(r"C:\pkg\a.inf".into());
+        wait_until_idle(&hub);
+        assert_eq!(
+            runner.launches(),
+            vec![Launch::PowerShell { script: TOOL_SCRIPT.into(), args: vec![("Mode".into(), "inf".into()), ("Arg".into(), r"C:\pkg\a.inf".into())], elevated: true }]
+        );
+    }
+
+    #[test]
+    fn each_restore_point_failure_stops_before_the_change_and_says_why() {
+        for (state, text) in [
+            ("off", "System Restore is off on drive C:."),
+            ("recent", "Windows already created a restore point in the last 24 hours."),
+            ("failed", "The restore point could not be created: boom"),
+        ] {
+            let (hub, runner, reader) = install_hub();
+            let before = reads(&reader);
+            runner.prepare(crate::platform::When::Nth(0), 0, &refused(state));
+            hub.install_with(vec!["id-1".into()], true);
+            wait_until_idle(&hub);
+            let st = hub.lock();
+            assert_eq!(st.restore_prompt.as_ref().map(|p| p.reason.as_str()), Some(text));
+            assert_eq!(st.message, None, "the change did not run, so no outcome");
+            drop(st);
+            assert_eq!(runner.launches().len(), 1);
+            assert_eq!(reads(&reader), before, "nothing changed, so no re-read");
+        }
+    }
+
+    #[test]
+    fn continuing_after_a_failed_restore_point_runs_the_change_without_one() {
+        let (hub, runner, _) = install_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, &refused("recent"));
+        runner.prepare(crate::platform::When::Nth(1), 0, r#"{"ok":true,"reboot":false,"items":[{"Id":"id-1","Title":"A","Code":2,"HResult":0}]}"#);
+        hub.install_with(vec!["id-1".into()], true);
+        wait_until_idle(&hub);
+        hub.continue_without_restore();
+        wait_until_idle(&hub);
+        let launches = runner.launches();
+        assert_eq!(launches.len(), 2);
+        assert_eq!(launches[1], Launch::PowerShell { script: INSTALL_SCRIPT.into(), args: vec![("Ids".into(), "id-1".into())], elevated: true });
+        assert!(hub.lock().restore_prompt.is_none());
+        assert_eq!(hub.lock().message, Some(("Installed 1 driver update.".to_string(), false)));
+    }
+
+    #[test]
+    fn cancelling_after_a_failed_restore_point_changes_nothing() {
+        let (hub, runner, _) = install_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, &refused("off"));
+        hub.install_inf_with(r"C:\pkg\a.inf".into(), true);
+        wait_until_idle(&hub);
+        assert!(hub.lock().restore_prompt.is_some());
+        hub.cancel_restore();
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches().len(), 1, "no second launch");
+        let st = hub.lock();
+        assert!(st.restore_prompt.is_none());
+        assert_eq!(st.message, Some(("Cancelled: nothing was changed.".to_string(), false)));
+    }
+
+    #[test]
+    fn a_dismissed_prompt_with_a_restore_point_is_a_cancel_not_a_restore_failure() {
+        let (hub, runner, _) = install_hub();
+        runner.answer(crate::platform::ELEVATION_CANCELLED);
+        hub.install_with(vec!["id-1".into()], true);
+        wait_until_idle(&hub);
+        let st = hub.lock();
+        assert!(st.restore_prompt.is_none());
+        assert_eq!(st.message, Some((CANCELLED_TEXT.to_string(), false)));
+    }
+
+    #[test]
+    fn a_step_goes_in_front_of_the_change_and_its_result_joins_the_job_result() {
+        let script = with_steps(INSTALL_SCRIPT, &[&RESTORE_POINT]);
+        assert!(script.starts_with("param([string]$Out, [string]$Steps, [string]$Ids)"));
+        let step = script.find("Checkpoint-Computer").expect("the restore point step");
+        assert!(script.contains("-RestorePointType DEVICE_DRIVER_INSTALL"));
+        assert!(step < script.find("CreateUpdateSearcher").expect("the change"), "the step runs first");
+        assert!(script.contains("$res['steps'] = $stepResults; ConvertTo-Json -InputObject $res"));
     }
 
     /// Reads this PC's drivers: `cargo test -- --ignored --nocapture`.
