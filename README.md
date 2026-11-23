@@ -150,12 +150,12 @@ $env:APPS_DUMP = "$env:TEMP\apps.json"; cargo test --release apps::tests::lists_
 
 ## CI/CD
 
-GitHub Actions on `windows-latest` (the app only builds with MSVC), kept to a
-minimum of runner minutes:
+GitHub Actions on Windows, Linux and macOS (Apple Silicon), with the Rust
+compiler pinned in `rust-toolchain.toml`:
 
 | Workflow | When | What it does |
 |---|---|---|
-| `.github/workflows/ci.yml` | pull requests that change `src/`, `assets/`, `Cargo.toml`/`Cargo.lock` or the workflow; manual | `cargo test --release` only (tests that read the real PC are `#[ignore]` and skipped). Doc-only changes and pushes to `main` do not run it. |
+| `.github/workflows/ci.yml` | pull requests that change `src/`, `assets/`, `Cargo.toml`/`Cargo.lock`, `rust-toolchain.toml` or the workflow; every push to `main`; manual | `cargo test --release --locked` on `windows-latest`, `ubuntu-latest` and `macos-latest` (tests that read the real PC are `#[ignore]` and skipped; Linux installs the GUI build packages first). Doc-only pull requests do not run it. |
 | `.github/workflows/release.yml` | push of a `v*` tag | `cargo build --release` and a GitHub Release with `UltimatePCManager.zip` (`Ultimate PC Manager.exe`, README, font license). |
 
 Both have a 30-minute timeout and reuse the Cargo cache. To publish a version:

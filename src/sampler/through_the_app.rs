@@ -190,6 +190,13 @@ fn the_settings_speed_is_the_counters_speed_and_not_the_hardwares() {
         next_sample(&app);
         assert_eq!(counters.reads(), tick, "the counters read at the settings speed");
     }
+    // The page asked for 10 ms, far faster than the counters' ticks: on a
+    // loaded machine the reads come later, so wait for them (up to ten
+    // seconds) instead of counting what a short window happened to hold.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while hardware.reads() <= 10 && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert!(hardware.reads() > 10, "the hardware at the speed of the page that looks: {}", hardware.reads());
 }
 
