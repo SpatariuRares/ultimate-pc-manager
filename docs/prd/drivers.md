@@ -160,6 +160,12 @@ The device context menu and the side panel offer "Disable device" (or "Enable de
 - Outcomes: "Done.", "Restart Windows to finish." (the API asked for a restart), "No previous driver is kept for this device." (Windows reported `ERROR_NO_MORE_ITEMS`: the device has no backup driver) or "Windows refused: <Windows' reason>".
 - Windows documents no read-only check for "a backup driver exists", so the entry is offered for every device and Windows answers when asked.
 
+### Problems view (spec #11, #24)
+A "Problems" scope after "Windows built-in" lists only the devices that are connected and have a Configuration Manager problem code, with their count (amber while not chosen). A disconnected device is never a problem. The scope, its count and the band line exist only while some device has a problem (the scope stays while chosen, and says "No device has a problem." when empty). The count is part of the page's derived data and is worked out once per change of data, scope or filter. The scope is saved like the others (`"problems"`).
+- The status band adds "N devices have a problem" ("1 device has a problem") with "Show them", which opens the scope.
+- Each row says "Code <n>: <explanation>" under its name, from a fixed table of the documented codes (`problems.rs`), for example 10 "The device cannot start.", 22 "The device is disabled.", 28 "No driver is installed.", 43 "Windows stopped the device because it reported problems.". An unknown code is still named and gets no suggestion.
+- The side panel shows the code and its explanation, then "Try:" with a suggestion: "Update or reinstall the driver", "Restart the device" or "Enable the device". It is a link to the page's own action when there is one (Install update when Windows Update offers a newer driver; the Restart or Enable device dialog), otherwise plain text.
+
 ### Filter drivers (spec #11, #33)
 A "Filter drivers" tab lists the loaded file-system minifilters read-only: name, altitude, instances and frame, highest altitude first like `fltmc filters`, with a "Filter name" search.
 - They are read in process with `FilterFindFirst`/`FilterFindNext` (Filter Manager user API), in the same read as the driver listing, with normal rights.

@@ -13,6 +13,7 @@ use egui::{vec2, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Rec
 use super::filters::{self, FilterDriver, FilterRead};
 use super::engine::{self as drivers, DeviceDriver, DriverUpdate, HashFor, Hub, KernelDriver, KernelFigures, KernelScope};
 use super::engine::virustotal_url;
+use super::problems;
 use super::signature::{signature_text, Signature, SignatureBook};
 use super::store::{self, Flags, Selection, StoreFigures, StoreList, StorePackage};
 use crate::addons::plural;
@@ -30,6 +31,8 @@ pub enum Scope {
     Hardware,
     /// Drivers that ship with Windows.
     Builtin,
+    /// Devices with a Configuration Manager problem code.
+    Problems,
     /// Kernel driver services.
     Kernel,
     /// The driver packages Windows keeps.
@@ -245,6 +248,7 @@ impl ListNote {
             ListNote::Failed(reason) => return ("Drivers could not be enumerated".into(), Some(reason.clone())),
             ListNote::NothingReported => return ("No drivers were reported".into(), Some("Windows published no driver registrations.".into())),
             ListNote::FilteredOut if kernel => "No matching drivers.",
+            ListNote::FilteredOut if scope == Scope::Problems => "No device has a problem.",
             ListNote::FilteredOut => "No drivers here.",
             ListNote::NoMatch if kernel => KERNEL_NO_MATCH,
             ListNote::NoMatch => "No driver or maker matches what you typed.",
@@ -457,6 +461,8 @@ pub struct Derived {
     hardware_count: usize,
     /// Windows built-in drivers after folding, for the scope button.
     builtin_count: usize,
+    /// Devices with a problem after folding, for the scope button and the band.
+    problem_count: usize,
     /// Devices matching the scope and the search, before folding.
     matching: usize,
     /// The device list, kind by kind (empty on the kernel scope).
@@ -482,12 +488,15 @@ impl Derived {
         };
         let hardware_count = fold(devices, scoped(true)).len();
         let builtin_count = fold(devices, scoped(false)).len();
+        let problem_rows: Vec<usize> = devices.iter().enumerate().filter(|(_, d)| problems::is_problem(d)).map(|(i, _)| i).collect();
+        let problem_count = fold(devices, problem_rows.clone()).len();
         let q = inputs.search.trim().to_lowercase();
 
         let mut items = Vec::new();
         let mut matching = 0;
-        if matches!(inputs.scope, Scope::Hardware | Scope::Builtin) {
-            let matches: Vec<usize> = scoped(inputs.scope == Scope::Hardware)
+        if matches!(inputs.scope, Scope::Hardware | Scope::Builtin | Scope::Problems) {
+            let in_scope = if inputs.scope == Scope::Problems { problem_rows } else { scoped(inputs.scope == Scope::Hardware) };
+            let matches: Vec<usize> = in_scope
                 .into_iter()
                 .filter(|&i| {
                     let d = &devices[i];
@@ -521,7 +530,9 @@ impl Derived {
                     let update = offered.get(d.instance_id.as_str()).copied();
                     let older = update.and_then(|i| updates.as_ref().map(|u| &u[i])).is_some_and(|u| !u.worth_installing());
                     let check = check_the_maker(d, inputs.today, inputs.old_years);
-                    let sub = if older {
+                    let sub = if inputs.scope == Scope::Problems {
+                        Some(Sub::Problem)
+                    } else if older {
                         Some(Sub::OlderOffer)
                     } else if check.is_some() {
                         Some(Sub::CheckMaker)
@@ -564,6 +575,7 @@ impl Derived {
             signatures: signatures.clone(),
             hardware_count,
             builtin_count,
+            problem_count,
             matching,
             items,
             tops,
@@ -810,7 +822,7 @@ impl DriversPage {
         });
         ui.add_space(8.0);
 
-        self.drivers_band(ui, &devices, updates.as_deref(), busy.as_deref(), message.as_ref(), reboot, &checked_at, idle);
+        self.drivers_band(ui, &devices, updates.as_deref(), busy.as_deref(), message.as_ref(), reboot, &checked_at, idle, view.problem_count);
         if !output.is_empty() {
             egui::CollapsingHeader::new(RichText::new("Output of the last tool").color(th.label)).id_salt("drv-output").show(ui, |ui| {
                 ui.label(RichText::new(&output).monospace().size(11.0));
@@ -822,14 +834,17 @@ impl DriversPage {
 
         // ------------------------------------------------ scope row
         ui.horizontal(|ui| {
-            let scopes = [
-                (Scope::Hardware, "Hardware drivers", view.hardware_count),
-                (Scope::Builtin, "Windows built-in", view.builtin_count),
+            let mut scopes = vec![(Scope::Hardware, "Hardware drivers", view.hardware_count), (Scope::Builtin, "Windows built-in", view.builtin_count)];
+            // The scope shows only while there is a problem to list (or it is the chosen one).
+            if view.problem_count > 0 || self.drv_ui.scope == Scope::Problems {
+                scopes.push((Scope::Problems, "Problems", view.problem_count));
+            }
+            scopes.extend([
                 (Scope::Kernel, "Kernel modules", kernel.len()),
                 (Scope::Store, "Driver store", store.len()),
                 (Scope::Filters, "Filter drivers", filter_read.as_deref().map_or(0, filters_count)),
-            ];
-            if let Some(scope) = parts::scope_group(ui, self.drv_ui.scope, &scopes).clicked {
+            ]);
+            if let Some(scope) = parts::ScopeGroup::new(self.drv_ui.scope, &scopes).alert(Scope::Problems).show(ui).clicked {
                 self.drv_ui.scope = scope;
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -969,12 +984,14 @@ impl DriversPage {
         reboot: bool,
         checked_at: &str,
         idle: bool,
+        problem_count: usize,
     ) {
         let th = theme::of_ui(ui);
         let newer: Vec<&DriverUpdate> = updates.map(|u| u.iter().filter(|x| x.worth_installing()).collect()).unwrap_or_default();
         let older: Vec<&DriverUpdate> = updates.map(|u| u.iter().filter(|x| !x.worth_installing()).collect()).unwrap_or_default();
         let device = |u: &DriverUpdate| u.device.as_ref().and_then(|id| devices.iter().find(|d| &d.instance_id == id));
         let mut select: Option<String> = None;
+        let mut show_problems = false;
 
         let n = newer.len();
         let (mark, headline) = if let Some(b) = busy {
@@ -996,6 +1013,14 @@ impl DriversPage {
         }
         band.show(ui, |ui, area| match area {
             BandArea::Body => {
+                if problem_count > 0 && busy.is_none() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(problems::band_text(problem_count)).strong().color(th.red));
+                        if ui.link("Show them").clicked() {
+                            show_problems = true;
+                        }
+                    });
+                }
                 if busy.is_none() && !newer.is_empty() {
                     for u in newer.iter().take(3) {
                         let dev = device(u);
@@ -1082,6 +1107,10 @@ impl DriversPage {
             BandArea::Below => {}
         });
 
+        if show_problems {
+            self.drv_ui.scope = Scope::Problems;
+            self.drv_ui.search.clear();
+        }
         if let Some(id) = select {
             if let Some(d) = devices.iter().find(|d| d.instance_id == id) {
                 self.drv_ui.scope = if d.third_party() { Scope::Hardware } else { Scope::Builtin };
@@ -1171,7 +1200,7 @@ impl DriversPage {
                     Sub::CheckMaker => (format!("{} years old: check the maker", row.check.unwrap_or_default()), th.amber),
                     Sub::Folded => (format!("{} entries folded into one", row.count), th.faint),
                     Sub::NotConnected => ("Not connected".to_string(), th.faint),
-                    Sub::Problem => (d.status(), th.red),
+                    Sub::Problem => (problems::row_text(d), th.red),
                 });
                 let y1 = if sub.is_some() { r.top() + 12.0 } else { r.center().y };
                 let cell = |i: usize, s: &str, col: Color32| {
@@ -1275,6 +1304,10 @@ impl DriversPage {
                     row("Entries", format!("{copies} identical entries"));
                 }
             });
+            if problems::is_problem(d) {
+                ui.add_space(8.0);
+                self.problem_section(ui, d, upd, idle);
+            }
             ui.add_space(8.0);
             separator(ui);
             ui.add_space(8.0);
@@ -1351,6 +1384,37 @@ impl DriversPage {
                     actions.push(Action::Copy(device_details(d, upd, signature)));
                 }
             });
+        });
+    }
+
+    /// The side panel's problem section: the code in plain words and what to
+    /// try, linked to the page's own action when it has one.
+    fn problem_section(&mut self, ui: &mut Ui, d: &DeviceDriver, upd: Option<&DriverUpdate>, idle: bool) {
+        let th = theme::of_ui(ui);
+        let p = problems::explain(d.problem);
+        ui.label(RichText::new(format!("Code {}: {}", p.code, p.explanation)).strong().color(th.red));
+        let Some(fix) = p.fix else { return };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.label(RichText::new("Try:").size(12.0).color(th.label));
+            // The action the suggestion links to, when this page has it for this device.
+            let device_action = match fix {
+                problems::Fix::Restart => Some(drivers::DeviceAction::Restart),
+                problems::Fix::Enable => Some(drivers::DeviceAction::toggle_for(d)).filter(|a| *a == drivers::DeviceAction::Enable),
+                problems::Fix::Driver => None,
+            };
+            let update = if fix == problems::Fix::Driver { upd.filter(|u| u.worth_installing()) } else { None };
+            if device_action.is_some() || update.is_some() {
+                if ui.add_enabled(idle, egui::Link::new(RichText::new(fix.text()).size(12.0))).clicked() {
+                    if let Some(action) = device_action {
+                        self.drv_ui.confirm_device = Some(DeviceConfirm::new(action, d));
+                    } else if let Some(u) = update {
+                        self.drv_ui.confirm_job = Some(drivers::Redo::Updates(vec![u.id.clone()]));
+                    }
+                }
+            } else {
+                ui.label(RichText::new(fix.text()).size(12.0).color(th.soft));
+            }
         });
     }
 
@@ -3127,6 +3191,114 @@ use super::tests::{gpu, page_and_runner, page_with};
         page.drv_ui.selected_device = Some(r"ROOT\Alpha GPU\0000".into());
         let shown = screen.settle(&mut page);
         assert!(shown.iter().any(|(_, t)| t.starts_with("This is a display adapter") && t.contains("stronger confirmation")), "{shown:?}");
+    }
+
+    fn broken(name: &str, code: u32) -> DeviceDriver {
+        DeviceDriver { problem: code, ..device(name, "Net") }
+    }
+
+    fn says(texts: &[(Pos2, String)], part: &str) -> bool {
+        texts.iter().any(|(_, t)| t.contains(part))
+    }
+
+    #[test]
+    fn no_problem_means_no_scope_and_no_band_line() {
+        let (mut page, mut screen) = (page_with(vec![device("Alpha NIC", "Net"), DeviceDriver { present: false, problem: 45, ..device("Gone NIC", "Net") }], vec![]), Screen::new());
+        page.drv_ui.show_disconnected = true;
+        let shown = screen.settle(&mut page);
+        assert!(!says(&shown, "Problems") && !says(&shown, "have a problem") && !says(&shown, "has a problem") && !drawn(&shown, "Show them"), "{shown:?}");
+    }
+
+    #[test]
+    fn the_band_counts_the_devices_with_a_problem_and_show_them_opens_the_problems_scope() {
+        let devices = vec![device("Alpha NIC", "Net"), broken("Beta NIC", 10), broken("Gamma NIC", 28), DeviceDriver { present: false, ..broken("Gone NIC", 45) }];
+        let (mut page, mut screen) = (page_with(devices, vec![]), Screen::new());
+        page.drv_ui.show_disconnected = true;
+        let shown = screen.settle(&mut page);
+        assert!(drawn(&shown, "2 devices have a problem"), "a disconnected device is not counted: {shown:?}");
+        assert!(shown.iter().any(|(_, t)| t.starts_with("Problems")), "the scope is there: {shown:?}");
+        assert!(drawn(&shown, "Alpha NIC"), "the usual scope lists every device");
+
+        let shown = screen.click(&mut page, at(&shown, "Show them"), egui::PointerButton::Primary);
+        assert!(page.drv_ui.scope == Scope::Problems);
+        assert!(drawn(&shown, "Beta NIC") && drawn(&shown, "Gamma NIC"), "{shown:?}");
+        assert!(!drawn(&shown, "Alpha NIC") && !drawn(&shown, "Gone NIC"), "only the devices with a problem: {shown:?}");
+        assert!(drawn(&shown, "Code 10: The device cannot start.") && drawn(&shown, "Code 28: No driver is installed."), "{shown:?}");
+    }
+
+    #[test]
+    fn a_single_problem_is_told_in_the_singular() {
+        let (mut page, mut screen) = (page_with(vec![broken("Beta NIC", 43)], vec![]), Screen::new());
+        let shown = screen.settle(&mut page);
+        assert!(drawn(&shown, "1 device has a problem"), "{shown:?}");
+    }
+
+    #[test]
+    fn the_problems_scope_is_searched_like_the_others_and_says_so_when_empty() {
+        let (mut page, mut screen) = (page_with(vec![broken("Beta NIC", 10), broken("Gamma NIC", 28)], vec![]), Screen::new());
+        page.drv_ui.scope = Scope::Problems;
+        page.drv_ui.search = "gamma".into();
+        let shown = screen.settle(&mut page);
+        assert!(drawn(&shown, "Gamma NIC") && !drawn(&shown, "Beta NIC"), "{shown:?}");
+
+        let (mut page, mut screen) = (page_with(vec![device("Alpha NIC", "Net")], vec![]), Screen::new());
+        page.drv_ui.scope = Scope::Problems;
+        let shown = screen.settle(&mut page);
+        assert!(drawn(&shown, "No device has a problem."), "{shown:?}");
+    }
+
+    #[test]
+    fn the_scope_count_is_worked_out_with_the_other_counts_once_per_change() {
+        let (mut page, mut screen) = (page_with(vec![device("Alpha NIC", "Net"), broken("Beta NIC", 10)], vec![]), Screen::new());
+        for _ in 0..4 {
+            screen.settle(&mut page);
+        }
+        assert_eq!(page.derived_builds(), 1, "the count came with the first build");
+        page.drv_ui.scope = Scope::Problems;
+        screen.settle(&mut page);
+        screen.settle(&mut page);
+        assert_eq!(page.derived_builds(), 2, "the scope changed once");
+        page.drv.lock().devices = vec![broken("Beta NIC", 10), broken("Gamma NIC", 28)].into();
+        let shown = screen.settle(&mut page);
+        screen.settle(&mut page);
+        assert_eq!(page.derived_builds(), 3, "a new read of the devices");
+        assert!(drawn(&shown, "2 devices have a problem"), "{shown:?}");
+    }
+
+    #[test]
+    fn the_panel_explains_the_code_and_links_each_suggestion_to_its_action() {
+        // 43: Restart the device opens the same dialog as the Restart device button.
+        let (mut page, mut screen) = (page_with(vec![broken("Beta NIC", 43)], vec![]), Screen::new());
+        page.drv_ui.selected_device = Some(r"ROOT\Beta NIC\0000".into());
+        let shown = screen.settle(&mut page);
+        assert!(drawn(&shown, "Code 43: Windows stopped the device because it reported problems."), "{shown:?}");
+        screen.click(&mut page, at(&shown, "Restart the device"), egui::PointerButton::Primary);
+        let pending = page.drv_ui.confirm_device.clone().expect("the dialog opens");
+        assert!(pending.action == drivers::DeviceAction::Restart && pending.instance_id == r"ROOT\Beta NIC\0000");
+
+        // 22: Enable the device.
+        let (mut page, mut screen) = (page_with(vec![broken("Off NIC", 22)], vec![]), Screen::new());
+        page.drv_ui.selected_device = Some(r"ROOT\Off NIC\0000".into());
+        let shown = screen.settle(&mut page);
+        assert!(drawn(&shown, "Code 22: The device is disabled."), "{shown:?}");
+        screen.click(&mut page, at(&shown, "Enable the device"), egui::PointerButton::Primary);
+        assert!(page.drv_ui.confirm_device.as_ref().is_some_and(|c| c.action == drivers::DeviceAction::Enable));
+
+        // 10: the page has no driver action for it without an offer, so it is advice only.
+        let (mut page, mut screen) = (page_with(vec![broken("Bad NIC", 10)], vec![]), Screen::new());
+        page.drv_ui.selected_device = Some(r"ROOT\Bad NIC\0000".into());
+        let shown = screen.settle(&mut page);
+        assert!(drawn(&shown, "Update or reinstall the driver"), "{shown:?}");
+        screen.click(&mut page, at(&shown, "Update or reinstall the driver"), egui::PointerButton::Primary);
+        assert!(page.drv_ui.confirm_device.is_none() && page.drv_ui.confirm_job.is_none(), "nothing to link to");
+    }
+
+    #[test]
+    fn a_working_device_has_no_problem_section_in_the_panel() {
+        let (mut page, mut screen) = (page_with(vec![device("Alpha NIC", "Net")], vec![]), Screen::new());
+        page.drv_ui.selected_device = Some(r"ROOT\Alpha NIC\0000".into());
+        let shown = screen.settle(&mut page);
+        assert!(!says(&shown, "Code ") && !drawn(&shown, "Try:"), "{shown:?}");
     }
 
     #[test]
