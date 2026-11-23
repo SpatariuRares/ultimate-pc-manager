@@ -237,23 +237,13 @@ pub trait Addon {
     /// that ran it (it may be this one). Told only while it is on, once per
     /// job; reload here what lists installed software (optional).
     fn packages_changed(&mut self, _by: &'static str) {}
-    /// What it can do now at the update speed `interval_ms` when it records
-    /// sensors for other add-ons' pages (Flight Recorder); `None`, the
-    /// default, for every other add-on. Asked even while it is off (the
-    /// host then says [`Recording::Off`]); keep it cheap.
-    fn sensor_recording(&self, _interval_ms: u64) -> Option<Recording> {
-        None
+    /// The capabilities it offers to other add-ons (optional); none by
+    /// default. The host asks only while it is on and not stopping, and the
+    /// first add-on in registry order that offers a capability answers
+    /// (see [`Offers`]).
+    fn offers(&mut self) -> Offers<'_> {
+        Offers::default()
     }
-    /// Starts (`on`) or stops its sensor recording for another add-on's
-    /// page, through its own Record and Stop (optional; refused by default).
-    /// Only called while it is on; see [`AddonHost::record_sensors`].
-    fn set_sensor_recording(&mut self, _on: bool, _page: &mut PageContext) -> Result<(), &'static str> {
-        Err(RECORDING_OFF)
-    }
-    /// Before its page is drawn: what the add-on that records sensors can
-    /// do now (optional), so the page can offer to record or stop with
-    /// [`crate::platform::Action::RecordSensors`].
-    fn recording_shown(&mut self, _recording: Recording) {}
     /// Its own settings, opaque to the host (optional). `Null`, the
     /// default, means it keeps none of its own and the host keeps the value
     /// last given to it. Saved with the add-on's entry, kept while it is off.
@@ -266,9 +256,29 @@ pub trait Addon {
     fn load_settings(&mut self, _settings: &serde_json::Value) {}
 }
 
+/// The capabilities an add-on offers to the others, one field each. To add
+/// a capability: a trait for it, a field here, and a host method that asks
+/// [`provider`] for it. An add-on offers one by filling its field in
+/// [`Addon::offers`].
+#[derive(Default)]
+pub struct Offers<'a> {
+    /// It records sensors for other add-ons' pages (Flight Recorder).
+    pub sensor_recorder: Option<&'a mut dyn SensorRecorder>,
+}
+
+/// The sensor recorder capability: what Power & Freq's "Record" talks to.
+pub trait SensorRecorder {
+    /// What it can do now at the update speed `interval_ms`; keep it cheap.
+    fn sensor_recording(&self, interval_ms: u64) -> Recording;
+    /// Starts (`on`) or stops its sensor recording for another add-on's
+    /// page, through its own Record and Stop (see
+    /// [`AddonHost::record_sensors`]).
+    fn set_sensor_recording(&mut self, on: bool, page: &mut PageContext) -> Result<(), &'static str>;
+}
+
 /// What the add-on that records sensors for other pages (Flight Recorder)
 /// can do now, as the host tells another add-on's page (see
-/// [`Addon::sensor_recording`] and [`Addon::recording_shown`]).
+/// [`SensorRecorder::sensor_recording`] and [`PageContext::recording`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Recording {
     /// It is off (or stopping, or not registered): nothing can be recorded.
@@ -513,17 +523,14 @@ struct Slot {
     settings: serde_json::Value,
 }
 
-/// What the first add-on among `slots` that records sensors can do now
-/// (see [`Addon::sensor_recording`]): Off while it is off or stopping, or
-/// when none of them records sensors.
-fn recording_of<'a>(slots: impl IntoIterator<Item = &'a Slot>, interval_ms: u64) -> Recording {
-    slots
-        .into_iter()
-        .find_map(|s| match &s.entry {
-            Entry::Addon(a) => a.sensor_recording(interval_ms).map(|r| if s.enabled && !s.stopping { r } else { Recording::Off }),
-            Entry::Core(_) => None,
-        })
-        .unwrap_or(Recording::Off)
+/// The capability the first add-on among `slots` that is on and not
+/// stopping offers (picked from its [`Offers`] by `pick`); None when none
+/// does. A disabled or stopping add-on offers nothing.
+fn provider<'s, T: ?Sized + 's>(slots: impl IntoIterator<Item = &'s mut Slot>, pick: impl Fn(Offers<'s>) -> Option<&'s mut T>) -> Option<&'s mut T> {
+    slots.into_iter().filter(|s| s.enabled && !s.stopping).find_map(|s| match &mut s.entry {
+        Entry::Addon(a) => pick(a.offers()),
+        Entry::Core(_) => None,
+    })
 }
 
 /// The page every invalid request falls back to.
@@ -1067,17 +1074,18 @@ impl AddonHost {
         let Entry::Addon(addon) = &mut slot.entry else {
             return false;
         };
-        // The page may ask the other add-ons that are on who owns a path.
+        // The page is told what the add-on that records sensors can do now.
+        let interval_ms = page.settings.interval_ms();
+        let recording = provider(before.iter_mut().chain(after.iter_mut()), |o| o.sensor_recorder).map_or(Recording::Off, |r| r.sensor_recording(interval_ms));
+        // And it may ask the other add-ons that are on who owns a path.
         let others = |path: &std::path::Path| {
             before.iter().chain(after.iter()).filter(|s| s.enabled && !s.stopping).find_map(|s| match &s.entry {
                 Entry::Addon(a) => a.owner_of(path).map(|label| crate::platform::Owner { addon: a.id(), page: a.name(), label }),
                 Entry::Core(_) => None,
             })
         };
-        // And what the add-on that records sensors can do now.
-        addon.recording_shown(recording_of(before.iter().chain(after.iter()), page.settings.interval_ms()));
         let id = addon.id();
-        let mut inner = PageContext { settings: page.settings, sample: page.sample, actions: std::mem::take(&mut page.actions), owners: Some(&others), lease: None };
+        let mut inner = PageContext { settings: page.settings, sample: page.sample, actions: std::mem::take(&mut page.actions), owners: Some(&others), lease: None, recording };
         // A stopping add-on is off: its page reads no sensors.
         inner.lease = (!slot.stopping).then(|| self.context.leases().lease(leases::Surface::Page(id)));
         addon.ui(ui, &mut inner);
@@ -1167,28 +1175,15 @@ impl AddonHost {
         }
     }
 
-    /// What the add-on that records sensors can do now at the update speed
-    /// `interval_ms` (see [`Addon::sensor_recording`]): [`Recording::Off`]
-    /// while it is off or stopping, or when none is registered.
-    pub fn sensor_recording(&self, interval_ms: u64) -> Recording {
-        recording_of(&self.slots, interval_ms)
-    }
-
     /// [`crate::platform::Action::RecordSensors`]: starts (`on`) or stops
     /// the sensor recording of the add-on that records sensors, through its
     /// own Record and Stop. Refused with [`RECORDING_OFF`] while it is off.
     pub fn record_sensors(&mut self, on: bool, page: &mut PageContext) -> Result<(), &'static str> {
-        let interval_ms = page.settings.interval_ms();
-        let recorder = self.slots.iter_mut().filter(|s| s.enabled && !s.stopping).find_map(|s| match &mut s.entry {
-            Entry::Addon(a) if a.sensor_recording(interval_ms).is_some() => Some(a),
-            _ => None,
-        });
-        match recorder {
-            Some(a) => a.set_sensor_recording(on, page),
+        match provider(&mut self.slots, |o| o.sensor_recorder) {
+            Some(recorder) => recorder.set_sensor_recording(on, page),
             None => Err(RECORDING_OFF),
         }
     }
-
     /// The sensors for a core surface (the Summary page), asked in this
     /// frame: the host keeps them while the surface asks and drops them at
     /// the end of the first frame it does not.
@@ -1656,15 +1651,90 @@ mod tests {
     /// once asked to start.
     struct Records(bool);
 
-    impl Addon for Records {
-        test_addon!("records", "Records", "Records sensors.");
-        fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
-        fn sensor_recording(&self, _interval_ms: u64) -> Option<Recording> {
-            Some(if self.0 { Recording::Running } else { Recording::Ready })
+    impl SensorRecorder for Records {
+        fn sensor_recording(&self, _interval_ms: u64) -> Recording {
+            if self.0 {
+                Recording::Running
+            } else {
+                Recording::Ready
+            }
         }
         fn set_sensor_recording(&mut self, on: bool, _page: &mut PageContext) -> Result<(), &'static str> {
             self.0 = on;
             Ok(())
+        }
+    }
+
+    impl Addon for Records {
+        test_addon!("records", "Records", "Records sensors.");
+        fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
+        fn offers(&mut self) -> Offers<'_> {
+            Offers { sensor_recorder: Some(self) }
+        }
+    }
+
+    /// A recorder with its own id, Ready until it is asked to start; it
+    /// notes in the log that it was started.
+    struct NamedRecorder(&'static str, std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+    impl SensorRecorder for NamedRecorder {
+        fn sensor_recording(&self, _interval_ms: u64) -> Recording {
+            Recording::Ready
+        }
+        fn set_sensor_recording(&mut self, on: bool, _page: &mut PageContext) -> Result<(), &'static str> {
+            if on {
+                self.1.lock().unwrap().push(self.0);
+            }
+            Ok(())
+        }
+    }
+
+    impl Addon for NamedRecorder {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn description(&self) -> &'static str {
+            "A named recorder."
+        }
+        fn requirements(&self) -> Requirements {
+            Requirements::default()
+        }
+        fn consumption(&self) -> Consumption {
+            Consumption { cpu: "None", network: "None", disk: "None", when: "Never" }
+        }
+        fn tier(&self) -> Tier {
+            Tier::Free
+        }
+        fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
+        fn offers(&mut self) -> Offers<'_> {
+            Offers { sensor_recorder: Some(self) }
+        }
+    }
+
+    /// A recorder in an operation that cannot be interrupted: turned off,
+    /// it is stopping.
+    struct RecorderKeeping;
+
+    impl SensorRecorder for RecorderKeeping {
+        fn sensor_recording(&self, _interval_ms: u64) -> Recording {
+            Recording::Ready
+        }
+        fn set_sensor_recording(&mut self, _on: bool, _page: &mut PageContext) -> Result<(), &'static str> {
+            Ok(())
+        }
+    }
+
+    impl Addon for RecorderKeeping {
+        test_addon!("keeping-recorder", "Keeping recorder", "Records and holds work.");
+        fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
+        fn offers(&mut self) -> Offers<'_> {
+            Offers { sensor_recorder: Some(self) }
+        }
+        fn uninterruptible(&self) -> bool {
+            true
         }
     }
 
@@ -1673,10 +1743,22 @@ mod tests {
 
     impl Addon for Shows {
         test_addon!("shows", "Shows", "Offers to record.");
-        fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
-        fn recording_shown(&mut self, recording: Recording) {
-            *self.0.lock().unwrap() = Some(recording);
+        fn ui(&mut self, _: &mut egui::Ui, page: &mut PageContext) {
+            *self.0.lock().unwrap() = Some(page.recording);
         }
+    }
+
+    /// What the page "shows" is told by `host` when it is drawn.
+    fn recording_shown_by(host: &mut AddonHost, told: &std::sync::Mutex<Option<Recording>>) -> Option<Recording> {
+        frame(|ui, page| {
+            host.ui("shows", ui, page);
+        });
+        told.lock().unwrap().take()
+    }
+
+    fn record(host: &mut AddonHost, on: bool) -> Result<(), &'static str> {
+        let (settings, sample) = (Settings::default(), Snapshot::default());
+        host.record_sensors(on, &mut PageContext::new(&settings, &sample))
     }
 
     #[test]
@@ -1684,31 +1766,52 @@ mod tests {
         let told = std::sync::Arc::default();
         let entries = vec![Entry::Addon(Box::new(Shows(std::sync::Arc::clone(&told)))), Entry::Addon(Box::new(Records(false)))];
         let (mut host, _) = AddonHost::for_tests_with(entries, &json!({}));
-        let shown = |host: &mut AddonHost| {
-            frame(|ui, page| {
-                host.ui("shows", ui, page);
-            });
-            told.lock().unwrap().take()
-        };
-        assert_eq!(host.sensor_recording(1000), Recording::Ready);
-        assert_eq!(shown(&mut host), Some(Recording::Ready), "the page is told before it is drawn");
-        let (settings, sample) = (Settings::default(), Snapshot::default());
-        assert_eq!(host.record_sensors(true, &mut PageContext::new(&settings, &sample)), Ok(()));
-        assert_eq!(host.sensor_recording(1000), Recording::Running);
-        assert_eq!(shown(&mut host), Some(Recording::Running), "the page follows the recorder's state");
-        assert_eq!(host.record_sensors(false, &mut PageContext::new(&settings, &sample)), Ok(()));
-        assert_eq!(host.sensor_recording(1000), Recording::Ready);
+        assert_eq!(recording_shown_by(&mut host, &told), Some(Recording::Ready), "the page is told before it is drawn");
+        assert_eq!(record(&mut host, true), Ok(()));
+        assert_eq!(recording_shown_by(&mut host, &told), Some(Recording::Running), "the page follows the recorder's state");
+        assert_eq!(record(&mut host, false), Ok(()));
+        assert_eq!(recording_shown_by(&mut host, &told), Some(Recording::Ready));
+    }
 
+    #[test]
+    fn a_disabled_recorder_says_off() {
+        let told = std::sync::Arc::default();
+        let entries = vec![Entry::Addon(Box::new(Shows(std::sync::Arc::clone(&told)))), Entry::Addon(Box::new(Records(false)))];
+        let (mut host, _) = AddonHost::for_tests_with(entries, &json!({}));
         host.set_enabled("records", false);
-        assert_eq!(host.sensor_recording(1000), Recording::Off);
-        assert_eq!(shown(&mut host), Some(Recording::Off), "off is told too");
-        assert_eq!(host.record_sensors(true, &mut PageContext::new(&settings, &sample)), Err(RECORDING_OFF), "nothing starts while it is off");
+        assert_eq!(recording_shown_by(&mut host, &told), Some(Recording::Off), "off is told too");
+        assert_eq!(record(&mut host, true), Err(RECORDING_OFF), "nothing starts while it is off");
     }
 
     #[test]
     fn without_an_addon_that_records_sensors_the_recording_is_off() {
-        let (host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Shows(std::sync::Arc::default())))], &json!({}));
-        assert_eq!(host.sensor_recording(1000), Recording::Off);
+        let told = std::sync::Arc::default();
+        let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Shows(std::sync::Arc::clone(&told))))], &json!({}));
+        assert_eq!(recording_shown_by(&mut host, &told), Some(Recording::Off));
+        assert_eq!(record(&mut host, true), Err(RECORDING_OFF));
+    }
+
+    #[test]
+    fn a_stopping_recorder_does_not_count() {
+        let told = std::sync::Arc::default();
+        let entries = vec![Entry::Addon(Box::new(Shows(std::sync::Arc::clone(&told)))), Entry::Addon(Box::new(RecorderKeeping))];
+        let (mut host, _) = AddonHost::for_tests_with(entries, &json!({}));
+        assert_eq!(recording_shown_by(&mut host, &told), Some(Recording::Ready), "on: it counts");
+        host.set_enabled("keeping-recorder", false);
+        assert_eq!(recording_shown_by(&mut host, &told), Some(Recording::Off), "stopping: it does not count");
+        assert_eq!(record(&mut host, true), Err(RECORDING_OFF));
+    }
+
+    #[test]
+    fn with_two_recorders_the_first_in_registry_order_answers() {
+        let log = std::sync::Arc::default();
+        let entries = vec![Entry::Addon(Box::new(NamedRecorder("first", std::sync::Arc::clone(&log)))), Entry::Addon(Box::new(NamedRecorder("second", std::sync::Arc::clone(&log))))];
+        let (mut host, _) = AddonHost::for_tests_with(entries, &json!({}));
+        assert_eq!(record(&mut host, true), Ok(()));
+        assert_eq!(*log.lock().unwrap(), ["first"]);
+        host.set_enabled("first", false);
+        assert_eq!(record(&mut host, true), Ok(()));
+        assert_eq!(*log.lock().unwrap(), ["first", "second"], "with the first off, the next one answers");
     }
 
     /// An add-on that notes which of its hooks the host called.

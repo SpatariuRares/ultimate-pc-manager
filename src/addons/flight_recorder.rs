@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use egui::{RichText, Ui};
 
-use crate::addons::{read_settings, write_settings, Addon, Consumption, Recording, Requirements};
+use crate::addons::{read_settings, write_settings, Addon, Consumption, Offers, Recording, Requirements, SensorRecorder};
 use crate::platform::{Action, AddonContext, PageContext};
 use crate::sampler::Snapshot;
 use crate::sensors::npu;
@@ -100,7 +100,7 @@ pub const OFF_RECORDING: &str = "A recording is running. Save the trace first?";
 pub const OFF_UNSAVED: &str = "The last trace is not saved. Save it first?";
 
 /// What its Record can do for another add-on's page (see
-/// [`Addon::sensor_recording`]): Running while it records; Locked while a
+/// [`SensorRecorder::sensor_recording`]): Running while it records; Locked while a
 /// replay is open (`replaying`) or Record is `blocked`; Ready otherwise.
 pub fn recording_state(recording: bool, replaying: bool, blocked: Option<&'static str>) -> Recording {
     if recording {
@@ -553,20 +553,9 @@ impl Addon for FlightRecorder {
     }
 
     /// It records sensors for other pages (Power & Freq's "Record with
-    /// Flight Recorder"): see [`recording_state`].
-    fn sensor_recording(&self, interval_ms: u64) -> Option<Recording> {
-        Some(recording_state(self.is_recording(), self.is_replaying(), self.record_blocked(interval_ms)))
-    }
-
-    /// Record (with the sensors) or Stop (which opens the Save dialog),
-    /// exactly as its own buttons do.
-    fn set_sensor_recording(&mut self, on: bool, page: &mut PageContext) -> Result<(), &'static str> {
-        if on {
-            self.record(page.settings.interval_ms(), page.sample)
-        } else {
-            self.stop_recording(&mut page.actions);
-            Ok(())
-        }
+    /// Flight Recorder").
+    fn offers(&mut self) -> Offers<'_> {
+        Offers { sensor_recorder: Some(self) }
     }
 
     fn settings(&self) -> serde_json::Value {
@@ -678,6 +667,24 @@ impl Addon for FlightRecorder {
             None
         };
         self.page(ui, page);
+    }
+}
+
+/// What other pages see of it and ask of it: see [`recording_state`]. Record
+/// (with the sensors) or Stop (which opens the Save dialog), exactly as its
+/// own buttons do.
+impl SensorRecorder for FlightRecorder {
+    fn sensor_recording(&self, interval_ms: u64) -> Recording {
+        recording_state(self.is_recording(), self.is_replaying(), self.record_blocked(interval_ms))
+    }
+
+    fn set_sensor_recording(&mut self, on: bool, page: &mut PageContext) -> Result<(), &'static str> {
+        if on {
+            self.record(page.settings.interval_ms(), page.sample)
+        } else {
+            self.stop_recording(&mut page.actions);
+            Ok(())
+        }
     }
 }
 
@@ -1554,18 +1561,18 @@ mod tests {
         let mut fr = started();
         let (settings, s) = (crate::settings::Settings::default(), sample(1.0));
         let mut page = PageContext::new(&settings, &s);
-        assert_eq!(fr.sensor_recording(NORMAL), Some(Recording::Ready));
+        assert_eq!(fr.sensor_recording(NORMAL), Recording::Ready);
         assert_eq!(fr.set_sensor_recording(true, &mut page), Ok(()));
         assert!(fr.is_recording());
         assert!(fr.recording_sensors.is_some(), "the recording holds its sensor interest");
         assert_eq!(fr.threads(), 1);
-        assert_eq!(fr.sensor_recording(NORMAL), Some(Recording::Running));
+        assert_eq!(fr.sensor_recording(NORMAL), Recording::Running);
         assert_eq!(fr.set_sensor_recording(true, &mut page), Err(ALREADY_RECORDING));
         assert_eq!(fr.set_sensor_recording(false, &mut page), Ok(()));
         assert!(!fr.is_recording());
         assert_eq!(fr.threads(), 0);
         assert!(fr.has_unsaved(), "Stop offers to save it (no dialog in tests)");
-        assert_eq!(fr.sensor_recording(NORMAL), Some(Recording::Locked(SAVE_OR_DISCARD_FIRST)));
+        assert_eq!(fr.sensor_recording(NORMAL), Recording::Locked(SAVE_OR_DISCARD_FIRST));
     }
 
     #[test]
@@ -1574,7 +1581,7 @@ mod tests {
         assert_eq!(fr.record(NORMAL, &sample(1.0)), Ok(()));
         assert_eq!(fr.record(NORMAL, &sample(1.0)), Err(ALREADY_RECORDING));
         assert!(fr.recording_sensors.is_some());
-        assert_eq!(fr.sensor_recording(NORMAL), Some(Recording::Running), "another page sees its own recording");
+        assert_eq!(fr.sensor_recording(NORMAL), Recording::Running, "another page sees its own recording");
         fr.stop_recording(&mut Vec::new());
         assert!(!fr.is_recording());
         assert!(fr.recording_sensors.is_none());
@@ -1586,10 +1593,12 @@ mod tests {
     #[test]
     fn the_host_says_off_once_it_is_turned_off() {
         let mut host = recording_host();
-        assert_eq!(host.sensor_recording(NORMAL), Recording::Running);
+        let (settings, s) = (crate::settings::Settings::default(), sample(1.0));
+        let record = |host: &mut crate::addons::AddonHost| host.record_sensors(true, &mut PageContext::new(&settings, &s));
+        assert_eq!(record(&mut host), Err(ALREADY_RECORDING), "it answers while it is on");
         host.set_enabled("flight-recorder", false);
         host.answer_off(crate::addons::OffAnswer::Discard);
-        assert_eq!(host.sensor_recording(NORMAL), Recording::Off);
+        assert_eq!(record(&mut host), Err(crate::addons::RECORDING_OFF), "the host says off");
     }
 
     #[test]

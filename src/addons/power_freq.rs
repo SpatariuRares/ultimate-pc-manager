@@ -705,10 +705,6 @@ impl Addon for PowerFreq {
         }
     }
 
-    fn recording_shown(&mut self, recording: Recording) {
-        self.recording = recording;
-    }
-
     /// The values of the whole PC this PC reads ([`tile_lines`]).
     fn summary(&mut self, ui: &mut Ui, page: &mut PageContext) {
         self.tile_on = self.prefs.summary_tile;
@@ -938,6 +934,7 @@ impl PowerFreq {
     /// records; pressed, it asks the app through the add-on host.
     fn record_row(&mut self, ui: &mut Ui, page: &mut PageContext) {
         let sub = page.sub_text();
+        self.recording = page.recording; // what the host says Flight Recorder can do now
         ui.horizontal(|ui| {
             let pressed = match record_action(self.recording) {
                 RecordAction::Record(reason) => {
@@ -1328,11 +1325,11 @@ mod tests {
     fn pressing_the_action_asks_the_host_to_start_or_stop_the_recording() {
         let mut p = PowerFreq::default();
         assert_eq!(p.record_request(), None, "Flight Recorder is off until the host says otherwise");
-        p.recording_shown(Recording::Ready);
+        p.recording = Recording::Ready;
         assert_eq!(p.record_request(), Some(Action::RecordSensors(true)));
-        p.recording_shown(Recording::Running);
+        p.recording = Recording::Running;
         assert_eq!(p.record_request(), Some(Action::RecordSensors(false)));
-        p.recording_shown(Recording::Locked(crate::addons::flight_recorder::SAVE_OR_DISCARD_FIRST));
+        p.recording = Recording::Locked(crate::addons::flight_recorder::SAVE_OR_DISCARD_FIRST);
         assert_eq!(p.record_request(), None);
     }
 
@@ -2050,9 +2047,6 @@ mod tests {
         }
         fn summary_hidden(&mut self) {
             self.0.lock().unwrap().summary_hidden();
-        }
-        fn recording_shown(&mut self, recording: Recording) {
-            self.0.lock().unwrap().recording_shown(recording);
         }
         fn summary(&mut self, ui: &mut Ui, page: &mut PageContext) {
             self.0.lock().unwrap().summary(ui, page);
