@@ -5,6 +5,7 @@ use egui::{Align, Layout, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 
 use crate::addons::Core;
+use crate::availability::{is_available, Feature};
 use crate::core_page::{page_title, CorePage, PageCtx};
 use crate::list_pages::{fact_values, panel_title, summary_band, GAP};
 use crate::platform::Action;
@@ -64,10 +65,13 @@ impl CorePage for ServicesPage {
                     self.reload(ctx.system);
                 }
                 let sel = self.selected.clone();
-                for (label, what) in SERVICE_ACTIONS.into_iter().rev() {
-                    if parts::header_button(ui, label, sel.is_some()).clicked() {
-                        if let Some(n) = &sel {
-                            actions.push(Action::Service(n.clone(), what));
+                // Control is hidden, not disabled, where the system has none.
+                if is_available(Feature::ServiceControl) {
+                    for (label, what) in SERVICE_ACTIONS.into_iter().rev() {
+                        if parts::header_button(ui, label, sel.is_some()).clicked() {
+                            if let Some(n) = &sel {
+                                actions.push(Action::Service(n.clone(), what));
+                            }
                         }
                     }
                 }
@@ -84,7 +88,15 @@ impl CorePage for ServicesPage {
             }
             None => Vec::new(),
         };
-        summary_band(ui, Mark::None, &services_headline(&list), "From the Service Control Manager, read when the page opens, on Refresh and after each start, stop or restart.");
+        // Rows that carry a scope come from the system's service managers
+        // (not the Service Control Manager).
+        let scoped = list.iter().any(|s| !s.scope.is_empty());
+        let source_note = if scoped {
+            "From the service managers of this system, read when the page opens and on Refresh."
+        } else {
+            "From the Service Control Manager, read when the page opens, on Refresh and after each start, stop or restart."
+        };
+        summary_band(ui, Mark::None, &services_headline(&list), source_note);
         let q = self.search.trim().to_lowercase();
         // By name or display name, or by the PID of the host (Go to
         // service(s) from Processes filters by it).
@@ -99,7 +111,7 @@ impl CorePage for ServicesPage {
             |ui, _| {
                 let mut new_sel = None;
                 design_table(ui, |ui| {
-                    TableBuilder::new(ui)
+                    let mut table = TableBuilder::new(ui)
                         .resizable(true)
                         .sense(Sense::click())
                         .cell_layout(Layout::left_to_right(Align::Center))
@@ -107,9 +119,15 @@ impl CorePage for ServicesPage {
                         .column(Column::initial(60.0))
                         .column(Column::remainder().at_least(120.0).clip(true))
                         .column(Column::initial(90.0))
-                        .column(Column::initial(100.0).clip(true))
+                        .column(Column::initial(100.0).clip(true));
+                    let mut headings = vec!["Name", "PID", "Description", "Status", "Start type"];
+                    if scoped {
+                        table = table.column(Column::initial(70.0));
+                        headings.push("Scope");
+                    }
+                    table
                         .header(TABLE_HEADER_HEIGHT, |mut h| {
-                            for t in ["Name", "PID", "Description", "Status", "Start type"] {
+                            for t in headings {
                                 h.col(|ui| column_heading(ui, t));
                             }
                         })
@@ -134,18 +152,29 @@ impl CorePage for ServicesPage {
                                 row.col(|ui| {
                                     cell_text(ui, &s.start_type, CellInk::Soft, on);
                                 });
+                                if scoped {
+                                    row.col(|ui| {
+                                        cell_text(ui, &s.scope, CellInk::Soft, on);
+                                    });
+                                }
                                 let r = row.response();
                                 if r.clicked() || r.secondary_clicked() {
                                     new_sel = Some(s.name.clone());
                                 }
                                 r.context_menu(|ui| {
-                                    for (label, what) in SERVICE_ACTIONS {
-                                        if ui.button(label).clicked() {
-                                            actions.push(Action::Service(s.name.clone(), what));
-                                            ui.close();
+                                    if is_available(Feature::ServiceControl) {
+                                        for (label, what) in SERVICE_ACTIONS {
+                                            if ui.button(label).clicked() {
+                                                actions.push(Action::Service(s.name.clone(), what));
+                                                ui.close();
+                                            }
                                         }
+                                        ui.separator();
                                     }
-                                    ui.separator();
+                                    if has_process_jump(s) && ui.button(GO_TO_PROCESS).clicked() {
+                                        actions.push(Action::GoToProcess(s.pid));
+                                        ui.close();
+                                    }
                                     if ui.button("Copy name").clicked() {
                                         actions.push(Action::Copy(s.name.clone()));
                                         ui.close();
@@ -164,7 +193,7 @@ impl CorePage for ServicesPage {
                 let name = new_sel.as_ref().or(selected.as_ref());
                 let chosen = name.and_then(|n| list.iter().find(|s| &s.name == n));
                 SidePanel::new("svc-detail").show(ui, chosen, |ui, s| {
-                    panel_action = service_detail(ui, s).map(|what| Action::Service(s.name.clone(), what));
+                    panel_action = service_detail(ui, s).map(|what| if what == GO_TO_PROCESS_ACTION { Action::GoToProcess(s.pid) } else { Action::Service(s.name.clone(), what) });
                 });
             },
         );
@@ -180,18 +209,42 @@ impl CorePage for ServicesPage {
 fn service_detail(ui: &mut Ui, s: &ServiceRow) -> Option<&'static str> {
     panel_title(ui, &s.name);
     let pid = if s.pid > 0 { s.pid.to_string() } else { String::new() };
-    let values = [s.display.as_str(), pid.as_str(), s.status.as_str(), s.start_type.as_str()];
-    facts(ui, &["Description", "PID", "Status", "Start type"], |ui, i| fact_values(ui, &values, i));
+    let mut labels = vec!["Description", "PID", "Status", "Start type"];
+    let mut values = vec![s.display.as_str(), pid.as_str(), s.status.as_str(), s.start_type.as_str()];
+    if !s.scope.is_empty() {
+        labels.push("Scope");
+        values.push(s.scope.as_str());
+    }
+    if !s.source.is_empty() {
+        labels.push("Source");
+        values.push(s.source.as_str());
+    }
+    facts(ui, &labels, |ui, i| fact_values(ui, &values, i));
     ui.add_space(8.0);
     let mut clicked = None;
     ui.horizontal(|ui| {
-        for (label, what) in SERVICE_ACTIONS {
-            if parts::outline_button(ui, label, true).clicked() {
-                clicked = Some(what);
+        if is_available(Feature::ServiceControl) {
+            for (label, what) in SERVICE_ACTIONS {
+                if parts::outline_button(ui, label, true).clicked() {
+                    clicked = Some(what);
+                }
             }
+        }
+        if has_process_jump(s) && parts::outline_button(ui, GO_TO_PROCESS, true).clicked() {
+            clicked = Some(GO_TO_PROCESS_ACTION);
         }
     });
     clicked
+}
+
+/// The jump to Processes: the words and the panel's answer for it.
+const GO_TO_PROCESS: &str = "Go to process";
+const GO_TO_PROCESS_ACTION: &str = "go-to-process";
+
+/// A service that runs shows the jump to its process when its manager says
+/// which one (rows with a source; the Windows list keeps its look).
+fn has_process_jump(s: &ServiceRow) -> bool {
+    s.pid > 0 && !s.source.is_empty()
 }
 
 /// "339 services (152 running, 187 stopped)".
@@ -209,7 +262,7 @@ mod tests {
     use crate::widgets::parts::EMPTY_DETAIL;
 
     fn service(status: &str) -> ServiceRow {
-        ServiceRow { name: "Svc".into(), display: String::new(), pid: 0, status: status.into(), start_type: "Manual".into() }
+        ServiceRow { name: "Svc".into(), display: String::new(), pid: 0, status: status.into(), start_type: "Manual".into(), ..Default::default() }
     }
 
     fn running(name: &str) -> ServiceRow {
@@ -232,7 +285,7 @@ mod tests {
     #[test]
     fn the_services_side_panel_shows_the_chosen_service_and_its_actions() {
         let env = Env::new();
-        let wsearch = ServiceRow { name: "WSearch".into(), display: "Windows Search".into(), pid: 14192, status: "Running".into(), start_type: "Automatic".into() };
+        let wsearch = ServiceRow { name: "WSearch".into(), display: "Windows Search".into(), pid: 14192, status: "Running".into(), start_type: "Automatic".into(), ..Default::default() };
         env.system.script_services(vec![wsearch, service("Stopped")]);
         let mut page = ServicesPage::default();
         let ui = ui_ctx();
@@ -249,13 +302,62 @@ mod tests {
 
     #[test]
     fn the_services_panel_holds_the_rows_fields() {
-        let s = ServiceRow { name: "WSearch".into(), display: "Windows Search".into(), pid: 14192, status: "Running".into(), start_type: "Automatic".into() };
+        let s = ServiceRow { name: "WSearch".into(), display: "Windows Search".into(), pid: 14192, status: "Running".into(), start_type: "Automatic".into(), ..Default::default() };
         let shown = words(|ui| {
             service_detail(ui, &s);
         });
         for w in ["WSearch", "Description", "Windows Search", "PID", "14192", "Status", "Running", "Start type", "Automatic", "Start", "Stop", "Restart"] {
             assert!(has(&shown, w), "{w} in {shown:?}");
         }
+    }
+
+    fn systemd_row(name: &str, scope: &str, pid: u32) -> ServiceRow {
+        ServiceRow { name: name.into(), display: "A daemon".into(), pid, status: "Running".into(), start_type: "Enabled".into(), source: "systemd".into(), scope: scope.into() }
+    }
+
+    #[test]
+    fn rows_with_a_scope_show_it_in_the_list_and_the_panel_with_their_source() {
+        let env = Env::new();
+        env.system.script_services(vec![systemd_row("ssh.service", "System", 812), systemd_row("pipewire.service", "User", 2210)]);
+        let mut page = ServicesPage::default();
+        page.show(Some("pipewire.service".into()), String::new());
+        let shown = texts(&ui_ctx(), &mut page, &env.ctx());
+        for w in ["Scope", "System", "User", "Source", "systemd", "2210"] {
+            assert!(has(&shown, w), "{w} in {shown:?}");
+        }
+        let windows_like = texts(&ui_ctx(), &mut ServicesPage::default(), &Env::new().ctx());
+        assert!(!has(&windows_like, "Scope"), "a list without scopes keeps the Windows columns: {windows_like:?}");
+    }
+
+    #[test]
+    fn a_running_service_of_a_manager_links_to_its_process() {
+        let s = systemd_row("ssh.service", "System", 812);
+        let shown = words(|ui| {
+            service_detail(ui, &s);
+        });
+        assert!(has(&shown, GO_TO_PROCESS), "{shown:?}");
+        let stopped = ServiceRow { pid: 0, status: "Stopped".into(), ..s };
+        assert!(!has(&words(|ui| {
+            service_detail(ui, &stopped);
+        }), GO_TO_PROCESS), "no process, no jump");
+        let windows = ServiceRow { name: "WSearch".into(), pid: 14192, ..service("Running") };
+        assert!(!has(&words(|ui| {
+            service_detail(ui, &windows);
+        }), GO_TO_PROCESS), "the Windows panel is unchanged");
+    }
+
+    #[test]
+    fn control_is_hidden_where_the_system_has_none_and_the_jump_stays() {
+        let _guard = crate::availability::unavailable_in_test(&[Feature::ServiceControl]);
+        let env = Env::new();
+        env.system.script_services(vec![systemd_row("ssh.service", "System", 812)]);
+        let mut page = ServicesPage::default();
+        page.show(Some("ssh.service".into()), String::new());
+        let shown = texts(&ui_ctx(), &mut page, &env.ctx());
+        for action in ["Start", "Stop", "Restart"] {
+            assert!(!has(&shown, action), "{action} hidden: {shown:?}");
+        }
+        assert!(has(&shown, GO_TO_PROCESS) && has(&shown, "ssh.service"), "{shown:?}");
     }
 
     #[test]

@@ -44,7 +44,9 @@ features! {
     Elevation,
     /// Desktop notifications.
     Notifications,
-    /// Listing and controlling services.
+    /// Listing the services the system runs.
+    ServiceListing,
+    /// Starting, stopping and restarting services.
     ServiceControl,
     /// Priority, affinity, suspend and efficiency of processes.
     ProcessControl,
@@ -92,12 +94,21 @@ fn reason(feature: Feature) -> Option<&'static str> {
 }
 
 /// Whether this system has the feature at all.
-pub(crate) fn system_has(_feature: Feature) -> bool {
+pub(crate) fn system_has(feature: Feature) -> bool {
     #[cfg(windows)]
-    return true;
-    // No current feature has a Linux or macOS implementation yet.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    return false;
+    return {
+        let _ = feature;
+        true
+    };
+    // Linux has the service list (its sources say when no service manager
+    // is there); macOS has no feature implemented yet.
+    #[cfg(target_os = "linux")]
+    return matches!(feature, Feature::ServiceListing);
+    #[cfg(target_os = "macos")]
+    return {
+        let _ = feature;
+        false
+    };
 }
 
 /// Is the feature available on this system.
@@ -182,9 +193,17 @@ mod tests {
         assert_eq!(unavailable_features(), Vec::<Feature>::new());
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn no_current_feature_is_in_the_system_off_windows() {
+    fn on_linux_the_service_list_is_there_and_service_control_is_not_yet() {
+        for &feature in Feature::ALL {
+            assert_eq!(system_has(feature), feature == Feature::ServiceListing, "{feature:?}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn no_current_feature_is_in_the_system_on_macos() {
         for &feature in Feature::ALL {
             assert!(!system_has(feature), "{feature:?}");
         }

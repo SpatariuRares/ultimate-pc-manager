@@ -5,6 +5,12 @@
 //! submodules read and control the services (Linux and macOS report that
 //! they are not available yet).
 
+// The service managers a Linux system can run (tested on every system).
+#[cfg(any(target_os = "linux", test))]
+mod sources;
+#[cfg(any(target_os = "linux", test))]
+mod systemd;
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
