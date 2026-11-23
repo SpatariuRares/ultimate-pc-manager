@@ -92,11 +92,15 @@ fn reason(feature: Feature) -> Option<&'static str> {
 }
 
 /// Whether this system has the feature at all.
-pub(crate) fn system_has(_feature: Feature) -> bool {
+pub(crate) fn system_has(feature: Feature) -> bool {
+    let _ = feature;
     #[cfg(windows)]
     return true;
-    // No current feature has a Linux or macOS implementation yet.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // Linux has the startup entries; every other feature is Windows-only for
+    // now. macOS has none yet.
+    #[cfg(target_os = "linux")]
+    return matches!(feature, Feature::StartupEntries);
+    #[cfg(target_os = "macos")]
     return false;
 }
 
@@ -184,9 +188,10 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn no_current_feature_is_in_the_system_off_windows() {
+    fn only_the_features_with_an_implementation_are_in_the_system_off_windows() {
         for &feature in Feature::ALL {
-            assert!(!system_has(feature), "{feature:?}");
+            let has = cfg!(target_os = "linux") && matches!(feature, Feature::StartupEntries);
+            assert_eq!(system_has(feature), has, "{feature:?}");
         }
     }
 

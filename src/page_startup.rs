@@ -74,7 +74,7 @@ impl CorePage for StartupPage {
             return;
         }
         let off = list.iter().filter(|r| !r.enabled).count();
-        let sub = format!("{off} of them are turned off. From the Run keys and Startup folders, read when the page opens and on Refresh.");
+        let sub = format!("{off} of them are turned off. {}, read when the page opens and on Refresh.", startup_sources());
         summary_band(ui, Mark::None, &startup_headline(&list), &sub);
         let selected = self.selected;
         let mut panel_action = None;
@@ -125,7 +125,7 @@ impl CorePage for StartupPage {
                                         ui.close();
                                     }
                                     if ui.button("Open file location").clicked() {
-                                        actions.push(Action::OpenLocation(first_path(&r.command)));
+                                        actions.push(Action::OpenLocation(location_target(r)));
                                         ui.close();
                                     }
                                     if ui.button("Search online").clicked() {
@@ -162,6 +162,25 @@ fn startup_detail(ui: &mut Ui, r: &StartupRow) -> bool {
     facts(ui, &["Status", "Location", "Command"], |ui, i| fact_values(ui, &values, i));
     ui.add_space(8.0);
     parts::outline_button(ui, if r.enabled { "Disable" } else { "Enable" }, true).clicked()
+}
+
+/// What "Open file location" shows for a row: the file the entry lives in
+/// when its source has one, else the program its command starts.
+fn location_target(r: &StartupRow) -> String {
+    if r.file.is_empty() {
+        first_path(&r.command)
+    } else {
+        r.file.clone()
+    }
+}
+
+/// Where the list comes from, as the band says it.
+fn startup_sources() -> &'static str {
+    if cfg!(windows) {
+        "From the Run keys and Startup folders"
+    } else {
+        "From the autostart folders of the user and the system"
+    }
 }
 
 /// "9 of 32 startup apps are enabled".
@@ -219,6 +238,14 @@ mod tests {
         assert!(!has(&chosen, EMPTY_DETAIL));
         assert_eq!(chosen.iter().filter(|w| *w == "HKCU Run").count(), 2, "the location in the list and in the panel");
         assert_eq!(chosen.iter().filter(|w| *w == "Disable").count(), 2, "Disable in the header and in the panel");
+    }
+
+    #[test]
+    fn open_file_location_shows_the_entrys_own_file_when_it_has_one_else_the_program() {
+        let desktop = StartupRow { command: "notes --background".into(), file: "/home/u/.config/autostart/notes.desktop".into(), ..Default::default() };
+        assert_eq!(location_target(&desktop), "/home/u/.config/autostart/notes.desktop");
+        let run = StartupRow { command: r#""C:\Tools\tool.exe" -x"#.into(), ..Default::default() };
+        assert_eq!(location_target(&run), r"C:\Tools\tool.exe");
     }
 
     #[test]
