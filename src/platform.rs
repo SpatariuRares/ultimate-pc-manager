@@ -155,7 +155,7 @@ pub struct Owner {
 }
 
 /// Asks the add-ons that are on who owns a path.
-pub type Owners<'a> = &'a dyn Fn(&std::path::Path) -> Option<Owner>;
+pub type Owners<'a> = &'a std::cell::RefCell<dyn FnMut(&std::path::Path) -> Option<Owner> + 'a>;
 
 /// What an add-on gets while it draws (its page, Summary tile or settings
 /// section): the latest performance sample, the global settings (theme,
@@ -185,7 +185,7 @@ impl<'a> PageContext<'a> {
     /// The row of another add-on that is on which owns `path` (None when
     /// no add-on that is on claims it).
     pub fn owner_of(&self, path: &std::path::Path) -> Option<Owner> {
-        self.owners.and_then(|ask| ask(path))
+        self.owners.and_then(|ask| (ask.borrow_mut())(path))
     }
 
     /// The shared sensor service, for what is drawn now: the latest frame,

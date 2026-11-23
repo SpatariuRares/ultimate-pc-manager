@@ -205,15 +205,6 @@ pub trait Addon {
     fn command_line(&mut self, _args: &[String]) -> bool {
         false
     }
-    /// The name of its row that owns `path` (e.g. the installed app whose
-    /// folder holds it), so another add-on's page can link to it
-    /// (optional; none by default). Asked only while it is on; keep it cheap.
-    fn owner_of(&self, _path: &std::path::Path) -> Option<String> {
-        None
-    }
-    /// Shows the row that owns `path` on its page (after
-    /// [`Addon::owner_of`] named it); the app then opens the page.
-    fn reveal(&mut self, _path: &std::path::Path) {}
     /// "Packages changed": a job of the install queue (see
     /// [`AddonContext::install_queue`]) ended; `by` is the id of the add-on
     /// that ran it (it may be this one). Told only while it is on, once per
@@ -249,7 +240,11 @@ pub struct Offers<'a> {
     /// It adds a column to the Processes table and an item to a process's
     /// menu (Connections).
     pub process_column: Option<&'a mut dyn ProcessColumnProvider>,
+    /// It owns paths (the installed app whose folder holds one), so other
+    /// add-ons' pages can link to its row (Installed Apps).
+    pub path_owner: Option<&'a mut dyn PathOwner>,
 }
+
 
 /// The Processes column capability: a column in the Processes table and an
 /// item in a process's menu, only while the add-on that offers it is on.
@@ -268,6 +263,17 @@ pub trait ProcessColumnProvider {
     /// Opens its page on the process `pid` (its menu item was chosen); the
     /// app then opens the page.
     fn reveal_process(&mut self, pid: u32);
+}
+
+
+/// The owner-of-paths capability: what Disk Space's link to a row talks to.
+pub trait PathOwner {
+    /// The name of its row that owns `path` (e.g. the installed app whose
+    /// folder holds it). Asked while it is on; keep it cheap.
+    fn owner_of(&self, path: &std::path::Path) -> Option<String>;
+    /// Shows the row that owns `path` on its page (after
+    /// [`PathOwner::owner_of`] named it); the app then opens the page.
+    fn reveal(&mut self, path: &std::path::Path);
 }
 
 /// The sensor recorder capability: what Power & Freq's "Record" talks to.
@@ -1090,12 +1096,15 @@ impl AddonHost {
         let interval_ms = page.settings.interval_ms();
         let recording = provider(before.iter_mut().chain(after.iter_mut()), |o| o.sensor_recorder).map_or(Recording::Off, |r| r.sensor_recording(interval_ms));
         // And it may ask the other add-ons that are on who owns a path.
-        let others = |path: &std::path::Path| {
-            before.iter().chain(after.iter()).filter(|s| s.enabled && !s.stopping).find_map(|s| match &s.entry {
-                Entry::Addon(a) => a.owner_of(path).map(|label| crate::platform::Owner { addon: a.id(), page: a.name(), label }),
+        let others = std::cell::RefCell::new(|path: &std::path::Path| {
+            before.iter_mut().chain(after.iter_mut()).filter(|s| s.enabled && !s.stopping).find_map(|s| match &mut s.entry {
+                Entry::Addon(a) => {
+                    let (id, name) = (a.id(), a.name());
+                    a.offers().path_owner.and_then(|o| o.owner_of(path)).map(|label| crate::platform::Owner { addon: id, page: name, label })
+                }
                 Entry::Core(_) => None,
             })
-        };
+        });
         let id = addon.id();
         let mut inner = PageContext { settings: page.settings, sample: page.sample, actions: std::mem::take(&mut page.actions), owners: Some(&others), lease: None, recording };
         // A stopping add-on is off: its page reads no sensors.
@@ -1147,11 +1156,12 @@ impl AddonHost {
     }
 
     /// Shows the row of the add-on `id` that owns `path` (see
-    /// [`Addon::reveal`]). False (and nothing done) when it is off.
+    /// [`PathOwner::reveal`]). False (and nothing done) when it is off or
+    /// does not offer owning paths.
     pub fn reveal(&mut self, id: &str, path: &std::path::Path) -> bool {
-        match self.enabled_addon(id) {
-            Some(addon) => {
-                addon.reveal(path);
+        match self.enabled_addon(id).and_then(|addon| addon.offers().path_owner) {
+            Some(owner) => {
+                owner.reveal(path);
                 true
             }
             None => false,
@@ -1380,6 +1390,12 @@ mod tests {
     impl Addon for Owns {
         test_addon!("owns", "Owns", "Owns a folder.");
         fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
+        fn offers(&mut self) -> Offers<'_> {
+            Offers { path_owner: Some(self), ..Offers::default() }
+        }
+    }
+
+    impl PathOwner for Owns {
         fn owner_of(&self, path: &std::path::Path) -> Option<String> {
             path.starts_with(r"C:\Apps\Tool").then(|| "Tool".to_string())
         }
