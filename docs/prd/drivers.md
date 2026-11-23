@@ -111,6 +111,12 @@ A compact read-only "Security" strip under the status band shows Memory integrit
 - The values are read with normal rights, in process, in the same read as the driver listing; nothing is written and no elevated job is added. When the add-on is turned off the read is dropped and nothing new starts.
 - "Open Windows Security" opens `windowsdefender://coreisolation`; the strip says "Read-only: change them in Windows Security."
 
+### Filter drivers (spec #11, #33)
+A "Filter drivers" tab lists the loaded file-system minifilters read-only: name, altitude, instances and frame, highest altitude first like `fltmc filters`, with a "Filter name" search.
+- They are read in process with `FilterFindFirst`/`FilterFindNext` (Filter Manager user API), in the same read as the driver listing, with normal rights.
+- When Windows refuses without administrator rights the tab says "Needs administrator rights to list filters."; the page never asks for rights on its own.
+- There is no unload or other action. When the add-on is turned off the read is dropped and nothing new starts; no elevated job is added.
+
 ### Behavior as an add-on
 54. As a user, I want to turn Drivers on or off from the Add-ons page in Settings, so that I keep the app light if I do not need it. *(our addition)*
 55. As a user, I want the add-on, when off, not to appear in the side menu nor be reachable with `--page "Drivers"`, so that it is truly absent. *(our addition)*

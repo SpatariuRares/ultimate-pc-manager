@@ -447,6 +447,9 @@ pub struct State {
     /// The last read of the security settings; `None` until the first
     /// listing has read them.
     pub security: Option<SecurityReading>,
+    /// The last read of the loaded filters; `None` until the first listing
+    /// has read them.
+    pub filters: Option<Arc<super::filters::FilterRead>>,
 }
 
 #[derive(Clone)]
@@ -531,6 +534,7 @@ impl Hub {
             // A system without drivers says so; it never reads as an empty
             // list. Each tab shows its own list's error, so both get it.
             if let Some(why) = unavailable_text(Feature::DeviceSetupApi) {
+                st.filters = Some(Arc::new(super::filters::FilterRead::Failed(why.clone())));
                 publish_listing(&mut st, Err(why.clone()), Err(why));
                 st.listed_at = crate::platform::clock_now();
                 return;
@@ -551,9 +555,14 @@ impl Hub {
             return;
         }
         let security = self.reader.security();
+        if self.live().is_none() {
+            return;
+        }
+        let filters = self.reader.filters();
         let Some(mut st) = self.live() else { return };
         publish_listing(&mut st, devices, kernel);
         st.security = Some(security);
+        st.filters = Some(Arc::new(filters));
         st.listed_at = crate::platform::clock_now();
     }
 
@@ -1728,6 +1737,7 @@ mod outcome_tests {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+    use crate::addons::drivers::filters::{FilterDriver, FilterRead, NEEDS_ADMIN};
     use crate::addons::drivers::windows::WindowsListing;
     use crate::addons::until;
     use std::sync::atomic::AtomicUsize;
@@ -1805,11 +1815,24 @@ mod security_tests {
         in_kernel: AtomicBool,
         release: AtomicBool,
         hold: bool,
+        filters: FilterRead,
+        filters_asked: AtomicUsize,
     }
 
     impl Fake {
         fn new(security: SecurityReading, hold: bool) -> Arc<Fake> {
-            Arc::new(Fake { security, asked: AtomicUsize::new(0), in_kernel: AtomicBool::new(false), release: AtomicBool::new(!hold), hold })
+            Fake::with_filters(security, hold, FilterRead::Filters(Vec::new()))
+        }
+        fn with_filters(security: SecurityReading, hold: bool, filters: FilterRead) -> Arc<Fake> {
+            Arc::new(Fake {
+                security,
+                asked: AtomicUsize::new(0),
+                in_kernel: AtomicBool::new(false),
+                release: AtomicBool::new(!hold),
+                hold,
+                filters,
+                filters_asked: AtomicUsize::new(0),
+            })
         }
     }
 
@@ -1827,6 +1850,78 @@ mod security_tests {
         fn security(&self) -> SecurityReading {
             self.asked.fetch_add(1, Ordering::SeqCst);
             self.security.clone()
+        }
+        fn filters(&self) -> FilterRead {
+            self.filters_asked.fetch_add(1, Ordering::SeqCst);
+            self.filters.clone()
+        }
+    }
+
+    fn minifilter(name: &str) -> FilterDriver {
+        FilterDriver { name: name.into(), altitude: "328010".into(), instances: 3, frame: 0 }
+    }
+
+    #[test]
+    fn a_listing_reads_the_loaded_filters_with_normal_rights_and_starts_nothing_elevated() {
+        let (ctx, runner) = AddonContext::recording();
+        let list = FilterRead::Filters(vec![minifilter("WdFilter")]);
+        let fake = Fake::with_filters(reading(Reading::Value(1), Reading::Value(1)), false, list.clone());
+        let hub = Hub::new(ctx, fake.clone());
+        assert!(hub.lock().filters.is_none(), "nothing is read before the page asks");
+        hub.refresh();
+        until("the filters are read", || hub.lock().filters.is_some());
+        assert_eq!(hub.lock().filters.as_deref(), Some(&list));
+        assert_eq!(fake.filters_asked.load(Ordering::SeqCst), 1);
+        assert!(runner.launches().is_empty(), "no PowerShell, no elevation prompt");
+    }
+
+    #[test]
+    fn filters_that_need_administrator_rights_say_so_and_nothing_is_started() {
+        let (ctx, runner) = AddonContext::recording();
+        let fake = Fake::with_filters(reading(Reading::Value(1), Reading::Value(1)), false, FilterRead::NeedsAdmin);
+        let hub = Hub::new(ctx, fake);
+        hub.refresh();
+        until("the outcome is published", || hub.lock().filters.is_some());
+        assert_eq!(hub.lock().filters.as_deref(), Some(&FilterRead::NeedsAdmin));
+        assert!(runner.launches().is_empty(), "the page never asks for rights on its own");
+    }
+
+    #[test]
+    fn turning_off_while_the_listing_runs_drops_the_filter_read() {
+        let (ctx, _) = AddonContext::recording();
+        let fake = Fake::with_filters(reading(Reading::Value(1), Reading::Value(1)), true, FilterRead::Filters(vec![minifilter("WdFilter")]));
+        let hub = Hub::new(ctx, fake.clone());
+        hub.refresh();
+        until("the listing is running", || fake.in_kernel.load(Ordering::SeqCst));
+        hub.stop();
+        fake.release.store(true, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(fake.filters_asked.load(Ordering::SeqCst), 0, "the filters are not read once the add-on is off");
+        assert!(hub.lock().filters.is_none(), "and nothing is published");
+    }
+
+    #[test]
+    fn a_hub_that_was_stopped_starts_no_filter_read() {
+        let (ctx, _) = AddonContext::recording();
+        let fake = Fake::new(reading(Reading::Value(1), Reading::Value(1)), false);
+        let hub = Hub::new(ctx, fake.clone());
+        hub.stop();
+        hub.refresh();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(fake.filters_asked.load(Ordering::SeqCst), 0);
+    }
+
+    /// Reads this PC's loaded filters (run with `--ignored --nocapture`, and
+    /// again as administrator: without rights it says so).
+    #[test]
+    #[ignore]
+    fn reads_the_loaded_filters_of_this_pc() {
+        let read = WindowsListing.filters();
+        println!("{read:?}");
+        match read {
+            FilterRead::Filters(list) => assert!(list.iter().any(|f| !f.name.is_empty() && f.altitude.parse::<f64>().is_ok()), "{list:?}"),
+            FilterRead::NeedsAdmin => println!("{NEEDS_ADMIN}"),
+            FilterRead::Failed(why) => panic!("the read failed: {why}"),
         }
     }
 
