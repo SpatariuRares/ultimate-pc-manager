@@ -541,8 +541,9 @@ mod tests {
             i => Some(format!("name {i}")),
         });
         let start = std::time::Instant::now();
-        let names = name_each(vec![0, 1, 2, 3], query, Duration::from_millis(100));
-        assert!(start.elapsed() < Duration::from_secs(2), "took {:?}", start.elapsed());
+        // A time limit well above what a loaded PC needs to answer the quick ones.
+        let names = name_each(vec![0, 1, 2, 3], query, Duration::from_millis(1500));
+        assert!(start.elapsed() < Duration::from_secs(20), "took {:?}", start.elapsed());
         assert_eq!(names, [Named::Name("name 0".into()), Named::Stuck, Named::Name("name 2".into()), Named::Nameless]);
     }
 

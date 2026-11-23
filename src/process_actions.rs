@@ -250,7 +250,17 @@ mod tests {
         assert!(!dir.starts_with(worktree), "outside the worktree");
         let mut child = sleeping_child();
         let pid = child.id();
-        let written = write_dump(pid, "PING.EXE", &dir);
+        // A child that has only just started cannot be dumped until its
+        // start-up is done (Windows answers "partial copy"): under load that
+        // takes longer, so the dump is asked for again until it is written.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let written = loop {
+            let attempt = write_dump(pid, "PING.EXE", &dir);
+            if attempt.is_ok() || std::time::Instant::now() > until {
+                break attempt;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
         let _ = child.kill();
         let _ = child.wait();
         let path = written.expect("the dump is written");

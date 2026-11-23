@@ -796,6 +796,27 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_bundled_selawik_files_parse_as_fonts_that_lay_out_text() {
+        let (regular, semibold) = bundled_body().expect("bundled off Windows");
+        let ctx = egui::Context::default();
+        ctx.set_fonts(font_definitions_named("selawik", Some(regular), Some(semibold)));
+        let mut widths = Vec::new();
+        // The fonts apply from the frame after they are set.
+        for _ in 0..2 {
+            widths.clear();
+            crate::test_ui::run(&ctx, (400.0, 200.0), vec![], |ui| {
+                for family in [FontFamily::Proportional, semibold()] {
+                    let galley = ui.painter().layout_no_wrap("Hamburgefonts".to_string(), egui::FontId::new(16.0, family), egui::Color32::WHITE);
+                    widths.push(galley.size().x);
+                }
+            });
+        }
+        assert!(widths.iter().all(|w| *w > 20.0), "text laid out with the bundled faces has a width: {widths:?}");
+        assert_ne!(widths[0], widths[1], "the semibold face is another font file");
+    }
+
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|a| a.to_string()).collect()
     }
