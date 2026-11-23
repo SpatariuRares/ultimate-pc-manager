@@ -64,6 +64,8 @@ pub fn this_pc() -> &'static CoreTopology {
 mod windows;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::{cpu_facts, cpu_name_from};
 #[cfg(target_os = "macos")]
 mod macos;
 

@@ -25,6 +25,9 @@ pub mod disk;
 pub mod gpu_counters;
 /// Kernel time, pages read, compression, page file and the performance info.
 pub mod system_counters;
+/// Linux: the kernel's per-processor time tallies (`/proc/stat`).
+#[cfg(target_os = "linux")]
+pub mod proc_stat;
 /// Power source, battery, thermal state and ACPI thermal zones.
 pub mod power;
 /// Video cards (pure): readings, heading line, card matching.

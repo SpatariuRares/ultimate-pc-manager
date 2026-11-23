@@ -1,0 +1,5 @@
+processor	: 0
+model name	: Old Test CPU @ 2.80GHz
+cpu MHz		: 2800.000
+flags		: fpu sse2 hypervisor
+
