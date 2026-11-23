@@ -11,11 +11,15 @@ pub mod cli;
 pub mod engine;
 /// The Drivers page.
 pub mod page;
+/// The Windows reader of the listing.
+pub mod windows;
 
 use crate::addons::{checked_tile_lines, is_default, plural, read_settings, summary_tile, write_settings, Addon, Consumption, Requirements};
 use crate::platform::{Action, AddonContext, PageContext};
 
-use engine::{Hub, KernelScope};
+use std::sync::Arc;
+
+use engine::{DeviceDriver, Hub, KernelDriver, KernelScope};
 use page::{DriversPage, Scope, DEFAULT_OLD_YEARS};
 
 /// Its id and shown name (also in its install-queue requests).
@@ -27,9 +31,20 @@ pub const NEEDS: &str = "Searching for driver updates needs the internet and the
 Administrator rights are asked through UAC only to install, scan for hardware changes and unload drivers \
 (with PowerShell, pnputil and sc): do not start this app as administrator.";
 
+/// Where the add-on reads the installed devices and kernel drivers from:
+/// the Windows reader in the app, a fake in tests. Owned by the add-on, not
+/// by the shared add-on context.
+pub trait Listing: Send + Sync {
+    /// The devices with a driver, or why they could not be read.
+    fn devices(&self) -> Result<Vec<DeviceDriver>, String>;
+    /// The kernel driver services, or why they could not be read.
+    fn kernel(&self) -> Result<Vec<KernelDriver>, String>;
+}
+
 /// The add-on: its page while it is on, and while it waits to turn off.
-#[derive(Default)]
 pub struct Drivers {
+    /// Asked for the listing each time the page reads it.
+    reader: Arc<dyn Listing>,
     /// The page and its background work, while the add-on is on. Turned
     /// off during a driver install, the page stays (its hub stopped) to
     /// follow that install until it ends.
@@ -105,7 +120,19 @@ impl Prefs {
     }
 }
 
+impl Default for Drivers {
+    fn default() -> Self {
+        Drivers { reader: Arc::new(windows::WindowsListing), page: None, prefs: Prefs::default(), from_command_line: None }
+    }
+}
+
 impl Drivers {
+    /// The add-on reading its listing from `reader`.
+    #[cfg(test)]
+    pub fn with_reader(reader: Arc<dyn Listing>) -> Self {
+        Drivers { reader, ..Drivers::default() }
+    }
+
     /// The page while the add-on is on (or waits to turn off).
     #[cfg(test)]
     pub fn page(&mut self) -> Option<&mut DriversPage> {
@@ -169,7 +196,7 @@ impl Addon for Drivers {
     fn start(&mut self, context: &AddonContext) {
         self.prefs = self.current();
         self.from_command_line = None;
-        let mut page = DriversPage::new(Hub::new(context.clone()), context.clone());
+        let mut page = DriversPage::new(Hub::new(context.clone(), Arc::clone(&self.reader)), context.clone());
         self.prefs.apply_to(&mut page);
         self.page = Some(page);
     }
@@ -604,5 +631,127 @@ mod command_line_tests {
         let mut addon = Drivers::default();
         assert!(!addon.command_line(&args(&["--drivers-scope", "loaded"])));
         assert!(addon.page().is_none());
+    }
+}
+
+/// The listing reader, through the add-on host with a fake reader (#103).
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+    use crate::addons::{until, AddonHost, Entry};
+    use crate::sampler::Snapshot;
+    use crate::settings::Settings;
+    use serde_json::json;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// A reader that answers from a script (the last answer repeats) and
+    /// counts how many times it was asked for the devices.
+    struct Fake {
+        script: Mutex<VecDeque<Result<Vec<DeviceDriver>, String>>>,
+        asked: AtomicUsize,
+    }
+
+    impl Fake {
+        fn answering(script: Vec<Result<Vec<DeviceDriver>, String>>) -> Arc<Fake> {
+            Arc::new(Fake { script: Mutex::new(script.into()), asked: AtomicUsize::new(0) })
+        }
+        fn asked(&self) -> usize {
+            self.asked.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Listing for Fake {
+        fn devices(&self) -> Result<Vec<DeviceDriver>, String> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            let mut script = self.script.lock().unwrap();
+            if script.len() > 1 {
+                script.pop_front().unwrap()
+            } else {
+                script.front().cloned().unwrap_or_else(|| Ok(Vec::new()))
+            }
+        }
+        fn kernel(&self) -> Result<Vec<KernelDriver>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn device(name: &str) -> DeviceDriver {
+        DeviceDriver { instance_id: name.into(), name: name.into(), class: "Display".into(), provider: "Acme".into(), present: true, ..Default::default() }
+    }
+
+    fn host_with(reader: &Arc<Fake>, enabled: bool) -> AddonHost {
+        let reader: Arc<dyn Listing> = reader.clone();
+        let entries = vec![Entry::Addon(Box::new(Drivers::with_reader(reader)))];
+        AddonHost::for_tests_with(entries, &json!({ "drivers": { "enabled": enabled } })).0
+    }
+
+    /// Every text of one frame of the page, as the user sees it.
+    fn shown(host: &mut AddonHost) -> String {
+        fn texts(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                _ => {}
+            }
+        }
+        let (settings, sample) = (Settings::default(), Snapshot::default());
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut text = String::new();
+        // Two passes: the first one only sizes what the page lays out.
+        for _ in 0..2 {
+            text.clear();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    host.ui("drivers", ui, &mut PageContext::new(&settings, &sample));
+                });
+            });
+            output.shapes.iter().for_each(|s| texts(&s.shape, &mut text));
+        }
+        text
+    }
+
+    #[test]
+    fn opening_the_page_reads_once_and_shows_the_rows() {
+        let reader = Fake::answering(vec![Ok(vec![device("Alpha GPU")])]);
+        let mut host = host_with(&reader, true);
+        until("the row is shown", || shown(&mut host).contains("Alpha GPU"));
+        shown(&mut host);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(reader.asked(), 1, "drawing the page again reads nothing more");
+    }
+
+    #[test]
+    fn a_failed_read_shows_its_reason_and_drops_the_old_rows_and_a_good_read_clears_it() {
+        let reader = Fake::answering(vec![Ok(vec![device("Alpha GPU")]), Err("the listing broke".into()), Ok(vec![device("Beta NIC")])]);
+        let mut host = host_with(&reader, true);
+        until("the first read is shown", || shown(&mut host).contains("Alpha GPU"));
+
+        assert!(host.refresh("drivers"));
+        until("the failure is shown", || shown(&mut host).contains("the listing broke"));
+        let page = shown(&mut host);
+        assert!(page.contains("Drivers could not be enumerated"), "{page}");
+        assert!(!page.contains("Alpha GPU"), "the old rows are dropped: {page}");
+
+        assert!(host.refresh("drivers"));
+        until("the new rows are shown", || shown(&mut host).contains("Beta NIC"));
+        let page = shown(&mut host);
+        assert!(!page.contains("the listing broke") && !page.contains("could not be enumerated"), "the error is cleared: {page}");
+        assert_eq!(reader.asked(), 3);
+    }
+
+    #[test]
+    fn turned_off_refresh_asks_the_reader_nothing() {
+        let reader = Fake::answering(vec![Ok(vec![device("Alpha GPU")])]);
+        let mut host = host_with(&reader, false);
+        assert!(!host.refresh("drivers"), "no page to refresh");
+        assert_eq!(shown(&mut host), "", "nothing is drawn");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(reader.asked(), 0);
     }
 }
