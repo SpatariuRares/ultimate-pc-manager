@@ -103,6 +103,13 @@ It is the last add-on in the migration order proposed by the add-ons document.
 52. As a user, I want "Drivers could not be enumerated" with the reason when reading fails, instead of a silent empty list, so that I understand it is an error. *(missing: today a reading error gives an empty list)*
 53. As a user, I want "No drivers were reported" / "Windows published no driver registrations." when Windows returns nothing, distinct from "No drivers here." and from the filter states, so that I can tell a problem from a filter. *(missing)*
 
+### Driver store (spec #11, #26)
+A "Driver store" tab after Kernel modules lists the driver packages Windows keeps: published name (oemNN.inf) with the original INF under it, provider, class, version, date, signer, and the devices using it. A filter ("Package, INF, provider or device") and "Copy details" (row menu and side panel) work as on the other tabs; the filter and the selection are the tab's own.
+- Read with `pnputil /enum-drivers /devices /format xml` and normal rights (no UAC), parsed from the XML, never from localised text. `/enum-drivers` lists the third-party packages (`oemNN.inf`) only. The read follows the driver listing in the same background job: the other tabs do not wait for it, a refresh re-reads it, and when the add-on is turned off its result is dropped and nothing new starts.
+- **Old**: another package with the same original INF name and provider (case does not matter) has a newer version (numbers compared part by part, missing parts count as 0), then a later date when the versions are equal. **In use**: at least one device. **Inbox**: the provider starts with "Microsoft" (case-insensitive); inbox packages are flagged and never offered for removal.
+- Figures, over the whole store (not the filter): packages, third-party (not inbox), old (old, not in use, not inbox: what "Remove old packages" will remove), disk space used and what can be freed. The size of a package is its folder in `System32\DriverStore\FileRepository`, found through `HKLM\SYSTEM\DriverDatabase\DriverInfFiles\<oemNN.inf>`; a package whose folder is not found has no size, and when none has one the figure says "unknown", never 0.
+- Removal and backup (stories 47-50, 55-58) are later tickets (#28, #29); this tab only reads.
+
 ### Security band (spec #11, #32)
 A compact read-only "Security" strip under the status band shows Memory integrity (`HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled`) and the vulnerable driver blocklist (`HKLM\SYSTEM\CurrentControlSet\Control\CI\Config\VulnerableDriverBlocklistEnable`).
 - Each value shows as "On" (1), "Off" (0), "Not set" (no key or value: the page does not guess) or "could not be read" (access denied, another type, any other number), each with its own explaining line; an unreadable value is never shown as off.
@@ -179,7 +186,7 @@ Modules tested: driver data module, driver page module, `DriversAddon`.
 
 - The add-on platform itself (registry, Add-ons page, licenses, sales): separate PRD.
 - Downloading drivers from manufacturers' websites (NVIDIA, AMD, Intel…): the add-on only opens their page.
-- Uninstalling a driver package from the driver store, going back to the previous driver (Device Manager rollback), disabling a device.
+- Uninstalling a driver package from the driver store (listing it is in scope; removal is spec #11, #28), going back to the previous driver (Device Manager rollback), disabling a device.
 - Restore points before installation.
 - Driver values read through manufacturers' SDKs.
 - Phase 2 of the platform (add-ons in a separate process or WASM).

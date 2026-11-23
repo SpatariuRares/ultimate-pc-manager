@@ -11,6 +11,7 @@ use std::sync::Arc;
 use egui::{vec2, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, Ui};
 
 use super::engine::{self as drivers, DeviceDriver, DriverUpdate, Hub, KernelDriver, KernelFigures, KernelScope};
+use super::store::{Flags, StoreFigures, StoreList, StorePackage};
 use crate::addons::plural;
 use crate::platform::{csv_field, Action, AddonContext};
 use crate::theme;
@@ -28,6 +29,8 @@ pub enum Scope {
     Builtin,
     /// Kernel driver services.
     Kernel,
+    /// The driver packages Windows keeps.
+    Store,
 }
 
 /// What the page remembers between frames.
@@ -40,6 +43,8 @@ pub struct DriversUi {
     pub show_disconnected: bool,
     pub selected_device: Option<String>,
     pub selected_kernel: Option<String>,
+    /// The published name ("oem42.inf") of the selected store package.
+    pub selected_store: Option<String>,
     pub confirm_unload: Option<String>,
     /// An offered driver that is not newer, waiting for "Install anyway".
     pub confirm_older: Option<DriverUpdate>,
@@ -156,6 +161,9 @@ enum ListNote {
 impl ListNote {
     /// The title and the detail line for `scope`.
     fn texts(&self, scope: Scope) -> (String, Option<String>) {
+        if scope == Scope::Store {
+            return self.store_texts();
+        }
         let kernel = scope == Scope::Kernel;
         let title = match self {
             ListNote::Reading if kernel => "Asking the service control manager for every driver registered on this machine.",
@@ -170,6 +178,23 @@ impl ListNote {
         (title.into(), None)
     }
 }
+
+impl ListNote {
+    /// The title and the detail line on the Driver store tab.
+    fn store_texts(&self) -> (String, Option<String>) {
+        let title = match self {
+            ListNote::Reading => "Reading the driver store\u{2026}",
+            ListNote::Failed(reason) => return ("The driver store could not be read".into(), Some(reason.clone())),
+            ListNote::NothingReported => return ("The driver store holds no packages".into(), Some("Windows reported no third-party driver packages.".into())),
+            ListNote::FilteredOut => "No packages here.",
+            ListNote::NoMatch => STORE_NO_MATCH,
+        };
+        (title.into(), None)
+    }
+}
+
+/// The empty-filter text on the Driver store tab.
+const STORE_NO_MATCH: &str = "No package, INF, provider or device matches what you typed.";
 
 /// The note a list shows while `shown` of the `total` drivers its read
 /// returned are listed (`total` before scope, filter and search); `error`
@@ -327,7 +352,7 @@ impl Derived {
 
         let mut items = Vec::new();
         let mut matching = 0;
-        if inputs.scope != Scope::Kernel {
+        if !matches!(inputs.scope, Scope::Kernel | Scope::Store) {
             let matches: Vec<usize> = scoped(inputs.scope == Scope::Hardware)
                 .into_iter()
                 .filter(|&i| {
@@ -446,6 +471,11 @@ pub struct DriversPage {
     derived: Option<Arc<Derived>>,
     /// How many times `derived` was built (a test reads it).
     derived_builds: usize,
+    /// The Driver store tab's rows and figures, reused until the read or
+    /// the filter text changes.
+    store_list: Option<Arc<StoreList>>,
+    /// How many times `store_list` was built (a test reads it).
+    store_builds: usize,
 }
 
 impl DriversPage {
@@ -459,7 +489,29 @@ impl DriversPage {
             old_years: DEFAULT_OLD_YEARS,
             derived: None,
             derived_builds: 0,
+            store_list: None,
+            store_builds: 0,
         }
+    }
+
+    /// How many times the Driver store's rows were worked out so far.
+    #[cfg(test)]
+    pub fn store_builds(&self) -> usize {
+        self.store_builds
+    }
+
+    /// The Driver store's rows and figures for this read and the current
+    /// filter text: built only when either changed since the last call.
+    fn store_view(&mut self, packages: &Arc<[StorePackage]>) -> Arc<StoreList> {
+        if let Some(list) = &self.store_list {
+            if list.is_for(packages, &self.drv_ui.search) {
+                return list.clone();
+            }
+        }
+        let list = Arc::new(StoreList::build(packages, &self.drv_ui.search));
+        self.store_builds += 1;
+        self.store_list = Some(list.clone());
+        list
     }
 
     /// How many times the counts and groups were worked out so far.
@@ -533,6 +585,9 @@ impl DriversPage {
         let checked_at = st.checked_at.clone();
         let listed_at = st.listed_at.clone();
         let security = st.security.clone();
+        let store = st.store.clone();
+        let store_error = st.store_error.clone();
+        let store_reading = st.store_reading;
         drop(st);
         let admin = self.context.is_admin();
         let idle = busy.is_none();
@@ -581,16 +636,18 @@ impl DriversPage {
                 (Scope::Hardware, "Hardware drivers", view.hardware_count),
                 (Scope::Builtin, "Windows built-in", view.builtin_count),
                 (Scope::Kernel, "Kernel modules", kernel.len()),
+                (Scope::Store, "Driver store", store.len()),
             ];
             if let Some(scope) = parts::scope_group(ui, self.drv_ui.scope, &scopes).clicked {
                 self.drv_ui.scope = scope;
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if self.drv_ui.scope != Scope::Kernel {
+                if !matches!(self.drv_ui.scope, Scope::Kernel | Scope::Store) {
                     ui.checkbox(&mut self.drv_ui.show_disconnected, "Show disconnected");
                     ui.add_space(8.0);
                 }
-                crate::widgets::search_field(ui, &mut self.drv_ui.search, "Find a driver or maker", 240.0);
+                let hint = if self.drv_ui.scope == Scope::Store { STORE_FILTER_HINT } else { "Find a driver or maker" };
+                crate::widgets::search_field(ui, &mut self.drv_ui.search, hint, 240.0);
             });
         });
         if self.drv_ui.scope == Scope::Kernel {
@@ -623,6 +680,11 @@ impl DriversPage {
             Scope::Kernel => {
                 self.kernel_list(&mut list_ui, actions, &view, admin, listing, kernel_error.as_deref());
                 self.kernel_side(&mut side_ui, actions, &kernel, admin, idle);
+            }
+            Scope::Store => {
+                let list = self.store_view(&store);
+                self.store_list(&mut list_ui, actions, &list, store_reading, store_error.as_deref());
+                self.store_side(&mut side_ui, actions, &list);
             }
             scope => {
                 let searching = !self.drv_ui.search.trim().is_empty();
@@ -1166,6 +1228,122 @@ impl DriversPage {
         });
     }
 
+    /// The Driver store tab: the figures, then one row per package.
+    fn store_list(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, list: &StoreList, reading: bool, error: Option<&str>) {
+        let th = theme::of_ui(ui);
+        let packages = &list.packages;
+        // Reading, failed or nothing reported: no figures to give.
+        if let Some(note) = list_note(reading, error, packages.len(), packages.len(), false) {
+            show_note(ui, &note, Scope::Store);
+            return;
+        }
+        store_strip(ui, &list.figures);
+        ui.add_space(10.0);
+        let rows = &list.rows;
+        if let Some(note) = list_note(reading, error, packages.len(), rows.len(), !self.drv_ui.search.trim().is_empty()) {
+            show_note(ui, &note, Scope::Store);
+            return;
+        }
+        let w = ui.available_width();
+        let fixed = [110.0, 100.0, 90.0];
+        let gap = 12.0;
+        let flex = (w - fixed.iter().sum::<f32>() - gap * 6.0 - 20.0).max(300.0);
+        // Package, provider, class, version, date, signer, flags.
+        let cols = [fixed[0] + 40.0, flex * 0.3, fixed[1], fixed[1] + 20.0, fixed[2], flex * 0.3, flex * 0.4];
+        let xs: Vec<f32> = cols
+            .iter()
+            .scan(10.0, |x, c| {
+                let start = *x;
+                *x += c + gap;
+                Some(start)
+            })
+            .collect();
+        let (hr, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
+        for (i, h) in ["Package", "Provider", "Class", "Version", "Date", "Signer", "Used by"].iter().enumerate() {
+            ui.painter().text(Pos2::new(hr.left() + xs[i], hr.center().y), Align2::LEFT_CENTER, *h, text(12.0), th.label);
+        }
+        ui.painter().rect_filled(Rect::from_min_size(Pos2::new(hr.left(), hr.bottom() - 1.0), vec2(w, 1.0)), CornerRadius::ZERO, th.line);
+        let mut clicked = None;
+        egui::ScrollArea::vertical().id_salt("drv-store-list").auto_shrink([false, false]).show_rows(ui, STORE_ROW, rows.len(), |ui, range| {
+            for &i in &rows[range] {
+                let p = &packages[i];
+                let flags = list.flags[i];
+                let (r, resp) = ui.allocate_exact_size(vec2(w, STORE_ROW), Sense::click());
+                let painter = ui.painter();
+                let selected = self.drv_ui.selected_store.as_deref() == Some(p.published.as_str());
+                parts::row_fill(painter, r, selected, resp.hovered());
+                let cell = |i: usize, s: &str, col: Color32| {
+                    let s = fit(painter, s, &text(13.0), cols[i]);
+                    painter.text(Pos2::new(r.left() + xs[i], r.top() + 13.0), Align2::LEFT_CENTER, s, text(13.0), col);
+                };
+                cell(0, &p.published, if selected { th.on_selected } else { th.text });
+                cell(1, &p.provider, th.soft);
+                cell(2, &p.class, th.soft);
+                cell(3, &p.version, th.soft);
+                cell(4, &or_dash(&p.date), th.soft);
+                cell(5, &or_dash(&p.signer), th.soft);
+                // The INF under the name; the devices under the flags.
+                let faint = parts::sub_colour(&th, selected);
+                painter.text(Pos2::new(r.left() + xs[0], r.top() + 30.0), Align2::LEFT_CENTER, fit(painter, &p.original, &text(11.5), cols[0]), text(11.5), faint);
+                let mut x = r.left() + xs[6];
+                for word in flags.words() {
+                    let colour = match word {
+                        "Old" => th.amber,
+                        "In use" => th.green,
+                        _ => th.faint,
+                    };
+                    x = painter.text(Pos2::new(x, r.top() + 13.0), Align2::LEFT_CENTER, word, text(12.0), colour).right() + 8.0;
+                }
+                if !p.devices.is_empty() {
+                    painter.text(Pos2::new(r.left() + xs[6], r.top() + 30.0), Align2::LEFT_CENTER, plural(p.devices.len(), "device"), text(11.5), faint);
+                }
+                if resp.clicked() {
+                    clicked = Some(p.published.clone());
+                }
+                let details = store_details(p, flags);
+                resp.context_menu(|ui| {
+                    if ui.button("Copy details").clicked() {
+                        actions.push(Action::Copy(details.clone()));
+                        ui.close();
+                    }
+                });
+            }
+        });
+        if let Some(name) = clicked {
+            self.drv_ui.selected_store = Some(name);
+        }
+    }
+
+    /// The selected package's details and "Copy details".
+    fn store_side(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, list: &StoreList) {
+        let at = self.drv_ui.selected_store.as_deref().and_then(|name| list.packages.iter().position(|p| p.published == name));
+        parts::SidePanel::new("drv-store-side").show(ui, at, |ui, at| {
+            let th = theme::of_ui(ui);
+            let (p, flags) = (&list.packages[at], list.flags[at]);
+            ui.label(RichText::new(&p.published).font(display(15.0)).color(th.text));
+            ui.add_space(6.0);
+            egui::Grid::new("drv-store-grid").striped(false).num_columns(2).spacing([14.0, 5.0]).show(ui, |ui| {
+                for (k, v) in store_detail_rows(p, flags).into_iter().skip(1) {
+                    ui.label(RichText::new(k).color(th.label));
+                    ui.add(egui::Label::new(v).wrap());
+                    ui.end_row();
+                }
+            });
+            if flags.inbox {
+                ui.add_space(4.0);
+                ui.label(RichText::new(STORE_INBOX_NOTE).size(12.0).color(th.faint));
+            }
+            ui.add_space(8.0);
+            separator(ui);
+            ui.add_space(10.0);
+            ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
+                if parts::outline_button(ui, "Copy details", true).clicked() {
+                    actions.push(Action::Copy(store_details(p, flags)));
+                }
+            });
+        });
+    }
+
     fn drivers_dialogs(&mut self, ui: &mut Ui) {
         let th = theme::of_ui(ui);
         if let Some(service) = self.drv_ui.confirm_unload.clone() {
@@ -1321,6 +1499,72 @@ fn device_details(d: &DeviceDriver, u: Option<&DriverUpdate>) -> String {
         s.push_str(&format!("Windows Update offers: {} ({}, {what})\n", u.title, u.version));
     }
     s
+}
+
+/// Height of a Driver store row: the name and the INF under it.
+const STORE_ROW: f32 = 40.0;
+
+/// The filter box's hint on the Driver store tab.
+const STORE_FILTER_HINT: &str = "Package, INF, provider or device";
+
+/// Said in the side panel of an inbox package.
+const STORE_INBOX_NOTE: &str = "Inbox (Microsoft) package: not offered for removal.";
+
+/// What the strip over the store says: each figure as its value and the
+/// words after it, in order. The disk figures say "unknown" when no
+/// package's folder could be measured.
+fn store_figure_words(f: &StoreFigures) -> Vec<(String, &'static str)> {
+    let size = |b: Option<u64>| b.map(fmt_size).unwrap_or_else(|| "unknown".into());
+    let mut words = vec![
+        (f.packages.to_string(), "packages"),
+        (f.third_party.to_string(), "third-party"),
+        (f.old.to_string(), "old"),
+        (size(f.bytes), "used"),
+    ];
+    if f.freeable.is_some() {
+        words.push((size(f.freeable), "can be freed"));
+    }
+    words
+}
+
+/// The Driver store's figures in a strip, with the reminder that reading
+/// needs no administrator rights.
+fn store_strip(ui: &mut Ui, f: &StoreFigures) {
+    let th = theme::of_ui(ui);
+    crate::widgets::strip(ui, |ui| {
+        ui.label(RichText::new("Driver store").size(13.0).strong().color(th.soft));
+        for (value, what) in store_figure_words(f) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(RichText::new(value).size(13.0).strong().color(th.text));
+                ui.label(RichText::new(what).size(13.0).color(th.label));
+            });
+        }
+        ui.label(RichText::new("Read without administrator rights. Microsoft inbox packages are never offered for removal.").size(12.0).color(th.faint));
+    });
+}
+
+/// A package's detail fields, labelled and in a fixed order. Shared by the
+/// side panel (which leaves out the first, its title) and "Copy details".
+fn store_detail_rows(p: &StorePackage, flags: Flags) -> Vec<(&'static str, String)> {
+    let used_by = if p.devices.is_empty() { "No device".to_string() } else { p.devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join("; ") };
+    let words = flags.words();
+    vec![
+        ("Package", p.published.clone()),
+        ("Original INF", p.original.clone()),
+        ("Provider", or_dash(&p.provider)),
+        ("Class", or_dash(&p.class)),
+        ("Version", or_dash(&p.version)),
+        ("Date", or_dash(&p.date)),
+        ("Signer", or_dash(&p.signer)),
+        ("Size", p.size.map(fmt_size).unwrap_or_else(|| "\u{2014}".into())),
+        ("Used by", used_by),
+        ("Flags", if words.is_empty() { "\u{2014}".to_string() } else { words.join(", ") }),
+    ]
+}
+
+fn store_details(p: &StorePackage, flags: Flags) -> String {
+    store_detail_rows(p, flags).iter().map(|(k, v)| format!("{k}: {v}\n")).collect()
 }
 
 /// The four kernel figures as tiles: value, label and subtitle.
@@ -1744,5 +1988,221 @@ mod age_tests {
         assert_eq!(check_the_maker(&old, today, 2), Some(3), "a lower threshold");
         assert_eq!(check_the_maker(&driver("Microsoft", "2015-01-01"), today, 3), None, "Windows' own drivers come with Windows Update");
         assert_eq!(check_the_maker(&driver("Realtek", "unknown"), today, 3), None);
+    }
+}
+
+/// The Driver store tab (#26).
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use crate::addons::drivers::store::parse_store;
+
+    /// The recorded `pnputil /enum-drivers /devices /format xml`.
+    const FIXTURE: &str = include_str!("fixtures/pnputil-enum-drivers.xml");
+
+    struct NoReader;
+    impl crate::addons::drivers::ListingReader for NoReader {
+        fn devices(&self) -> Result<Vec<DeviceDriver>, String> {
+            Ok(Vec::new())
+        }
+        fn kernel(&self) -> Result<Vec<KernelDriver>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A page on the Driver store tab with the recorded packages, each
+    /// measured at 1 MB.
+    fn page() -> DriversPage {
+        let mut packages = parse_store(FIXTURE).expect("the recording parses");
+        packages.iter_mut().for_each(|p| p.size = Some(1_048_576));
+        let (ctx, _) = AddonContext::recording();
+        let hub = Hub::new(ctx.clone(), Arc::new(NoReader));
+        hub.lock().store = packages.into();
+        let mut page = DriversPage::new(hub, ctx);
+        page.drv_ui.started = true;
+        page.drv_ui.scope = Scope::Store;
+        page
+    }
+
+    fn frame(page: &mut DriversPage) -> Vec<String> {
+        fn texts(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))), ..Default::default() };
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            out.clear();
+            let output = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| page.ui(ui, &mut Vec::new()));
+            });
+            output.shapes.iter().for_each(|s| texts(&s.shape, &mut out));
+        }
+        out
+    }
+
+    #[test]
+    fn the_tab_sits_after_kernel_modules_with_its_count() {
+        let mut page = page();
+        let t = frame(&mut page);
+        let at = |what: &str| t.iter().position(|x| x == what).unwrap_or_else(|| panic!("{what} is shown: {t:?}"));
+        // Each tab is its name and its count.
+        assert!(at("Kernel modules  0") + 1 == at("Driver store  16"), "{t:?}");
+    }
+
+    #[test]
+    fn the_four_figures_say_packages_third_party_old_and_disk_space() {
+        let mut page = page();
+        let t = frame(&mut page);
+        let at = t.iter().position(|x| x == "packages").expect("the strip is shown");
+        // Each figure draws its value, then its words.
+        let pairs: Vec<(&str, &str)> = (0..5).map(|i| (t[at - 1 + i * 2].as_str(), t[at + i * 2].as_str())).collect();
+        assert_eq!(pairs, [("16", "packages"), ("12", "third-party"), ("5", "old"), ("16.0 MB", "used"), ("5.0 MB", "can be freed")]);
+        assert!(t.iter().any(|x| x.starts_with("Read without administrator rights")));
+    }
+
+    #[test]
+    fn an_unmeasured_store_says_unknown_for_disk_space() {
+        let f = StoreFigures { packages: 3, third_party: 3, old: 1, bytes: None, freeable: None };
+        let words = store_figure_words(&f);
+        assert_eq!(words.last().unwrap(), &("unknown".to_string(), "used"), "never 0 B");
+        assert_eq!(words.len(), 4, "nothing is said about what can be freed");
+    }
+
+    #[test]
+    fn rows_show_the_columns_and_the_flags() {
+        let mut page = page();
+        let t = frame(&mut page);
+        for want in ["oem146.inf", "amdfendr.inf", "Advanced Micro Devices, Inc.", "System", "24.30.0.2", "2024-10-28", "In use", "Old", "1 device"] {
+            assert!(t.iter().any(|x| x == want), "{want} is shown: {t:?}");
+        }
+        for header in ["Package", "Provider", "Class", "Version", "Date", "Signer", "Used by"] {
+            assert!(t.iter().any(|x| x == header), "{header}");
+        }
+    }
+
+    #[test]
+    fn inbox_packages_are_flagged_and_the_filter_finds_them() {
+        let mut page = page();
+        page.drv_ui.search = "microsoft".into();
+        let t = frame(&mut page);
+        assert_eq!(t.iter().filter(|x| *x == "Inbox").count(), 4, "{t:?}");
+        assert!(!t.iter().any(|x| x == "oem146.inf"), "the rest is filtered out");
+        page.drv_ui.search = "gigabit".into();
+        let t = frame(&mut page);
+        assert!(t.iter().any(|x| x == "oem50.inf"), "a device's name matches: {t:?}");
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_says_so_and_keeps_the_figures() {
+        let mut page = page();
+        page.drv_ui.search = "no such package".into();
+        let t = frame(&mut page);
+        assert!(t.iter().any(|x| x == STORE_NO_MATCH));
+        assert!(t.iter().any(|x| x == "packages"), "the figures still describe the store");
+    }
+
+    #[test]
+    fn the_rows_are_worked_out_once_per_read_and_filter_change() {
+        let mut page = page();
+        for _ in 0..5 {
+            frame(&mut page);
+        }
+        assert_eq!(page.store_builds(), 1, "five frames, nothing changed");
+        page.drv_ui.search = "nv".into();
+        frame(&mut page);
+        frame(&mut page);
+        assert_eq!(page.store_builds(), 2, "the filter changed once");
+        let mut again = parse_store(FIXTURE).unwrap();
+        again.pop();
+        page.drv.lock().store = again.into();
+        frame(&mut page);
+        frame(&mut page);
+        assert_eq!(page.store_builds(), 3, "a new read");
+        page.drv_ui.scope = Scope::Kernel;
+        frame(&mut page);
+        assert_eq!(page.store_builds(), 3, "the other tabs build nothing for the store");
+    }
+
+    #[test]
+    fn a_selected_package_shows_its_details_and_copy_details() {
+        let mut page = page();
+        page.drv_ui.selected_store = Some("oem50.inf".into());
+        let t = frame(&mut page);
+        for want in ["Original INF", "axusbeth.inf", "Signer", "Microsoft Windows Hardware Compatibility Publisher", "Used by", "ASIX USB to Gigabit Ethernet Family Adapter", "Old, In use", "Copy details", "1.0 MB"] {
+            assert!(t.iter().any(|x| x == want), "{want} is shown: {t:?}");
+        }
+    }
+
+    #[test]
+    fn copy_details_uses_fixed_labels_in_order() {
+        let packages = parse_store(FIXTURE).unwrap();
+        let list = StoreList::build(&packages.into(), "");
+        let at = list.packages.iter().position(|p| p.published == "oem10.inf").unwrap();
+        let text = store_details(&list.packages[at], list.flags[at]);
+        let labels: Vec<&str> = text.lines().map(|l| l.split(':').next().unwrap()).collect();
+        assert_eq!(labels, ["Package", "Original INF", "Provider", "Class", "Version", "Date", "Signer", "Size", "Used by", "Flags"]);
+        assert!(text.contains("Used by: No device\n") && text.contains("Flags: Inbox\n") && text.contains("Size: \u{2014}\n"), "{text}");
+    }
+
+    #[test]
+    fn an_inbox_package_says_it_is_not_offered_for_removal() {
+        let mut page = page();
+        page.drv_ui.selected_store = Some("oem10.inf".into());
+        let t = frame(&mut page);
+        assert!(t.iter().any(|x| x == STORE_INBOX_NOTE), "{t:?}");
+        page.drv_ui.selected_store = Some("oem130.inf".into());
+        assert!(!frame(&mut page).iter().any(|x| x == STORE_INBOX_NOTE));
+    }
+
+    #[test]
+    fn reading_and_failing_have_their_own_notes() {
+        let mut page = page();
+        page.drv.lock().store = Vec::new().into();
+        page.drv.lock().store_reading = true;
+        assert!(frame(&mut page).iter().any(|x| x == "Reading the driver store\u{2026}"));
+        {
+            let mut st = page.drv.lock();
+            st.store_reading = false;
+            st.store_error = Some("pnputil is missing".into());
+        }
+        let t = frame(&mut page);
+        assert!(t.iter().any(|x| x == "The driver store could not be read") && t.iter().any(|x| x == "pnputil is missing"), "{t:?}");
+        page.drv.lock().store_error = None;
+        assert!(frame(&mut page).iter().any(|x| x == "The driver store holds no packages"));
+    }
+
+    #[test]
+    fn the_filter_box_has_the_stores_hint_there_and_its_own_elsewhere() {
+        let mut page = page();
+        assert!(frame(&mut page).iter().any(|x| x == STORE_FILTER_HINT));
+        page.drv_ui.scope = Scope::Hardware;
+        let t = frame(&mut page);
+        assert!(t.iter().any(|x| x == "Find a driver or maker") && !t.iter().any(|x| x == STORE_FILTER_HINT));
+    }
+
+    #[test]
+    fn the_other_tabs_keep_their_rows_and_show_disconnected_only_where_it_applies() {
+        let mut page = page();
+        page.drv.lock().devices = vec![DeviceDriver { instance_id: "a".into(), name: "Alpha GPU".into(), class: "Display".into(), provider: "Acme".into(), present: true, ..Default::default() }].into();
+        page.drv_ui.scope = Scope::Hardware;
+        let t = frame(&mut page);
+        assert!(t.iter().any(|x| x == "Alpha GPU") && t.iter().any(|x| x == "Show disconnected"));
+        page.drv_ui.scope = Scope::Store;
+        let t = frame(&mut page);
+        assert!(!t.iter().any(|x| x == "Show disconnected" || x == "Alpha GPU"));
+    }
+
+    #[test]
+    fn the_store_tab_is_saved_by_name_and_the_old_names_still_read() {
+        assert_eq!(serde_json::to_value(Scope::Store).unwrap(), "store");
+        assert!(serde_json::from_value::<Scope>(serde_json::json!("store")).unwrap() == Scope::Store);
+        assert!(serde_json::from_value::<Scope>(serde_json::json!("builtin")).unwrap() == Scope::Builtin);
+        assert!(serde_json::from_value::<Scope>(serde_json::json!("kernel")).unwrap() == Scope::Kernel);
     }
 }

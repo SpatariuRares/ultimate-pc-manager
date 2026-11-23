@@ -20,6 +20,7 @@ use crate::platform::install_queue::{Request, Work};
 use crate::platform::series::{Run, Series};
 use crate::platform::{AddonContext, Generation};
 
+use super::store::StorePackage;
 use super::ListingReader;
 
 #[derive(Clone, Debug, Default)]
@@ -431,6 +432,12 @@ pub struct State {
     pub devices_error: Option<String>,
     /// Why the last read of the driver services failed (then `kernel` is empty).
     pub kernel_error: Option<String>,
+    /// The driver packages Windows keeps (the Driver store tab).
+    pub store: Arc<[StorePackage]>,
+    /// Why the last read of the driver store failed (then `store` is empty).
+    pub store_error: Option<String>,
+    /// The driver store is being read (it follows the listing).
+    pub store_reading: bool,
     /// None until the first check.
     pub updates: Option<Arc<[DriverUpdate]>>,
     pub checked_at: String,
@@ -504,7 +511,10 @@ impl Hub {
     /// the state is forgotten; a running driver install goes on (see
     /// [`Hub::running`]) and keeps reporting into the state.
     pub fn stop(&self) {
-        self.series.stop(|st| st.listing = false);
+        self.series.stop(|st| {
+            st.listing = false;
+            st.store_reading = false;
+        });
         self.halt.store(true, Ordering::SeqCst);
     }
 
@@ -525,17 +535,19 @@ impl Hub {
     pub fn refresh(&self) {
         {
             let Some(mut st) = self.live() else { return };
-            if st.listing {
+            if st.listing || st.store_reading {
                 return;
             }
             // A system without drivers says so; it never reads as an empty
             // list. Each tab shows its own list's error, so both get it.
             if let Some(why) = unavailable_text(Feature::DeviceSetupApi) {
+                publish_store(&mut st, Err(why.clone()));
                 publish_listing(&mut st, Err(why.clone()), Err(why));
                 st.listed_at = crate::platform::clock_now();
                 return;
             }
             st.listing = true;
+            st.store_reading = true;
         }
         self.spawn(None, false, |hub, _| hub.refresh_now());
     }
@@ -555,6 +567,15 @@ impl Hub {
         publish_listing(&mut st, devices, kernel);
         st.security = Some(security);
         st.listed_at = crate::platform::clock_now();
+        drop(st);
+        // The driver store comes last: its tool takes a moment, and the
+        // other tabs need not wait for it. Read-only and with normal rights.
+        if self.live().is_none() {
+            return;
+        }
+        let store = self.reader.store();
+        let Some(mut st) = self.live() else { return };
+        publish_store(&mut st, store);
     }
 
     /// Searches Windows Update for driver updates (takes 10–60 s).
@@ -809,7 +830,7 @@ fn match_updates(devices: &[DeviceDriver], updates: &mut [DriverUpdate]) {
 }
 
 /// "4.22.1.0" -> [4, 22, 1, 0]; None when it is not a dotted version.
-fn parse_version(v: &str) -> Option<Vec<u64>> {
+pub(super) fn parse_version(v: &str) -> Option<Vec<u64>> {
     let parts: Option<Vec<u64>> = v.trim().split('.').map(|p| p.parse().ok()).collect();
     parts.filter(|p| !p.is_empty())
 }
@@ -1048,6 +1069,15 @@ fn publish_listing(st: &mut State, devices: Result<Vec<DeviceDriver>, String>, k
         match_updates(devices, &mut list);
         *u = list.into();
     }
+}
+
+/// Puts a driver store read into `st`: no rows on failure.
+fn publish_store(st: &mut State, read: Result<Vec<StorePackage>, String>) {
+    match read {
+        Ok(list) => (st.store, st.store_error) = (list.into(), None),
+        Err(e) => (st.store, st.store_error) = (Vec::new().into(), Some(e)),
+    }
+    st.store_reading = false;
 }
 
 /// Puts the outcome of a Windows Update search that ended at `at` into
@@ -1879,5 +1909,146 @@ mod security_tests {
         println!("{:?}", security_view(Some(&r)));
         assert!(!matches!(r.memory_integrity, Reading::Failed(_)), "read with normal rights: {:?}", r.memory_integrity);
         assert!(!matches!(r.blocklist, Reading::Failed(_)), "read with normal rights: {:?}", r.blocklist);
+    }
+}
+
+/// The driver store is read with the listing, with normal rights (#26).
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use crate::addons::drivers::store::StoreDevice;
+    use crate::addons::until;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A reader whose store read answers from a value and can be held.
+    struct Store {
+        answer: Result<Vec<StorePackage>, String>,
+        hold: bool,
+        asked: AtomicUsize,
+        in_read: AtomicBool,
+        release: AtomicBool,
+    }
+
+    impl Store {
+        fn new(answer: Result<Vec<StorePackage>, String>, hold: bool) -> Arc<Store> {
+            Arc::new(Store { answer, hold, asked: AtomicUsize::new(0), in_read: AtomicBool::new(false), release: AtomicBool::new(false) })
+        }
+    }
+
+    impl ListingReader for Store {
+        fn devices(&self) -> Result<Vec<DeviceDriver>, String> {
+            Ok(Vec::new())
+        }
+        fn kernel(&self) -> Result<Vec<KernelDriver>, String> {
+            Ok(Vec::new())
+        }
+        fn store(&self) -> Result<Vec<StorePackage>, String> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            self.in_read.store(true, Ordering::SeqCst);
+            while self.hold && !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            self.answer.clone()
+        }
+    }
+
+    fn package(name: &str) -> StorePackage {
+        StorePackage {
+            published: name.into(),
+            original: "x.inf".into(),
+            devices: vec![StoreDevice { instance_id: "ROOT\\X\\0".into(), name: "X".into() }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_listing_reads_the_driver_store_with_normal_rights_and_starts_nothing_elevated() {
+        let (ctx, runner) = AddonContext::recording();
+        let reader = Store::new(Ok(vec![package("oem1.inf"), package("oem2.inf")]), false);
+        let hub = Hub::new(ctx, reader.clone());
+        assert!(hub.lock().store.is_empty() && !hub.lock().store_reading, "nothing is read before the page asks");
+        hub.refresh();
+        until("the store is read", || hub.lock().store.len() == 2);
+        let st = hub.lock();
+        assert!(!st.store_reading && st.store_error.is_none());
+        drop(st);
+        assert_eq!(reader.asked.load(Ordering::SeqCst), 1);
+        assert!(runner.launches().is_empty(), "no PowerShell, no elevation, no UAC prompt");
+    }
+
+    #[test]
+    fn a_failed_store_read_keeps_its_reason_and_no_rows() {
+        let (ctx, _) = AddonContext::recording();
+        let hub = Hub::new(ctx, Store::new(Err("pnputil is missing".into()), false));
+        hub.refresh();
+        until("the read ends", || !hub.lock().store_reading && hub.lock().store_error.is_some());
+        assert_eq!(hub.lock().store_error.as_deref(), Some("pnputil is missing"));
+        assert!(hub.lock().store.is_empty());
+    }
+
+    #[test]
+    fn the_store_is_read_after_the_other_lists_which_do_not_wait_for_it() {
+        let (ctx, _) = AddonContext::recording();
+        let reader = Store::new(Ok(vec![package("oem1.inf")]), true);
+        let hub = Hub::new(ctx, reader.clone());
+        hub.refresh();
+        until("the store read starts", || reader.in_read.load(Ordering::SeqCst));
+        assert!(!hub.lock().listing, "the devices and kernel drivers are already published");
+        assert!(hub.lock().store_reading, "and the store is still being read");
+        reader.release.store(true, Ordering::SeqCst);
+        until("the store is shown", || hub.lock().store.len() == 1);
+    }
+
+    #[test]
+    fn a_hub_that_was_stopped_reads_no_store() {
+        let (ctx, _) = AddonContext::recording();
+        let reader = Store::new(Ok(vec![package("oem1.inf")]), false);
+        let hub = Hub::new(ctx, reader.clone());
+        hub.stop();
+        hub.refresh();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(reader.asked.load(Ordering::SeqCst), 0, "nothing starts while off");
+        assert!(hub.lock().store.is_empty());
+    }
+
+    #[test]
+    fn turning_off_while_the_store_is_read_drops_its_result() {
+        let (ctx, _) = AddonContext::recording();
+        let reader = Store::new(Ok(vec![package("oem1.inf")]), true);
+        let hub = Hub::new(ctx, reader.clone());
+        hub.refresh();
+        until("the store read is running", || reader.in_read.load(Ordering::SeqCst));
+        hub.stop();
+        reader.release.store(true, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let st = hub.lock();
+        assert!(st.store.is_empty() && st.store_error.is_none(), "nothing is published");
+        assert!(!st.store_reading, "and the page is not left reading");
+    }
+
+    #[test]
+    fn a_store_read_replaces_the_last_one_and_a_failure_drops_the_rows() {
+        let mut st = State::default();
+        publish_store(&mut st, Err("no drivers here".into()));
+        assert_eq!(st.store_error.as_deref(), Some("no drivers here"));
+        publish_store(&mut st, Ok(vec![package("oem1.inf")]));
+        assert!(st.store_error.is_none() && st.store.len() == 1, "a good read clears the error");
+        publish_store(&mut st, Err("again".into()));
+        assert!(st.store.is_empty(), "a failed read drops the old rows");
+    }
+
+    /// Reads this PC's driver store (run with `--ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn reads_the_driver_store_of_this_pc() {
+        use crate::addons::drivers::store::{classify, StoreFigures};
+        let started = std::time::Instant::now();
+        let list = crate::addons::drivers::windows::WindowsListing.store().expect("the store is read with normal rights");
+        println!("{} packages in {:?}", list.len(), started.elapsed());
+        let measured = list.iter().filter(|p| p.size.is_some()).count();
+        println!("{measured} with a size");
+        println!("{:?}", StoreFigures::of(&list, &classify(&list)));
+        assert!(!list.is_empty());
+        assert!(measured > 0, "the packages' folders are found");
     }
 }

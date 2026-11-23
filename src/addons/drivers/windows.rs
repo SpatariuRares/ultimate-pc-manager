@@ -2,6 +2,7 @@
 //! code, moved unchanged. Elsewhere it lists nothing.
 
 use super::engine::{DeviceDriver, KernelDriver, SecurityReading};
+use super::store::StorePackage;
 use super::ListingReader;
 
 /// The Drivers add-on's reader on a real PC.
@@ -18,6 +19,9 @@ impl ListingReader for WindowsListing {
     fn security(&self) -> SecurityReading {
         imp::read_security()
     }
+    fn store(&self) -> Result<Vec<StorePackage>, String> {
+        imp::read_store()
+    }
 }
 
 #[cfg(not(windows))]
@@ -33,11 +37,15 @@ mod imp {
     pub fn read_security() -> SecurityReading {
         SecurityReading::unreadable(&unavailable_error(Feature::DeviceSetupApi))
     }
+    pub fn read_store() -> Result<Vec<super::StorePackage>, String> {
+        Err(unavailable_error(Feature::DeviceSetupApi))
+    }
 }
 
 #[cfg(windows)]
 mod imp {
     use super::super::engine::*;
+    use super::StorePackage;
     use std::ffi::c_void;
     use std::ptr::{null, null_mut};
 
@@ -69,6 +77,54 @@ mod imp {
             memory_integrity: read_dword(r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity", "Enabled"),
             blocklist: read_dword(r"SYSTEM\CurrentControlSet\Control\CI\Config", "VulnerableDriverBlocklistEnable"),
         }
+    }
+
+    // ------------------------------------------------------- driver store
+
+    /// The folder of a package in the driver store, from the registry's
+    /// driver database ("oem42.inf" -> `nv_dispi.inf_amd64_0123456789abcdef`).
+    fn store_folder(published: &str) -> Option<String> {
+        use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+        let key = winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(format!(r"SYSTEM\DriverDatabase\DriverInfFiles\{published}"), KEY_READ)
+            .ok()?;
+        key.get_value::<Vec<String>, _>("").ok().and_then(|v| v.into_iter().find(|s| !s.is_empty())).or_else(|| key.get_value::<String, _>("").ok().filter(|s| !s.is_empty()))
+    }
+
+    /// The bytes of the files under `dir`.
+    fn folder_size(dir: &std::path::Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+        entries
+            .flatten()
+            .map(|e| match e.metadata() {
+                Ok(m) if m.is_dir() => folder_size(&e.path()),
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            })
+            .sum()
+    }
+
+    /// The driver packages Windows keeps: `pnputil /enum-drivers /devices
+    /// /format xml` with normal rights, then each package's folder measured.
+    pub fn read_store() -> Result<Vec<StorePackage>, String> {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let out = std::process::Command::new(format!(r"{root}\System32\pnputil.exe"))
+            .args(["/enum-drivers", "/devices", "/format", "xml"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("pnputil could not be started: {e}"))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut packages = super::super::store::parse_store(&text).map_err(|e| match out.status.code() {
+            Some(0) | None => e,
+            Some(code) => format!("{e}; pnputil exited with code {code}"),
+        })?;
+        let repository = std::path::Path::new(&root).join(r"System32\DriverStore\FileRepository");
+        for p in &mut packages {
+            p.size = store_folder(&p.published).map(|f| folder_size(&repository.join(f)));
+        }
+        Ok(packages)
     }
 
     fn wide(s: &str) -> Vec<u16> {

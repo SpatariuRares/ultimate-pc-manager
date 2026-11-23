@@ -11,6 +11,8 @@ pub mod cli;
 pub mod engine;
 /// The Drivers page.
 pub mod page;
+/// The driver store: reading and classifying the packages.
+pub mod store;
 /// The Windows reader of the listing.
 pub mod windows;
 
@@ -43,6 +45,11 @@ pub trait ListingReader: Send + Sync {
     /// with normal rights. A reader that cannot read them says so.
     fn security(&self) -> engine::SecurityReading {
         engine::SecurityReading::unreadable("this reader does not read the security settings")
+    }
+    /// The driver packages Windows keeps, read with normal rights, or why
+    /// they could not be read.
+    fn store(&self) -> Result<Vec<store::StorePackage>, String> {
+        Err("this reader does not read the driver store".into())
     }
 }
 
