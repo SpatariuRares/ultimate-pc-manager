@@ -1233,7 +1233,7 @@ impl DriversPage {
                 let details = device_details(d, upd, device_signature(d, &view.signatures));
                 let inf = d.inf_path();
                 let name = d.name.clone();
-                let offered = [drivers::DeviceAction::toggle_for(d), drivers::DeviceAction::Restart];
+                let offered = [drivers::DeviceAction::Rollback, drivers::DeviceAction::toggle_for(d), drivers::DeviceAction::Restart];
                 resp.context_menu(|ui| {
                     if ui.button("Open the driver's folder").clicked() {
                         actions.push(Action::OpenLocation(inf.clone()));
@@ -1249,7 +1249,6 @@ impl DriversPage {
                     }
                     ui.separator();
                     ui.label(RichText::new("Device").size(11.5).color(th.faint));
-                    // Roll back driver (#31) goes first in this group.
                     for action in offered {
                         if crate::widgets::admin_menu_item(ui, action.label(), idle).clicked() {
                             device_pick = Some(DeviceConfirm::new(action, d));
@@ -1362,15 +1361,14 @@ impl DriversPage {
             ui.label(RichText::new("Device").strong().color(th.soft));
             ui.add_space(4.0);
             ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
-                // Roll back driver (#31) goes first in this group.
-                for action in [drivers::DeviceAction::toggle_for(d), drivers::DeviceAction::Restart] {
+                for action in [drivers::DeviceAction::Rollback, drivers::DeviceAction::toggle_for(d), drivers::DeviceAction::Restart] {
                     if parts::admin_button(ui, action.label(), false, idle).clicked() {
                         self.drv_ui.confirm_device = Some(DeviceConfirm::new(action, d));
                     }
                 }
             });
             if let Some(kind) = drivers::protected_kind(&d.class) {
-                ui.label(RichText::new(format!("This is a {kind}: disabling or restarting it asks for a stronger confirmation.")).size(11.5).color(th.amber));
+                ui.label(RichText::new(format!("This is a {kind}: disabling, restarting or rolling it back asks for a stronger confirmation.")).size(11.5).color(th.amber));
             }
             ui.add_space(10.0);
             ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
@@ -3151,6 +3149,52 @@ use super::tests::{gpu, page_and_runner, page_with};
         let shown = screen.settle(&mut page);
         assert!(drawn(&shown, "Disable device") && drawn(&shown, "Restart device"), "{shown:?}");
         assert!(!shown.iter().any(|(_, t)| t.contains("stronger confirmation")), "an ordinary device has no stronger warning");
+    }
+
+    #[test]
+    fn the_menu_and_the_panel_offer_roll_back_driver_first_in_the_device_group() {
+        let (mut page, mut screen) = (page_with(vec![device("Alpha NIC", "Net")], vec![]), Screen::new());
+        let shown = device_menu(&mut screen, &mut page, "Alpha NIC");
+        assert!(drawn(&shown, "Roll back driver") && drawn(&shown, "Disable device"), "{shown:?}");
+        let y = |s: &str| shown.iter().find(|(_, t)| t.trim() == s).map(|(p, _)| p.y).unwrap();
+        assert!(y("Roll back driver") < y("Disable device"), "it goes first in the group");
+        let (mut page, mut screen) = (page_with(vec![device("Alpha NIC", "Net")], vec![]), Screen::new());
+        page.drv_ui.selected_device = Some(r"ROOT\Alpha NIC\0000".into());
+        let shown = screen.settle(&mut page);
+        assert!(drawn(&shown, "Roll back driver"), "{shown:?}");
+    }
+
+    #[test]
+    fn rolling_back_asks_first_and_launches_the_job_with_the_restore_point_option() {
+        let ((mut page, runner), mut screen) = (page_and_runner(vec![device("Alpha NIC", "Net")], vec![]), Screen::new());
+        let shown = device_menu(&mut screen, &mut page, "Alpha NIC");
+        screen.click(&mut page, at_button(&shown, "Roll back driver"), egui::PointerButton::Primary);
+        let dialog = screen.settle(&mut page);
+        assert!(drawn(&dialog, "Windows goes back to the previous driver it kept for this device."), "{dialog:?}");
+        assert!(runner.launches().is_empty(), "nothing starts before the answer");
+        screen.click(&mut page, at_button(&dialog, "Roll back driver"), egui::PointerButton::Primary);
+        wait_for_launches(&runner, 1);
+        match &runner.launches()[0] {
+            crate::platform::Launch::PowerShell { args, elevated, .. } => {
+                assert!(*elevated);
+                assert!(args.contains(&("Mode".to_string(), "rollback-device".to_string())));
+                assert!(args.contains(&("Arg".to_string(), r"ROOT\Alpha NIC\0000".to_string())));
+                assert!(args.contains(&("Steps".to_string(), "restore-point,rollback-device".to_string())));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn rolling_back_a_protected_device_needs_the_stronger_warning_ticked() {
+        let ((mut page, runner), mut screen) = (page_and_runner(vec![device("Alpha GPU", "Display")], vec![]), Screen::new());
+        let shown = device_menu(&mut screen, &mut page, "Alpha GPU");
+        screen.click(&mut page, at_button(&shown, "Roll back driver"), egui::PointerButton::Primary);
+        let dialog = screen.settle(&mut page);
+        assert!(drawn(&dialog, "This is a display adapter: you may lose your screen or your boot disk until Windows restarts."), "{dialog:?}");
+        screen.click(&mut page, at_button(&dialog, "Roll back driver"), egui::PointerButton::Primary);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(runner.launches().is_empty(), "inert before the tick");
     }
 
     #[test]
