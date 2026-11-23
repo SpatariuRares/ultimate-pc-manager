@@ -23,7 +23,7 @@ e una mezza dozzina di utility.
 
 ## 2. Il prodotto
 
-**Ultimate PC Manager** è un'app desktop nativa per **Windows 10/11** (scritta in
+**Ultimate PC Manager** è un'app desktop nativa per **Windows 11, Linux e macOS** (scritta in
 Rust): leggera, veloce, senza installazioni pesanti, senza abbonamenti né
 funzioni "Pro" bloccate.
 
@@ -163,7 +163,7 @@ Claude.
 
 **1) Esplorazione (prima chat)**
 ```
-I'm creating a brand identity from scratch for "Ultimate PC Manager", a native Windows 10/11 app that
+I'm creating a brand identity from scratch for "Ultimate PC Manager", a native Windows 11, Linux and macOS app that
 replaces the built-in Task Manager and a handful of utilities: live CPU/GPU/memory/disk/network monitoring,
 processes, services, drivers, installed-app updates, disk space analysis, benchmarks and a "flight recorder"
 of system metrics. Audience: power users, gamers, hardware enthusiasts. Personality: definitive, precise,

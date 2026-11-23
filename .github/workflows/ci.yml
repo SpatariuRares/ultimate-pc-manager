@@ -8,6 +8,8 @@ on:
     paths:
       - 'src/**'
       - 'assets/**'
+      - 'tests/**'
+      - 'build.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
