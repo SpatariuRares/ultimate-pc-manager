@@ -98,9 +98,10 @@ pub(crate) fn system_has(feature: Feature) -> bool {
         let _ = feature;
         true
     };
-    // Linux: signals, nice values and affinity work through kill, renice and taskset.
+    // Linux: signals, nice values and affinity work through kill, renice and taskset;
+    // the startup entries are read from the XDG autostart folders.
     #[cfg(target_os = "linux")]
-    return matches!(feature, Feature::ProcessControl);
+    return matches!(feature, Feature::ProcessControl | Feature::StartupEntries);
     // No current feature has a macOS implementation yet.
     #[cfg(target_os = "macos")]
     return {
@@ -201,9 +202,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn on_linux_only_process_control_is_in_the_system_so_far() {
+    fn on_linux_only_process_control_and_startup_entries_are_in_the_system_so_far() {
         for &feature in Feature::ALL {
-            assert_eq!(system_has(feature), feature == Feature::ProcessControl, "{feature:?}");
+            assert_eq!(system_has(feature), matches!(feature, Feature::ProcessControl | Feature::StartupEntries), "{feature:?}");
         }
     }
 

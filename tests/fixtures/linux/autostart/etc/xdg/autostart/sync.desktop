@@ -1,0 +1,4 @@
+[Desktop Entry]
+Type=Application
+Name=Cloud Sync
+Exec=cloud-sync --quiet

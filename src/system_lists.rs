@@ -58,6 +58,9 @@ pub struct StartupRow {
     pub command: String,
     pub location: String,
     pub enabled: bool,
+    /// The file the entry lives in, when it has one to show ("Open file
+    /// location" opens its folder); empty when the command is the target.
+    pub file: String,
 }
 
 /// Said when an action names a startup entry that has left the list.

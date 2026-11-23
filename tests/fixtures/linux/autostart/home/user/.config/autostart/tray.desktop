@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Tray Helper
+Exec=tray-helper
+Hidden=true
