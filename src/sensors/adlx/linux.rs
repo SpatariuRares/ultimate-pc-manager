@@ -1,0 +1,6 @@
+//! Linux: ADLX is a Windows library, so there is none.
+
+/// The library: not available on this system.
+pub fn library() -> Result<Box<dyn crate::sensors::vendor_gpu::Library>, String> {
+    Err("ADLX is a Windows library".to_string())
+}

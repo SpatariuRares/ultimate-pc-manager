@@ -7,11 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-#[cfg_attr(not(windows), allow(unused_imports))]
-use super::model::Instance;
 use super::model::{CounterSet, Device, DeviceKind, Group, Reading, Unit};
-#[cfg_attr(not(windows), allow(unused_imports))]
-use crate::perfdata::counter;
 use super::provider::Provider;
 
 /// NVMe S.M.A.R.T.: the health log and its readings.
@@ -105,11 +101,6 @@ pub fn set_probe_consent(consent: bool) {
     PROBE_CONSENT.store(consent, std::sync::atomic::Ordering::Relaxed);
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
-fn probe_consent() -> bool {
-    PROBE_CONSENT.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Which disks have a direct S.M.A.R.T. query, by their bus: `Some(false)`
 /// = NVMe health log, `Some(true)` = ATA attributes, `None` = none (USB,
 /// RAID, virtual...).
@@ -181,26 +172,16 @@ impl DiskSample {
     }
 }
 
-/// Rate counters need this much time between two collections.
-#[cfg_attr(not(windows), allow(dead_code))]
-const MIN_SPAN: Duration = Duration::from_millis(200);
-
 /// The disk provider. Built on its worker thread (holds a PDH query).
 pub struct DiskCounters {
-    #[cfg(windows)]
-    query: Option<super::pdh::Query>,
-    #[cfg(windows)]
-    collected: Instant,
+    counters: imp::Counters,
     /// (disk number, model) of every physical disk.
-    #[cfg_attr(not(windows), allow(dead_code))]
     models: Vec<(u32, String)>,
     /// NVMe and SATA disks: number, whether ATA, last direct S.M.A.R.T.
     /// query and when it was made (`None` while the query is blocked).
-    #[cfg_attr(not(windows), allow(dead_code))]
     smart: Vec<(u32, bool, Option<(DiskSmart, Instant)>)>,
     /// Whether the hardware sensors are looked at: the health of the disks
     /// (S.M.A.R.T.) is read only then (see [`Provider::hardware_wanted`]).
-    #[cfg_attr(not(windows), allow(dead_code))]
     health: bool,
     /// What the last read counted: every disk's idle time, read and write
     /// rate, the last two with their raw totals (see [`Provider::counted`]).
@@ -215,79 +196,12 @@ impl DiskCounters {
     /// A provider for these disks (their models and buses are its input).
     pub fn over(disks: Vec<crate::perfdata::DiskInfo>) -> Self {
         DiskCounters {
-            #[cfg(windows)]
-            query: super::pdh::Query::open(&[
-                (counter::IDLE, r"\PhysicalDisk(*)\% Idle Time"),
-                (counter::DREAD, r"\PhysicalDisk(*)\Disk Read Bytes/sec"),
-                (counter::DWRITE, r"\PhysicalDisk(*)\Disk Write Bytes/sec"),
-                (counter::DRESP, r"\PhysicalDisk(*)\Avg. Disk sec/Transfer"),
-            ]),
-            #[cfg(windows)]
-            collected: Instant::now(),
+            counters: imp::Counters::open(),
             models: disks.iter().map(|d| (d.number, d.model.clone())).collect(),
             smart: disks.iter().filter_map(|d| smart_bus(d.bus).map(|ata| (d.number, ata, None))).collect(),
             health: true,
             counted: Vec::new(),
         }
-    }
-
-    #[cfg(windows)]
-    fn sample(&mut self) -> Vec<DiskSample> {
-        let mut disks: Vec<DiskSample> = self.models.iter().map(|(n, m)| DiskSample { number: *n, model: m.clone(), ..Default::default() }).collect();
-        let now = Instant::now();
-        let admin = crate::platform::is_admin();
-        let consent = probe_consent();
-        for (n, ata, last) in self.smart.iter_mut().filter(|_| self.health) {
-            let gate = if *ata { blocked(true, admin, consent).map(DiskSmart::Ata) } else { blocked(false, admin, consent).map(DiskSmart::Nvme) };
-            let smart = match gate {
-                Some(not_tried) => {
-                    // Not cached: consenting (or elevating) reads at once.
-                    *last = None;
-                    not_tried
-                }
-                None => {
-                    let (read, when) = match last.take() {
-                        Some((cached, t)) if !smart_due(Some(t), now) => (cached, t),
-                        _ => (if *ata { DiskSmart::Ata(ata::query(*n)) } else { DiskSmart::Nvme(nvme::query(*n)) }, now),
-                    };
-                    *last = Some((read.clone(), when));
-                    read
-                }
-            };
-            if let Some(d) = disks.iter_mut().find(|d| d.number == *n) {
-                d.smart = Some(smart);
-            }
-        }
-        let Some(q) = self.query.as_mut() else { return disks };
-        let wait = MIN_SPAN.saturating_sub(self.collected.elapsed());
-        if !wait.is_zero() {
-            std::thread::sleep(wait);
-        }
-        q.collect();
-        self.collected = Instant::now();
-        let counted = [q.counted(counter::IDLE, false), q.counted(counter::DREAD, true), q.counted(counter::DWRITE, true)];
-        for (counted, set) in counted.iter().zip([
-            (|d: &mut DiskSample, v: f64| d.idle_percent = Some(v)) as fn(&mut DiskSample, f64),
-            |d, v| d.read_bytes_per_sec = Some(v),
-            |d, v| d.write_bytes_per_sec = Some(v),
-        ]) {
-            for Instance { name: inst, value: v, .. } in &counted.instances {
-                let v = *v;
-                let Some(n) = disk_number(inst) else { continue };
-                let i = match disks.iter().position(|d| d.number == n) {
-                    Some(i) => i,
-                    None => {
-                        disks.push(DiskSample { number: n, ..Default::default() });
-                        disks.len() - 1
-                    }
-                };
-                set(&mut disks[i], v);
-            }
-        }
-        disks.sort_by_key(|d| d.number);
-        // The average response time is only reported (the readings have no row for it).
-        self.counted = counted.into_iter().chain([q.counted(counter::DRESP, false)]).collect();
-        disks
     }
 }
 
@@ -297,13 +211,7 @@ impl Provider for DiskCounters {
     }
 
     fn availability(&mut self) -> Result<(), String> {
-        #[cfg(windows)]
-        return match self.query {
-            Some(_) => Ok(()),
-            None => Err("performance counters are off on this PC".into()),
-        };
-        #[cfg(not(windows))]
-        Err(crate::availability::unavailable_error(crate::availability::Feature::HardwareSensors))
+        self.counters.availability()
     }
 
     fn hardware_wanted(&mut self, wanted: bool) {
@@ -315,15 +223,24 @@ impl Provider for DiskCounters {
     }
 
     fn read(&mut self, at: Instant) -> Vec<Reading> {
-        #[cfg(windows)]
-        return self.sample().iter().flat_map(|d| d.readings(at)).collect();
-        #[cfg(not(windows))]
-        {
-            let _ = at;
-            Vec::new()
-        }
+        let disks = self.counters.sample(&self.models, &mut self.smart, self.health, &mut self.counted);
+        disks.iter().flat_map(|d| d.readings(at)).collect()
     }
 }
+
+#[cfg(windows)]
+mod windows;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(windows)]
+use windows as imp;
+#[cfg(target_os = "linux")]
+use linux as imp;
+#[cfg(target_os = "macos")]
+use macos as imp;
 
 #[cfg(test)]
 mod tests {
