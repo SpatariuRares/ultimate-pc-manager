@@ -11,8 +11,9 @@ fn home(env: Env) -> Option<PathBuf> {
 
 /// `var` if set to an absolute path, else `fallback` under `HOME`.
 fn xdg(env: Env, var: &str, fallback: &str) -> Option<PathBuf> {
-    // Absolute on Linux means a leading `/` (also when judged on another host).
-    match env(var).map(PathBuf::from).filter(|p| p.to_string_lossy().starts_with('/')) {
+    // Absolute: a leading `/`, or whatever the host calls absolute (so the
+    // rules can be tried on another host with its own paths).
+    match env(var).map(PathBuf::from).filter(|p| p.is_absolute() || p.to_string_lossy().starts_with('/')) {
         Some(dir) => Some(dir),
         None => home(env).map(|h| h.join(Path::new(fallback))),
     }
