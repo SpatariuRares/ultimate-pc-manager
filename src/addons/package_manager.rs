@@ -387,8 +387,8 @@ type Commands = Arc<Mutex<Vec<Command>>>;
 
 /// Where install logs go: %LOCALAPPDATA%\UltimatePCManager\package-manager\logs.
 fn default_logs() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join(crate::settings::DATA_FOLDER).join(ID).join("logs")
+    let app = crate::app_folders::cache().unwrap_or_else(|| std::env::temp_dir().join(crate::settings::DATA_FOLDER));
+    app.join(ID).join("logs")
 }
 
 /// Where the series' journals go: the add-on's folder beside the app's
@@ -398,14 +398,13 @@ fn default_journals() -> PathBuf {
     if cfg!(test) {
         return readiness::temp_output().with_extension("journal");
     }
-    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join(crate::settings::DATA_FOLDER).join(ID).join("journal")
+    let app = crate::app_folders::data().unwrap_or_else(|| std::env::temp_dir().join(crate::settings::DATA_FOLDER));
+    app.join(ID).join("journal")
 }
 
 /// The bundle folder when none was chosen: the user's Documents.
 fn default_bundle_folder() -> PathBuf {
-    let home = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    home.join("Documents")
+    crate::app_folders::documents().unwrap_or_else(std::env::temp_dir)
 }
 
 /// A new log file in `logs` for `verb` ("install", "update", "uninstall")

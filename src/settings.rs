@@ -195,7 +195,7 @@ impl Default for ProcessTable {
 }
 
 /// The name of the app's data folders, in %APPDATA% and %LOCALAPPDATA%.
-pub const DATA_FOLDER: &str = "UltimatePCManager";
+pub const DATA_FOLDER: &str = crate::app_folders::APP_FOLDER;
 
 /// Their name before the app was renamed "Ultimate PC Manager".
 const OLD_DATA_FOLDER: &str = "MyTaskManager";
@@ -203,17 +203,14 @@ const OLD_DATA_FOLDER: &str = "MyTaskManager";
 /// The app's data folder (%APPDATA%\UltimatePCManager), where its settings and
 /// the add-ons' files live.
 pub fn app_dir() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("APPDATA").or_else(|| std::env::var_os("HOME"))?;
-    Some(std::path::Path::new(&base).join(DATA_FOLDER))
+    crate::app_folders::config()
 }
 
 /// Renames the data folders of the old name ("MyTaskManager") to the new
 /// one, once, so settings and histories survive the rename. A folder of the
 /// new name, once there, is left as it is.
 pub fn move_old_data_folders() {
-    for var in ["APPDATA", "LOCALAPPDATA"] {
-        let Some(base) = std::env::var_os(var) else { continue };
-        let base = std::path::Path::new(&base);
+    for base in crate::app_folders::legacy_bases() {
         let (old, new) = (base.join(OLD_DATA_FOLDER), base.join(DATA_FOLDER));
         if old.is_dir() && !new.exists() {
             let _ = std::fs::rename(old, new);

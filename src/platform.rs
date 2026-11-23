@@ -1009,8 +1009,8 @@ mod imp {
 
     /// Where scripts and their results are written while they run.
     fn jobs_dir() -> Result<std::path::PathBuf, String> {
-        let base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
-        let dir = base.join(crate::settings::DATA_FOLDER).join("jobs");
+        let app = crate::app_folders::cache().unwrap_or_else(|| std::env::temp_dir().join(crate::settings::DATA_FOLDER));
+        let dir = app.join("jobs");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         Ok(dir)
     }

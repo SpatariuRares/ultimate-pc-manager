@@ -62,8 +62,7 @@ impl Prefs {
 
 /// The user's Documents folder (else the temp folder).
 pub fn documents() -> PathBuf {
-    std::env::var_os("USERPROFILE")
-        .map(|h| PathBuf::from(h).join("Documents"))
+    crate::app_folders::documents()
         .filter(|d| d.is_dir())
         .unwrap_or_else(std::env::temp_dir)
 }
