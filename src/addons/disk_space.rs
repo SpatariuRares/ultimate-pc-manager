@@ -1304,7 +1304,7 @@ impl Addon for DiskSpace {
         if changed && limited {
             self.keep_scans = Some(keep);
         }
-        let shown = self.history_folder.clone().unwrap_or_else(|| history::DEFAULT_FOLDER.into());
+        let shown = self.history_folder.clone().unwrap_or_else(history::default_folder);
         match setting_folder(ui, "History folder", None, &shown, Some(("Reset to default", self.history_folder.is_some())), true) {
             FolderAct::Choose => {
                 if let Some(dir) = self.context.as_ref().and_then(|c| c.pick_folder("Choose the folder for the scan history", "Choose")) {
