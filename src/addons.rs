@@ -1683,7 +1683,7 @@ mod tests {
         test_addon!("records", "Records", "Records sensors.");
         fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
         fn offers(&mut self) -> Offers<'_> {
-            Offers { sensor_recorder: Some(self) }
+            Offers { sensor_recorder: Some(self), ..Offers::default() }
         }
     }
 
@@ -1724,7 +1724,7 @@ mod tests {
         }
         fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
         fn offers(&mut self) -> Offers<'_> {
-            Offers { sensor_recorder: Some(self) }
+            Offers { sensor_recorder: Some(self), ..Offers::default() }
         }
     }
 
@@ -1745,7 +1745,7 @@ mod tests {
         test_addon!("keeping-recorder", "Keeping recorder", "Records and holds work.");
         fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
         fn offers(&mut self) -> Offers<'_> {
-            Offers { sensor_recorder: Some(self) }
+            Offers { sensor_recorder: Some(self), ..Offers::default() }
         }
         fn uninterruptible(&self) -> bool {
             true
