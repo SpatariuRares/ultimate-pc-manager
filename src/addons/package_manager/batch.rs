@@ -10,7 +10,6 @@
 use std::path::PathBuf;
 
 use crate::platform::install_queue::Work;
-use crate::platform::winget::join_names;
 
 use super::catalog::{Found, Pin};
 
@@ -190,10 +189,10 @@ pub fn summary(items: &[Item], kind: Kind) -> Vec<String> {
         items.iter().filter_map(|i| pick(&i.status).map(|why| format!("{} ({why})", i.package.name))).collect()
     };
     let classes = [
-        (title.to_string(), join_names(&names(|s| *s == Status::Ok))),
-        (format!("{title}, restart Windows to finish"), join_names(&names(|s| *s == Status::OkRestart))),
+        (title.to_string(), super::primary_source().join_names(&names(|s| *s == Status::Ok))),
+        (format!("{title}, restart Windows to finish"), super::primary_source().join_names(&names(|s| *s == Status::OkRestart))),
         ("Skipped".to_string(), reasons(|s| if let Status::Skipped(w) = s { Some(w) } else { None }).join("; ")),
-        ("Cancelled".to_string(), join_names(&names(|s| *s == Status::Cancelled))),
+        ("Cancelled".to_string(), super::primary_source().join_names(&names(|s| *s == Status::Cancelled))),
         ("Failed".to_string(), reasons(|s| if let Status::Failed(w) = s { Some(w) } else { None }).join("; ")),
         ("Not started".to_string(), reasons(|s| if let Status::NotStarted(w) = s { Some(w) } else { None }).join("; ")),
         ("To install by hand".to_string(), reasons(|s| if let Status::Manual(u) = s { Some(u) } else { None }).join("; ")),

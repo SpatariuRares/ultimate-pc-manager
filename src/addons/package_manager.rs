@@ -54,13 +54,12 @@ use egui::{RichText, Ui};
 use crate::addons::{is_default, read_settings, write_settings, Addon, Consumption, Requirements, CloseWait, Asked, Capability};
 use crate::platform::install_queue::{Request, Work};
 use crate::platform::series::{Run, Series};
-use crate::platform::winget::{classify, describe, last_lines, ExitClass};
 use crate::platform::{lock_state, AddonContext, Generation, Job, PageContext, Ran};
 
 use batch::{Item, Kind, Status};
 use bundle::BundleView;
-use catalog::{Found, PackageSource, Pin, Target};
-use readiness::{Answer, Readiness, Repair};
+use catalog::{ExitClass, Found, PackageSource, Pin, Target};
+use readiness::{Readiness, Repair};
 
 /// The add-on's id, and its page's.
 pub const ID: &str = "package-manager";
@@ -179,7 +178,7 @@ pub struct Install {
 impl Install {
     /// The last lines of its output worth showing (no progress bars).
     pub fn last_lines(&self) -> String {
-        last_lines(&self.lines.join("\n"), 5)
+        primary_source().last_lines(&self.lines.join("\n"), 5)
     }
 }
 
@@ -201,14 +200,15 @@ impl Outcome {
             Outcome::NotStarted(why) => return format!("{name} was not started: {}", why.trim()),
             Outcome::Exited { code, found } => (*code, *found),
         };
-        let words = describe(code);
-        match classify(code) {
+        let source = primary_source();
+        let words = source.describe(code);
+        match source.classify(code) {
             ExitClass::Installed | ExitClass::InstalledRestart if found == Some(false) => {
                 format!("{name} was installed according to winget ({}), but it is not found among the installed packages.", code_text(code))
             }
             ExitClass::Installed => format!("{name} was installed ({}).", code_text(code)),
             ExitClass::InstalledRestart => format!("{name} was installed; {words}."),
-            ExitClass::Skipped(_) => format!("{name} was skipped: {words}."),
+            ExitClass::Skipped => format!("{name} was skipped: {words}."),
             ExitClass::Cancelled => format!("{name} was cancelled: {words}."),
             ExitClass::Failed => format!("{name} started installing but failed: {words}."),
         }
@@ -220,15 +220,16 @@ impl Outcome {
             Outcome::NotStarted(why) => return Status::NotStarted(why.trim().trim_end_matches('.').to_string()),
             Outcome::Exited { code, found } => (*code, *found),
         };
-        match classify(code) {
+        let source = primary_source();
+        match source.classify(code) {
             ExitClass::Installed | ExitClass::InstalledRestart if found == Some(false) => {
                 Status::Failed(format!("installed according to winget ({}), but not found among the installed packages", code_text(code)))
             }
             ExitClass::Installed => Status::Ok,
             ExitClass::InstalledRestart => Status::OkRestart,
-            ExitClass::Skipped(_) => Status::Skipped(describe(code)),
+            ExitClass::Skipped => Status::Skipped(source.describe(code)),
             ExitClass::Cancelled => Status::Cancelled,
-            ExitClass::Failed => Status::Failed(describe(code)),
+            ExitClass::Failed => Status::Failed(source.describe(code)),
         }
     }
 }
@@ -239,7 +240,7 @@ fn code_text(code: i32) -> String {
     if code == 0 {
         "exit code 0".into()
     } else {
-        describe(code)
+        primary_source().describe(code)
     }
 }
 
@@ -474,7 +475,7 @@ fn install_package(context: &AddonContext, source: &dyn PackageSource, package: 
         Ran::NotStarted(why) => Outcome::NotStarted(why),
         Ran::Stopped => Outcome::NotStarted("it was stopped.".into()),
         Ran::Exited(code) => {
-            let installed = matches!(classify(code), ExitClass::Installed | ExitClass::InstalledRestart);
+            let installed = matches!(source.classify(code), ExitClass::Installed | ExitClass::InstalledRestart);
             let found = if installed { source.is_installed(context, &package.catalog, &package.id, accept, &never) } else { None };
             Outcome::Exited { code, found }
         }
@@ -960,12 +961,10 @@ impl PackageManager {
                 lock_state(&self.state).repair_error = error;
             }
             Some((Repair::Register, _)) => self.spawn(Check::Repairing, |context, stop, job| {
-                let args = readiness::powershell_args(readiness::REGISTER_APP_INSTALLER);
-                let error = match readiness::ask(context, "powershell.exe", &args, stop) {
+                let error = match primary_source().register(context, stop) {
                     None => return,
-                    Some(Answer::Exited(0, _)) => None,
-                    Some(Answer::Exited(code, out)) => Some(format!("Registering App Installer failed (exit code {code}). {}", out.trim())),
-                    Some(Answer::NotStarted) => Some("PowerShell did not start.".into()),
+                    Some(Ok(())) => None,
+                    Some(Err(why)) => Some(why),
                 };
                 if let Some(r) = primary_source().availability(context, stop) {
                     job.publish(|s| {

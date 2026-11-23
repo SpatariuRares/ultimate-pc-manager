@@ -25,7 +25,7 @@ use egui::{RichText, Ui};
 
 use crate::platform::install_queue::{Request, Work};
 use crate::platform::uninstaller::{self, Uninstaller};
-use crate::platform::winget::{classify, describe, ExitClass, UNINSTALL_COMMAND_FAILED};
+use super::catalog::ExitClass;
 use crate::platform::{lock_state, AddonContext, Job, Ran};
 
 use super::batch::{Kind, Status};
@@ -190,7 +190,7 @@ pub(super) fn update_package(context: &AddonContext, source: &dyn PackageSource,
         Ran::NotStarted(why) => Outcome::NotStarted(why),
         Ran::Stopped => Outcome::NotStarted("it was stopped.".into()),
         Ran::Exited(code) => {
-            let updated = matches!(classify(code), ExitClass::Installed | ExitClass::InstalledRestart);
+            let updated = matches!(source.classify(code), ExitClass::Installed | ExitClass::InstalledRestart);
             let found = if updated { source.installed_version(context, &package.catalog, &package.id, accept, &never) } else { None };
             let found = found.map(|version| version.is_some_and(|v| !known_version(&package.version) || v == package.version));
             Outcome::Exited { code, found }
@@ -208,7 +208,7 @@ fn known_version(version: &str) -> bool {
 /// is told apart.
 pub fn update_status(outcome: &Outcome, version: &str) -> Status {
     match outcome {
-        Outcome::Exited { code, found: Some(false) } if matches!(classify(*code), ExitClass::Installed | ExitClass::InstalledRestart) => {
+        Outcome::Exited { code, found: Some(false) } if matches!(super::primary_source().classify(*code), ExitClass::Installed | ExitClass::InstalledRestart) => {
             let what = if known_version(version) { format!("version {version} is") } else { "it is".to_string() };
             Status::Failed(format!("updated according to winget ({}), but {what} not found among the installed packages", code_text(*code)))
         }
@@ -242,11 +242,11 @@ fn uninstall_with(context: &AddonContext, source: &dyn PackageSource, package: &
         Ran::Stopped => return Err(format!("{name} was not started: it was stopped.")),
         Ran::Exited(code) => code,
     };
-    if let (UNINSTALL_COMMAND_FAILED, Some(elevating)) = (code, elevating) {
+    if let (true, Some(elevating)) = (source.uninstall_needs_admin(code), elevating) {
         let local = source.local_id(context, &package.catalog, &package.id, accept, &never);
         let entry = local.filter(|l| l.starts_with("ARP\\Machine\\")).and_then(|l| registry_key(&l)).and_then(|key| (elevating.entry_of)(&key));
         let Some(entry) = entry else {
-            return Err(format!("{name} could not be uninstalled: {}. {ADMIN_HINT}", describe(code)));
+            return Err(format!("{name} could not be uninstalled: {}. {ADMIN_HINT}", source.describe(code)));
         };
         (elevating.uninstall)(&entry)?;
         return match source.is_installed(context, &package.catalog, &package.id, accept, &never) {
@@ -254,14 +254,14 @@ fn uninstall_with(context: &AddonContext, source: &dyn PackageSource, package: &
             _ => Ok(format!("{name} was uninstalled.")),
         };
     }
-    match classify(code) {
+    match source.classify(code) {
         ExitClass::Installed | ExitClass::InstalledRestart if source.is_installed(context, &package.catalog, &package.id, accept, &never) == Some(true) => {
             Err(format!("{name} is still installed after winget uninstalled it ({}).", code_text(code)))
         }
         ExitClass::Installed => Ok(format!("{name} was uninstalled.")),
-        ExitClass::InstalledRestart => Ok(format!("{name} was uninstalled; {}.", describe(code))),
-        ExitClass::Cancelled => Err(format!("{name} was not uninstalled: {}.", describe(code))),
-        ExitClass::Skipped(_) | ExitClass::Failed => Err(format!("{name} could not be uninstalled: {}.", describe(code))),
+        ExitClass::InstalledRestart => Ok(format!("{name} was uninstalled; {}.", source.describe(code))),
+        ExitClass::Cancelled => Err(format!("{name} was not uninstalled: {}.", source.describe(code))),
+        ExitClass::Skipped | ExitClass::Failed => Err(format!("{name} could not be uninstalled: {}.", source.describe(code))),
     }
 }
 
@@ -482,7 +482,7 @@ mod tests {
     use crate::settings::Settings;
     use serde_json::json;
 
-    use crate::platform::winget::{NO_PACKAGE_FOUND, UNINSTALL_COMMAND_FAILED};
+    use crate::platform::winget::{describe, NO_PACKAGE_FOUND, UNINSTALL_COMMAND_FAILED};
 
     /// A `winget list` table with these rows (name, id, version, available,
     /// source), padded the way winget pads it.

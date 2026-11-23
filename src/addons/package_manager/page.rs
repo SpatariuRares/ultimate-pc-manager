@@ -585,7 +585,7 @@ impl PackageManager {
                     crate::widgets::separator(ui);
                 }
                 if !b.done {
-                    let lines = crate::platform::winget::last_lines(&b.lines.join("\n"), 5);
+                    let lines = super::primary_source().last_lines(&b.lines.join("\n"), 5);
                     if !lines.is_empty() {
                         let name = b.items.iter().find(|i| i.status == Status::Running).map(|i| i.package.name.as_str()).unwrap_or("the package");
                         ui.label(RichText::new(format!("Last lines from {name}")).size(12.0).color(pal.label));
