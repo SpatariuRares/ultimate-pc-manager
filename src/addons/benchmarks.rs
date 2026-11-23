@@ -1064,7 +1064,7 @@ impl Addon for Benchmarks {
     /// The internet for the Internet test only; free space for the disk
     /// test; no administrator rights and no external program.
     fn requirements(&self) -> Requirements {
-        Requirements { admin: false, network: true, programs: &[], note: Some(NEEDS) }
+        Requirements { admin: false, network: true, programs: &[], note: Some(NEEDS), ..Requirements::default() }
     }
     fn consumption(&self) -> Consumption {
         Consumption { cpu: "High while running", network: "Only during the Internet test", disk: "High while running", when: "Only when you start a test" }

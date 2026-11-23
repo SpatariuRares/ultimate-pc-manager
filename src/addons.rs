@@ -74,8 +74,11 @@ impl Tier {
 }
 
 /// What an add-on needs from the PC.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct Requirements {
+    /// The systems the add-on is designed for; it is listed only on these.
+    /// All three by default.
+    pub systems: &'static [System],
     /// Some actions ask for administrator rights.
     pub admin: bool,
     /// Contacts services on the internet.
@@ -84,6 +87,36 @@ pub struct Requirements {
     pub programs: &'static [&'static str],
     /// A warning shown under the requirements, if any.
     pub note: Option<&'static str>,
+}
+
+impl Default for Requirements {
+    fn default() -> Self {
+        Requirements { systems: &System::ALL, admin: false, network: false, programs: &[], note: None }
+    }
+}
+
+/// An operating system the app supports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum System {
+    Windows,
+    Linux,
+    MacOs,
+}
+
+impl System {
+    /// The three supported systems.
+    pub const ALL: [System; 3] = [System::Windows, System::Linux, System::MacOs];
+
+    /// The system the app runs on.
+    pub fn current() -> System {
+        if cfg!(target_os = "windows") {
+            System::Windows
+        } else if cfg!(target_os = "macos") {
+            System::MacOs
+        } else {
+            System::Linux
+        }
+    }
 }
 
 /// The resource use an add-on declares, in words.
@@ -781,6 +814,19 @@ impl AddonHost {
         (Self::with_context(entries, section, context), runner)
     }
 
+    /// Like [`AddonHost::for_tests_with`], as if the app ran on `system`.
+    #[cfg(test)]
+    pub fn for_tests_on(entries: Vec<Entry>, system: System) -> (Self, std::sync::Arc<crate::platform::RecordingRunner>) {
+        Self::for_tests_on_with(entries, system, &serde_json::Value::Null)
+    }
+
+    /// [`AddonHost::for_tests_on`] with saved settings.
+    #[cfg(test)]
+    pub fn for_tests_on_with(entries: Vec<Entry>, system: System, section: &serde_json::Value) -> (Self, std::sync::Arc<crate::platform::RecordingRunner>) {
+        let (context, runner) = AddonContext::recording();
+        (Self::with_context_on(entries, section, context, system), runner)
+    }
+
     /// The context the add-ons get (Summary's tiles and the tests use its
     /// sensor service).
     pub fn context(&self) -> &AddonContext {
@@ -790,8 +836,19 @@ impl AddonHost {
     /// The host for `entries`: each add-on gets its saved settings (on or
     /// off), then the add-ons that are on are started with `context`.
     fn with_context(entries: Vec<Entry>, section: &serde_json::Value, context: AddonContext) -> Self {
+        Self::with_context_on(entries, section, context, System::current())
+    }
+
+    /// Like [`AddonHost::with_context`] on `system`: an add-on not designed
+    /// for it is left out (never listed, never started). Its saved state
+    /// stays in the settings file, which `write_section` keeps.
+    fn with_context_on(entries: Vec<Entry>, section: &serde_json::Value, context: AddonContext, system: System) -> Self {
         let slots = entries
             .into_iter()
+            .filter(|entry| match entry {
+                Entry::Addon(addon) => addon.requirements().systems.contains(&system),
+                Entry::Core(_) => true,
+            })
             .map(|entry| {
                 let saved = section.get(entry.id()).filter(|_| matches!(entry, Entry::Addon(_)));
                 let enabled = saved.and_then(|e| e.get("enabled")).and_then(|v| v.as_bool()).unwrap_or(true);
@@ -2323,6 +2380,48 @@ mod tests {
             assert!(host.visible().contains(&id));
         }
         assert_eq!(host.addons().count(), 8);
+    }
+
+    #[test]
+    fn a_system_specific_addon_is_listed_only_on_its_systems() {
+        use crate::addons::fake::{test_registry_with_linux_only, LINUX_ONLY};
+        for (system, listed) in [(System::Linux, true), (System::Windows, false), (System::MacOs, false)] {
+            let (host, _) = AddonHost::for_tests_on(test_registry_with_linux_only(), system);
+            assert_eq!(host.visible().contains(&LINUX_ONLY), listed, "sidebar on {system:?}");
+            assert_eq!(host.addons().any(|(a, _)| a.id() == LINUX_ONLY), listed, "Settings > Add-ons on {system:?}");
+            assert_eq!(host.is_enabled(LINUX_ONLY), listed, "{system:?}");
+            assert_eq!(host.resolve_page(LINUX_ONLY) == LINUX_ONLY, listed, "--page on {system:?}");
+        }
+    }
+
+    #[test]
+    fn an_addon_hidden_on_this_system_keeps_its_saved_state() {
+        use crate::addons::fake::{test_registry_with_linux_only, LINUX_ONLY};
+        let section = serde_json::json!({ LINUX_ONLY: { "enabled": false } });
+        let (host, _) = AddonHost::for_tests_on_with(test_registry_with_linux_only(), System::Windows, &section);
+        let mut written = section.clone();
+        host.write_section(&mut written);
+        assert_eq!(written[LINUX_ONLY]["enabled"], false, "saved state survives on another system");
+    }
+
+    #[test]
+    fn requirements_default_to_all_three_systems() {
+        assert_eq!(Requirements::default().systems, System::ALL);
+        assert_eq!(System::ALL, [System::Windows, System::Linux, System::MacOs]);
+    }
+
+    #[test]
+    fn the_existing_addons_are_listed_on_all_three_systems() {
+        for system in System::ALL {
+            let (host, _) = AddonHost::for_tests_on(registry(), system);
+            assert_eq!(host.addons().count(), 8, "{system:?}");
+            assert_eq!(host.visible(), host.ids(), "{system:?}");
+        }
+        for entry in registry() {
+            if let Entry::Addon(a) = entry {
+                assert_eq!(a.requirements().systems, System::ALL, "{}", a.id());
+            }
+        }
     }
 
     #[test]

@@ -1055,7 +1055,7 @@ impl Addon for PackageManager {
         "Install, update and remove programs from the winget catalogs."
     }
     fn requirements(&self) -> Requirements {
-        Requirements { admin: true, network: true, programs: &["winget (App Installer)", "PowerShell"], note: Some(NEEDS) }
+        Requirements { admin: true, network: true, programs: &["winget (App Installer)", "PowerShell"], note: Some(NEEDS), ..Requirements::default() }
     }
     fn consumption(&self) -> Consumption {
         Consumption { cpu: "Low", network: "While checking, searching or installing", disk: "While installing", when: "Only while its page is open or a job runs" }
