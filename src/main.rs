@@ -10,6 +10,7 @@ mod system;
 mod system_info;
 mod fs_root;
 mod linux_facts;
+mod user_sessions;
 mod availability;
 mod core_page;
 mod page_summary;
