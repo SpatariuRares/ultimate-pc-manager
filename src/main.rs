@@ -23,6 +23,7 @@ mod perfdata;
 mod path_cache;
 mod platform;
 mod proc_info;
+mod process_menu;
 mod process_view;
 mod sampler;
 mod sensors;

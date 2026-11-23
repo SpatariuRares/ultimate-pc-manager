@@ -1119,7 +1119,7 @@ mod tests {
 
     #[test]
     fn set_affinity_lists_the_logical_cpus_and_toggles_one_on_a_child_process() {
-        use crate::widgets::{menu_entries, MenuEntry, MenuState};
+        use crate::process_menu::{menu_entries, MenuEntry, MenuState};
         let mut child = sleeping_child();
         let pid = child.id();
         let read = get_affinity(pid);
