@@ -256,7 +256,7 @@ impl Addon for Drivers {
     /// The internet and Windows Update for the search; administrator
     /// rights only to install, scan and unload.
     fn requirements(&self) -> Requirements {
-        Requirements { admin: true, network: true, programs: &["PowerShell", "pnputil", "sc"], note: Some(NEEDS) }
+        Requirements { admin: true, network: true, programs: &["PowerShell", "pnputil", "sc"], note: Some(NEEDS), ..Requirements::default() }
     }
     fn consumption(&self) -> Consumption {
         Consumption { cpu: "Medium", network: "On update checks", disk: "On install", when: "On open and on your actions" }

@@ -114,7 +114,7 @@ impl Addon for InstalledApps {
     /// The internet and winget for the updates, PowerShell for the Store
     /// apps; administrator rights only when a setup asks for them.
     fn requirements(&self) -> Requirements {
-        Requirements { admin: true, network: true, programs: &["winget (App Installer)", "PowerShell"], note: Some(NEEDS) }
+        Requirements { admin: true, network: true, programs: &["winget (App Installer)", "PowerShell"], note: Some(NEEDS), ..Requirements::default() }
     }
     fn consumption(&self) -> Consumption {
         Consumption { cpu: "Medium", network: "On checks and updates", disk: "On install and uninstall", when: "On open and on your actions" }
