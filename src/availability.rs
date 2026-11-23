@@ -48,6 +48,24 @@ features! {
     ServiceControl,
     /// Priority, affinity, suspend and efficiency of processes.
     ProcessControl,
+    /// Efficiency mode: lowering a process's priority and power use.
+    ProcessEfficiency,
+    /// Analysing the wait chain of a process's threads.
+    ProcessWaitChain,
+    /// Turning file and registry virtualisation of a process on or off.
+    ProcessUacVirtualization,
+    /// Writing a process's memory to a dump file.
+    ProcessDump,
+    /// The graphics usage of each process.
+    ProcessGpuUsage,
+    /// The count of handles each process holds.
+    ProcessHandleCounts,
+    /// The architecture a process was built for, as the system tells it.
+    ProcessArchitecture,
+    /// The verified signer of a program file.
+    FileSignatures,
+    /// The description in a program file's version details.
+    FileVersionInfo,
     /// The entries that start with the system.
     StartupEntries,
     /// The system's power options panel.
