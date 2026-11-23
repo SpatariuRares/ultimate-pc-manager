@@ -115,11 +115,8 @@ pub(crate) struct Account {
 
 /// The accounts that run processes, by name; processes without a user
 /// are "System".
-pub(crate) fn accounts(procs: &[ProcRow]) -> Vec<Account> {
-    accounts_with_sessions(procs, &[])
-}
-
-/// The same, with the login sessions each account has; an account that is
+///
+/// Each account also has the login sessions given; an account that is
 /// logged in but runs nothing we list still gets its row.
 pub(crate) fn accounts_with_sessions(procs: &[ProcRow], sessions: &[Session]) -> Vec<Account> {
     let mut by: BTreeMap<String, Account> = BTreeMap::new();
@@ -136,7 +133,7 @@ pub(crate) fn accounts_with_sessions(procs: &[ProcRow], sessions: &[Session]) ->
     }
     let mut all: Vec<Account> = by.into_values().collect();
     for a in &mut all {
-        a.procs.sort_by(|x, y| y.mem.cmp(&x.mem));
+        a.procs.sort_by_key(|p| std::cmp::Reverse(p.mem));
     }
     all
 }
@@ -337,6 +334,10 @@ mod tests {
 
     fn proc(pid: u32, name: &str, user: &str, cpu: f32, mem: u64) -> ProcRow {
         ProcRow { pid, name: name.into(), user: user.into(), cpu, mem, ..Default::default() }
+    }
+
+    fn accounts(procs: &[ProcRow]) -> Vec<Account> {
+        accounts_with_sessions(procs, &[])
     }
 
     fn sample() -> Vec<ProcRow> {
