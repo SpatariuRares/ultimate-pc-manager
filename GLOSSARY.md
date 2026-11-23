@@ -36,4 +36,8 @@ _Avoid_: Windows-only add-on (for the existing ones, which must reach concept pa
 
 **Feature**:
 One capability inside a page, such as a column, an action or a panel; unlike a page, a feature is hidden on a system that has nothing it could show.
-_Avoid_: function, capability (for a whole page)
+_Avoid_: function, capability (a capability is what an add-on offers the host, see **Capability**)
+
+**Capability**:
+What an add-on offers the host for others to ask for, such as recording sensors, a Processes column, owning paths, unsaved work or a reason to wait before closing; it counts only while its add-on is on.
+_Avoid_: feature (a part of a page), service

@@ -2065,6 +2065,28 @@ mod tests {
     }
 
     #[test]
+    fn power_freq_is_told_what_the_recorder_can_do_before_its_page_is_drawn() {
+        use crate::addons::Recording;
+        let power_freq = std::sync::Arc::<std::sync::Mutex<PowerFreq>>::default();
+        let entries = vec![
+            crate::addons::Entry::Addon(Box::<crate::addons::flight_recorder::FlightRecorder>::default()),
+            crate::addons::Entry::Addon(Box::new(Hosted(std::sync::Arc::clone(&power_freq)))),
+        ];
+        let mut host = crate::addons::AddonHost::for_tests_with(entries, &serde_json::json!({})).0;
+        let told = |host: &mut crate::addons::AddonHost| {
+            draw_surfaces(host, true, false);
+            power_freq.lock().unwrap().recording
+        };
+        assert_eq!(told(&mut host), Recording::Ready, "the recorder is on and can start");
+        let (settings, snap) = (Settings::default(), Snapshot::default());
+        assert_eq!(host.record_sensors(true, &mut PageContext::new(&settings, &snap)), Ok(()));
+        assert_eq!(told(&mut host), Recording::Running, "told in the frame that draws it");
+        host.set_enabled("flight-recorder", false);
+        host.answer_off(crate::addons::OffAnswer::Discard);
+        assert_eq!(told(&mut host), Recording::Off, "the recorder is off");
+    }
+
+    #[test]
     fn statistics_survive_the_page_to_the_tile_and_reset_when_neither_is_shown() {
         let (mut host, power_freq) = hosted_with_tile();
         let min_max = || power_freq.lock().unwrap().stats.min_max(CORE_AVERAGE);

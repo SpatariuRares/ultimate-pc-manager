@@ -1597,14 +1597,61 @@ mod tests {
         assert_eq!(fr.record_blocked(NORMAL), Some(SAVE_OR_DISCARD_FIRST));
     }
 
+    /// A page that notes what the host told it about the sensor recording.
+    struct Watcher(std::sync::Arc<std::sync::Mutex<Option<Recording>>>);
+
+    impl crate::addons::Addon for Watcher {
+        fn id(&self) -> &'static str {
+            "watcher"
+        }
+        fn name(&self) -> &'static str {
+            "Watcher"
+        }
+        fn description(&self) -> &'static str {
+            "Watches the recording."
+        }
+        fn requirements(&self) -> crate::addons::Requirements {
+            crate::addons::Requirements::default()
+        }
+        fn consumption(&self) -> crate::addons::Consumption {
+            crate::addons::Consumption { cpu: "None", network: "None", disk: "None", when: "Never" }
+        }
+        fn ui(&mut self, _: &mut egui::Ui, page: &mut PageContext) {
+            *self.0.lock().unwrap() = Some(page.recording);
+        }
+    }
+
+    /// A host with a recording running and a page that watches it.
+    fn host_with_a_watching_page() -> (crate::addons::AddonHost, std::sync::Arc<std::sync::Mutex<Option<Recording>>>) {
+        let mut fr = FlightRecorder::default();
+        fr.start(&AddonContext::recording().0);
+        fr.record(NORMAL, &sample(1.0)).unwrap();
+        let told = std::sync::Arc::<std::sync::Mutex<Option<Recording>>>::default();
+        let entries = vec![crate::addons::Entry::Addon(Box::new(fr)), crate::addons::Entry::Addon(Box::new(Watcher(told.clone())))];
+        (crate::addons::AddonHost::for_tests_with(entries, &serde_json::json!({})).0, told)
+    }
+
+    /// What the host tells the page "watcher" when it draws it.
+    fn recording_told(host: &mut crate::addons::AddonHost, told: &std::sync::Mutex<Option<Recording>>) -> Option<Recording> {
+        let (settings, s) = (crate::settings::Settings::default(), sample(1.0));
+        let _ = egui::Context::default().run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                host.ui("watcher", ui, &mut PageContext::new(&settings, &s));
+            });
+        });
+        told.lock().unwrap().take()
+    }
+
     #[test]
     fn the_host_says_off_once_it_is_turned_off() {
-        let mut host = recording_host();
+        let (mut host, told) = host_with_a_watching_page();
         let (settings, s) = (crate::settings::Settings::default(), sample(1.0));
         let record = |host: &mut crate::addons::AddonHost| host.record_sensors(true, &mut PageContext::new(&settings, &s));
+        assert_eq!(recording_told(&mut host, &told), Some(Recording::Running), "another page is told it records");
         assert_eq!(record(&mut host), Err(ALREADY_RECORDING), "it answers while it is on");
         host.set_enabled("flight-recorder", false);
         host.answer_off(crate::addons::OffAnswer::Discard);
+        assert_eq!(recording_told(&mut host, &told), Some(Recording::Off), "another page is told it is off");
         assert_eq!(record(&mut host), Err(crate::addons::RECORDING_OFF), "the host says off");
     }
 

@@ -54,17 +54,6 @@ pub trait Addon {
     /// Called when the user turns the add-on on or off, and at startup if it is on.
     fn start(&mut self, ctx: &AddonContext);
     fn stop(&mut self);
-    /// Optional: work that turning it off would lose (e.g. a recording in progress).
-    /// If present, the host does not turn it off right away: the app asks with the
-    /// common Save / Discard / Cancel dialog (`AddonHost::off_question` / `answer_off`),
-    /// then calls `stop`.
-    /// Closing the app (X, File › Exit, Alt+F4) also asks this question for every add-on
-    /// that is on and has unsaved work (`request_close` / `close_question` / `answer_close`):
-    /// a successful Save or Discard (which calls `stop`) closes the app; a failed Save or
-    /// Cancel leaves it open. The add-on stays on in the settings.
-    fn unsaved_work(&self) -> Option<&'static str> { None }
-    /// Save for that question; false if it was not saved (the add-on stays on).
-    fn save_work(&mut self) -> bool { true }
     /// Its own threads that are still alive; the contract requires 0 when the add-on is off.
     fn threads(&self) -> usize { 0 }
 
@@ -85,41 +74,22 @@ pub trait Addon {
     /// The command-line arguments, once at startup and only if it is on, for its own
     /// flags (e.g. `--scan` for Disk Space).
     fn command_line(&mut self, _args: &[String]) {}
-    /// The name of its row that owns `path` (e.g. the installed app whose folder contains
-    /// it), so that another add-on's page can link to it. Asked only if it is on; it must
-    /// be cheap.
-    fn owner_of(&self, _path: &Path) -> Option<String> { None }
-    /// Shows on its page the row that owns `path` (after `owner_of`); the app then opens
-    /// the page.
-    fn reveal(&mut self, _path: &Path) {}
-    /// Optional: its column in the Processes table (hidden until the user shows it) and
-    /// its item at the end of a process's menu ("Go to ..."). Asked only if it is on.
-    fn process_column(&self) -> Option<ProcessColumn> { None }
-    /// The column's figure per PID, asked once per frame while the column shows; it may
-    /// start reading then. `process_column_hidden` tells it the column is gone.
-    fn process_figures(&mut self, _settings: &Settings) -> Option<HashMap<u32, usize>> { None }
-    fn process_column_hidden(&mut self) {}
-    /// Opens its page on the process `pid` (its menu item was chosen).
-    fn reveal_process(&mut self, _pid: u32) {}
     /// Optional: "packages changed". A job of the install queue has ended; `by` is the id
     /// of the add-on that ran it. Called only if it is on, once per job.
     fn packages_changed(&mut self, _by: &'static str) {}
-    /// Optional: what the app asks before closing while the add-on works (e.g. a series
-    /// of installs). `None`, the default, closes without asking.
-    fn close_question(&self) -> Option<String> { None }
+    /// Optional: the capability it offers when `asked` for it (see "Capabilities" below).
+    /// An add-on answers each capability it offers with itself, the others with `None`.
+    fn offers(&mut self, _asked: Asked) -> Option<Capability<'_>> { None }
+}
 
-    /// Optional, for the add-on that records sensors for other pages (Flight Recorder):
-    /// what it can do now at the update speed `interval_ms`. `None`, the default, for
-    /// every other add-on. Asked even while it is off (the host then says
-    /// `Recording::Off`); it must be cheap.
-    fn sensor_recording(&self, _interval_ms: u64) -> Option<Recording> { None }
-    /// Starts (`on`) or stops that recording for another add-on's page, through its own
-    /// Record and Stop. Called only while it is on (see `AddonHost::record_sensors`);
-    /// refused by default with the host's generic `RECORDING_OFF` reason.
-    fn set_sensor_recording(&mut self, _on: bool, _page: &mut PageContext) -> Result<(), &'static str> { Err(RECORDING_OFF) }
-    /// Before its page is drawn: what the recording add-on can do now, so the page can
-    /// offer to record or stop with `Action::RecordSensors` (optional).
-    fn recording_shown(&mut self, _recording: Recording) {}
+/// Capabilities an add-on can offer: one variant of `Asked` (what the host asks for) and
+/// one of `Capability` (what the add-on lends), listed once in `capabilities!`.
+pub enum Capability<'a> {
+    SensorRecorder(&'a mut dyn SensorRecorder), // records sensors for other pages (Flight Recorder)
+    ProcessColumn(&'a mut dyn ProcessColumnProvider), // a Processes column and menu item (Connections)
+    PathOwner(&'a mut dyn PathOwner),           // owns paths: `owner_of`, `reveal` (Installed Apps)
+    UnsavedWork(&'a mut dyn UnsavedWork),       // work that turning off or closing would lose
+    CloseWait(&'a mut dyn CloseWait),           // a reason to wait before closing (Package Manager)
 }
 
 /// What the add-on that records sensors can do now, as the host tells a page.
@@ -147,15 +117,40 @@ and the install queue (`install_queue`): only one install,
 update or uninstall job at a time across the whole app. Whoever waits sees who
 holds the queue; turning an add-on off withdraws its waiting requests.
 
-When the app closes, the host first asks about unsaved work (see `unsaved_work`
-above), then collects the questions of the add-ons that are on
-(`AddonHost::close_questions`, from `close_question`): if there is at least one,
+When the app closes, the host first asks about unsaved work (the `UnsavedWork`
+capability: `unsaved_work`, `save_work`; turning an add-on off asks the same Save /
+Discard / Cancel question with `AddonHost::off_question` / `answer_off`, and closing
+with `request_close` / `close_save_question` / `answer_close`), then collects the
+reasons of the add-ons that are on (`AddonHost::close_questions`, from the `CloseWait`
+capability's `close_reason`): if there is at least one,
 the app cancels the close and asks "Close the app?". Once confirmed,
 `AddonHost::close` stops every add-on that is on as turning it off would (an
 operation that must not be interrupted finishes its current step) and withdraws
 their requests from the queue, but keeps them saved as on; the app closes when
 `AddonHost::can_close` is true, that is when none of those operations is still
 running.
+
+### Capabilities
+
+A **capability** is what an add-on offers the host for other add-ons or the app to
+ask for: recording sensors, a Processes column, owning paths, unsaved work, a
+reason to wait before closing. Each is a small trait (`SensorRecorder`,
+`ProcessColumnProvider`, `PathOwner`, `UnsavedWork`, `CloseWait`) that the add-on
+implements and hands out from the single hook `Addon::offers`. The host never names
+an add-on: it asks the lookup for a capability and uses the first add-on in registry
+order that offers it.
+
+The rule "a capability counts only while its add-on is on and not stopping" is kept
+once, in that lookup (`provider` / `providers` in `src/addons.rs`). Two documented
+exceptions sit beside it: `UnsavedWork` and `CloseWait` count until the add-on is off
+for good (`providers_until_off`), because an add-on turned off during an
+uninterruptible operation still holds work the app must ask about before closing;
+and `ask_directly` reaches an add-on whatever its state, only for the notice that its
+Processes column is no longer drawn.
+
+To add a capability: a trait for it, one line in `capabilities!`, a host method (or a
+`PageContext` field, as `recording` is told to a page before it is drawn) that asks the
+lookup, and the add-ons that offer it answering that `Asked` in `offers`.
 
 ### Reading sensors
 
@@ -208,10 +203,10 @@ require (administrator, network) and the license status. The design is the
 
 ## 3. Paid add-ons
 
-> Today every add-on is **Free** (`TIERS` in `src/addons.rs`); the project relies on
+> Today every add-on is **Free** (its row in `ADDONS`, holding its id, tier and constructor, in `src/addons.rs`); the project relies on
 > donations. This section only records how selling could work if that ever changes.
 
-> The table may also hold **feature rows**, named
+> `FEATURE_TIERS` holds **feature rows**, named
 > `<add-on id>.<feature>`, for parts of an add-on that could be sold apart:
 > `power-freq.alerts` (threshold alerts) and `power-freq.pins` (sensors pinned to
 > the Summary tile). The add-on asks `tier_of` for its feature row; there is no

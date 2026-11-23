@@ -55,13 +55,12 @@ pub const FEATURE_TIERS: &[(&str, Tier)] = &[
 /// The tier of the add-on or feature `id` (Free when it has no line): an
 /// add-on's row in [`ADDONS`], else a line of [`FEATURE_TIERS`].
 pub fn tier_of(id: &str) -> Tier {
-    static ADDON_TIERS: std::sync::OnceLock<Vec<(&'static str, Tier)>> = std::sync::OnceLock::new();
-    let addon_tiers = ADDON_TIERS.get_or_init(|| ADDONS.iter().map(|(tier, make)| (make().id(), *tier)).collect());
-    addon_tiers
+    ADDONS
         .iter()
-        .chain(FEATURE_TIERS)
+        .map(|(i, tier, _)| (*i, *tier))
+        .chain(FEATURE_TIERS.iter().copied())
         .find(|(i, _)| *i == id)
-        .map_or(Tier::Free, |(_, t)| *t)
+        .map_or(Tier::Free, |(_, t)| t)
 }
 
 impl Tier {
@@ -193,11 +192,10 @@ pub trait Addon {
     /// job; reload here what lists installed software (optional).
     fn packages_changed(&mut self, _by: &'static str) {}
     /// The capability it offers when `asked` for it (optional); none by
-    /// default. The host asks one capability at a time, and only while it is
-    /// on and not stopping, so an add-on can offer several: it answers each
-    /// it offers with itself and the others with `None`. The first add-on in
-    /// registry order that offers a capability answers for it (see
-    /// [`Capability`]).
+    /// default. The host asks one capability at a time, so an add-on can
+    /// offer several: it answers each it offers with itself and the others
+    /// with `None`. Whether an add-on counts as offering it is decided once,
+    /// by the lookup that asks (see [`Capability`]).
     fn offers(&mut self, _asked: Asked) -> Option<Capability<'_>> {
         None
     }
@@ -213,35 +211,43 @@ pub trait Addon {
     fn load_settings(&mut self, _settings: &serde_json::Value) {}
 }
 
-/// The capabilities an add-on can offer to the others, as the host asks for
-/// them (see [`Addon::offers`]). To add one: a trait for it, a variant here
-/// and in [`Capability`], and a host method that asks [`provider`] for it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Asked {
-    /// Recording sensors for other add-ons' pages (Flight Recorder).
-    SensorRecorder,
-    /// A column in the Processes table and an item in a process's menu
-    /// (Connections).
-    ProcessColumn,
-    /// Owning paths, so other add-ons' pages can link to its row (Installed
-    /// Apps).
-    PathOwner,
-    /// Holding work that turning it off or closing the app would lose
-    /// (Flight Recorder's recording).
-    UnsavedWork,
-    /// A reason to wait before the app closes (Package Manager's series of
-    /// installs).
-    CloseWait,
+/// Lists the capabilities an add-on can offer to the others once: each gets a
+/// variant of [`Asked`] (what the host asks for) and of [`Capability`] (what an
+/// add-on lends when it is asked), so a capability is never named twice.
+macro_rules! capabilities {
+    ($($(#[$doc:meta])* $name:ident($offered:path),)*) => {
+        /// What the host asks an add-on to offer (see [`Addon::offers`]).
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub enum Asked {
+            $($(#[$doc])* $name,)*
+        }
+
+        /// What an add-on lends of itself when it is [`Asked`] for a
+        /// capability: the variant is the one asked for.
+        pub enum Capability<'a> {
+            $($name(&'a mut dyn $offered),)*
+        }
+    };
 }
 
-/// What an add-on lends of itself when it is [`Asked`] for a capability: the
-/// variant is the one asked for.
-pub enum Capability<'a> {
-    SensorRecorder(&'a mut dyn SensorRecorder),
-    ProcessColumn(&'a mut dyn ProcessColumnProvider),
-    PathOwner(&'a mut dyn PathOwner),
-    UnsavedWork(&'a mut dyn UnsavedWork),
-    CloseWait(&'a mut dyn CloseWait),
+// To add a capability: a trait for it, one line here, a host method that asks
+// `provider` (or `providers`) for it, and the add-ons that offer it answering
+// that `Asked` in `Addon::offers`.
+capabilities! {
+    /// Recording sensors for other add-ons' pages (Flight Recorder).
+    SensorRecorder(SensorRecorder),
+    /// A column in the Processes table and an item in a process's menu
+    /// (Connections).
+    ProcessColumn(ProcessColumnProvider),
+    /// Owning paths, so other add-ons' pages can link to its row (Installed
+    /// Apps).
+    PathOwner(PathOwner),
+    /// Holding work that turning it off or closing the app would lose
+    /// (Flight Recorder's recording).
+    UnsavedWork(UnsavedWork),
+    /// A reason to wait before the app closes (Package Manager's series of
+    /// installs).
+    CloseWait(CloseWait),
 }
 
 /// The Processes column capability: a column in the Processes table and an
@@ -519,23 +525,24 @@ impl Entry {
     }
 }
 
-/// Every add-on, in menu order: its tier and how to make it. Adding an
-/// add-on is one line here. Every add-on is free for now.
-const ADDONS: &[(Tier, fn() -> Box<dyn Addon>)] = &[
-    (Tier::Free, || Box::<power_freq::PowerFreq>::default()),
-    (Tier::Free, || Box::<flight_recorder::FlightRecorder>::default()),
-    (Tier::Free, || Box::<connections::Connections>::default()),
-    (Tier::Free, || Box::<installed_apps::InstalledApps>::default()),
-    (Tier::Free, || Box::<drivers::Drivers>::default()),
-    (Tier::Free, || Box::<disk_space::DiskSpace>::default()),
-    (Tier::Free, || Box::<benchmarks::Benchmarks>::default()),
-    (Tier::Free, || Box::<package_manager::PackageManager>::default()),
+/// Every add-on, in menu order: its id (the one [`Addon::id`] gives), its tier
+/// and how to make it. Adding an add-on is one line here. Every add-on is free
+/// for now.
+const ADDONS: &[(&str, Tier, fn() -> Box<dyn Addon>)] = &[
+    ("power-freq", Tier::Free, || Box::<power_freq::PowerFreq>::default()),
+    ("flight-recorder", Tier::Free, || Box::<flight_recorder::FlightRecorder>::default()),
+    ("connections", Tier::Free, || Box::<connections::Connections>::default()),
+    ("installed-apps", Tier::Free, || Box::<installed_apps::InstalledApps>::default()),
+    ("drivers", Tier::Free, || Box::<drivers::Drivers>::default()),
+    ("disk-space", Tier::Free, || Box::<disk_space::DiskSpace>::default()),
+    ("benchmarks", Tier::Free, || Box::<benchmarks::Benchmarks>::default()),
+    ("package-manager", Tier::Free, || Box::<package_manager::PackageManager>::default()),
 ];
 
 /// The ordered registry of every page: the core, then the add-ons.
 pub fn registry() -> Vec<Entry> {
     let mut entries: Vec<Entry> = Core::ALL.into_iter().map(Entry::Core).collect();
-    entries.extend(ADDONS.iter().map(|(_, make)| Entry::Addon(make())));
+    entries.extend(ADDONS.iter().map(|(_, _, make)| Entry::Addon(make())));
     entries
 }
 
@@ -544,60 +551,86 @@ struct Slot {
     entry: Entry,
     enabled: bool,
     /// Turned off during an uninterruptible operation: off in every way
-    /// (no page, hook or new work) but waiting for that operation to end.
+    /// (no hook, capability or new work; its page stays drawn, without
+    /// sensors, to follow the operation) but waiting for that operation to
+    /// end. The work it still holds counts until then (see
+    /// [`providers_until_off`]).
     stopping: bool,
     /// The add-on's own settings, opaque to the host (`Null` for core pages
     /// and add-ons that saved none).
     settings: serde_json::Value,
 }
 
-/// The capability `$slots`' first add-on that is on and not stopping
-/// offers (see [`provider_with_id`]), with the add-on's id; None when none
-/// does. A disabled or stopping add-on offers nothing.
-macro_rules! provider_with_id {
-    ($slots:expr, $which:ident) => {
-        provider_with_id($slots, Asked::$which, |c| match c {
-            Capability::$which(cap) => Some(cap),
-            _ => None,
-        })
-    };
+/// An add-on that offers a capability, as the lookup answers.
+struct Provider<'s> {
+    id: &'static str,
+    /// The add-on's shown name.
+    name: &'static str,
+    capability: Capability<'s>,
 }
 
-/// [`provider_with_id!`] without the id.
-macro_rules! provider {
-    ($slots:expr, $which:ident) => {
-        provider_with_id!($slots, $which).map(|(_, cap)| cap)
-    };
+/// THE place that decides whether a capability counts: it counts only while
+/// its add-on is on and not stopping. Every use of a capability goes through
+/// this lookup (or [`providers_until_off`], below). The add-ons among `slots`
+/// that offer what is `asked`, in registry order; a disabled or stopping
+/// add-on offers nothing.
+fn providers<'s>(slots: impl IntoIterator<Item = &'s mut Slot>, asked: Asked) -> impl Iterator<Item = Provider<'s>> {
+    offering(slots, asked, false)
 }
 
-/// What the add-on `$addon` offers for `$which`, if it offers it (it is not
-/// asked whether it is on: the caller decides who to ask).
-macro_rules! offered {
-    ($addon:expr, $which:ident) => {
-        $addon.offers(Asked::$which).and_then(|c| match c {
-            Capability::$which(cap) => Some(cap),
-            _ => None,
-        })
-    };
+/// The first of [`providers`]: the add-on that answers for `asked`.
+fn provider<'s>(slots: impl IntoIterator<Item = &'s mut Slot>, asked: Asked) -> Option<Provider<'s>> {
+    providers(slots, asked).next()
 }
 
-/// The one place that decides who answers for a capability: the first add-on
-/// among `slots`, in registry order, that is on and not stopping and offers
-/// what is `asked` (`pick` takes the capability out of its answer).
-fn provider_with_id<'s, T: ?Sized + 's>(slots: impl IntoIterator<Item = &'s mut Slot>, asked: Asked, pick: impl Fn(Capability<'s>) -> Option<&'s mut T>) -> Option<(&'static str, &'s mut T)> {
-    slots.into_iter().filter(|s| s.enabled && !s.stopping).find_map(|s| match &mut s.entry {
+/// The documented exception to "not stopping", for the capabilities that
+/// speak for work still held: [`UnsavedWork`] (the question before turning
+/// off or closing, its answers) and [`CloseWait`] (the reason to wait before
+/// closing). An add-on turned off during an uninterruptible operation is
+/// stopping but still on, holds that work and the app still has to ask about
+/// it before closing (pinned by the close tests), so these count until it is
+/// off for good.
+fn providers_until_off<'s>(slots: impl IntoIterator<Item = &'s mut Slot>, asked: Asked) -> impl Iterator<Item = Provider<'s>> {
+    offering(slots, asked, true)
+}
+
+/// The one implementation of the rule behind [`providers`] and
+/// [`providers_until_off`].
+fn offering<'s>(slots: impl IntoIterator<Item = &'s mut Slot>, asked: Asked, until_off: bool) -> impl Iterator<Item = Provider<'s>> {
+    slots.into_iter().filter(move |s| s.enabled && (until_off || !s.stopping)).filter_map(move |s| match &mut s.entry {
         Entry::Addon(a) => {
-            let id = a.id();
-            a.offers(asked).and_then(&pick).map(|c| (id, c))
+            let (id, name) = (a.id(), a.name());
+            a.offers(asked).map(|capability| Provider { id, name, capability })
         }
         Entry::Core(_) => None,
     })
 }
 
-/// The question about the unsaved work of `entry` (see [`UnsavedWork`]).
-fn unsaved_work_of(entry: &mut Entry) -> Option<&'static str> {
-    let Entry::Addon(addon) = entry else { return None };
-    offered!(addon, UnsavedWork).and_then(|u| u.unsaved_work())
+/// The one other exception: asks an add-on that is off whatever its state,
+/// for the notice that tells a column it is no longer drawn (the add-on may
+/// have been turned off in this very frame, so no lookup would reach it).
+fn ask_directly(addon: &mut dyn Addon, asked: Asked) -> Option<Capability<'_>> {
+    addon.offers(asked)
+}
+
+/// The question about the unsaved work of the add-on in `slot`, which is
+/// being turned off or closed with (see [`providers_until_off`]).
+fn unsaved_work_of(slot: &mut Slot) -> Option<&'static str> {
+    providers_until_off(std::iter::once(slot), Asked::UnsavedWork).find_map(|p| match p.capability {
+        Capability::UnsavedWork(work) => work.unsaved_work(),
+        _ => None,
+    })
+}
+
+/// Saves the unsaved work of the add-on in `slot` (true when there is none to
+/// save or it was saved).
+fn save_work_of(slot: &mut Slot) -> bool {
+    providers_until_off(std::iter::once(slot), Asked::UnsavedWork)
+        .find_map(|p| match p.capability {
+            Capability::UnsavedWork(work) => Some(work.save_work()),
+            _ => None,
+        })
+        .unwrap_or(true)
 }
 
 /// The page every invalid request falls back to.
@@ -872,18 +905,19 @@ impl AddonHost {
         let Entry::Addon(addon) = &mut slot.entry else {
             return false;
         };
+        let id = addon.id();
         if slot.stopping {
             return !on;
         }
-        if self.asking == Some(addon.id()) {
+        if self.asking == Some(id) {
             self.asking = None;
         }
         if slot.enabled != on {
             if on {
                 addon.start(&self.context);
                 slot.enabled = true;
-            } else if offered!(addon, UnsavedWork).is_some_and(|u| u.unsaved_work().is_some()) {
-                self.asking = Some(addon.id());
+            } else if unsaved_work_of(slot).is_some() {
+                self.asking = Some(id);
             } else {
                 Self::turn_off(slot, &self.context);
             }
@@ -910,9 +944,8 @@ impl AddonHost {
     pub fn off_question(&mut self) -> Option<OffQuestion> {
         let id = self.asking?;
         let slot = self.slots.iter_mut().find(|s| s.entry.id() == id)?;
-        let question = unsaved_work_of(&mut slot.entry)?;
-        let Entry::Addon(addon) = &slot.entry else { return None };
-        Some(OffQuestion { id, name: addon.name(), question })
+        let question = unsaved_work_of(slot)?;
+        Some(OffQuestion { id, name: slot.entry.name(), question })
     }
 
     /// Answers the [`OffQuestion`]: Save saves the work and turns the
@@ -922,9 +955,8 @@ impl AddonHost {
     pub fn answer_off(&mut self, answer: OffAnswer) -> bool {
         let Some(id) = self.asking.take() else { return false };
         let Some(slot) = self.slots.iter_mut().find(|s| s.entry.id() == id) else { return false };
-        let Entry::Addon(addon) = &mut slot.entry else { return false };
         let off = match answer {
-            OffAnswer::Save => offered!(addon, UnsavedWork).map_or(true, |u| u.save_work()),
+            OffAnswer::Save => save_work_of(slot),
             OffAnswer::Discard => true,
             OffAnswer::Cancel => false,
         };
@@ -936,10 +968,9 @@ impl AddonHost {
 
     /// The first add-on that is on and holds unsaved work, with its question.
     fn first_unsaved(&mut self) -> Option<OffQuestion> {
-        self.slots.iter_mut().filter(|s| s.enabled).find_map(|s| {
-            let question = unsaved_work_of(&mut s.entry)?;
-            let Entry::Addon(addon) = &s.entry else { return None };
-            Some(OffQuestion { id: addon.id(), name: addon.name(), question })
+        providers_until_off(self.slots.iter_mut(), Asked::UnsavedWork).find_map(|p| match p.capability {
+            Capability::UnsavedWork(work) => Some(OffQuestion { id: p.id, name: p.name, question: work.unsaved_work()? }),
+            _ => None,
         })
     }
 
@@ -971,13 +1002,14 @@ impl AddonHost {
     pub fn answer_close(&mut self, answer: OffAnswer) -> bool {
         let Some(q) = self.close_save_question() else { return false };
         let Some(slot) = self.slots.iter_mut().find(|s| s.entry.id() == q.id) else { return false };
-        let Entry::Addon(addon) = &mut slot.entry else { return false };
         let done = match answer {
-            OffAnswer::Save => offered!(addon, UnsavedWork).map_or(true, |u| u.save_work()),
+            OffAnswer::Save => save_work_of(slot),
             OffAnswer::Discard => {
-                addon.stop();
-                self.context.leases().release(addon.id());
-                self.context.install_queue().withdraw(addon.id());
+                if let Entry::Addon(addon) = &mut slot.entry {
+                    addon.stop();
+                    self.context.leases().release(addon.id());
+                    self.context.install_queue().withdraw(addon.id());
+                }
                 true
             }
             OffAnswer::Cancel => false,
@@ -1027,13 +1059,12 @@ impl AddonHost {
     /// What the add-ons that are on ask before the app closes (see
     /// [`CloseWait`]); empty: it closes without asking.
     pub fn close_questions(&mut self) -> Vec<String> {
-        let mut reasons = Vec::new();
-        for slot in self.slots.iter_mut().filter(|s| s.enabled) {
-            if let Entry::Addon(addon) = &mut slot.entry {
-                reasons.extend(offered!(addon, CloseWait).and_then(|c| c.close_reason()));
-            }
-        }
-        reasons
+        providers_until_off(self.slots.iter_mut(), Asked::CloseWait)
+            .filter_map(|p| match p.capability {
+                Capability::CloseWait(wait) => wait.close_reason(),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The app is closing: stops every add-on that is on, as turning it off
@@ -1152,15 +1183,15 @@ impl AddonHost {
         };
         // The page is told what the add-on that records sensors can do now.
         let interval_ms = page.settings.interval_ms();
-        let recording = provider!(before.iter_mut().chain(after.iter_mut()), SensorRecorder).map_or(Recording::Off, |r| r.sensor_recording(interval_ms));
+        let recording = match provider(before.iter_mut().chain(after.iter_mut()), Asked::SensorRecorder) {
+            Some(Provider { capability: Capability::SensorRecorder(recorder), .. }) => recorder.sensor_recording(interval_ms),
+            _ => Recording::Off,
+        };
         // And it may ask the other add-ons that are on who owns a path.
         let others = std::cell::RefCell::new(|path: &std::path::Path| {
-            before.iter_mut().chain(after.iter_mut()).filter(|s| s.enabled && !s.stopping).find_map(|s| match &mut s.entry {
-                Entry::Addon(a) => {
-                    let (id, name) = (a.id(), a.name());
-                    offered!(a, PathOwner).and_then(|o| o.owner_of(path)).map(|label| crate::platform::Owner { addon: id, page: name, label })
-                }
-                Entry::Core(_) => None,
+            providers(before.iter_mut().chain(after.iter_mut()), Asked::PathOwner).find_map(|p| match p.capability {
+                Capability::PathOwner(owner) => owner.owner_of(path).map(|label| crate::platform::Owner { addon: p.id, page: p.name, label }),
+                _ => None,
             })
         });
         let id = addon.id();
@@ -1217,28 +1248,34 @@ impl AddonHost {
     /// [`PathOwner::reveal`]). False (and nothing done) when it is off or
     /// does not offer owning paths.
     pub fn reveal(&mut self, id: &str, path: &std::path::Path) -> bool {
-        match self.enabled_addon(id).and_then(|addon| offered!(addon, PathOwner)) {
-            Some(owner) => {
+        match providers(&mut self.slots, Asked::PathOwner).find(|p| p.id == id) {
+            Some(Provider { capability: Capability::PathOwner(owner), .. }) => {
                 owner.reveal(path);
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
     /// The Processes column offered by the add-on that is on, by add-on id
     /// (see [`ProcessColumnProvider`]); empty when none offers it.
     pub fn process_columns(&mut self) -> Vec<(&'static str, ProcessColumn)> {
-        provider_with_id!(&mut self.slots, ProcessColumn).map(|(id, c)| (id, c.process_column())).into_iter().collect()
+        match provider(&mut self.slots, Asked::ProcessColumn) {
+            Some(Provider { id, capability: Capability::ProcessColumn(column), .. }) => vec![(id, column.process_column())],
+            _ => Vec::new(),
+        }
     }
 
     /// The figures of the add-on `id`'s Processes column, which is drawn in
     /// this frame (see [`ProcessColumnProvider::process_figures`]). None when
     /// it is off, offers no column or has no reading yet.
     pub fn process_figures(&mut self, id: &str, settings: &crate::settings::Settings) -> Option<HashMap<u32, usize>> {
-        let (id, column) = provider_with_id!(&mut self.slots, ProcessColumn).filter(|(i, _)| *i == id)?;
+        let Some(Provider { id: provider_id, capability: Capability::ProcessColumn(column), .. }) = provider(&mut self.slots, Asked::ProcessColumn) else { return None };
+        if provider_id != id {
+            return None;
+        }
         let figures = column.process_figures(settings);
-        self.columns.mark(id);
+        self.columns.mark(provider_id);
         figures
     }
 
@@ -1246,12 +1283,12 @@ impl AddonHost {
     /// [`ProcessColumnProvider::reveal_process`]). False (and nothing done)
     /// when it is off or offers no column.
     pub fn reveal_process(&mut self, id: &str, pid: u32) -> bool {
-        match provider_with_id!(&mut self.slots, ProcessColumn).filter(|(i, _)| *i == id) {
-            Some((_, column)) => {
+        match provider(&mut self.slots, Asked::ProcessColumn) {
+            Some(Provider { id: provider_id, capability: Capability::ProcessColumn(column), .. }) if provider_id == id => {
                 column.reveal_process(pid);
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -1259,11 +1296,13 @@ impl AddonHost {
     /// the sensor recording of the add-on that records sensors, through its
     /// own Record and Stop. Refused with [`RECORDING_OFF`] while it is off.
     pub fn record_sensors(&mut self, on: bool, page: &mut PageContext) -> Result<(), &'static str> {
-        match provider!(&mut self.slots, SensorRecorder) {
-            Some(recorder) => recorder.set_sensor_recording(on, page),
-            None => Err(RECORDING_OFF),
+        match provider(&mut self.slots, Asked::SensorRecorder) {
+            Some(Provider { capability: Capability::SensorRecorder(recorder), .. }) => recorder.set_sensor_recording(on, page),
+            _ => Err(RECORDING_OFF),
         }
     }
+
+
     /// The sensors for a core surface (the Summary page), asked in this
     /// frame: the host keeps them while the surface asks and drops them at
     /// the end of the first frame it does not.
@@ -1290,7 +1329,7 @@ impl AddonHost {
                     a.summary_hidden();
                 }
                 if columns_hidden.contains(&a.id()) {
-                    if let Some(column) = offered!(a, ProcessColumn) {
+                    if let Some(Capability::ProcessColumn(column)) = ask_directly(a.as_mut(), Asked::ProcessColumn) {
                         column.process_column_hidden();
                     }
                 }
@@ -1439,6 +1478,15 @@ mod tests {
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| f(ui, &mut PageContext::new(&settings, &sample)));
         });
+    }
+
+    #[test]
+    fn every_registry_row_names_the_id_of_the_add_on_it_makes() {
+        for (id, tier, make) in ADDONS {
+            let addon = make();
+            assert_eq!(*id, addon.id(), "the row's id is the add-on's");
+            assert_eq!(tier_of(id), *tier, "its tier is read from the row");
+        }
     }
 
     /// An add-on owning the files under `C:\Apps\Tool` (as "Tool"); notes
