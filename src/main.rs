@@ -2,6 +2,8 @@
 
 mod app;
 mod app_folders;
+mod fs_root;
+mod linux_facts;
 mod availability;
 mod core_page;
 mod page_summary;
