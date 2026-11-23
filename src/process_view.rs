@@ -289,7 +289,7 @@ impl FileTexts {
 pub fn compare(col: ProcCol, a: &ProcRow, b: &ProcRow, figures: &Figures, files: &FileTexts) -> Ordering {
     use std::cmp::Ordering::Equal;
     // Priorities compare by rank, Low below Realtime; unknown lowest.
-    let rank = |p: &ProcRow| crate::winsys::PRIORITIES.iter().rev().position(|c| *c == p.priority);
+    let rank = |p: &ProcRow| crate::process_actions::PRIORITIES.iter().rev().position(|c| *c == p.priority);
     match col {
         ProcCol::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
         ProcCol::Pid => a.pid.cmp(&b.pid),
