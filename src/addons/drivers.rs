@@ -13,6 +13,8 @@ pub mod engine;
 pub mod filters;
 /// The Drivers page.
 pub mod page;
+/// Devices with a problem code, in plain words.
+pub mod problems;
 /// Driver signatures: WinVerifyTrust, catalogs and WHQL.
 pub mod signature;
 /// The driver store: reading and classifying the packages.
@@ -585,6 +587,21 @@ mod settings_tests {
         next_run.start(&ctx);
         assert!(next_run.page().unwrap().drv_ui.scope == Scope::Builtin, "read from the saved settings");
         assert_eq!(next_run.settings()["fromANewerVersion"], 1, "fields it does not know are kept");
+    }
+
+    #[test]
+    fn the_problems_scope_is_saved_and_comes_back() {
+        let (ctx, _) = AddonContext::recording();
+        let mut addon = Drivers::default();
+        addon.load_settings(&serde_json::Value::Null);
+        addon.start(&ctx);
+        addon.page().unwrap().drv_ui.scope = Scope::Problems;
+        addon.stop();
+        assert_eq!(addon.settings()["scope"], "problems");
+        let mut next_run = Drivers::default();
+        next_run.load_settings(&addon.settings());
+        next_run.start(&ctx);
+        assert!(next_run.page().unwrap().drv_ui.scope == Scope::Problems);
     }
 
     #[test]
