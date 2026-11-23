@@ -12,7 +12,7 @@ use egui::{vec2, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Rec
 
 use super::filters::{self, FilterDriver, FilterRead};
 use super::engine::{self as drivers, DeviceDriver, DriverUpdate, HashFor, Hub, KernelDriver, KernelFigures, KernelScope};
-use super::engine::virustotal_url;
+use super::engine::{virustotal_url, BUSY_TEXT};
 use super::problems;
 use super::signature::{signature_text, Signature, SignatureBook};
 use super::store::{self, Flags, Selection, StoreFigures, StoreList, StorePackage};
@@ -41,8 +41,6 @@ pub enum Scope {
     Filters,
 }
 
-/// Shown in a confirm dialog while another driver job holds the page.
-const BUSY_TEXT: &str = "Another driver job is running. Wait for it to finish.";
 
 /// A device action the user asked for and has not yet confirmed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1053,7 +1051,7 @@ impl DriversPage {
                         );
                     }
                 }
-                if let Some((m, err)) = message.filter(|_| busy.is_none()) {
+                if let Some((m, err)) = message.filter(|(m, _)| busy.is_none() != (m == BUSY_TEXT)) {
                     ui.label(RichText::new(m).size(12.5).color(if *err { th.red } else { th.green }));
                 }
                 if reboot {
@@ -1809,6 +1807,12 @@ impl DriversPage {
         }
     }
 
+    /// No job holds the page: what every confirm dialog reads to enable its
+    /// button (the Hub refuses a second job all the same).
+    fn job_free(&self) -> bool {
+        self.drv.lock().busy.is_none()
+    }
+
     fn drivers_dialogs(&mut self, ui: &mut Ui) {
         let th = theme::of_ui(ui);
         if let Some(sha) = self.drv_ui.confirm_virustotal.clone() {
@@ -1834,12 +1838,14 @@ impl DriversPage {
             }
         }
         if let Some(service) = self.drv_ui.confirm_unload.clone() {
+            let idle = self.job_free();
             let mut decided = None;
             egui::Window::new("Unload this driver?").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
                 ui.label(format!("Windows will be asked to stop \"{service}\"."));
                 ui.label(RichText::new("Devices that use it stop working until it loads again or Windows restarts.").color(th.label));
+                crate::widgets::busy_note(ui, BUSY_TEXT, idle);
                 ui.horizontal(|ui| {
-                    if parts::admin_button(ui, "Unload", false, true).clicked() {
+                    if parts::admin_button(ui, "Unload", false, idle).clicked() {
                         decided = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
@@ -1855,13 +1861,15 @@ impl DriversPage {
             }
         }
         if let Some(u) = self.drv_ui.confirm_older.clone() {
+            let idle = self.job_free();
             let mut decided = None;
             egui::Window::new("Install an older driver?").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
                 ui.label(format!("Windows Update offers {} ({}).", u.model, u.version));
                 ui.label(RichText::new("It is not newer than the driver you have. Install it only to go back to that version.").color(th.label));
                 crate::widgets::restore_point_option(ui, &mut self.restore_point);
+                crate::widgets::busy_note(ui, BUSY_TEXT, idle);
                 ui.horizontal(|ui| {
-                    if parts::admin_button(ui, &format!("Install {}", u.version), false, true).clicked() {
+                    if parts::admin_button(ui, &format!("Install {}", u.version), false, idle).clicked() {
                         decided = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
@@ -1877,7 +1885,7 @@ impl DriversPage {
             }
         }
         if let Some(mut confirm) = self.drv_ui.confirm_device.clone() {
-            let idle = self.drv.lock().busy.is_none();
+            let idle = self.job_free();
             let mut decided = None;
             egui::Window::new(format!("{} {}?", confirm.action.label().split(' ').next().unwrap_or_default(), confirm.name))
                 .collapsible(false)
@@ -1889,9 +1897,7 @@ impl DriversPage {
                         crate::widgets::strong_confirm(ui, &warning, &mut confirm.understood);
                     }
                     crate::widgets::restore_point_option(ui, &mut self.restore_point);
-                    if !idle {
-                        ui.label(RichText::new(BUSY_TEXT).color(th.amber));
-                    }
+                    crate::widgets::busy_note(ui, BUSY_TEXT, idle);
                     ui.horizontal(|ui| {
                         if parts::admin_button(ui, confirm.action.label(), false, idle && confirm.confirmable()).clicked() {
                             decided = Some(true);
@@ -1918,12 +1924,14 @@ impl DriversPage {
                 // Device actions have their own dialog (`confirm_device`).
                 drivers::Redo::Device(action, _) => (action.label(), action.consequence().to_string(), action.label()),
             };
+            let idle = self.job_free();
             let mut decided = None;
             egui::Window::new(title).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
                 ui.label(what);
                 crate::widgets::restore_point_option(ui, &mut self.restore_point);
+                crate::widgets::busy_note(ui, BUSY_TEXT, idle);
                 ui.horizontal(|ui| {
-                    if parts::admin_button(ui, label, false, true).clicked() {
+                    if parts::admin_button(ui, label, false, idle).clicked() {
                         decided = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
@@ -1994,6 +2002,7 @@ impl DriversPage {
             RemoveKind::Forced => "Remove even if in use",
             RemoveKind::Selected => "Remove",
         };
+        let idle = self.job_free();
         let mut decided = None;
         let mut understood = ask.understood;
         egui::Window::new(title).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
@@ -2019,8 +2028,9 @@ impl DriversPage {
                 }
             }
             crate::widgets::restore_point_option(ui, &mut self.restore_point);
+            crate::widgets::busy_note(ui, BUSY_TEXT, idle);
             ui.horizontal(|ui| {
-                let enabled = ask.kind != RemoveKind::Forced || understood;
+                let enabled = idle && (ask.kind != RemoveKind::Forced || understood);
                 if parts::admin_button(ui, label, false, enabled).clicked() {
                     decided = Some(true);
                 }
@@ -2062,6 +2072,7 @@ impl DriversPage {
         };
         let title = if ask.names.is_none() { "Back up every third-party driver".to_string() } else { format!("Back up {}", plural(n, "selected package")) };
         let dated = store::backup_folder(ask.folder.trim(), today());
+        let idle = self.job_free();
         let mut decided = None;
         let mut browse = false;
         egui::Window::new(title).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
@@ -2075,9 +2086,10 @@ impl DriversPage {
             let sub = dated.rsplit('\\').next().unwrap_or_default();
             ui.label(RichText::new(format!("A dated subfolder is created ({sub}).")).size(12.0).color(th.label));
             ui.label(RichText::new(store::BACKUP_RESTORE_NOTE).size(12.0).color(th.label));
+            crate::widgets::busy_note(ui, BUSY_TEXT, idle);
             ui.horizontal(|ui| {
                 let label = format!("Back up {}", plural(n, "package"));
-                if parts::admin_button(ui, &label, false, !ask.folder.trim().is_empty() && n > 0).clicked() {
+                if parts::admin_button(ui, &label, false, idle && !ask.folder.trim().is_empty() && n > 0).clicked() {
                     decided = Some(true);
                 }
                 if ui.button("Cancel").clicked() {
@@ -3739,6 +3751,48 @@ mod store_tests {
     }
 
     #[test]
+    fn every_confirm_dialog_disables_its_button_and_says_why_while_another_job_runs() {
+        let off = DeviceDriver { problem: 22, instance_id: r"ROOT\X\0000".into(), name: "Alpha NIC".into(), ..Default::default() };
+        let open: Vec<(&str, String, fn(&mut DriversPage, &DeviceDriver))> = vec![
+            ("install", admin("Install"), |p, _| p.drv_ui.confirm_job = Some(drivers::Redo::Updates(vec!["id-1".into()]))),
+            ("install from an INF file", admin("Install"), |p, _| p.drv_ui.confirm_job = Some(drivers::Redo::Inf(r"C:\d\a.inf".into()))),
+            ("remove", admin(REMOVE_OLD_LABEL), |p, _| {
+                let names = store::old_removable(&p.drv.lock().store);
+                p.drv_ui.confirm_remove = Some(RemoveAsk { kind: RemoveKind::Old, names, understood: false });
+            }),
+            ("device action", admin("Enable device"), |p, d| p.drv_ui.confirm_device = Some(DeviceConfirm::new(drivers::DeviceAction::Enable, d))),
+            ("unload", admin("Unload"), |p, _| p.drv_ui.confirm_unload = Some("beep".into())),
+            ("backup", admin("Back up 12 packages"), |p, _| {
+                p.drv_ui.confirm_backup = Some(BackupAsk { names: None, folder: r"D:\B".into() });
+            }),
+        ];
+        for (name, button, show) in open {
+            let (mut page, runner) = page_with_runner();
+            page.drv.lock().busy = Some("Installing\u{2026}".into());
+            show(&mut page, &off);
+            let mut screen = Screen::new();
+            let t = screen.settle(&mut page);
+            assert!(drawn(&t, BUSY_TEXT), "{name}: the dialog says another job runs");
+            screen.click(&mut page, last(&t, &button));
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            assert!(runner.launches().is_empty(), "{name}: the confirm button is off while a job runs");
+            assert_eq!(page.drv.lock().busy.as_deref(), Some("Installing\u{2026}"), "{name}: the running job is not affected");
+
+            page.drv.lock().busy = None;
+            let t = screen.settle(&mut page);
+            assert!(!drawn(&t, BUSY_TEXT), "{name}: nothing to say once idle");
+            screen.click(&mut page, last(&t, &button));
+            for _ in 0..100 {
+                if !runner.launches().is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(!runner.launches().is_empty(), "{name}: the same click starts the job when idle");
+        }
+    }
+
+    #[test]
     fn remove_old_confirms_with_the_list_then_runs_one_elevated_launch_without_force() {
         let (mut page, runner) = page_with_runner();
         let old = store::old_removable(&page.drv.lock().store);
@@ -3865,7 +3919,7 @@ mod store_tests {
         let at = last(&t, &admin(BACKUP_SELECTED_LABEL));
         let t = screen.click(&mut page, at);
         assert_eq!(page.drv_ui.confirm_backup.as_ref().and_then(|a| a.names.clone()), Some(vec![free.clone()]));
-        assert!(drawn(&t, "Back up 1 selected package") && drawn(&t, &admin("Back up 1 package")), "{t:?}");
+        assert!(drawn(&t, "Back up 1 selected package") && drawn(&t, &admin("Back up 12 packages")), "{t:?}");
     }
 
     #[test]
