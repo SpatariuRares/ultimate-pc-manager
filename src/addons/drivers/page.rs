@@ -12,6 +12,7 @@ use egui::{vec2, Align, Align2, Color32, CornerRadius, FontId, Layout, Pos2, Rec
 
 use super::filters::{self, FilterDriver, FilterRead};
 use super::engine::{self as drivers, DeviceDriver, DriverUpdate, Hub, KernelDriver, KernelFigures, KernelScope};
+use super::signature::{signature_text, Signature, SignatureBook};
 use crate::addons::plural;
 use crate::platform::{csv_field, csv_text_field, Action, AddonContext};
 use crate::theme;
@@ -46,6 +47,8 @@ pub struct DriversUi {
     pub confirm_unload: Option<String>,
     /// An offered driver that is not newer, waiting for "Install anyway".
     pub confirm_older: Option<DriverUpdate>,
+    /// An install waiting for its confirm dialog (with the restore point option).
+    pub confirm_job: Option<drivers::Redo>,
     /// Bring the selected row into view on the next frame.
     pub scroll_to_selected: bool,
     pub started: bool,
@@ -354,6 +357,8 @@ pub struct Derived {
     devices: Arc<[DeviceDriver]>,
     kernel: Arc<[KernelDriver]>,
     updates: Option<Arc<[DriverUpdate]>>,
+    /// The signature results these counts were worked out from.
+    signatures: Arc<SignatureBook>,
     inputs: Inputs,
     /// Third-party drivers after folding, for the scope button.
     hardware_count: usize,
@@ -373,7 +378,7 @@ pub struct Derived {
 }
 
 impl Derived {
-    fn build(devices: &Arc<[DeviceDriver]>, kernel: &Arc<[KernelDriver]>, updates: &Option<Arc<[DriverUpdate]>>, inputs: Inputs) -> Derived {
+    fn build(devices: &Arc<[DeviceDriver]>, kernel: &Arc<[KernelDriver]>, updates: &Option<Arc<[DriverUpdate]>>, signatures: &Arc<SignatureBook>, inputs: Inputs) -> Derived {
         let scoped = |hardware: bool| -> Vec<usize> {
             devices
                 .iter()
@@ -451,18 +456,19 @@ impl Derived {
             kernel
                 .iter()
                 .enumerate()
-                .filter(|(_, d)| inputs.kernel_filter.matches(d))
+                .filter(|(_, d)| inputs.kernel_filter.matches(d, signatures.of(&d.path)))
                 .filter(|(_, d)| kernel_text_matches(d, &q))
                 .map(|(i, _)| i)
                 .collect()
         } else {
             Vec::new()
         };
-        let kernel_counts = KernelScope::ALL.iter().map(|&s| (s, s.count(kernel))).collect();
+        let kernel_counts = KernelScope::SHOWN.iter().map(|&s| (s, s.count(kernel, signatures))).collect();
         Derived {
             devices: devices.clone(),
             kernel: kernel.clone(),
             updates: updates.clone(),
+            signatures: signatures.clone(),
             hardware_count,
             builtin_count,
             matching,
@@ -477,13 +483,13 @@ impl Derived {
     }
 
     /// Still right for these lists and this filter.
-    fn is_for(&self, devices: &Arc<[DeviceDriver]>, kernel: &Arc<[KernelDriver]>, updates: &Option<Arc<[DriverUpdate]>>, inputs: &Inputs) -> bool {
+    fn is_for(&self, devices: &Arc<[DeviceDriver]>, kernel: &Arc<[KernelDriver]>, updates: &Option<Arc<[DriverUpdate]>>, signatures: &Arc<SignatureBook>, inputs: &Inputs) -> bool {
         let same_updates = match (&self.updates, updates) {
             (None, None) => true,
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             _ => false,
         };
-        Arc::ptr_eq(&self.devices, devices) && Arc::ptr_eq(&self.kernel, kernel) && same_updates && self.inputs == *inputs
+        Arc::ptr_eq(&self.devices, devices) && Arc::ptr_eq(&self.kernel, kernel) && same_updates && Arc::ptr_eq(&self.signatures, signatures) && self.inputs == *inputs
     }
 
     fn update_of(&self, row: &DeviceRow) -> Option<&DriverUpdate> {
@@ -500,6 +506,8 @@ pub struct DriversPage {
     pub said: Vec<String>,
     /// "Check Windows Update when the page opens".
     pub check_on_open: bool,
+    /// "Create a restore point first": on by default, remembered.
+    pub restore_point: bool,
     /// Third-party drivers this many years old get "check the maker".
     pub old_years: i64,
     /// The data worked out from the lists and the filter, reused until
@@ -517,6 +525,7 @@ impl DriversPage {
             context,
             said: Vec::new(),
             check_on_open: false,
+            restore_point: true,
             old_years: DEFAULT_OLD_YEARS,
             derived: None,
             derived_builds: 0,
@@ -532,7 +541,7 @@ impl DriversPage {
     /// The counts, groups and rows for these lists and the current filter:
     /// built when the lists or a filter changed since the last call, else
     /// the same data again.
-    fn derived(&mut self, devices: &Arc<[DeviceDriver]>, kernel: &Arc<[KernelDriver]>, updates: &Option<Arc<[DriverUpdate]>>) -> Arc<Derived> {
+    fn derived(&mut self, devices: &Arc<[DeviceDriver]>, kernel: &Arc<[KernelDriver]>, updates: &Option<Arc<[DriverUpdate]>>, signatures: &Arc<SignatureBook>) -> Arc<Derived> {
         let inputs = Inputs {
             search: self.drv_ui.search.clone(),
             show_disconnected: self.drv_ui.show_disconnected,
@@ -542,11 +551,11 @@ impl DriversPage {
             today: today(),
         };
         if let Some(d) = &self.derived {
-            if d.is_for(devices, kernel, updates, &inputs) {
+            if d.is_for(devices, kernel, updates, signatures, &inputs) {
                 return d.clone();
             }
         }
-        let d = Arc::new(Derived::build(devices, kernel, updates, inputs));
+        let d = Arc::new(Derived::build(devices, kernel, updates, signatures, inputs));
         self.derived_builds += 1;
         self.derived = Some(d.clone());
         d
@@ -595,10 +604,11 @@ impl DriversPage {
         let listed_at = st.listed_at.clone();
         let security = st.security.clone();
         let filter_read = st.filters.clone();
+        let signatures = st.signatures.clone();
         drop(st);
         let admin = self.context.is_admin();
         let idle = busy.is_none();
-        let view = self.derived(&devices, &kernel, &updates);
+        let view = self.derived(&devices, &kernel, &updates, &signatures);
 
         // ------------------------------------------------ actions (the app's header has the title and Refresh)
         ui.horizontal(|ui| {
@@ -610,7 +620,7 @@ impl DriversPage {
                     ui.set_min_width(260.0);
                     if parts::admin_button(ui, "Install from an INF file\u{2026}", false, idle).clicked() {
                         if let Some(p) = self.context.pick_open_file(&[drivers::INF_FILE, crate::platform::ANY_FILE], None) {
-                            self.drv.install_inf(p);
+                            self.drv_ui.confirm_job = Some(drivers::Redo::Inf(p));
                         }
                         ui.close();
                     }
@@ -619,7 +629,7 @@ impl DriversPage {
                         ui.close();
                     }
                     if ui.add(egui::Button::new("      Export the list as CSV\u{2026}").min_size(vec2(0.0, 32.0))).clicked() {
-                        self.export_drivers_csv(&devices, &kernel, updates.as_deref());
+                        self.export_drivers_csv(&devices, &kernel, updates.as_deref(), &signatures);
                         ui.close();
                     }
                 });
@@ -689,7 +699,7 @@ impl DriversPage {
 
         // ------------------------------------------------ list + side panel
         // A click or a keystroke above may have changed the filter.
-        let view = self.derived(&devices, &kernel, &updates);
+        let view = self.derived(&devices, &kernel, &updates, &signatures);
         let area = ui.available_rect_before_wrap();
         ui.allocate_rect(area, Sense::hover());
         let side_w = 350.0f32.min(area.width() * 0.36);
@@ -700,7 +710,7 @@ impl DriversPage {
         match self.drv_ui.scope {
             Scope::Kernel => {
                 self.kernel_list(&mut list_ui, actions, &view, admin, listing, kernel_error.as_deref());
-                self.kernel_side(&mut side_ui, actions, &kernel, admin, idle);
+                self.kernel_side(&mut side_ui, actions, &kernel, &signatures, admin, idle);
             }
             Scope::Filters => {
                 self.filter_list(&mut list_ui, filter_read.as_deref());
@@ -714,7 +724,7 @@ impl DriversPage {
                 } else {
                     self.device_list(&mut list_ui, actions, &view);
                 }
-                self.device_side(&mut side_ui, actions, &devices, updates.as_deref(), idle);
+                self.device_side(&mut side_ui, actions, &devices, updates.as_deref(), &signatures, idle);
             }
         }
 
@@ -873,7 +883,7 @@ impl DriversPage {
                     if !newer.is_empty() {
                         let label = if newer.len() == 1 { "Install update".to_string() } else { format!("Install {} updates", newer.len()) };
                         if parts::admin_button(ui, &label, true, idle).clicked() {
-                            self.drv.install(newer.iter().map(|u| u.id.clone()).collect());
+                            self.drv_ui.confirm_job = Some(drivers::Redo::Updates(newer.iter().map(|u| u.id.clone()).collect()));
                         }
                         ui.label(RichText::new("Windows asks for administrator permission").size(11.5).color(th.label));
                         ui.add_space(6.0);
@@ -1011,7 +1021,7 @@ impl DriversPage {
                 if resp.clicked() {
                     clicked = Some(d.instance_id.clone());
                 }
-                let details = device_details(d, upd);
+                let details = device_details(d, upd, device_signature(d, &view.signatures));
                 let inf = d.inf_path();
                 let name = d.name.clone();
                 resp.context_menu(|ui| {
@@ -1035,7 +1045,8 @@ impl DriversPage {
         }
     }
 
-    fn device_side(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, devices: &[DeviceDriver], updates: Option<&[DriverUpdate]>, idle: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn device_side(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, devices: &[DeviceDriver], updates: Option<&[DriverUpdate]>, signatures: &SignatureBook, idle: bool) {
         let chosen = self.drv_ui.selected_device.clone().and_then(|id| devices.iter().find(|d| d.instance_id == id));
         if chosen.is_none() {
             empty_panel(ui, DEVICE_EMPTY);
@@ -1046,6 +1057,7 @@ impl DriversPage {
             let upd = updates.and_then(|u| u.iter().find(|x| x.device.as_deref() == Some(d.instance_id.as_str())));
             let copies = devices.iter().filter(|o| o.name == d.name && o.version == d.version && o.provider == d.provider && (o.present || !d.present)).count();
             ui.label(RichText::new(&d.name).font(display(15.0)).color(th.text));
+            let signature = device_signature(d, signatures);
             let state = if d.present { format!("connected, {}", d.status().to_lowercase()) } else { "not connected".into() };
             ui.label(RichText::new(format!("{}, {state}", kind_of(&d.class))).size(12.0).color(th.label));
             ui.add_space(6.0);
@@ -1057,6 +1069,9 @@ impl DriversPage {
                 };
                 row("Maker", or_dash(&d.provider));
                 row("Version", or_dash(&d.version));
+                for (k, v) in signature_rows(signature) {
+                    row(k, v);
+                }
                 row("Released", if with_windows(d) { "With Windows".into() } else { long_date(&d.date) });
                 row("Package", or_dash(&d.inf));
                 if !d.service.is_empty() {
@@ -1079,7 +1094,7 @@ impl DriversPage {
                     compare(ui, d, u);
                     ui.add_space(6.0);
                     if parts::admin_button(ui, "Install update", true, idle).clicked() {
-                        self.drv.install(vec![u.id.clone()]);
+                        self.drv_ui.confirm_job = Some(drivers::Redo::Updates(vec![u.id.clone()]));
                     }
                     ui.label(RichText::new("Windows asks for administrator permission. Some drivers need a restart.").size(11.5).color(th.label));
                 }
@@ -1124,7 +1139,7 @@ impl DriversPage {
                     self.open_device_manager();
                 }
                 if parts::outline_button(ui, "Copy details", true).clicked() {
-                    actions.push(Action::Copy(device_details(d, upd)));
+                    actions.push(Action::Copy(device_details(d, upd, signature)));
                 }
             });
         });
@@ -1151,17 +1166,17 @@ impl DriversPage {
             return;
         }
         let w = ui.available_width();
-        let fixed = [80.0, 85.0, 85.0, 130.0];
+        let fixed = [80.0, 85.0, 85.0, 130.0, 130.0];
         let gap = 12.0;
-        let flex = (w - fixed.iter().sum::<f32>() - gap * 6.0 - 20.0).max(240.0);
-        let cols = [flex * 0.45, flex * 0.2, fixed[0], fixed[1], fixed[2], fixed[3], flex * 0.35];
+        let flex = (w - fixed.iter().sum::<f32>() - gap * 7.0 - 20.0).max(240.0);
+        let cols = [flex * 0.45, flex * 0.2, fixed[0], fixed[1], fixed[2], fixed[3], flex * 0.35, fixed[4]];
         let xs: Vec<f32> = cols.iter().scan(10.0, |x, c| {
             let start = *x;
             *x += c + gap;
             Some(start)
         }).collect();
         let (hr, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
-        for (i, h) in ["Driver", "Name", "State", "Start type", "Type", "Version", "Vendor"].iter().enumerate() {
+        for (i, h) in ["Driver", "Name", "State", "Start type", "Type", "Version", "Vendor", "Signature"].iter().enumerate() {
             ui.painter().text(Pos2::new(hr.left() + xs[i], hr.center().y), Align2::LEFT_CENTER, *h, text(12.0), th.label);
         }
         ui.painter().rect_filled(Rect::from_min_size(Pos2::new(hr.left(), hr.bottom() - 1.0), vec2(w, 1.0)), CornerRadius::ZERO, th.line);
@@ -1174,6 +1189,8 @@ impl DriversPage {
                 let p = ui.painter();
                 let selected = self.drv_ui.selected_kernel.as_deref() == Some(d.service.as_str());
                 parts::row_fill(p, r, selected, resp.hovered());
+                let signature = view.signatures.of(&d.path);
+                let signature_label = signature_text(signature);
                 let vals = [
                     d.display.as_str(),
                     d.service.as_str(),
@@ -1182,11 +1199,18 @@ impl DriversPage {
                     d.kind.label(),
                     if d.version.is_empty() { "\u{2014}" } else { d.version.as_str() },
                     if d.vendor.is_empty() { "\u{2014}" } else { d.vendor.as_str() },
+                    signature_label.as_str(),
                 ];
                 for (i, v) in vals.iter().enumerate() {
                     let col = match (i, selected) {
                         (0, true) => th.on_selected,
                         (0, false) => th.text,
+                        (7, _) => match signature {
+                            Some(Signature::Whql { .. }) => th.green,
+                            Some(Signature::Unsigned) => th.red,
+                            Some(Signature::Signed { .. }) => th.soft,
+                            _ => th.faint,
+                        },
                         _ => th.soft,
                     };
                     p.text(Pos2::new(r.left() + xs[i], r.center().y), Align2::LEFT_CENTER, fit(p, v, &text(13.0), cols[i]), text(13.0), col);
@@ -1194,7 +1218,7 @@ impl DriversPage {
                 if resp.clicked() {
                     clicked = Some(d.service.clone());
                 }
-                let (path, service, details) = (d.path.clone(), d.service.clone(), kernel_details(d, admin));
+                let (path, service, details) = (d.path.clone(), d.service.clone(), kernel_details(d, admin, signature));
                 let unloadable = d.unload_note(admin).0;
                 resp.context_menu(|ui| {
                     if ui.button("Open file location").clicked() {
@@ -1276,7 +1300,7 @@ impl DriversPage {
         });
     }
 
-    fn kernel_side(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, kernel: &[KernelDriver], admin: bool, idle: bool) {
+    fn kernel_side(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, kernel: &[KernelDriver], signatures: &SignatureBook, admin: bool, idle: bool) {
         let chosen = self.drv_ui.selected_kernel.clone().and_then(|s| kernel.iter().find(|d| d.service == s));
         if chosen.is_none() {
             empty_panel(ui, KERNEL_EMPTY);
@@ -1285,10 +1309,11 @@ impl DriversPage {
         parts::SidePanel::new("drv-side").show(ui, chosen, |ui, d| {
             let th = theme::of_ui(ui);
             let (offered, _) = d.unload_note(admin);
+            let signature = signatures.of(&d.path);
             ui.label(RichText::new(&d.display).font(display(15.0)).color(th.text));
             ui.add_space(6.0);
             egui::Grid::new("drv-kernel-side").striped(false).num_columns(2).spacing([14.0, 5.0]).show(ui, |ui| {
-                for (k, v) in kernel_detail_rows(d, admin) {
+                for (k, v) in kernel_detail_rows(d, admin, signature) {
                     ui.label(RichText::new(k).color(th.label));
                     ui.add(egui::Label::new(v).wrap());
                     ui.end_row();
@@ -1308,7 +1333,7 @@ impl DriversPage {
                     actions.push(Action::Copy(d.service.clone()));
                 }
                 if parts::outline_button(ui, "Copy details", true).clicked() {
-                    actions.push(Action::Copy(kernel_details(d, admin)));
+                    actions.push(Action::Copy(kernel_details(d, admin, signature)));
                 }
                 if offered {
                     ui.label(RichText::new("Advanced").size(11.5).color(th.faint));
@@ -1348,6 +1373,7 @@ impl DriversPage {
             egui::Window::new("Install an older driver?").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
                 ui.label(format!("Windows Update offers {} ({}).", u.model, u.version));
                 ui.label(RichText::new("It is not newer than the driver you have. Install it only to go back to that version.").color(th.label));
+                crate::widgets::restore_point_option(ui, &mut self.restore_point);
                 ui.horizontal(|ui| {
                     if parts::admin_button(ui, &format!("Install {}", u.version), false, true).clicked() {
                         decided = Some(true);
@@ -1358,17 +1384,67 @@ impl DriversPage {
                 });
             });
             if decided == Some(true) {
-                self.drv.install(vec![u.id.clone()]);
+                self.drv.install_with(vec![u.id.clone()], self.restore_point);
             }
             if decided.is_some() {
                 self.drv_ui.confirm_older = None;
             }
         }
+        if let Some(job) = self.drv_ui.confirm_job.clone() {
+            let (title, what, label) = match &job {
+                drivers::Redo::Updates(ids) => ("Install driver updates?", format!("Windows Update will download and install {}.", plural(ids.len(), "driver update")), "Install"),
+                drivers::Redo::Inf(path) => ("Install this driver package?", format!("{path} will be added and installed on matching devices."), "Install"),
+            };
+            let mut decided = None;
+            egui::Window::new(title).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+                ui.label(what);
+                crate::widgets::restore_point_option(ui, &mut self.restore_point);
+                ui.horizontal(|ui| {
+                    if parts::admin_button(ui, label, false, true).clicked() {
+                        decided = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decided = Some(false);
+                    }
+                });
+            });
+            if decided == Some(true) {
+                match job {
+                    drivers::Redo::Updates(ids) => self.drv.install_with(ids, self.restore_point),
+                    drivers::Redo::Inf(path) => self.drv.install_inf_with(path, self.restore_point),
+                }
+            }
+            if decided.is_some() {
+                self.drv_ui.confirm_job = None;
+            }
+        }
+        // The restore point could not be made, so nothing was changed yet.
+        let prompt = self.drv.lock().restore_prompt.clone();
+        if let Some(prompt) = prompt {
+            let mut decided = None;
+            egui::Window::new("Restore point not created").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
+                ui.label(RichText::new(&prompt.reason).color(th.amber));
+                ui.label("Continue without a new restore point?");
+                ui.horizontal(|ui| {
+                    if parts::admin_button(ui, "Continue", false, true).clicked() {
+                        decided = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decided = Some(false);
+                    }
+                });
+            });
+            match decided {
+                Some(true) => self.drv.continue_without_restore(),
+                Some(false) => self.drv.cancel_restore(),
+                None => {}
+            }
+        }
     }
 
-    fn export_drivers_csv(&mut self, devices: &[DeviceDriver], kernel: &[KernelDriver], updates: Option<&[DriverUpdate]>) {
+    fn export_drivers_csv(&mut self, devices: &[DeviceDriver], kernel: &[KernelDriver], updates: Option<&[DriverUpdate]>, signatures: &SignatureBook) {
         let Some(path) = self.context.pick_save_as(&crate::platform::CSV_FILE, "drivers.csv") else { return };
-        let s = drivers_csv(devices, kernel, updates);
+        let s = drivers_csv(devices, kernel, updates, signatures);
         match std::fs::write(&path, format!("\u{feff}{s}")) {
             Ok(()) => self.say(format!("Saved {path}")),
             Err(e) => self.say(format!("Could not save: {e}")),
@@ -1379,8 +1455,8 @@ impl DriversPage {
 /// The CSV text of the export. Text cells are neutralised against spreadsheet
 /// formulas; numbers (load index, kernel memory in bytes) stay plain.
 /// The kernel-only columns come last and are empty on device rows.
-fn drivers_csv(devices: &[DeviceDriver], kernel: &[KernelDriver], updates: Option<&[DriverUpdate]>) -> String {
-    let mut s = String::from("Kind,Name,Class/Type,Provider/Vendor,Version,Date,Status,INF/Service,Windows Update,Instance ID/Path,Start type,Driver kind,Load index,Kernel memory (bytes),Load order group,Depends on\n");
+fn drivers_csv(devices: &[DeviceDriver], kernel: &[KernelDriver], updates: Option<&[DriverUpdate]>, signatures: &SignatureBook) -> String {
+    let mut s = String::from("Kind,Name,Class/Type,Provider/Vendor,Version,Date,Status,INF/Service,Windows Update,Instance ID/Path,Start type,Driver kind,Load index,Kernel memory (bytes),Load order group,Depends on,Signature\n");
     for d in devices {
         let u = updates.and_then(|u| u.iter().find(|x| x.device.as_deref() == Some(d.instance_id.as_str())));
         let up = match (updates, u) {
@@ -1391,13 +1467,12 @@ fn drivers_csv(devices: &[DeviceDriver], kernel: &[KernelDriver], updates: Optio
         };
         let f = ["Device", &d.name, &d.class, &d.provider, &d.version, &d.date, &d.status(), &d.inf, &up, &d.instance_id];
         let mut line: Vec<String> = f.iter().map(|x| csv_text_field(x)).collect();
-        line.extend(std::iter::repeat(String::new()).take(6));
+        line.extend(std::iter::repeat(String::new()).take(7));
         s.push_str(&line.join(","));
         s.push('\n');
     }
     for d in kernel {
         let depends: Vec<String> = d.depends_services.iter().cloned().chain(d.depends_groups.iter().map(|g| format!("group {g}"))).collect();
-        // The Signature column (#25) goes at the end of this list and of the header.
         let text = [
             "Kernel driver", &d.display, d.kind.label(), &d.vendor, &d.version, "", if d.running { "Running" } else { "Stopped" },
             &d.service, "", &d.path, d.start_type, d.kind.label(),
@@ -1407,6 +1482,7 @@ fn drivers_csv(devices: &[DeviceDriver], kernel: &[KernelDriver], updates: Optio
         cells.push(csv_field(&d.image_size.map(|i| i.to_string()).unwrap_or_default()));
         cells.push(csv_text_field(&d.group));
         cells.push(csv_text_field(&depends.join("; ")));
+        cells.push(csv_text_field(&signature_text(signatures.of(&d.path))));
         s.push_str(&cells.join(","));
         s.push('\n');
     }
@@ -1475,7 +1551,25 @@ fn or_dash(s: &str) -> String {
 }
 
 
-fn device_details(d: &DeviceDriver, u: Option<&DriverUpdate>) -> String {
+/// What the signature check found for a device's driver: its INF.
+fn device_signature<'a>(d: &DeviceDriver, signatures: &'a SignatureBook) -> Option<&'a Signature> {
+    if d.inf.is_empty() {
+        return None;
+    }
+    signatures.of(&d.inf_path())
+}
+
+/// The Signature row (what the check found) and, when there is one, the
+/// Signer row (who signed), as both detail panels show them.
+fn signature_rows(signature: Option<&Signature>) -> Vec<(&'static str, String)> {
+    let mut rows = vec![("Signature", signature_text(signature))];
+    if let Some(signer) = signature.and_then(Signature::signer) {
+        rows.push(("Signer", signer.to_string()));
+    }
+    rows
+}
+
+fn device_details(d: &DeviceDriver, u: Option<&DriverUpdate>, signature: Option<&Signature>) -> String {
     let mut s = format!(
         "Device: {}\nClass: {}\nManufacturer: {}\nProvider: {}\nVersion: {}\nDate: {}\nINF: {}\nService: {}\nStatus: {}\nInstance ID: {}\nHardware IDs: {}\n",
         d.name,
@@ -1490,6 +1584,9 @@ fn device_details(d: &DeviceDriver, u: Option<&DriverUpdate>) -> String {
         d.instance_id,
         d.hardware_ids.join("; ")
     );
+    for (k, v) in signature_rows(signature) {
+        s.push_str(&format!("{k}: {v}\n"));
+    }
     if let Some(u) = u {
         let what = if u.worth_installing() { "newer" } else { "not newer" };
         s.push_str(&format!("Windows Update offers: {} ({}, {what})\n", u.title, u.version));
@@ -1526,7 +1623,7 @@ const KERNEL_NO_MATCH: &str = "No driver name, display name or vendor matches th
 
 /// The kernel module's detail fields, labelled and in a fixed order.
 /// Shared by the side panel and "Copy details".
-fn kernel_detail_rows(d: &KernelDriver, admin: bool) -> Vec<(&'static str, String)> {
+fn kernel_detail_rows(d: &KernelDriver, admin: bool, signature: Option<&Signature>) -> Vec<(&'static str, String)> {
     let dash = || "\u{2014}".to_string();
     let load_index = match (d.load_index, d.group.is_empty()) {
         (Some(i), true) => i.to_string(),
@@ -1541,8 +1638,9 @@ fn kernel_detail_rows(d: &KernelDriver, admin: bool) -> Vec<(&'static str, Strin
         ("Start type", d.start_type.into()),
         ("Version", or_dash(&d.version)),
         ("Vendor", or_dash(&d.vendor)),
-        ("Load index", load_index),
     ];
+    rows.extend(signature_rows(signature));
+    rows.push(("Load index", load_index));
     // Rows that exist only when the service has the value.
     if !d.group.is_empty() {
         rows.push(("Load order group", d.group.clone()));
@@ -1559,8 +1657,8 @@ fn kernel_detail_rows(d: &KernelDriver, admin: bool) -> Vec<(&'static str, Strin
     rows
 }
 
-fn kernel_details(d: &KernelDriver, admin: bool) -> String {
-    kernel_detail_rows(d, admin).iter().map(|(k, v)| format!("{k}: {v}\n")).collect()
+fn kernel_details(d: &KernelDriver, admin: bool, signature: Option<&Signature>) -> String {
+    kernel_detail_rows(d, admin, signature).iter().map(|(k, v)| format!("{k}: {v}\n")).collect()
 }
 
 #[cfg(test)]
@@ -1778,6 +1876,129 @@ mod tests {
         assert_eq!(kind_of("AudioProcessingObject"), "Sound");
         assert_eq!(kind_of("HIDClass"), "Mice, keyboards and controllers");
     }
+
+    // ---------------------------------------------------- signatures (#25)
+
+    fn book(entries: &[(&str, Signature)]) -> Arc<SignatureBook> {
+        let mut b = SignatureBook::default();
+        for (path, sig) in entries {
+            b.insert(path, sig.clone());
+        }
+        Arc::new(b)
+    }
+
+    fn whql() -> Signature {
+        Signature::Whql { signer: crate::addons::drivers::signature::WHQL_PUBLISHER.into() }
+    }
+
+    fn kernel_page(signatures: Arc<SignatureBook>) -> DriversPage {
+        let kernel = vec![
+            loaded("nvlddmkm", "NVIDIA", r"C:\d\nv.sys", Some(2048)),
+            loaded("cpuz", "CPUID", r"C:\d\cpuz.sys", Some(1024)),
+            loaded("mycomp", "", r"C:\d\mycomp.sys", None),
+            loaded("fresh", "Acme", r"C:\d\fresh.sys", None),
+        ];
+        let mut page = page_with(Vec::new(), kernel);
+        page.drv.lock().signatures = signatures;
+        page.drv_ui.scope = Scope::Kernel;
+        page
+    }
+
+    fn sample_book() -> Arc<SignatureBook> {
+        book(&[
+            (r"C:\d\nv.sys", whql()),
+            (r"C:\d\cpuz.sys", Signature::Unsigned),
+            (r"C:\d\mycomp.sys", Signature::CouldNotCheck("the catalog database is busy".into())),
+        ])
+    }
+
+    #[test]
+    fn kernel_modules_have_a_signature_column_with_every_value() {
+        let mut page = kernel_page(sample_book());
+        let t = frame(&mut page);
+        assert!(t.iter().any(|x| x == "Signature"), "the column header: {t:?}");
+        for value in ["WHQL", "Unsigned", "Not checked"] {
+            assert!(t.iter().any(|x| x == value), "{value} is shown: {t:?}");
+        }
+        // A long result is cut to the column's width.
+        assert!(t.iter().any(|x| x.starts_with("Could not check")), "{t:?}");
+    }
+
+    #[test]
+    fn the_unsigned_scope_has_its_count_and_lists_only_unsigned_modules() {
+        let mut page = kernel_page(sample_book());
+        let t = frame(&mut page);
+        assert!(t.iter().any(|x| x == "Unsigned  1"), "the scope button counts the unsigned ones: {t:?}");
+        assert!(t.iter().any(|x| x == "All  4"));
+        page.drv_ui.kernel_filter = KernelScope::Unsigned;
+        let t = frame(&mut page);
+        assert!(t.iter().any(|x| x == "cpuz"), "{t:?}");
+        for hidden in ["nvlddmkm", "mycomp", "fresh"] {
+            assert!(!t.iter().any(|x| x == hidden), "{hidden} is not unsigned: {t:?}");
+        }
+        assert!(t.iter().any(|x| x == "1 shown"));
+    }
+
+    #[test]
+    fn a_signature_that_arrives_later_updates_the_count_once_and_the_rest_is_not_redone() {
+        let mut page = kernel_page(Arc::new(SignatureBook::default()));
+        for _ in 0..3 {
+            frame(&mut page);
+        }
+        assert_eq!(page.derived_builds(), 1, "three frames, nothing changed");
+        assert!(frame(&mut page).iter().any(|x| x == "Unsigned  0"));
+        page.drv.lock().signatures = sample_book();
+        let t = frame(&mut page);
+        frame(&mut page);
+        assert_eq!(page.derived_builds(), 2, "the new results are worked out once, in the same derived data");
+        assert!(t.iter().any(|x| x == "Unsigned  1"), "{t:?}");
+    }
+
+    #[test]
+    fn both_detail_panels_show_a_signature_row_and_the_signer() {
+        let mut page = kernel_page(sample_book());
+        page.drv_ui.selected_kernel = Some("nvlddmkm".into());
+        let t = frame(&mut page);
+        let at = t.iter().position(|x| x == "Signer").unwrap_or_else(|| panic!("a Signer row: {t:?}"));
+        assert_eq!(t[at + 1], crate::addons::drivers::signature::WHQL_PUBLISHER);
+        assert!(t.iter().filter(|x| *x == "Signature").count() >= 2, "the header and the panel's row: {t:?}");
+
+        let device = DeviceDriver { inf: "camo.inf".into(), provider: "Reincubate".into(), ..gpu("Camo") };
+        let mut page = page_with(vec![device.clone()], Vec::new());
+        page.drv.lock().signatures = book(&[(&device.inf_path(), Signature::Signed { signer: "Reincubate Ltd".into() })]);
+        page.drv_ui.selected_device = Some("Camo".into());
+        let t = frame(&mut page);
+        let at = t.iter().position(|x| x == "Signature").unwrap_or_else(|| panic!("a Signature row: {t:?}"));
+        assert_eq!(t[at + 1], "Signed");
+        assert_eq!(t[at + 2], "Signer");
+        assert_eq!(t[at + 3], "Reincubate Ltd");
+    }
+
+    #[test]
+    fn a_driver_not_checked_yet_says_so_and_has_no_signer_row() {
+        let rows = kernel_detail_rows(&KernelDriver::default(), true, None);
+        assert!(rows.contains(&("Signature", "Not checked".to_string())));
+        assert!(!rows.iter().any(|(k, _)| *k == "Signer"));
+        let failed = Signature::CouldNotCheck("in use".into());
+        assert!(kernel_details(&KernelDriver::default(), true, Some(&failed)).contains("Signature: Could not check: in use\n"));
+        let d = DeviceDriver { name: "Camo".into(), ..Default::default() };
+        assert!(device_details(&d, None, None).contains("Signature: Not checked\n"));
+        assert!(device_details(&d, None, Some(&whql())).contains(&format!("Signer: {}\n", crate::addons::drivers::signature::WHQL_PUBLISHER)));
+    }
+
+    #[test]
+    fn the_csv_fills_the_signature_column_for_kernel_modules_only() {
+        let k = |service: &str, path: &str| KernelDriver { service: service.into(), path: path.into(), ..Default::default() };
+        let signatures = book(&[(r"C:\d\a.sys", whql()), (r"C:\d\b.sys", Signature::CouldNotCheck("busy, try later".into()))]);
+        let device = DeviceDriver { name: "Dev".into(), ..Default::default() };
+        let csv = drivers_csv(&[device], &[k("a", r"C:\d\a.sys"), k("b", r"C:\d\b.sys"), k("c", r"C:\d\c.sys")], None, &signatures);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert!(lines[0].ends_with(",Depends on,Signature"));
+        assert!(lines[1].ends_with(",,,,,,,"), "a device row leaves it empty: {}", lines[1]);
+        assert!(lines[2].ends_with(",WHQL"), "{}", lines[2]);
+        assert!(lines[3].ends_with(",\"Could not check: busy, try later\""), "a cell with a comma is quoted: {}", lines[3]);
+        assert!(lines[4].ends_with(",Not checked"), "{}", lines[4]);
+    }
 }
 
 #[cfg(test)]
@@ -1791,22 +2012,22 @@ mod kernel_detail_tests {
             load_index: Some(7), image_size: Some(4096), group: "+Base".into(),
             depends_services: vec!["Tcpip".into()], depends_groups: vec!["NDIS".into()], ..Default::default()
         };
-        let csv = drivers_csv(&[], &[k], None);
+        let csv = drivers_csv(&[], &[k], None, &SignatureBook::default());
         let mut lines = csv.lines();
         let header: Vec<&str> = lines.next().unwrap().split(',').collect();
-        assert_eq!(&header[10..], ["Start type", "Driver kind", "Load index", "Kernel memory (bytes)", "Load order group", "Depends on"]);
+        assert_eq!(&header[10..], ["Start type", "Driver kind", "Load index", "Kernel memory (bytes)", "Load order group", "Depends on", "Signature"]);
         let row = lines.next().unwrap();
         assert!(row.contains(",'@Disk,") && row.contains(",'-Acme,") && row.contains(",'=svc,"));
-        assert!(row.ends_with(",Boot,Kernel,7,4096,'+Base,Tcpip; group NDIS"), "{row}");
+        assert!(row.ends_with(",Boot,Kernel,7,4096,'+Base,Tcpip; group NDIS,Not checked"), "{row}");
     }
 
     #[test]
     fn csv_export_device_rows_keep_their_columns() {
         let d = DeviceDriver { name: "=Evil".into(), instance_id: "PCI-X".into(), ..Default::default() };
-        let csv = drivers_csv(&[d], &[], None);
+        let csv = drivers_csv(&[d], &[], None, &SignatureBook::default());
         let row = csv.lines().nth(1).unwrap();
         assert!(row.starts_with("Device,'=Evil,"), "{row}");
-        assert!(row.ends_with(",not checked,PCI-X,,,,,,"), "{row}");
+        assert!(row.ends_with(",not checked,PCI-X,,,,,,,"), "{row}");
     }
 
     fn sample() -> KernelDriver {
@@ -1836,18 +2057,19 @@ Kind: Kernel\n\
 Start type: Boot\n\
 Version: 10.0.26100.1\n\
 Vendor: Microsoft Corporation\n\
+Signature: Not checked\n\
 Load index: 7 (Boot Bus Extender)\n\
 Load order group: Boot Bus Extender\n\
 Kernel memory: 152.0 KB\n\
 Location: C:\\Windows\\System32\\Drivers\\acpiex.sys\n\
 Unload: Not offered: Windows loaded it at boot, and the kernel refuses to stop a driver it started itself.\n";
-        assert_eq!(kernel_details(&sample(), true), expected);
+        assert_eq!(kernel_details(&sample(), true, None), expected);
     }
 
     #[test]
     fn missing_values_show_a_dash() {
         let d = KernelDriver { running: false, version: String::new(), vendor: String::new(), group: String::new(), image_size: None, load_index: None, ..sample() };
-        let text = kernel_details(&d, false);
+        let text = kernel_details(&d, false, None);
         assert!(text.contains("State: Stopped\n"));
         assert!(text.contains("Version: \u{2014}\n"));
         assert!(text.contains("Vendor: \u{2014}\n"));
@@ -1859,24 +2081,24 @@ Unload: Not offered: Windows loaded it at boot, and the kernel refuses to stop a
     #[test]
     fn group_and_dependencies_rows_appear_only_when_present_and_in_order() {
         let d = KernelDriver { depends_services: vec!["Tcpip".into()], depends_groups: vec!["NDIS".into()], ..sample() };
-        let text = kernel_details(&d, true);
+        let text = kernel_details(&d, true, None);
         assert!(text.contains("Load index: 7 (Boot Bus Extender)\nLoad order group: Boot Bus Extender\nDepends on: Tcpip, NDIS (group)\nKernel memory: "), "{text}");
-        let bare = kernel_details(&KernelDriver { group: String::new(), ..sample() }, true);
+        let bare = kernel_details(&KernelDriver { group: String::new(), ..sample() }, true, None);
         assert!(!bare.contains("Load order group") && !bare.contains("Depends on"), "{bare}");
-        assert!(kernel_details(&sample(), true).contains("Load order group: Boot Bus Extender\n"));
-        assert!(!kernel_details(&sample(), true).contains("Depends on"));
+        assert!(kernel_details(&sample(), true, None).contains("Load order group: Boot Bus Extender\n"));
+        assert!(!kernel_details(&sample(), true, None).contains("Depends on"));
     }
 
     #[test]
     fn pending_states_show_in_the_state_row() {
         let d = KernelDriver { running: false, state_code: Some(6), ..sample() };
-        assert!(kernel_details(&d, true).contains("State: Pause pending\n"));
+        assert!(kernel_details(&d, true, None).contains("State: Pause pending\n"));
     }
 
     #[test]
     fn load_index_without_group_has_no_parentheses() {
         let d = KernelDriver { group: String::new(), ..sample() };
-        assert!(kernel_details(&d, true).contains("Load index: 7\n"));
+        assert!(kernel_details(&d, true, None).contains("Load index: 7\n"));
     }
 
     #[test]

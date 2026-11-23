@@ -22,6 +22,9 @@ impl ListingReader for WindowsListing {
     fn filters(&self) -> FilterRead {
         imp::list_filters()
     }
+    fn signature(&self, path: &str) -> super::signature::Signature {
+        super::signature::check(path)
+    }
 }
 
 #[cfg(not(windows))]
