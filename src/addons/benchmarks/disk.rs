@@ -62,24 +62,23 @@ pub fn test_folder(chosen: Option<&str>, temp: PathBuf) -> Result<PathBuf, &'sta
     }
 }
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(target_os = "linux")]
+use linux as system;
+#[cfg(target_os = "macos")]
+use macos as system;
+#[cfg(windows)]
+use windows as system;
+
 /// The bytes free for this user on the drive of `folder`.
 pub fn free_space(folder: &Path) -> Option<u64> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        let wide: Vec<u16> = folder.as_os_str().encode_wide().chain(Some(0)).collect();
-        let mut free = 0u64;
-        // SAFETY: `wide` is a NUL-terminated path; the other outputs may be null.
-        let ok = unsafe {
-            windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut())
-        };
-        (ok != 0).then_some(free)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = folder;
-        None
-    }
+    system::free_space(folder)
 }
 
 /// `bytes` moved in `secs`, in MB/sec (1 MB = 1024 x 1024 bytes).
@@ -118,12 +117,7 @@ impl Drop for TestFile {
 fn create(path: &Path) -> std::io::Result<File> {
     let mut o = std::fs::OpenOptions::new();
     o.read(true).write(true).create(true).truncate(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH};
-        o.custom_flags(FILE_FLAG_WRITE_THROUGH | FILE_FLAG_NO_BUFFERING);
-    }
+    system::direct_io(&mut o);
     o.open(path)
 }
 
