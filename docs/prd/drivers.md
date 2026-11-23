@@ -92,12 +92,24 @@ It is the last add-on in the migration order proposed by the add-ons document.
 - **Kernel memory**: the sum of the image sizes of the loaded rows, each image file counted once (two services that point to the same file add its size once). When the list of loaded modules could not be read, the tile says "an unknown amount" and a note says why; it is never shown as 0.
 - **Matching modules**: a driver's image is matched to the loaded module by full path (case-insensitive, `\SystemRoot` and `\??\` spelled out); by file name alone only when the image path has no folder and one module has that name.
 
+<<<<<<< HEAD
 #### VirusTotal and SHA-256 (spec #11, #34)
 
 - "Copy SHA-256" on a kernel module hashes its file on this PC and copies the hash.
 - "Look up on VirusTotal" opens `https://www.virustotal.com/gui/file/<sha256>` in the browser: no API key, nothing uploaded; only the hash leaves the PC.
 - It is off by default (Settings, Add-ons, Drivers, "Offer \"Look up on VirusTotal\""). The first lookup asks "Send this file's SHA-256 to VirusTotal? The file itself is not uploaded."; the option and the consent are saved (`virusTotal`, `virusTotalConsent`), and cancelling saves nothing.
 - Both sit under "Advanced" in the kernel module menu and side panel. The hash is computed in the background and dropped if the add-on is turned off meanwhile.
+=======
+#### Signatures (spec #11, #25)
+
+- **Column and rows**: Kernel modules has a Signature column, and both detail panels (devices and kernel modules) a Signature row, with a Signer row when the signer's name is known. The values are "WHQL", "Signed", "Unsigned", "Not checked" (not checked yet) and "Could not check: <reason>", which is not "Unsigned".
+- **Check**: `WinVerifyTrust` with the driver policy, first on the file's own signature, then on the catalog that lists the file's hash (`CryptCATAdmin*`), so a driver signed through its package's catalog is not called unsigned. It reads the driver image of a kernel module and the INF of a device, with normal rights (no UAC).
+- **WHQL**: the signer chain has "Microsoft Windows Hardware Compatibility Publisher". The signer shown is the first certificate of the chain.
+- **When**: on a background thread after the list is shown; results arrive while the page is open. Results are cached in memory by path, size and modification time; a file that changed is checked again, and a failed check is tried again at the next reading.
+- **Unsigned scope**: a sixth scope on Kernel modules, with its count, lists the modules whose check found no signature (not the ones not checked yet, nor the ones that could not be checked). It is worked out with the other counts in the page's derived data, once per change of data or filter. `--drivers-scope unsigned` opens it.
+- **CSV**: the Signature column is the last one and is filled for kernel modules (empty on device rows).
+- **Add-on off**: the check ends before its next file, nothing is published after that and nothing new starts while the add-on is off.
+>>>>>>> spec-11-drivers-v2
 
 ### Other actions (More actions)
 45. As a user, I want "Install from an INF file…" to add a driver package and install it on compatible devices (with UAC), with the outcomes "Driver package installed.", "The package was added, but no device needed it…", "Done. Restart Windows to finish.", so that I can install a driver downloaded from the manufacturer. *(our addition; exists, to be verified end to end)*
@@ -112,11 +124,33 @@ It is the last add-on in the migration order proposed by the add-ons document.
 52. As a user, I want "Drivers could not be enumerated" with the reason when reading fails, instead of a silent empty list, so that I understand it is an error. *(missing: today a reading error gives an empty list)*
 53. As a user, I want "No drivers were reported" / "Windows published no driver registrations." when Windows returns nothing, distinct from "No drivers here." and from the filter states, so that I can tell a problem from a filter. *(missing)*
 
+### Driver store (spec #11, #26)
+A "Driver store" tab after Kernel modules lists the driver packages Windows keeps: published name (oemNN.inf) with the original INF under it, provider, class, version, date, signer, and the devices using it. A filter ("Package, INF, provider or device") and "Copy details" (row menu and side panel) work as on the other tabs; the filter and the selection are the tab's own.
+- Read with `pnputil /enum-drivers /devices /format xml` and normal rights (no UAC), parsed from the XML, never from localised text. `/enum-drivers` lists the third-party packages (`oemNN.inf`) only. The read follows the driver listing in the same background job: the other tabs do not wait for it, a refresh re-reads it, and when the add-on is turned off its result is dropped and nothing new starts.
+- **Old**: another package with the same original INF name and provider (case does not matter) has a newer version (numbers compared part by part, missing parts count as 0), then a later date when the versions are equal. **In use**: at least one device. **Inbox**: the provider starts with "Microsoft" (case-insensitive); inbox packages are flagged and never offered for removal.
+- Figures, over the whole store (not the filter): packages, third-party (not inbox), old (old, not in use, not inbox: what "Remove old packages" will remove), disk space used and what can be freed. The size of a package is its folder in `System32\DriverStore\FileRepository`, found through `HKLM\SYSTEM\DriverDatabase\DriverInfFiles\<oemNN.inf>`; a package whose folder is not found has no size, and when none has one the figure says "unknown", never 0.
+- Removal and backup (stories 47-50, 55-58) are later tickets (#28, #29); this tab only reads.
+
 ### Security band (spec #11, #32)
 A compact read-only "Security" strip under the status band shows Memory integrity (`HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled`) and the vulnerable driver blocklist (`HKLM\SYSTEM\CurrentControlSet\Control\CI\Config\VulnerableDriverBlocklistEnable`).
-- Each value shows as "On" (1), "Off" (0), "Not set" (no key or value: the page does not guess) or "could not be read" (access denied, another type, any other number), each with its own explaining line; an unreadable value is never shown as off.
+- Each value shows as "On" (1), "Off" (0), "Not set" or "could not be read" (access denied, another type, any other number), each with its own explaining line; an unreadable value is never shown as off.
+- **Memory integrity with no value or no key shows "Off"** (owner decision on #32), as Windows Security does when the setting was never turned on; "could not be read" is kept for a real read failure or an unknown value. The vulnerable driver blocklist is unchanged: with no value it still shows "Not set".
+- Possible later improvement: read the running state from WMI `Win32_DeviceGuard.SecurityServicesRunning`.
 - The values are read with normal rights, in process, in the same read as the driver listing; nothing is written and no elevated job is added. When the add-on is turned off the read is dropped and nothing new starts.
 - "Open Windows Security" opens `windowsdefender://coreisolation`; the strip says "Read-only: change them in Windows Security."
+
+### Restore point (spec #11, #27)
+Windows Update installs and INF installs offer "Create a restore point first" in their confirm dialog: on by default, remembered (setting `restorePoint`, saved only when turned off).
+- The restore point is a **step** of the same elevated job as the change, so the user sees one UAC prompt. The job script takes an ordered `Steps` argument (`restore-point,install-updates` or `restore-point,inf`); the step's PowerShell runs before the change and stores its result under `steps` in the job result. A later change adds its step by passing one more `Step` to `Hub::run_job`. With the option off the launch has no steps and is exactly the change's own script and arguments.
+- The step uses `Checkpoint-Computer` with the `DEVICE_DRIVER_INSTALL` type and reports "Restore point created.", "System Restore is off on drive C:." or "Windows already created a restore point in the last 24 hours." (any other failure: "The restore point could not be created: <reason>").
+- When it is not created, the job stops before the change (nothing was changed) and the page asks "Continue without a new restore point?" with Continue and Cancel. Continue runs the change again without a restore point (a second UAC prompt, only on this path); Cancel says "Cancelled: nothing was changed.". When it is created its message leads the outcome message.
+- Unload and Scan make no restore point. The job is an uninterruptible elevated job like the others: turning the add-on off waits for it.
+
+### Filter drivers (spec #11, #33)
+A "Filter drivers" tab lists the loaded file-system minifilters read-only: name, altitude, instances and frame, highest altitude first like `fltmc filters`, with a "Filter name" search.
+- They are read in process with `FilterFindFirst`/`FilterFindNext` (Filter Manager user API), in the same read as the driver listing, with normal rights.
+- When Windows refuses without administrator rights the tab says "Needs administrator rights to list filters."; the page never asks for rights on its own.
+- There is no unload or other action. When the add-on is turned off the read is dropped and nothing new starts; no elevated job is added.
 
 ### Behavior as an add-on
 54. As a user, I want to turn Drivers on or off from the Add-ons page in Settings, so that I keep the app light if I do not need it. *(our addition)*
@@ -188,7 +222,7 @@ Modules tested: driver data module, driver page module, `DriversAddon`.
 
 - The add-on platform itself (registry, Add-ons page, licenses, sales): separate PRD.
 - Downloading drivers from manufacturers' websites (NVIDIA, AMD, Intel…): the add-on only opens their page.
-- Uninstalling a driver package from the driver store, going back to the previous driver (Device Manager rollback), disabling a device.
+- Uninstalling a driver package from the driver store (listing it is in scope; removal is spec #11, #28), going back to the previous driver (Device Manager rollback), disabling a device.
 - Restore points before installation.
 - Driver values read through manufacturers' SDKs.
 - Phase 2 of the platform (add-ons in a separate process or WASM).

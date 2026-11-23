@@ -11,6 +11,7 @@
 //!   for hardware changes and stopping a driver need administrator rights:
 //!   they run in an elevated PowerShell, so Windows asks through UAC.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -20,6 +21,8 @@ use crate::platform::install_queue::{Request, Work};
 use crate::platform::series::{Run, Series};
 use crate::platform::{AddonContext, Generation};
 
+use super::signature::{Signature, SignatureBook};
+use super::store::StorePackage;
 use super::ListingReader;
 
 #[derive(Clone, Debug, Default)]
@@ -237,11 +240,19 @@ pub enum KernelScope {
     NotLoaded,
     ThirdParty,
     FileSystem,
+    /// Modules whose signature check found no signature (a failed check
+    /// does not count, and nor does one not done yet).
+    Unsigned,
 }
 
 impl KernelScope {
-    /// In display order.
+    /// The scopes saved by older versions, in their order (a saved index
+    /// points here); the command line's error lists these.
     pub const ALL: [KernelScope; 5] = [Self::All, Self::Loaded, Self::NotLoaded, Self::ThirdParty, Self::FileSystem];
+
+    /// The scopes the page offers, in display order: [`KernelScope::ALL`]
+    /// then Unsigned.
+    pub const SHOWN: [KernelScope; 6] = [Self::All, Self::Loaded, Self::NotLoaded, Self::ThirdParty, Self::FileSystem, Self::Unsigned];
 
     /// The scope saved by older versions as an index into
     /// [`KernelScope::ALL`]; All when unknown.
@@ -257,12 +268,13 @@ impl KernelScope {
             Self::NotLoaded => "not-loaded",
             Self::ThirdParty => "third-party",
             Self::FileSystem => "file-system",
+            Self::Unsigned => "unsigned",
         }
     }
 
     /// The scope named `name` (case does not matter); None when unknown.
     pub fn parse(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|s| s.name().eq_ignore_ascii_case(name.trim()))
+        Self::SHOWN.into_iter().find(|s| s.name().eq_ignore_ascii_case(name.trim()))
     }
 
     pub fn label(self) -> &'static str {
@@ -272,22 +284,25 @@ impl KernelScope {
             Self::NotLoaded => "Not loaded",
             Self::ThirdParty => "Third-party",
             Self::FileSystem => "File system",
+            Self::Unsigned => "Unsigned",
         }
     }
 
-    pub fn matches(self, d: &KernelDriver) -> bool {
+    /// `signature` is what the signature check found for this driver's file.
+    pub fn matches(self, d: &KernelDriver, signature: Option<&Signature>) -> bool {
         match self {
             Self::All => true,
             Self::Loaded => d.is_loaded(),
             Self::NotLoaded => !d.is_loaded(),
             Self::ThirdParty => d.third_party(),
             Self::FileSystem => d.kind == KernelKind::FileSystem,
+            Self::Unsigned => matches!(signature, Some(Signature::Unsigned)),
         }
     }
 
     /// How many drivers of the list fall in this scope.
-    pub fn count(self, list: &[KernelDriver]) -> usize {
-        list.iter().filter(|d| self.matches(d)).count()
+    pub fn count(self, list: &[KernelDriver], signatures: &SignatureBook) -> usize {
+        list.iter().filter(|d| self.matches(d, signatures.of(&d.path))).count()
     }
 }
 
@@ -357,7 +372,7 @@ impl KernelFigures {
         let mut images = std::collections::HashSet::new();
         for d in rows {
             f.drivers += 1;
-            if KernelScope::Loaded.matches(d) {
+            if KernelScope::Loaded.matches(d, None) {
                 f.loaded += 1;
                 if d.modules_unread {
                     f.memory = None;
@@ -368,7 +383,7 @@ impl KernelFigures {
                     }
                 }
             }
-            f.third_party += KernelScope::ThirdParty.matches(d) as usize;
+            f.third_party += KernelScope::ThirdParty.matches(d, None) as usize;
         }
         f
     }
@@ -431,6 +446,12 @@ pub struct State {
     pub devices_error: Option<String>,
     /// Why the last read of the driver services failed (then `kernel` is empty).
     pub kernel_error: Option<String>,
+    /// The driver packages Windows keeps (the Driver store tab).
+    pub store: Arc<[StorePackage]>,
+    /// Why the last read of the driver store failed (then `store` is empty).
+    pub store_error: Option<String>,
+    /// The driver store is being read (it follows the listing).
+    pub store_reading: bool,
     /// None until the first check.
     pub updates: Option<Arc<[DriverUpdate]>>,
     pub checked_at: String,
@@ -449,7 +470,17 @@ pub struct State {
     pub security: Option<SecurityReading>,
     /// The SHA-256 of a kernel module's file, waiting for the page to take it.
     pub hashed: Option<Hashed>,
+    /// The last read of the loaded filters; `None` until the first listing
+    /// has read them.
+    pub filters: Option<Arc<super::filters::FilterRead>>,
+    /// What the signature checks found so far, by file path. A snapshot
+    /// replaced as results arrive, so the page can tell when it changed.
+    pub signatures: Arc<SignatureBook>,
+    /// A restore point could not be created, so the change did not run: the
+    /// page asks whether to continue without one.
+    pub restore_prompt: Option<RestorePrompt>,
 }
+
 
 /// What a file's SHA-256 is wanted for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -475,6 +506,22 @@ pub fn virustotal_url(sha256: &str) -> Option<String> {
     valid.then(|| format!("https://www.virustotal.com/gui/file/{}", sha256.to_ascii_lowercase()))
 }
 
+/// What waits for the user's answer after a restore point failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestorePrompt {
+    /// Why there is no restore point (one of the honest messages).
+    pub reason: String,
+    /// The change to run again, without a restore point, on "Continue".
+    pub redo: Redo,
+}
+
+/// A change that can be run again without its restore point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Redo {
+    Updates(Vec<String>),
+    Inf(String),
+}
+
 #[derive(Clone)]
 pub struct Hub {
     st: Arc<Mutex<State>>,
@@ -488,13 +535,51 @@ pub struct Hub {
     series: Series<State>,
     /// Set by [`Hub::stop`]: ends a running Windows Update search's PowerShell.
     halt: Arc<AtomicBool>,
+    /// The signature checks: their cache and whether a pass is running.
+    signing: Arc<Signing>,
+}
+
+/// How many results the signature pass publishes at a time.
+const SIGNATURE_BATCH: usize = 16;
+
+/// A file as the signature cache knows it: its path, size and modification
+/// time. A file that changed is checked again.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Stamp {
+    path: String,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl Stamp {
+    fn of(path: &str) -> Stamp {
+        let meta = std::fs::metadata(path).ok();
+        Stamp { path: path.trim().to_lowercase(), size: meta.as_ref().map_or(0, |m| m.len()), modified: meta.and_then(|m| m.modified().ok()) }
+    }
+}
+
+#[derive(Default)]
+struct Signing {
+    /// The results worth keeping; a failed check is tried again later.
+    cache: Mutex<HashMap<Stamp, Signature>>,
+    /// A pass runs on its background thread.
+    running: AtomicBool,
+}
+
+/// The driver files whose signature the page shows: each kernel driver's
+/// image and each device's INF, once each.
+fn signed_files(st: &State) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let kernel = st.kernel.iter().map(|d| d.path.clone());
+    let devices = st.devices.iter().filter(|d| !d.inf.is_empty()).map(|d| d.inf_path());
+    kernel.chain(devices).filter(|p| !p.trim().is_empty() && seen.insert(p.trim().to_lowercase())).collect()
 }
 
 impl Hub {
     pub fn new(ctx: AddonContext, reader: Arc<dyn ListingReader>) -> Self {
         let st = Arc::new(Mutex::new(State::default()));
         let series = Series::new(&st, &Generation::default(), |s: &mut State| &mut s.busy);
-        Hub { st, ctx, reader, series, halt: Default::default() }
+        Hub { st, ctx, reader, series, halt: Default::default(), signing: Default::default() }
     }
 
     pub fn lock(&self) -> MutexGuard<'_, State> {
@@ -530,7 +615,10 @@ impl Hub {
     /// the state is forgotten; a running driver install goes on (see
     /// [`Hub::running`]) and keeps reporting into the state.
     pub fn stop(&self) {
-        self.series.stop(|st| st.listing = false);
+        self.series.stop(|st| {
+            st.listing = false;
+            st.store_reading = false;
+        });
         self.halt.store(true, Ordering::SeqCst);
     }
 
@@ -551,17 +639,20 @@ impl Hub {
     pub fn refresh(&self) {
         {
             let Some(mut st) = self.live() else { return };
-            if st.listing {
+            if st.listing || st.store_reading {
                 return;
             }
             // A system without drivers says so; it never reads as an empty
             // list. Each tab shows its own list's error, so both get it.
             if let Some(why) = unavailable_text(Feature::DeviceSetupApi) {
+                publish_store(&mut st, Err(why.clone()));
+                st.filters = Some(Arc::new(super::filters::FilterRead::Failed(why.clone())));
                 publish_listing(&mut st, Err(why.clone()), Err(why));
                 st.listed_at = crate::platform::clock_now();
                 return;
             }
             st.listing = true;
+            st.store_reading = true;
         }
         self.spawn(None, false, |hub, _| hub.refresh_now());
     }
@@ -577,10 +668,88 @@ impl Hub {
             return;
         }
         let security = self.reader.security();
+        if self.live().is_none() {
+            return;
+        }
+        let filters = self.reader.filters();
         let Some(mut st) = self.live() else { return };
         publish_listing(&mut st, devices, kernel);
         st.security = Some(security);
+        st.filters = Some(Arc::new(filters));
         st.listed_at = crate::platform::clock_now();
+        drop(st);
+        // The signature check runs on its own thread.
+        self.check_signatures();
+        // The driver store comes last: its tool takes a moment, and the
+        // other tabs need not wait for it. Read-only and with normal rights.
+        if self.live().is_none() {
+            return;
+        }
+        let store = self.reader.store();
+        let Some(mut st) = self.live() else { return };
+        publish_store(&mut st, store);
+    }
+
+    /// Checks the signatures of the listed driver files on a background
+    /// thread, after the list is shown. Each file is checked with normal
+    /// rights, at most once while its path, size and modification time stay
+    /// the same. Nothing starts once the hub was stopped, and a running pass
+    /// ends before its next file.
+    fn check_signatures(&self) {
+        if self.series.stopped() || self.signing.running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let hub = self.clone();
+        if std::thread::Builder::new().name("driver-signatures".into()).spawn(move || hub.signature_pass()).is_err() {
+            self.signing.running.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// The files of the current list not checked yet, with their stamps.
+    fn unchecked(&self) -> Option<Vec<(String, Stamp)>> {
+        let files = signed_files(&*self.live()?);
+        let cache = self.signing.cache.lock().unwrap_or_else(|e| e.into_inner());
+        Some(files.into_iter().map(|f| { let stamp = Stamp::of(&f); (f, stamp) }).filter(|(_, stamp)| !cache.contains_key(stamp)).collect())
+    }
+
+    fn signature_pass(&self) {
+        let mut tried = std::collections::HashSet::new();
+        loop {
+            let todo: Vec<(String, Stamp)> = self.unchecked().unwrap_or_default().into_iter().filter(|(f, _)| !tried.contains(f)).collect();
+            if todo.is_empty() {
+                self.signing.running.store(false, Ordering::SeqCst);
+                // A list may have landed while the last look was being made.
+                let more = self.unchecked().is_some_and(|t| t.iter().any(|(f, _)| !tried.contains(f)));
+                if more && !self.signing.running.swap(true, Ordering::SeqCst) {
+                    continue;
+                }
+                return;
+            }
+            for batch in todo.chunks(SIGNATURE_BATCH) {
+                let mut found = Vec::new();
+                for (file, stamp) in batch {
+                    if self.series.stopped() {
+                        self.signing.running.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                    tried.insert(file.clone());
+                    let signature = self.reader.signature(file);
+                    if !matches!(signature, Signature::CouldNotCheck(_)) {
+                        self.signing.cache.lock().unwrap_or_else(|e| e.into_inner()).insert(stamp.clone(), signature.clone());
+                    }
+                    found.push((file.clone(), signature));
+                }
+                let Some(mut st) = self.live() else {
+                    self.signing.running.store(false, Ordering::SeqCst);
+                    return;
+                };
+                let mut book = (*st.signatures).clone();
+                for (file, signature) in found {
+                    book.insert(&file, signature);
+                }
+                st.signatures = Arc::new(book);
+            }
+        }
     }
 
     /// Searches Windows Update for driver updates (takes 10–60 s).
@@ -607,6 +776,12 @@ impl Hub {
 
     /// Downloads and installs the given Windows Update driver updates.
     pub fn install(&self, ids: Vec<String>) {
+        self.install_with(ids, false);
+    }
+
+    /// Like [`Hub::install`]; `restore_point` makes the same elevated job
+    /// create a restore point first.
+    pub fn install_with(&self, ids: Vec<String>, restore_point: bool) {
         if ids.is_empty() {
             return;
         }
@@ -615,8 +790,17 @@ impl Hub {
             let items = ids.iter().map(|id| ("windows-update".to_string(), id.clone())).collect();
             let Some(turn) = run.queue(hub.ctx.install_queue(), queue_request(items)) else { return };
             let joined = ids.join(",");
-            let outcome = install_outcome(hub.ctx.powershell(INSTALL_SCRIPT, &[("Ids", joined.as_str())], true));
+            let ran = hub.run_job(INSTALL_SCRIPT, "install-updates", &[("Ids", joined.as_str())], &restore_steps(restore_point));
             drop(turn);
+            let (result, restore_note) = match ran {
+                JobRun::Done { result, note } => (result, note),
+                JobRun::Refused(reason) => {
+                    hub.refuse(run, reason, Redo::Updates(ids));
+                    return;
+                }
+            };
+            let mut outcome = install_outcome(result);
+            outcome.message.0 = with_note(restore_note, outcome.message.0);
             let done = outcome.installed;
             {
                 let mut st = hub.follow();
@@ -639,17 +823,72 @@ impl Hub {
     /// Adds a driver package and installs it on matching devices
     /// (pnputil /add-driver … /install). A folder installs every INF in it.
     pub fn install_inf(&self, path: String) {
-        self.pnputil("inf", path, true, "Installing the driver package \u{2014} confirm the Windows prompt\u{2026}");
+        self.install_inf_with(path, false);
+    }
+
+    /// Like [`Hub::install_inf`]; `restore_point` makes the same elevated job
+    /// create a restore point first.
+    pub fn install_inf_with(&self, path: String, restore_point: bool) {
+        self.pnputil("inf", path, true, "Installing the driver package \u{2014} confirm the Windows prompt\u{2026}", restore_point);
+    }
+
+    /// Runs `change` in one elevated job, the `steps` before it. A step that
+    /// refuses the change (a restore point that could not be made) stops the
+    /// job before anything is changed. With no steps the launch is the
+    /// change's own script and arguments, as before.
+    fn run_job(&self, change: &str, change_name: &str, args: &[(&str, &str)], steps: &[&Step]) -> JobRun {
+        if steps.is_empty() {
+            return JobRun::Done { result: self.ctx.powershell(change, args, true), note: None };
+        }
+        let script = with_steps(change, steps);
+        let names = steps.iter().map(|s| s.name).chain([change_name]).collect::<Vec<_>>().join(",");
+        let mut all = args.to_vec();
+        all.push(("Steps", names.as_str()));
+        match self.ctx.powershell(&script, &all, true) {
+            Ok(v) if v["ran"].as_bool() == Some(false) => JobRun::Refused(restore_text(&v["steps"][RESTORE_POINT.name])),
+            Ok(v) => {
+                let note = v["steps"].get(RESTORE_POINT.name).map(restore_text);
+                JobRun::Done { result: Ok(v), note }
+            }
+            Err(e) => JobRun::Done { result: Err(e), note: None },
+        }
+    }
+
+    /// The job stopped before its change: the page asks what to do.
+    fn refuse(&self, run: &Run<State>, reason: String, redo: Redo) {
+        let mut st = self.follow();
+        run.release(&mut st);
+        st.restore_prompt = Some(RestorePrompt { reason, redo });
+    }
+
+    /// "Continue" after a restore point failed: the change runs again
+    /// without one. Windows asks again, because the first job ended before
+    /// it changed anything.
+    pub fn continue_without_restore(&self) {
+        let prompt = self.follow().restore_prompt.take();
+        match prompt.map(|p| p.redo) {
+            Some(Redo::Updates(ids)) => self.install_with(ids, false),
+            Some(Redo::Inf(path)) => self.install_inf_with(path, false),
+            None => {}
+        }
+    }
+
+    /// "Cancel" after a restore point failed: nothing was changed.
+    pub fn cancel_restore(&self) {
+        let mut st = self.follow();
+        if st.restore_prompt.take().is_some() {
+            st.message = Some(("Cancelled: nothing was changed.".into(), false));
+        }
     }
 
     /// Asks Windows to look for new or removed hardware (pnputil /scan-devices).
     pub fn scan(&self) {
-        self.pnputil("scan", String::new(), false, "Scanning for hardware changes \u{2014} confirm the Windows prompt\u{2026}");
+        self.pnputil("scan", String::new(), false, "Scanning for hardware changes \u{2014} confirm the Windows prompt\u{2026}", false);
     }
 
     /// Stops (unloads) a kernel driver service (sc stop).
     pub fn unload(&self, service: String) {
-        self.pnputil("stop", service, false, "Asking the driver to unload \u{2014} confirm the Windows prompt\u{2026}");
+        self.pnputil("stop", service, false, "Asking the driver to unload \u{2014} confirm the Windows prompt\u{2026}", false);
     }
 
     /// Reads the file at `path` and hashes it with SHA-256 (no network, no
@@ -671,7 +910,7 @@ impl Hub {
 
     /// Installing a package is uninterruptible; scanning and unloading are
     /// not (their outcome is dropped when the add-on is turned off).
-    fn pnputil(&self, mode: &'static str, arg: String, uninterruptible: bool, busy: &str) {
+    fn pnputil(&self, mode: &'static str, arg: String, uninterruptible: bool, busy: &str, restore_point: bool) {
         self.spawn(Some(busy.into()), uninterruptible, move |hub, run| {
             // Only adding a driver package installs something.
             let turn = match mode {
@@ -681,8 +920,18 @@ impl Hub {
                 },
                 _ => None,
             };
-            let outcome = tool_outcome(mode, hub.ctx.powershell(TOOL_SCRIPT, &[("Mode", mode), ("Arg", arg.as_str())], true));
+            let steps = if mode == "inf" { restore_steps(restore_point) } else { Vec::new() };
+            let ran = hub.run_job(TOOL_SCRIPT, "inf", &[("Mode", mode), ("Arg", arg.as_str())], &steps);
             drop(turn);
+            let (result, restore_note) = match ran {
+                JobRun::Done { result, note } => (result, note),
+                JobRun::Refused(reason) => {
+                    hub.refuse(run, reason, Redo::Inf(arg));
+                    return;
+                }
+            };
+            let mut outcome = tool_outcome(mode, result);
+            outcome.message.0 = with_note(restore_note, outcome.message.0);
             {
                 let Some(mut st) = hub.outcome(uninterruptible) else { return };
                 run.release(&mut st);
@@ -697,6 +946,74 @@ impl Hub {
             }
             hub.refresh_now();
         });
+    }
+}
+
+/// A step an elevated job runs before its change. Adding one to a job is one
+/// entry in the `steps` of [`Hub::run_job`]: the step's PowerShell is put in
+/// front of the change, its result is stored under its name in the job's
+/// result (`steps`), and it may end the job early with `ran = false` so that
+/// nothing is changed.
+pub struct Step {
+    /// The name in the job's `Steps` argument and in its result.
+    pub name: &'static str,
+    /// PowerShell run after the `param` line; sees `$Steps`, `$Out` and `$stepResults`.
+    snippet: &'static str,
+}
+
+/// Creates a restore point of the device-driver-install type.
+pub const RESTORE_POINT: Step = Step { name: "restore-point", snippet: RESTORE_STEP };
+
+fn restore_steps(restore_point: bool) -> Vec<&'static Step> {
+    if restore_point {
+        vec![&RESTORE_POINT]
+    } else {
+        Vec::new()
+    }
+}
+
+/// What an elevated job came back with.
+enum JobRun {
+    /// The change ran (or the job did not start: a dismissed prompt).
+    /// `note` is the restore point's message when one was asked for.
+    Done { result: Result<serde_json::Value, String>, note: Option<String> },
+    /// The restore point was not made and the change did not run: why.
+    Refused(String),
+}
+
+/// `change` with `steps` in front: the `Steps` parameter is added and every
+/// step's result lands in the result's `steps`.
+pub fn with_steps(change: &str, steps: &[&Step]) -> String {
+    let (param, rest) = change.split_once('\n').unwrap_or((change, ""));
+    let param = param.replacen("param([string]$Out,", "param([string]$Out, [string]$Steps,", 1);
+    let mut out = format!("{param}\n$stepResults = [ordered]@{{}}\n");
+    for step in steps {
+        out.push_str(step.snippet);
+        out.push('\n');
+    }
+    out.push_str(&rest.replacen("ConvertTo-Json -InputObject $res", "$res['steps'] = $stepResults; ConvertTo-Json -InputObject $res", 1));
+    out
+}
+
+/// The honest message for a restore point step's result.
+pub fn restore_text(step: &serde_json::Value) -> String {
+    let drive = step["drive"].as_str().filter(|d| !d.is_empty()).unwrap_or("C:");
+    match step["state"].as_str() {
+        Some("created") => "Restore point created.".into(),
+        Some("off") => format!("System Restore is off on drive {drive}."),
+        Some("recent") => "Windows already created a restore point in the last 24 hours.".into(),
+        _ => match step["error"].as_str().filter(|e| !e.is_empty()) {
+            Some(e) => format!("The restore point could not be created: {e}"),
+            None => "The restore point could not be created.".into(),
+        },
+    }
+}
+
+/// The restore point's note in front of the change's own message.
+fn with_note(note: Option<String>, message: String) -> String {
+    match note {
+        Some(note) => format!("{note} {message}"),
+        None => message,
     }
 }
 
@@ -852,7 +1169,7 @@ fn match_updates(devices: &[DeviceDriver], updates: &mut [DriverUpdate]) {
 }
 
 /// "4.22.1.0" -> [4, 22, 1, 0]; None when it is not a dotted version.
-fn parse_version(v: &str) -> Option<Vec<u64>> {
+pub(super) fn parse_version(v: &str) -> Option<Vec<u64>> {
     let parts: Option<Vec<u64>> = v.trim().split('.').map(|p| p.parse().ok()).collect();
     parts.filter(|p| !p.is_empty())
 }
@@ -943,6 +1260,26 @@ try {
 ConvertTo-Json -InputObject $res -Depth 5 | Out-File -FilePath $Out -Encoding utf8
 "#;
 
+const RESTORE_STEP: &str = r#"if (($Steps -split ',') -contains 'restore-point') {
+  $rp = [ordered]@{ state = 'failed'; drive = $env:SystemDrive; error = '' }
+  try {
+    $since = (Get-Date).AddMinutes(-1)
+    Checkpoint-Computer -Description 'Ultimate PC Manager: driver change' -RestorePointType DEVICE_DRIVER_INSTALL -WarningAction SilentlyContinue -WarningVariable rpWarn -ErrorAction Stop
+    $made = @(Get-ComputerRestorePoint | Where-Object { $_.ConvertToDateTime($_.CreationTime) -ge $since }).Count -gt 0
+    if ($made) { $rp.state = 'created' }
+    elseif (($rpWarn | Out-String) -match '1440|already been created|within the past') { $rp.state = 'recent' }
+    else { $rp.error = 'Windows reported no new restore point.' }
+  } catch {
+    $m = $_.Exception.Message
+    if ($m -match 'disabled|turned off|not enabled') { $rp.state = 'off' } else { $rp.error = $m }
+  }
+  $stepResults['restore-point'] = $rp
+  if ($rp.state -ne 'created') {
+    ConvertTo-Json -InputObject ([ordered]@{ ok = $true; ran = $false; steps = $stepResults }) -Depth 5 | Out-File -FilePath $Out -Encoding utf8
+    return
+  }
+}"#;
+
 const TOOL_SCRIPT: &str = r#"param([string]$Out, [string]$Mode, [string]$Arg)
 $pnputil = Join-Path ([Environment]::SystemDirectory) 'pnputil.exe'
 $sc = Join-Path ([Environment]::SystemDirectory) 'sc.exe'
@@ -1028,6 +1365,16 @@ pub fn setting_of(reading: &Reading) -> Setting {
     }
 }
 
+/// Memory integrity: as Windows Security shows it, a missing value (or key)
+/// means it was never turned on, so it is off. A failed read or any number
+/// other than 0 and 1 stays unreadable.
+pub fn memory_integrity_of(reading: &Reading) -> Setting {
+    match reading {
+        Reading::NotSet => Setting::Off,
+        other => setting_of(other),
+    }
+}
+
 /// The name of the first setting.
 pub const MEMORY_INTEGRITY: &str = "Memory integrity";
 /// The name of the second setting.
@@ -1051,7 +1398,7 @@ pub fn security_view(reading: Option<&SecurityReading>) -> SecurityView {
     let Some(r) = reading else {
         return SecurityView { items: [(MEMORY_INTEGRITY, None), (BLOCKLIST, None)], note: "Reading the security settings\u{2026}".into() };
     };
-    let (memory, blocklist) = (setting_of(&r.memory_integrity), setting_of(&r.blocklist));
+    let (memory, blocklist) = (memory_integrity_of(&r.memory_integrity), setting_of(&r.blocklist));
     let mut notes: Vec<String> = Vec::new();
     match (memory, blocklist) {
         (Setting::Unreadable, Setting::Unreadable) => notes.push("Windows did not let us read these settings, so we do not guess.".into()),
@@ -1061,7 +1408,6 @@ pub fn security_view(reading: Option<&SecurityReading>) -> SecurityView {
     }
     match memory {
         Setting::Off => notes.push("Memory integrity is off: Windows does not isolate the kernel from unsafe code.".into()),
-        Setting::NotSet => notes.push("Memory integrity has no value in Windows, so we do not say whether it is on.".into()),
         _ => {}
     }
     match blocklist {
@@ -1091,6 +1437,15 @@ fn publish_listing(st: &mut State, devices: Result<Vec<DeviceDriver>, String>, k
         match_updates(devices, &mut list);
         *u = list.into();
     }
+}
+
+/// Puts a driver store read into `st`: no rows on failure.
+fn publish_store(st: &mut State, read: Result<Vec<StorePackage>, String>) {
+    match read {
+        Ok(list) => (st.store, st.store_error) = (list.into(), None),
+        Err(e) => (st.store, st.store_error) = (Vec::new().into(), Some(e)),
+    }
+    st.store_reading = false;
 }
 
 /// Puts the outcome of a Windows Update search that ended at `at` into
@@ -1243,6 +1598,128 @@ mod tests {
         assert_eq!(reads(&reader), before + 1);
     }
 
+    const RP_CREATED: &str = r#"{"ok":true,"reboot":false,"items":[{"Id":"id-1","Title":"A","Code":2,"HResult":0}],"steps":{"restore-point":{"state":"created","drive":"C:","error":""}}}"#;
+
+    fn refused(state: &str) -> String {
+        format!(r#"{{"ok":true,"ran":false,"steps":{{"restore-point":{{"state":"{state}","drive":"C:","error":"boom"}}}}}}"#)
+    }
+
+    #[test]
+    fn installing_with_a_restore_point_is_one_elevated_launch_with_the_ordered_steps() {
+        let (hub, runner, _) = install_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, RP_CREATED);
+        hub.install_with(vec!["id-1".into()], true);
+        wait_until_idle(&hub);
+        assert_eq!(
+            runner.launches(),
+            vec![Launch::PowerShell {
+                script: with_steps(INSTALL_SCRIPT, &[&RESTORE_POINT]),
+                args: vec![("Ids".into(), "id-1".into()), ("Steps".into(), "restore-point,install-updates".into())],
+                elevated: true
+            }]
+        );
+        assert_eq!(hub.lock().message, Some(("Restore point created. Installed 1 driver update.".to_string(), false)));
+        assert!(hub.lock().restore_prompt.is_none());
+    }
+
+    #[test]
+    fn an_inf_install_with_a_restore_point_is_one_elevated_launch_and_without_it_is_as_before() {
+        let (hub, runner, _) = install_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, r#"{"ok":true,"code":0,"output":"","steps":{"restore-point":{"state":"created","drive":"C:"}}}"#);
+        hub.install_inf_with(r"C:\pkg\a.inf".into(), true);
+        wait_until_idle(&hub);
+        assert_eq!(
+            runner.launches(),
+            vec![Launch::PowerShell {
+                script: with_steps(TOOL_SCRIPT, &[&RESTORE_POINT]),
+                args: vec![("Mode".into(), "inf".into()), ("Arg".into(), r"C:\pkg\a.inf".into()), ("Steps".into(), "restore-point,inf".into())],
+                elevated: true
+            }]
+        );
+        assert_eq!(hub.lock().message, Some(("Restore point created. Driver package installed.".to_string(), false)));
+
+        let (hub, runner, _) = install_hub();
+        hub.install_inf(r"C:\pkg\a.inf".into());
+        wait_until_idle(&hub);
+        assert_eq!(
+            runner.launches(),
+            vec![Launch::PowerShell { script: TOOL_SCRIPT.into(), args: vec![("Mode".into(), "inf".into()), ("Arg".into(), r"C:\pkg\a.inf".into())], elevated: true }]
+        );
+    }
+
+    #[test]
+    fn each_restore_point_failure_stops_before_the_change_and_says_why() {
+        for (state, text) in [
+            ("off", "System Restore is off on drive C:."),
+            ("recent", "Windows already created a restore point in the last 24 hours."),
+            ("failed", "The restore point could not be created: boom"),
+        ] {
+            let (hub, runner, reader) = install_hub();
+            let before = reads(&reader);
+            runner.prepare(crate::platform::When::Nth(0), 0, &refused(state));
+            hub.install_with(vec!["id-1".into()], true);
+            wait_until_idle(&hub);
+            let st = hub.lock();
+            assert_eq!(st.restore_prompt.as_ref().map(|p| p.reason.as_str()), Some(text));
+            assert_eq!(st.message, None, "the change did not run, so no outcome");
+            drop(st);
+            assert_eq!(runner.launches().len(), 1);
+            assert_eq!(reads(&reader), before, "nothing changed, so no re-read");
+        }
+    }
+
+    #[test]
+    fn continuing_after_a_failed_restore_point_runs_the_change_without_one() {
+        let (hub, runner, _) = install_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, &refused("recent"));
+        runner.prepare(crate::platform::When::Nth(1), 0, r#"{"ok":true,"reboot":false,"items":[{"Id":"id-1","Title":"A","Code":2,"HResult":0}]}"#);
+        hub.install_with(vec!["id-1".into()], true);
+        wait_until_idle(&hub);
+        hub.continue_without_restore();
+        wait_until_idle(&hub);
+        let launches = runner.launches();
+        assert_eq!(launches.len(), 2);
+        assert_eq!(launches[1], Launch::PowerShell { script: INSTALL_SCRIPT.into(), args: vec![("Ids".into(), "id-1".into())], elevated: true });
+        assert!(hub.lock().restore_prompt.is_none());
+        assert_eq!(hub.lock().message, Some(("Installed 1 driver update.".to_string(), false)));
+    }
+
+    #[test]
+    fn cancelling_after_a_failed_restore_point_changes_nothing() {
+        let (hub, runner, _) = install_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, &refused("off"));
+        hub.install_inf_with(r"C:\pkg\a.inf".into(), true);
+        wait_until_idle(&hub);
+        assert!(hub.lock().restore_prompt.is_some());
+        hub.cancel_restore();
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches().len(), 1, "no second launch");
+        let st = hub.lock();
+        assert!(st.restore_prompt.is_none());
+        assert_eq!(st.message, Some(("Cancelled: nothing was changed.".to_string(), false)));
+    }
+
+    #[test]
+    fn a_dismissed_prompt_with_a_restore_point_is_a_cancel_not_a_restore_failure() {
+        let (hub, runner, _) = install_hub();
+        runner.answer(crate::platform::ELEVATION_CANCELLED);
+        hub.install_with(vec!["id-1".into()], true);
+        wait_until_idle(&hub);
+        let st = hub.lock();
+        assert!(st.restore_prompt.is_none());
+        assert_eq!(st.message, Some((CANCELLED_TEXT.to_string(), false)));
+    }
+
+    #[test]
+    fn a_step_goes_in_front_of_the_change_and_its_result_joins_the_job_result() {
+        let script = with_steps(INSTALL_SCRIPT, &[&RESTORE_POINT]);
+        assert!(script.starts_with("param([string]$Out, [string]$Steps, [string]$Ids)"));
+        let step = script.find("Checkpoint-Computer").expect("the restore point step");
+        assert!(script.contains("-RestorePointType DEVICE_DRIVER_INSTALL"));
+        assert!(step < script.find("CreateUpdateSearcher").expect("the change"), "the step runs first");
+        assert!(script.contains("$res['steps'] = $stepResults; ConvertTo-Json -InputObject $res"));
+    }
+
     /// Reads this PC's drivers: `cargo test -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -1305,7 +1782,7 @@ mod kernel_scope_tests {
     }
 
     fn services(scope: KernelScope, list: &[KernelDriver]) -> Vec<&str> {
-        list.iter().filter(|d| scope.matches(d)).map(|d| d.service.as_str()).collect()
+        list.iter().filter(|d| scope.matches(d, None)).map(|d| d.service.as_str()).collect()
     }
 
     #[test]
@@ -1328,7 +1805,7 @@ mod kernel_scope_tests {
     #[test]
     fn scope_counts_match_the_sample() {
         let list = sample();
-        let counts: Vec<usize> = KernelScope::ALL.iter().map(|s| s.count(&list)).collect();
+        let counts: Vec<usize> = KernelScope::ALL.iter().map(|s| s.count(&list, &SignatureBook::default())).collect();
         assert_eq!(counts, [6, 3, 3, 2, 2]);
     }
 
@@ -1362,11 +1839,11 @@ mod kernel_scope_tests {
     fn a_service_in_a_pending_state_counts_as_loaded() {
         for code in [2, 3, 4, 5, 6, 7] {
             let d = KernelDriver { running: code == 4, state_code: Some(code), ..Default::default() };
-            assert!(KernelScope::Loaded.matches(&d), "state {code}");
-            assert!(!KernelScope::NotLoaded.matches(&d), "state {code}");
+            assert!(KernelScope::Loaded.matches(&d, None), "state {code}");
+            assert!(!KernelScope::NotLoaded.matches(&d, None), "state {code}");
         }
         let stopped = KernelDriver { state_code: Some(1), ..Default::default() };
-        assert!(KernelScope::NotLoaded.matches(&stopped) && !KernelScope::Loaded.matches(&stopped));
+        assert!(KernelScope::NotLoaded.matches(&stopped, None) && !KernelScope::Loaded.matches(&stopped, None));
     }
 
     #[test]
@@ -1429,9 +1906,186 @@ mod kernel_scope_tests {
     #[test]
     fn the_file_system_scope_follows_the_service_type_not_its_label() {
         let fs = KernelDriver { kind: KernelKind::FileSystem, ..Default::default() };
-        assert!(KernelScope::FileSystem.matches(&fs));
+        assert!(KernelScope::FileSystem.matches(&fs, None));
         assert_eq!(KernelKind::FileSystem.label(), "File system");
-        assert!(!KernelScope::FileSystem.matches(&KernelDriver::default()), "a plain kernel driver");
+        assert!(!KernelScope::FileSystem.matches(&KernelDriver::default(), None), "a plain kernel driver");
+    }
+
+    #[test]
+    fn the_unsigned_scope_lists_only_modules_whose_check_found_no_signature() {
+        let mut list = sample();
+        let mut book = SignatureBook::default();
+        for d in list.iter_mut() {
+            d.path = format!(r"C:\drivers\{}.sys", d.service);
+        }
+        book.insert(r"C:\drivers\nvlddmkm.sys", Signature::Whql { signer: "x".into() });
+        book.insert(r"C:\DRIVERS\vbox.sys", Signature::Unsigned);
+        book.insert(r"C:\drivers\beep.sys", Signature::CouldNotCheck("busy".into()));
+        // ntfs, disk and fastfat were not checked yet.
+        let unsigned: Vec<&str> = list.iter().filter(|d| KernelScope::Unsigned.matches(d, book.of(&d.path))).map(|d| d.service.as_str()).collect();
+        assert_eq!(unsigned, ["vbox"], "not checked and could not check are not unsigned");
+        assert_eq!(KernelScope::Unsigned.count(&list, &book), 1);
+        assert_eq!(KernelScope::SHOWN.map(|s| s.label()), ["All", "Loaded", "Not loaded", "Third-party", "File system", "Unsigned"]);
+        assert_eq!(KernelScope::Unsigned.count(&list, &SignatureBook::default()), 0, "nothing is unsigned before a check says so");
+        assert_eq!(KernelScope::parse("Unsigned"), Some(KernelScope::Unsigned));
+        assert_eq!(serde_json::to_value(KernelScope::Unsigned).unwrap(), "unsigned");
+        assert_eq!(serde_json::from_value::<KernelScope>(serde_json::json!("unsigned")).unwrap(), KernelScope::Unsigned, "it is saved by its name");
+        assert_eq!(KernelScope::from_index(4), KernelScope::FileSystem, "saved indexes keep their meaning");
+    }
+}
+
+/// Signature checks in the hub (#25): background, cached and stopped with
+/// the add-on.
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+    use crate::addons::until;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A reader of two kernel drivers and one device, whose signature
+    /// checks are counted and can be held.
+    struct Reader {
+        kernel: Vec<KernelDriver>,
+        devices: Vec<DeviceDriver>,
+        checks: AtomicUsize,
+        gate: Mutex<()>,
+        verdict: fn(&str) -> Signature,
+    }
+
+    impl ListingReader for Reader {
+        fn devices(&self) -> Result<Vec<DeviceDriver>, String> {
+            Ok(self.devices.clone())
+        }
+        fn kernel(&self) -> Result<Vec<KernelDriver>, String> {
+            Ok(self.kernel.clone())
+        }
+        fn signature(&self, path: &str) -> Signature {
+            let _held = self.gate.lock().unwrap();
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            (self.verdict)(path)
+        }
+    }
+
+    fn driver(service: &str, path: &str) -> KernelDriver {
+        KernelDriver { service: service.into(), path: path.into(), ..Default::default() }
+    }
+
+    fn by_name(path: &str) -> Signature {
+        if path.ends_with("bad.sys") {
+            Signature::Unsigned
+        } else if path.ends_with("camo.inf") {
+            Signature::Signed { signer: "Reincubate Ltd".into() }
+        } else {
+            Signature::Whql { signer: crate::addons::drivers::signature::WHQL_PUBLISHER.into() }
+        }
+    }
+
+    fn reader(kernel: &[(&str, &str)], verdict: fn(&str) -> Signature) -> Arc<Reader> {
+        Arc::new(Reader {
+            kernel: kernel.iter().map(|(s, p)| driver(s, p)).collect(),
+            devices: vec![DeviceDriver { inf: "camo.inf".into(), ..Default::default() }],
+            checks: AtomicUsize::new(0),
+            gate: Mutex::new(()),
+            verdict,
+        })
+    }
+
+    fn hub(reader: &Arc<Reader>) -> Hub {
+        let (ctx, _) = AddonContext::recording();
+        Hub::new(ctx, reader.clone())
+    }
+
+    fn settled(hub: &Hub) {
+        until("the signature pass ends", || !hub.signing.running.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn the_list_is_shown_before_the_signatures_are_known_and_they_arrive_later() {
+        let r = reader(&[("good", r"C:\d\good.sys"), ("bad", r"C:\d\bad.sys")], by_name);
+        let hub = hub(&r);
+        let held = r.gate.lock().unwrap();
+        hub.refresh_now();
+        assert_eq!(hub.lock().kernel.len(), 2, "the list is there");
+        assert!(hub.lock().signatures.is_empty(), "no signature while the check is held");
+        drop(held);
+        until("the signatures arrive", || hub.lock().signatures.len() == 3);
+        let st = hub.lock();
+        assert!(matches!(st.signatures.of(r"C:\d\good.sys"), Some(Signature::Whql { .. })));
+        assert_eq!(st.signatures.of(r"c:\d\BAD.sys"), Some(&Signature::Unsigned));
+        let inf = st.devices[0].inf_path();
+        assert!(matches!(st.signatures.of(&inf), Some(Signature::Signed { .. })), "a device's driver is its INF");
+    }
+
+    #[test]
+    fn a_file_is_checked_once_while_its_path_size_and_time_stay_the_same() {
+        let dir = std::env::temp_dir().join(format!("upm-sig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("one.sys");
+        std::fs::write(&file, b"v1").unwrap();
+        let path = file.to_string_lossy().to_string();
+        let r = reader(&[("one", &path)], by_name);
+        let hub = hub(&r);
+
+        hub.refresh_now();
+        settled(&hub);
+        let first = r.checks.load(Ordering::SeqCst);
+        assert_eq!(first, 2, "the driver and the device's INF");
+        hub.refresh_now();
+        settled(&hub);
+        assert_eq!(r.checks.load(Ordering::SeqCst), first, "a second listing asks nothing again");
+
+        std::fs::write(&file, b"version two").unwrap();
+        hub.refresh_now();
+        settled(&hub);
+        assert_eq!(r.checks.load(Ordering::SeqCst), first + 1, "a changed file is checked again, the INF is not");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_check_is_told_and_tried_again_on_the_next_listing() {
+        let r = reader(&[("busy", r"C:\d\busy.sys")], |p| if p.ends_with("busy.sys") { Signature::CouldNotCheck("in use".into()) } else { Signature::Unsigned });
+        let hub = hub(&r);
+        hub.refresh_now();
+        settled(&hub);
+        assert_eq!(hub.lock().signatures.of(r"C:\d\busy.sys"), Some(&Signature::CouldNotCheck("in use".into())));
+        let before = r.checks.load(Ordering::SeqCst);
+        hub.refresh_now();
+        settled(&hub);
+        assert_eq!(r.checks.load(Ordering::SeqCst), before + 1, "only the failed one is tried again");
+    }
+
+    #[test]
+    fn turning_the_add_on_off_ends_the_pass_and_starts_nothing() {
+        let many: Vec<(String, String)> = (0..40).map(|i| (format!("s{i}"), format!(r"C:\d\s{i}.sys"))).collect();
+        let pairs: Vec<(&str, &str)> = many.iter().map(|(s, p)| (s.as_str(), p.as_str())).collect();
+        let r = reader(&pairs, by_name);
+        let hub = hub(&r);
+        let held = r.gate.lock().unwrap();
+        hub.refresh_now();
+        until("the first check waits at the gate", || !hub.signing.running.load(Ordering::SeqCst) || r.checks.load(Ordering::SeqCst) == 0);
+        hub.stop();
+        drop(held);
+        settled(&hub);
+        let done = r.checks.load(Ordering::SeqCst);
+        assert!(done <= 1, "at most the check under way ends, not the other {} files: {done}", pairs.len());
+        assert!(hub.lock().signatures.is_empty(), "nothing is published once off");
+
+        hub.refresh();
+        hub.refresh_now();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(r.checks.load(Ordering::SeqCst), done, "no new check starts while off");
+        assert!(!hub.signing.running.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn checking_signatures_runs_no_program_and_asks_for_no_elevation() {
+        let r = reader(&[("good", r"C:\d\good.sys")], by_name);
+        let (ctx, runner) = AddonContext::recording();
+        let hub = Hub::new(ctx, r.clone());
+        hub.refresh_now();
+        settled(&hub);
+        assert_eq!(hub.lock().signatures.len(), 2);
+        assert!(runner.launches().is_empty(), "WinVerifyTrust is called in the app: no PowerShell, no UAC");
     }
 }
 
@@ -1771,6 +2425,7 @@ mod outcome_tests {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+    use crate::addons::drivers::filters::{FilterDriver, FilterRead, NEEDS_ADMIN};
     use crate::addons::drivers::windows::WindowsListing;
     use crate::addons::until;
     use std::sync::atomic::AtomicUsize;
@@ -1827,10 +2482,21 @@ mod security_tests {
     }
 
     #[test]
-    fn a_missing_value_is_not_set_and_is_not_guessed() {
-        let v = security_view(Some(&reading(Reading::NotSet, Reading::NotSet)));
-        assert_eq!(v.items, [(MEMORY_INTEGRITY, Some(Setting::NotSet)), (BLOCKLIST, Some(Setting::NotSet))]);
-        assert!(v.note.contains("Memory integrity has no value") && v.note.contains("The blocklist has no value"), "{}", v.note);
+    fn a_missing_memory_integrity_value_is_off_as_windows_security_shows_it() {
+        let v = security_view(Some(&reading(Reading::NotSet, Reading::Value(1))));
+        assert_eq!(v.items, [(MEMORY_INTEGRITY, Some(Setting::Off)), (BLOCKLIST, Some(Setting::On))]);
+        assert_eq!(v.note, "Memory integrity is off: Windows does not isolate the kernel from unsafe code.");
+        assert_eq!(memory_integrity_of(&Reading::Value(1)), Setting::On);
+        assert_eq!(memory_integrity_of(&Reading::Value(0)), Setting::Off);
+        assert_eq!(memory_integrity_of(&Reading::Value(7)), Setting::Unreadable, "an unknown value is not guessed");
+        assert_eq!(memory_integrity_of(&Reading::Failed("access is denied".into())), Setting::Unreadable, "a failed read is not off");
+    }
+
+    #[test]
+    fn a_missing_blocklist_value_stays_not_set_and_is_not_guessed() {
+        let v = security_view(Some(&reading(Reading::Value(1), Reading::NotSet)));
+        assert_eq!(v.items, [(MEMORY_INTEGRITY, Some(Setting::On)), (BLOCKLIST, Some(Setting::NotSet))]);
+        assert_eq!(v.note, "The blocklist has no value in Windows, so we do not say whether it is on.");
     }
 
     #[test]
@@ -1848,11 +2514,24 @@ mod security_tests {
         in_kernel: AtomicBool,
         release: AtomicBool,
         hold: bool,
+        filters: FilterRead,
+        filters_asked: AtomicUsize,
     }
 
     impl Fake {
         fn new(security: SecurityReading, hold: bool) -> Arc<Fake> {
-            Arc::new(Fake { security, asked: AtomicUsize::new(0), in_kernel: AtomicBool::new(false), release: AtomicBool::new(!hold), hold })
+            Fake::with_filters(security, hold, FilterRead::Filters(Vec::new()))
+        }
+        fn with_filters(security: SecurityReading, hold: bool, filters: FilterRead) -> Arc<Fake> {
+            Arc::new(Fake {
+                security,
+                asked: AtomicUsize::new(0),
+                in_kernel: AtomicBool::new(false),
+                release: AtomicBool::new(!hold),
+                hold,
+                filters,
+                filters_asked: AtomicUsize::new(0),
+            })
         }
     }
 
@@ -1870,6 +2549,78 @@ mod security_tests {
         fn security(&self) -> SecurityReading {
             self.asked.fetch_add(1, Ordering::SeqCst);
             self.security.clone()
+        }
+        fn filters(&self) -> FilterRead {
+            self.filters_asked.fetch_add(1, Ordering::SeqCst);
+            self.filters.clone()
+        }
+    }
+
+    fn minifilter(name: &str) -> FilterDriver {
+        FilterDriver { name: name.into(), altitude: "328010".into(), instances: 3, frame: 0 }
+    }
+
+    #[test]
+    fn a_listing_reads_the_loaded_filters_with_normal_rights_and_starts_nothing_elevated() {
+        let (ctx, runner) = AddonContext::recording();
+        let list = FilterRead::Filters(vec![minifilter("WdFilter")]);
+        let fake = Fake::with_filters(reading(Reading::Value(1), Reading::Value(1)), false, list.clone());
+        let hub = Hub::new(ctx, fake.clone());
+        assert!(hub.lock().filters.is_none(), "nothing is read before the page asks");
+        hub.refresh();
+        until("the filters are read", || hub.lock().filters.is_some());
+        assert_eq!(hub.lock().filters.as_deref(), Some(&list));
+        assert_eq!(fake.filters_asked.load(Ordering::SeqCst), 1);
+        assert!(runner.launches().is_empty(), "no PowerShell, no elevation prompt");
+    }
+
+    #[test]
+    fn filters_that_need_administrator_rights_say_so_and_nothing_is_started() {
+        let (ctx, runner) = AddonContext::recording();
+        let fake = Fake::with_filters(reading(Reading::Value(1), Reading::Value(1)), false, FilterRead::NeedsAdmin);
+        let hub = Hub::new(ctx, fake);
+        hub.refresh();
+        until("the outcome is published", || hub.lock().filters.is_some());
+        assert_eq!(hub.lock().filters.as_deref(), Some(&FilterRead::NeedsAdmin));
+        assert!(runner.launches().is_empty(), "the page never asks for rights on its own");
+    }
+
+    #[test]
+    fn turning_off_while_the_listing_runs_drops_the_filter_read() {
+        let (ctx, _) = AddonContext::recording();
+        let fake = Fake::with_filters(reading(Reading::Value(1), Reading::Value(1)), true, FilterRead::Filters(vec![minifilter("WdFilter")]));
+        let hub = Hub::new(ctx, fake.clone());
+        hub.refresh();
+        until("the listing is running", || fake.in_kernel.load(Ordering::SeqCst));
+        hub.stop();
+        fake.release.store(true, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(fake.filters_asked.load(Ordering::SeqCst), 0, "the filters are not read once the add-on is off");
+        assert!(hub.lock().filters.is_none(), "and nothing is published");
+    }
+
+    #[test]
+    fn a_hub_that_was_stopped_starts_no_filter_read() {
+        let (ctx, _) = AddonContext::recording();
+        let fake = Fake::new(reading(Reading::Value(1), Reading::Value(1)), false);
+        let hub = Hub::new(ctx, fake.clone());
+        hub.stop();
+        hub.refresh();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(fake.filters_asked.load(Ordering::SeqCst), 0);
+    }
+
+    /// Reads this PC's loaded filters (run with `--ignored --nocapture`, and
+    /// again as administrator: without rights it says so).
+    #[test]
+    #[ignore]
+    fn reads_the_loaded_filters_of_this_pc() {
+        let read = WindowsListing.filters();
+        println!("{read:?}");
+        match read {
+            FilterRead::Filters(list) => assert!(list.iter().any(|f| !f.name.is_empty() && f.altitude.parse::<f64>().is_ok()), "{list:?}"),
+            FilterRead::NeedsAdmin => println!("{NEEDS_ADMIN}"),
+            FilterRead::Failed(why) => panic!("the read failed: {why}"),
         }
     }
 
@@ -1922,5 +2673,146 @@ mod security_tests {
         println!("{:?}", security_view(Some(&r)));
         assert!(!matches!(r.memory_integrity, Reading::Failed(_)), "read with normal rights: {:?}", r.memory_integrity);
         assert!(!matches!(r.blocklist, Reading::Failed(_)), "read with normal rights: {:?}", r.blocklist);
+    }
+}
+
+/// The driver store is read with the listing, with normal rights (#26).
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use crate::addons::drivers::store::StoreDevice;
+    use crate::addons::until;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A reader whose store read answers from a value and can be held.
+    struct Store {
+        answer: Result<Vec<StorePackage>, String>,
+        hold: bool,
+        asked: AtomicUsize,
+        in_read: AtomicBool,
+        release: AtomicBool,
+    }
+
+    impl Store {
+        fn new(answer: Result<Vec<StorePackage>, String>, hold: bool) -> Arc<Store> {
+            Arc::new(Store { answer, hold, asked: AtomicUsize::new(0), in_read: AtomicBool::new(false), release: AtomicBool::new(false) })
+        }
+    }
+
+    impl ListingReader for Store {
+        fn devices(&self) -> Result<Vec<DeviceDriver>, String> {
+            Ok(Vec::new())
+        }
+        fn kernel(&self) -> Result<Vec<KernelDriver>, String> {
+            Ok(Vec::new())
+        }
+        fn store(&self) -> Result<Vec<StorePackage>, String> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            self.in_read.store(true, Ordering::SeqCst);
+            while self.hold && !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            self.answer.clone()
+        }
+    }
+
+    fn package(name: &str) -> StorePackage {
+        StorePackage {
+            published: name.into(),
+            original: "x.inf".into(),
+            devices: vec![StoreDevice { instance_id: "ROOT\\X\\0".into(), name: "X".into() }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_listing_reads_the_driver_store_with_normal_rights_and_starts_nothing_elevated() {
+        let (ctx, runner) = AddonContext::recording();
+        let reader = Store::new(Ok(vec![package("oem1.inf"), package("oem2.inf")]), false);
+        let hub = Hub::new(ctx, reader.clone());
+        assert!(hub.lock().store.is_empty() && !hub.lock().store_reading, "nothing is read before the page asks");
+        hub.refresh();
+        until("the store is read", || hub.lock().store.len() == 2);
+        let st = hub.lock();
+        assert!(!st.store_reading && st.store_error.is_none());
+        drop(st);
+        assert_eq!(reader.asked.load(Ordering::SeqCst), 1);
+        assert!(runner.launches().is_empty(), "no PowerShell, no elevation, no UAC prompt");
+    }
+
+    #[test]
+    fn a_failed_store_read_keeps_its_reason_and_no_rows() {
+        let (ctx, _) = AddonContext::recording();
+        let hub = Hub::new(ctx, Store::new(Err("pnputil is missing".into()), false));
+        hub.refresh();
+        until("the read ends", || !hub.lock().store_reading && hub.lock().store_error.is_some());
+        assert_eq!(hub.lock().store_error.as_deref(), Some("pnputil is missing"));
+        assert!(hub.lock().store.is_empty());
+    }
+
+    #[test]
+    fn the_store_is_read_after_the_other_lists_which_do_not_wait_for_it() {
+        let (ctx, _) = AddonContext::recording();
+        let reader = Store::new(Ok(vec![package("oem1.inf")]), true);
+        let hub = Hub::new(ctx, reader.clone());
+        hub.refresh();
+        until("the store read starts", || reader.in_read.load(Ordering::SeqCst));
+        assert!(!hub.lock().listing, "the devices and kernel drivers are already published");
+        assert!(hub.lock().store_reading, "and the store is still being read");
+        reader.release.store(true, Ordering::SeqCst);
+        until("the store is shown", || hub.lock().store.len() == 1);
+    }
+
+    #[test]
+    fn a_hub_that_was_stopped_reads_no_store() {
+        let (ctx, _) = AddonContext::recording();
+        let reader = Store::new(Ok(vec![package("oem1.inf")]), false);
+        let hub = Hub::new(ctx, reader.clone());
+        hub.stop();
+        hub.refresh();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(reader.asked.load(Ordering::SeqCst), 0, "nothing starts while off");
+        assert!(hub.lock().store.is_empty());
+    }
+
+    #[test]
+    fn turning_off_while_the_store_is_read_drops_its_result() {
+        let (ctx, _) = AddonContext::recording();
+        let reader = Store::new(Ok(vec![package("oem1.inf")]), true);
+        let hub = Hub::new(ctx, reader.clone());
+        hub.refresh();
+        until("the store read is running", || reader.in_read.load(Ordering::SeqCst));
+        hub.stop();
+        reader.release.store(true, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let st = hub.lock();
+        assert!(st.store.is_empty() && st.store_error.is_none(), "nothing is published");
+        assert!(!st.store_reading, "and the page is not left reading");
+    }
+
+    #[test]
+    fn a_store_read_replaces_the_last_one_and_a_failure_drops_the_rows() {
+        let mut st = State::default();
+        publish_store(&mut st, Err("no drivers here".into()));
+        assert_eq!(st.store_error.as_deref(), Some("no drivers here"));
+        publish_store(&mut st, Ok(vec![package("oem1.inf")]));
+        assert!(st.store_error.is_none() && st.store.len() == 1, "a good read clears the error");
+        publish_store(&mut st, Err("again".into()));
+        assert!(st.store.is_empty(), "a failed read drops the old rows");
+    }
+
+    /// Reads this PC's driver store (run with `--ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn reads_the_driver_store_of_this_pc() {
+        use crate::addons::drivers::store::{classify, StoreFigures};
+        let started = std::time::Instant::now();
+        let list = crate::addons::drivers::windows::WindowsListing.store().expect("the store is read with normal rights");
+        println!("{} packages in {:?}", list.len(), started.elapsed());
+        let measured = list.iter().filter(|p| p.size.is_some()).count();
+        println!("{measured} with a size");
+        println!("{:?}", StoreFigures::of(&list, &classify(&list)));
+        assert!(!list.is_empty());
+        assert!(measured * 10 >= list.len() * 9, "the packages' folders are found: {measured} of {}", list.len());
     }
 }

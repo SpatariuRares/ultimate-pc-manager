@@ -734,6 +734,18 @@ pub fn tree_row(ui: &mut Ui, row: &TreeRow, width: f32) -> egui::Response {
     if cut { resp.on_hover_text(row.value) } else { resp }
 }
 
+/// The "Create a restore point first" option of a confirm dialog: the same
+/// administrator prompt carries it, so it costs no extra prompt.
+pub fn restore_point_option(ui: &mut Ui, on: &mut bool) -> egui::Response {
+    let th = crate::theme::of_ui(ui);
+    ui.horizontal(|ui| {
+        let r = ui.checkbox(on, "Create a restore point first");
+        ui.label(egui::RichText::new("(same administrator prompt)").size(11.5).color(th.label));
+        r
+    })
+    .inner
+}
+
 /// A search field with the magnifier glyph, up to `width` wide. The
 /// magnifier stays on the left in a right-to-left header too.
 pub fn search_field(ui: &mut Ui, text: &mut String, hint: &str, width: f32) -> egui::Response {

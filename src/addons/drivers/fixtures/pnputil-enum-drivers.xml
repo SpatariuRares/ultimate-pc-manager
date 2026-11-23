@@ -1,0 +1,245 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PnpUtil Version="10.0.26300" Command="/enum-drivers /devices /format xml">
+    <Driver DriverName="oem146.inf">
+        <OriginalName>amdfendr.inf</OriginalName>
+        <ProviderName>Advanced Micro Devices, Inc.</ProviderName>
+        <ClassName>System</ClassName>
+        <ClassGuid>{4d36e97d-e325-11ce-bfc1-08002be10318}</ClassGuid>
+        <DriverVersion>10/28/2024 24.30.0.2</DriverVersion>
+        <SignerName>Microsoft Windows Hardware Compatibility Publisher</SignerName>
+        <CatalogAttributes>
+            <Attribute>Declarative</Attribute>
+        </CatalogAttributes>
+        <WhcpVersion>Unknown</WhcpVersion>
+        <Devices>
+            <Device InstanceId="ROOT\AMDLOG\0000">
+                <DeviceDescription>AMD Crash Defender</DeviceDescription>
+                <Status>Started</Status>
+            </Device>
+        </Devices>
+    </Driver>
+    <Driver DriverName="oem81.inf">
+        <OriginalName>amdgpio2.inf</OriginalName>
+        <ProviderName>Advanced Micro Devices, Inc</ProviderName>
+        <ClassName>System</ClassName>
+        <ClassGuid>{4d36e97d-e325-11ce-bfc1-08002be10318}</ClassGuid>
+        <DriverVersion>09/29/2019 2.2.0.121</DriverVersion>
+        <SignerName>Microsoft Windows Hardware Compatibility Publisher</SignerName>
+        <CatalogAttributes>
+            <Attribute>Universal</Attribute>
+        </CatalogAttributes>
+        <WhcpVersion>Unknown</WhcpVersion>
+    </Driver>
+    <Driver DriverName="oem130.inf">
+        <OriginalName>amdgpio2.inf</OriginalName>
+        <ProviderName>Advanced Micro Devices, Inc</ProviderName>
+        <ClassName>System</ClassName>
+        <ClassGuid>{4d36e97d-e325-11ce-bfc1-08002be10318}</ClassGuid>
+        <DriverVersion>08/20/2024 2.2.0.134</DriverVersion>
+        <SignerName>Microsoft Windows Hardware Compatibility Publisher</SignerName>
+        <CatalogAttributes>
+            <Attribute>Universal</Attribute>
+        </CatalogAttributes>
+        <WhcpVersion>Unknown</WhcpVersion>
+        <Devices>
+            <Device InstanceId="ACPI\AMDI0030\0">
+                <DeviceDescription>AMD GPIO Controller</DeviceDescription>
+                <Status>Started</Status>
+            </Device>
+        </Devices>
+    </Driver>
+    <Driver DriverName="oem176.inf">
+        <OriginalName>steelseriesggext.inf</OriginalName>
+        <ProviderName>SteelSeries ApS</ProviderName>
+        <ClassName>Extension</ClassName>
+        <ClassGuid>{e2f84ce7-8efa-411c-aa69-97454ca4cb57}</ClassGuid>
+        <ExtensionId>{19f2e83e-4150-4cfe-aecd-1f4e17825139}</ExtensionId>
+        <DriverVersion>11/18/2025 1.0.17.0</DriverVersion>
+        <SignerName>Microsoft Windows Hardware Compatibility Publisher</SignerName>
+        <CatalogAttributes>
+            <Attribute>Declarative</Attribute>
+        </CatalogAttributes>
+        <WhcpVersion>Unknown</WhcpVersion>
+        <Devices>
+            <Device InstanceId="USB\VID_1038&amp;PID_1858\0">
+                <DeviceDescription>USB Composite Device</DeviceDescription>
+                <Status>Started</Status>
+            </Device>
+            <Device InstanceId="USB\VID_1038&amp;PID_150D\0">
+                <DeviceDescription>USB Composite Device</DeviceDescription>
+                <Status>Started</Status>
+            </Device>
+            <Device InstanceId="USB\VID_1038&amp;PID_1612\0">
+                <DeviceDescription>USB Composite Device</DeviceDescription>
+                <Status>Started</Status>
+            </Device>
+            <Device InstanceId="USB\VID_1038&amp;PID_1612\0">
+                <DeviceDescription>USB Composite Device</DeviceDescription>
+                <Status>Disconnected</Status>
+            </Device>
+        </Devices>
+    </Driver>
+    <Driver DriverName="oem185.inf">
+        <OriginalName>axusbeth.inf</OriginalName>
+        <ProviderName>ASIX</ProviderName>
+        <ClassName>Net</ClassName>
+        <ClassGuid>{4d36e972-e325-11ce-bfc1-08002be10318}</ClassGuid>
+        <DriverVersion>01/05/2026 4.22.1.0</DriverVersion>
+        <SignerName>Microsoft Windows Hardware Compatibility Publisher</SignerName>
+        <CatalogAttributes>
+            <Attribute>Universal</Attribute>
+        </CatalogAttributes>
+        <WhcpVersion>Unknown</WhcpVersion>
+    </Driver>
+    <Driver DriverName="oem50.inf">
+        <OriginalName>axusbeth.inf</OriginalName>
+        <ProviderName>ASIX</ProviderName>
+        <ClassName>Net</ClassName>
+        <ClassGuid>{4d36e972-e325-11ce-bfc1-08002be10318}</ClassGuid>
+        <DriverVersion>10/12/2026 4.20.2.0</DriverVersion>
+        <SignerName>Microsoft Windows Hardware Compatibility Publisher</SignerName>
+        <CatalogAttributes>
+            <Attribute>Universal</Attribute>
+        </CatalogAttributes>
+        <WhcpVersion>Unknown</WhcpVersion>
+        <Devices>
+            <Device InstanceId="USB\VID_0B95&amp;PID_1790\0">
+                <DeviceDescription>ASIX USB to Gigabit Ethernet Family Adapter</DeviceDescription>
+                <Status>Started</Status>
+            </Device>
+        </Devices>
+    </Driver>
+    <Driver DriverName="oem101.inf">
+        <OriginalName>mt7612us.inf</OriginalName>
+        <ProviderName>Microsoft</ProviderName>
+        <ClassName>Net</ClassName>
+        <ClassGuid>{4d36e972-e325-11ce-bfc1-08002be10318}</ClassGuid>
+        <DriverVersion>11/30/2015 21.50.45.656</DriverVersion>
+        <SignerName>Microsoft Windows Hardware Compatibility Publisher</SignerName>
+        <CatalogAttributes>
+            <Attribute>Legacy</Attribute>
+        </CatalogAttributes>
+        <WhcpVersion>Unknown</WhcpVersion>
+    </Driver>
+    <Driver DriverName="oem179.inf">
+        <OriginalName>nvhda.inf</OriginalName>
+        <ProviderName>NVIDIA Corporation</ProviderName>
+        <ClassName>MEDIA</ClassName>
+        <ClassGuid>{4d36e96c-e325-11ce-bfc1-08002be10318}</ClassGuid>
+        <DriverVersion>12/27/2024 1.4.5.7</DriverVersion>
+        <SignerName>Microsoft Windows Hardware Compatibility Publisher</SignerName>
+        <CatalogAttributes>
+            <Attribute>Universal</Attribute>
+        </CatalogAttributes>
+        <WhcpVersion>Unknown</WhcpVersion>
+    </Driver>
+    <Driver DriverName="oem111.inf">
+        <OriginalName>nvhda.inf</OriginalName>
+        <ProviderName>NVIDIA Corporation</ProviderName>
+        <ClassName>MEDIA</ClassName>
+        <ClassGuid>{4d36e96c-e325-11ce-bfc1-08002be10318}</ClassGuid>
+        <DriverVersion>07/22/2026 1.4.5.7</DriverVersion>
+        <SignerName>Microsoft Windows Hardware Compatibility Publisher</SignerName>
+        <CatalogAttributes>
+            <Attribute>Declarative</Attribute>
+        </CatalogAttributes>
+        <WhcpVersion>Unknown</WhcpVersion>
+    </Driver>
+    <Driver DriverName="oem63.inf">
+        <OriginalName>nvhda.inf</OriginalName>
+        <ProviderName>NVIDIA Corporation</ProviderName>
+        <ClassName>MEDIA</ClassName>
+        <ClassGuid>{4d36e96c-e325-11ce-bfc1-08002be10318}</ClassGuid>
+        <DriverVersion>12/01/2025 1.4.5.7</DriverVersion>
+        <SignerName>Microsoft Windows Hardware Compatibility Publisher</SignerName>
+        <CatalogAttributes>
+            <Attribute>Universal</Attribute>
+        </CatalogAttributes>
+        <WhcpVersion>Unknown</WhcpVersion>
+    </Driver>
+    <Driver DriverName="oem195.inf">
+        <OriginalName>nvhda.inf</OriginalName>
+        <ProviderName>NVIDIA Corporation</ProviderName>
+        <ClassName>MEDIA</ClassName>
+        <ClassGuid>{4d36e96c-e325-11ce-bfc1-08002be10318}</ClassGuid>
+        <DriverVersion>08/25/2026 1.4.6.6</DriverVersion>
+        <SignerName>Microsoft Windows Hardware Compatibility Publisher</SignerName>
+        <CatalogAttributes>
+            <Attribute>Declarative</Attribute>
+        </CatalogAttributes>
+        <WhcpVersion>Unknown</WhcpVersion>
+        <Devices>
+            <Device InstanceId="HDAUDIO\FUNC_01&amp;VEN_10DE&amp;DEV_00A4&amp;SUBSYS_196E13BD&amp;REV_1001\0">
+                <DeviceDescription>NVIDIA High Definition Audio</DeviceDescription>
+                <Status>Started</Status>
+            </Device>
+        </Devices>
+    </Driver>
+    <Driver DriverName="oem29.inf">
+        <OriginalName>nvpcf.inf</OriginalName>
+        <ProviderName>NVIDIA</ProviderName>
+        <ClassName>SoftwareDevice</ClassName>
+        <ClassGuid>{62f9c741-b25a-46ce-b54c-9bccce08b6f2}</ClassGuid>
+        <DriverVersion>01/15/2023 31.0.15.2820</DriverVersion>
+        <SignerName>Microsoft Windows Hardware Compatibility Publisher</SignerName>
+        <CatalogAttributes>
+            <Attribute>Declarative</Attribute>
+        </CatalogAttributes>
+        <WhcpVersion>Unknown</WhcpVersion>
+    </Driver>
+    <Driver DriverName="oem178.inf">
+        <OriginalName>nvpcf.inf</OriginalName>
+        <ProviderName>NVIDIA</ProviderName>
+        <ClassName>SoftwareDevice</ClassName>
+        <ClassGuid>{62f9c741-b25a-46ce-b54c-9bccce08b6f2}</ClassGuid>
+        <DriverVersion>07/22/2026 32.0.16.1051</DriverVersion>
+        <SignerName>Microsoft Windows Hardware Compatibility Publisher</SignerName>
+        <CatalogAttributes>
+            <Attribute>Declarative</Attribute>
+        </CatalogAttributes>
+        <WhcpVersion>Unknown</WhcpVersion>
+    </Driver>
+    <Driver DriverName="oem10.inf">
+        <OriginalName>prnms006.inf</OriginalName>
+        <ProviderName>Microsoft</ProviderName>
+        <ClassName>Printer</ClassName>
+        <ClassGuid>{4d36e979-e325-11ce-bfc1-08002be10318}</ClassGuid>
+        <ClassVersion>4.0</ClassVersion>
+        <DriverVersion>05/28/2012 15.0.4128.4000</DriverVersion>
+        <SignerName>Microsoft Windows Hardware Compatibility Publisher</SignerName>
+        <CatalogAttributes>
+            <Attribute>Legacy</Attribute>
+        </CatalogAttributes>
+        <WhcpVersion>Unknown</WhcpVersion>
+    </Driver>
+    <Driver DriverName="oem191.inf">
+        <OriginalName>voiceclarityep_audio_component.inf</OriginalName>
+        <ProviderName>Microsoft Corporation</ProviderName>
+        <ClassName>AudioProcessingObject</ClassName>
+        <ClassGuid>{5989fce8-9cd0-467d-8a6a-5419e31529d4}</ClassGuid>
+        <DriverVersion>10/16/2026 1.0.4.55794</DriverVersion>
+        <SignerName>Microsoft Windows Hardware Compatibility Publisher</SignerName>
+        <CatalogAttributes>
+            <Attribute>Universal</Attribute>
+        </CatalogAttributes>
+        <WhcpVersion>Unknown</WhcpVersion>
+        <Devices>
+            <Device InstanceId="SWD\DRIVERENUM\0">
+                <DeviceDescription>Voice Clarity</DeviceDescription>
+                <Status>Started</Status>
+            </Device>
+        </Devices>
+    </Driver>
+    <Driver DriverName="oem172.inf">
+        <OriginalName>voiceclarityep_audio_component.inf</OriginalName>
+        <ProviderName>Microsoft Corporation</ProviderName>
+        <ClassName>AudioProcessingObject</ClassName>
+        <ClassGuid>{5989fce8-9cd0-467d-8a6a-5419e31529d4}</ClassGuid>
+        <DriverVersion>03/31/2026 10.0.26100.6710</DriverVersion>
+        <SignerName>Microsoft Windows Hardware Compatibility Publisher</SignerName>
+        <CatalogAttributes>
+            <Attribute>Universal</Attribute>
+        </CatalogAttributes>
+        <WhcpVersion>Unknown</WhcpVersion>
+    </Driver>
+</PnpUtil>
