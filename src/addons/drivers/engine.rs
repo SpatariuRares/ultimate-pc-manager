@@ -1543,7 +1543,7 @@ try {
       $asm = [AppDomain]::CurrentDomain.DefineDynamicAssembly((New-Object Reflection.AssemblyName 'UpcmRollback'), [Reflection.Emit.AssemblyBuilderAccess]::Run)
       $tb = $asm.DefineDynamicModule('UpcmRollback').DefineType('Native', 'Public,Class,Sealed,Abstract')
       $import = [Runtime.InteropServices.DllImportAttribute]
-      $fields = @($import.GetField('SetLastError'), $import.GetField('ExactSpelling'), $import.GetField('CharSet'))
+      $fields = [Reflection.FieldInfo[]]@($import.GetField('SetLastError'), $import.GetField('ExactSpelling'), $import.GetField('CharSet'))
       $imports = @(
         @('SetupDiCreateDeviceInfoList', $setupapi, [IntPtr], [Type[]]@([IntPtr], [IntPtr])),
         @('SetupDiOpenDeviceInfoW', $setupapi, [bool], [Type[]]@([IntPtr], [string], [IntPtr], [uint32], [byte[]])),
@@ -1552,22 +1552,24 @@ try {
       )
       foreach ($i in $imports) {
         $m = $tb.DefineMethod($i[0], 'Public,Static', $i[2], $i[3])
-        $m.SetCustomAttribute((New-Object Reflection.Emit.CustomAttributeBuilder($import.GetConstructor([Type[]]@([string])), @($i[1]), $fields, @($true, $true, [Runtime.InteropServices.CharSet]::Unicode))))
+        $m.SetCustomAttribute((New-Object Reflection.Emit.CustomAttributeBuilder($import.GetConstructor([Type[]]@([string])), @([string]$i[1]), $fields, @($true, $true, [Runtime.InteropServices.CharSet]::Unicode))))
       }
       $n = $tb.CreateType()
       # SP_DEVINFO_DATA: cbSize is 28 bytes in a 32-bit process and 32 in a 64-bit one.
-      $data = New-Object byte[] ([IntPtr]::Size * 4 + 12)
+      $data = New-Object byte[] ([IntPtr]::Size + 24)
       [BitConverter]::GetBytes([uint32]$data.Length).CopyTo($data, 0)
       $set = $n::SetupDiCreateDeviceInfoList([IntPtr]::Zero, [IntPtr]::Zero)
-      $err = 0; $reboot = 0
-      if ($set -eq [IntPtr](-1)) { $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+      $err = 0; $reboot = 0; $failed = $false
+      if ($set -eq [IntPtr](-1)) { $failed = $true; $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
       else {
         try {
-          if (-not $n::SetupDiOpenDeviceInfoW($set, $Arg, [IntPtr]::Zero, 0, $data)) { $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+          if (-not $n::SetupDiOpenDeviceInfoW($set, $Arg, [IntPtr]::Zero, 0, $data)) { $failed = $true; $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
           # ROLLBACK_FLAG_NO_UI is 0x00000001 (newdev.h).
-          elseif (-not $n::DiRollbackDriver($set, $data, [IntPtr]::Zero, 1, [ref]$reboot)) { $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+          elseif (-not $n::DiRollbackDriver($set, $data, [IntPtr]::Zero, 1, [ref]$reboot)) { $failed = $true; $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
         } finally { [void]$n::SetupDiDestroyDeviceInfoList($set) }
       }
+      # A failure is never shown as success, even when Windows left no error code.
+      if ($failed -and $err -eq 0) { $err = 31 }
       if ($err -ne 0) { $rc = $err; $o = (New-Object ComponentModel.Win32Exception($err)).Message }
       elseif ($reboot -ne 0) { $rc = 3010; $o = 'Restart Windows to finish.' }
       else { $rc = 0; $o = 'The previous driver was restored.' }
@@ -2446,6 +2448,37 @@ mod tests {
     }
 
     /// Reads this PC's drivers: `cargo test -- --ignored --nocapture`.
+    /// Runs the rollback arm in real Windows PowerShell, without elevation and
+    /// without ever calling `DiRollbackDriver`: it builds the dynamic assembly
+    /// and opens a present device through SetupAPI. Catches the arm's own bugs
+    /// (argument types, struct size) that the launch tests cannot.
+    #[test]
+    #[ignore]
+    fn the_rollback_arm_builds_its_assembly_and_opens_a_present_device_on_this_pc() {
+        let device = WindowsListing.devices().expect("devices listed").into_iter().find(|d| d.present && !d.instance_id.is_empty()).expect("a present device");
+        let arm = TOOL_SCRIPT.split("'rollback-device' {").nth(1).and_then(|r| r.split("'stop' {").next()).expect("a rollback arm");
+        let call = "elseif (-not $n::DiRollbackDriver($set, $data, [IntPtr]::Zero, 1, [ref]$reboot))";
+        assert!(arm.contains(call), "the rollback call changed: update this test");
+        // The very same arm, with the rollback call itself taken out.
+        let arm = arm.replace(call, "elseif ($false)");
+        let script = format!(
+            "$ErrorActionPreference='Stop'\n$Arg={}\nswitch ('rollback-device') {{\n'rollback-device' {{{arm}}}\nWrite-Output \"rc=$rc\"\nWrite-Output \"out=$o\"\n",
+            format!("'{}'", device.instance_id.replace('\'', "''"))
+        );
+        let file = std::env::temp_dir().join(format!("upcm-rollback-arm-{}.ps1", std::process::id()));
+        std::fs::write(&file, format!("\u{feff}{script}")).expect("script written");
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let out = std::process::Command::new(format!(r"{system}\System32\WindowsPowerShell\v1.0\powershell.exe"))
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&file)
+            .output()
+            .expect("powershell ran");
+        let _ = std::fs::remove_file(&file);
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        println!("{text}");
+        assert!(text.lines().any(|l| l.trim() == "rc=0"), "the arm did not open {}: {text}", device.instance_id);
+    }
+
     #[test]
     #[ignore]
     fn lists_this_pc() {
