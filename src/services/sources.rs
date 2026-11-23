@@ -1,5 +1,5 @@
-//! The service managers a system can run side by side (Linux: systemd now,
-//! others later), each as one [`ServiceSource`].
+//! The service managers a system can run side by side (Linux: systemd, OpenRC and
+//! runit), each as one [`ServiceSource`].
 //!
 //! Several sources coexist at runtime, so a trait is the right shape here:
 //! each source lists its own services, marks every row with itself and the

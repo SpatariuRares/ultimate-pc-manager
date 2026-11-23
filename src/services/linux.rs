@@ -1,9 +1,14 @@
 //! Services on Linux: the list from the service managers the system runs
-//! (systemd now), through [`super::sources`], and Start, Stop, Restart and
-//! enable or disable at boot, which each source does for its own services.
+//! (systemd, OpenRC and runit), through [`super::sources`], and Start, Stop,
+//! Restart and enable or disable at boot, which each source does for its own
+//! services.
 
+use super::openrc::OpenRc;
+use super::runit::Runit;
 use super::sources::{control, list_all, ControlHost, ServiceSource};
+
 use super::systemd::Systemd;
+use crate::fs_root::FsRoot;
 use super::{RunningService, ServiceRow};
 use crate::action_elevation::spawn_and_wait;
 use crate::platform::SystemRunner;
@@ -11,7 +16,7 @@ use crate::system_lists::ServiceKey;
 
 /// Every service manager this app can read, in the order they are asked.
 fn sources() -> Vec<Box<dyn ServiceSource>> {
-    vec![Box::new(Systemd)]
+    vec![Box::new(Systemd), Box::new(OpenRc), Box::new(Runit::new(FsRoot::system()))]
 }
 
 /// The services of every source present, or why none could be read.

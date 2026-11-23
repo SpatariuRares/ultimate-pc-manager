@@ -28,7 +28,7 @@ pub struct ServiceRow {
     pub pid: u32,
     pub status: String,
     pub start_type: String,
-    /// The service manager the row comes from ("systemd"); empty on Windows,
+    /// The service manager the row comes from ("systemd", "OpenRC" or "runit"); empty on Windows,
     /// which has the one.
     pub source: String,
     /// The scope the service belongs to ("System" or "User"); empty when the
