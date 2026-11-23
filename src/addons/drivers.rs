@@ -283,10 +283,13 @@ impl Addon for Drivers {
 
     /// `--drivers-scope <scope>` opens the page (even without `--page`)
     /// on Kernel modules with that scope, without saving it; an invalid
-    /// value is ignored.
+    /// value opens the page on its saved scope and is told (see
+    /// [`Addon::command_line_error`]).
     fn command_line(&mut self, args: &[String]) -> bool {
         self.scope_error = if self.page.is_some() { cli::scope_error(args) } else { None };
-        let (Some(page), Some(scope)) = (&mut self.page, cli::kernel_scope(args)) else { return false };
+        // An invalid value still asks for the page, which opens on its saved scope.
+        let invalid = self.scope_error.is_some();
+        let (Some(page), Some(scope)) = (&mut self.page, cli::kernel_scope(args)) else { return invalid };
         page.drv_ui.scope = Scope::Kernel;
         page.drv_ui.kernel_filter = scope;
         self.from_command_line = self.view();
@@ -631,7 +634,6 @@ mod command_line_tests {
     fn a_drivers_scope_alone_opens_the_drivers_page() {
         let (mut host, runner) = crate::addons::AddonHost::for_tests(&serde_json::json!({ "drivers": { "enabled": true } }));
         assert_eq!(host.command_line(&args(&["--drivers-scope", "loaded"])).page, Some("drivers"));
-        assert_eq!(host.command_line(&args(&["--drivers-scope", "everything"])).page, None, "an invalid value is ignored");
         assert_eq!(host.command_line(&args(&[])).page, None);
         assert!(runner.launches().is_empty(), "nothing is launched for it");
     }
@@ -659,7 +661,7 @@ mod command_line_tests {
         for name in ["drivers", "kernel-modules", "modules", "Drivers", "DRIVERS", "Kernel-Modules", "MODULES", "Modules"] {
             assert_eq!(host.landing(Some(name), "Summary", "Summary"), crate::addons::Landing::Page("drivers"), "{name}");
         }
-        assert_eq!(host.landing(Some("kernel"), "Summary", "Summary"), crate::addons::Landing::Page("Summary"), "other names still fall back");
+        assert_eq!(host.landing(Some("kernel"), "Summary", "Summary"), crate::addons::Landing::Page(crate::addons::SUMMARY), "other names still fall back");
     }
 
     #[test]
@@ -669,7 +671,12 @@ mod command_line_tests {
         assert!(saved.is_some());
         let line = host.command_line(&args(&["--page", "modules", "--drivers-scope", "everything"]));
         assert_eq!(line.errors, vec!["everything (valid scopes: all, loaded, not-loaded, third-party, file-system)".to_string()]);
-        assert_eq!(line.page, None, "an invalid value does not ask for the page");
+        assert_eq!(line.page, Some("drivers"), "an invalid value still opens the page");
+        assert_eq!(host.settings("drivers"), saved, "the saved scope stays");
+
+        let alone = host.command_line(&args(&["--drivers-scope", "everything"]));
+        assert_eq!(alone.page, Some("drivers"), "alone it opens the page on its saved scope");
+        assert_eq!(alone.errors.len(), 1);
         assert_eq!(host.settings("drivers"), saved, "the saved scope stays");
 
         for ok in [&["--drivers-scope", "loaded"][..], &["--drivers-scope=third-party"], &["--page", "Drivers"], &[]] {
