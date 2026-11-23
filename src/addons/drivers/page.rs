@@ -3963,7 +3963,7 @@ mod store_tests {
         let at = last(&t, &admin(BACKUP_SELECTED_LABEL));
         let t = screen.click(&mut page, at);
         assert_eq!(page.drv_ui.confirm_backup.as_ref().and_then(|a| a.names.clone()), Some(vec![free.clone()]));
-        assert!(drawn(&t, "Back up 1 selected package") && drawn(&t, &admin("Back up 12 packages")), "{t:?}");
+        assert!(drawn(&t, "Back up 1 selected package") && drawn(&t, &admin("Back up 1 package")), "{t:?}");
     }
 
     #[test]

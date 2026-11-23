@@ -1996,7 +1996,6 @@ mod tests {
         match &runner.launches()[0] {
             Launch::PowerShell { args, .. } => assert!(args.contains(&("Mode".to_string(), "rollback-device".to_string()))),
             other => panic!("{other:?}"),
->>>>>>> spec-11-drivers-v2
         }
     }
 
