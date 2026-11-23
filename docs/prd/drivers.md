@@ -152,7 +152,12 @@ The device context menu and the side panel offer "Disable device" (or "Enable de
 - Protected classes (disk drives and storage controllers, display adapters, system devices; the boot disk and its controller are in the storage group) need a stronger warning for Disable and Restart: "This is a <kind>: you may lose your screen or your boot disk until Windows restarts." The confirm button stays off until the user ticks "I understand, continue anyway". Enable never asks for it.
 - The job is `pnputil /disable-device`, `/enable-device` or `/restart-device` with the instance ID, from the System32 folder, elevated, in the same one-UAC-prompt job as the optional restore point step (modes `disable-device`, `enable-device`, `restart-device` of the tool script). It is uninterruptible like the other elevated jobs.
 - Outcomes: "Done.", "Restart Windows to finish." (pnputil code 3010) or "Windows refused: <reason>" (the last line pnputil printed, or its exit code). The list is read again after each outcome except a dismissed UAC prompt, which changed nothing.
-- Roll back driver (#31) will sit first in the same menu group and panel section.
+
+### Roll back driver (spec #11, #31)
+"Roll back driver" sits first in the same menu group and panel section, with the shield, the same confirm dialog ("Windows goes back to the previous driver it kept for this device."), restore point option, stronger warning for protected classes, outcomes and re-read as the other device actions.
+- The route is Device Manager's own: `DiRollbackDriver` (newdev.dll) with `ROLLBACK_FLAG_NO_UI`, called by mode `rollback-device` of the tool script, in the same one-UAC-prompt job. PowerShell has no built-in rollback command (`pnputil` has none; WMI/CIM has none), so the script builds a dynamic assembly in memory (`System.Reflection.Emit`, run-only) that imports `SetupDiCreateDeviceInfoList`, `SetupDiOpenDeviceInfoW`, `DiRollbackDriver` and `SetupDiDestroyDeviceInfoList`, loaded by their System32 path. Nothing is compiled or written to disk (no `Add-Type`), the runner (#17) is unchanged, and no other elevation path exists.
+- Outcomes: "Done.", "Restart Windows to finish." (the API asked for a restart), "No previous driver is kept for this device." (Windows reported `ERROR_NO_MORE_ITEMS`: the device has no backup driver) or "Windows refused: <Windows' reason>".
+- Windows documents no read-only check for "a backup driver exists", so the entry is offered for every device and Windows answers when asked.
 
 ### Filter drivers (spec #11, #33)
 A "Filter drivers" tab lists the loaded file-system minifilters read-only: name, altitude, instances and frame, highest altitude first like `fltmc filters`, with a "Filter name" search.

@@ -85,3 +85,21 @@ Use a harmless device, for example a USB device you can unplug or a Bluetooth ad
    - Expected: the dialog shows in red "This is a display adapter: you may lose your screen or your boot disk until Windows restarts." and the confirm button is off until "I understand, continue anyway" is ticked. The panel says the device asks for a stronger confirmation. "Enable device" on such a device asks no stronger confirmation. Only confirm this on a PC where you can afford a black screen for a moment.
 8. Start an Install update (or any other job) and, while the Windows prompt is open, right click a device.
    - Expected: both device actions are greyed out until the job ends.
+
+## #31: roll back a driver (needs UAC)
+
+Needs a device that has a previous driver (install a different driver version for a harmless device first, for example from Device Manager > Update driver > Browse). Never start with a display, disk or system device.
+
+1. Right click a harmless device without a previous driver (one never updated), choose "Roll back driver", confirm with the restore point on, answer UAC **Yes**.
+   - Expected: the first entry of the "Device" group, with the shield; the dialog says "Windows goes back to the previous driver it kept for this device."; one UAC prompt; then "No previous driver is kept for this device." and the list is read again. Nothing changed.
+2. On the device whose driver you changed, choose "Roll back driver" in the side panel, confirm, UAC **Yes**.
+   - Expected: "Done." (with "Restore point created." in front), no Device Manager window or other prompt, the list is read again and the device shows the older version and date. Device Manager shows the same driver version.
+3. Repeat step 2 once more at once, with the restore point option on.
+   - Expected: "Restore point not created" (Windows allows one per 24 hours) with Continue and Cancel; Cancel says "Cancelled: nothing was changed."; Continue asks UAC again and rolls back.
+4. Choose "Roll back driver", confirm, and close the UAC prompt with **No**.
+   - Expected: "Cancelled at the Windows prompt: nothing was changed." and the list is not read again.
+5. Roll back a device that needs a restart (some drivers do).
+   - Expected: "Restart Windows to finish.".
+6. Select a Display adapter that has a previous driver, "Roll back driver".
+   - Expected: the red stronger warning, the confirm button off until "I understand, continue anyway" is ticked. Only confirm this on a PC where you can afford a black screen for a moment.
+7. Check that no file was left behind: the job writes no script compiled to disk, so `%TEMP%` of the administrator account has no new `.dll`, `.cs` or `.cmdline` file after the roll back.

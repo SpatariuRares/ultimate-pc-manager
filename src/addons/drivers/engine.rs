@@ -530,6 +530,8 @@ pub enum DeviceAction {
     Disable,
     Enable,
     Restart,
+    /// Back to the previous driver Windows keeps (Device Manager's rollback).
+    Rollback,
 }
 
 impl DeviceAction {
@@ -539,11 +541,12 @@ impl DeviceAction {
             DeviceAction::Disable => "disable-device",
             DeviceAction::Enable => "enable-device",
             DeviceAction::Restart => "restart-device",
+            DeviceAction::Rollback => ROLLBACK_MODE,
         }
     }
 
     fn from_mode(mode: &str) -> Option<DeviceAction> {
-        [DeviceAction::Disable, DeviceAction::Enable, DeviceAction::Restart].into_iter().find(|a| a.mode() == mode)
+        [DeviceAction::Disable, DeviceAction::Enable, DeviceAction::Restart, DeviceAction::Rollback].into_iter().find(|a| a.mode() == mode)
     }
 
     /// The button and menu label.
@@ -552,6 +555,7 @@ impl DeviceAction {
             DeviceAction::Disable => "Disable device",
             DeviceAction::Enable => "Enable device",
             DeviceAction::Restart => "Restart device",
+            DeviceAction::Rollback => "Roll back driver",
         }
     }
 
@@ -561,6 +565,7 @@ impl DeviceAction {
             DeviceAction::Disable => "The device stops working until you enable it again.",
             DeviceAction::Enable => "Windows starts the device again.",
             DeviceAction::Restart => "The device stops for a moment and starts again.",
+            DeviceAction::Rollback => "Windows goes back to the previous driver it kept for this device.",
         }
     }
 
@@ -966,6 +971,7 @@ impl Hub {
             DeviceAction::Disable => "Disabling the device \u{2014} confirm the Windows prompt\u{2026}",
             DeviceAction::Enable => "Enabling the device \u{2014} confirm the Windows prompt\u{2026}",
             DeviceAction::Restart => "Restarting the device \u{2014} confirm the Windows prompt\u{2026}",
+            DeviceAction::Rollback => "Rolling back the driver \u{2014} confirm the Windows prompt\u{2026}",
         };
         self.pnputil(action.mode(), instance_id, true, busy, restore_point);
     }
@@ -1194,6 +1200,14 @@ pub struct ToolOutcome {
     pub cancelled: bool,
 }
 
+/// The tool script's mode for a driver rollback.
+const ROLLBACK_MODE: &str = "rollback-device";
+/// Win32 `ERROR_NO_MORE_ITEMS`: what `DiRollbackDriver` reports for a device
+/// without a backup driver.
+const ERROR_NO_MORE_ITEMS: i64 = 259;
+/// What a rollback says when Windows keeps no previous driver for the device.
+pub const NO_PREVIOUS_DRIVER: &str = "No previous driver is kept for this device.";
+
 /// Reads the tool script's result for `mode` ("inf", "scan" or "stop").
 /// pnputil: 0 done, 3010 done but restart needed, 259 nothing newer to
 /// install. sc: 0 asked, 1062 not started, 1052 refused, 1051 has dependents.
@@ -1212,6 +1226,7 @@ pub fn tool_outcome(mode: &str, result: Result<serde_json::Value, String>) -> To
     let code = v["code"].as_i64().unwrap_or(0);
     let device = DeviceAction::from_mode(mode).is_some();
     let message: (String, bool) = match (mode, code) {
+        (ROLLBACK_MODE, ERROR_NO_MORE_ITEMS) => (NO_PREVIOUS_DRIVER.into(), true),
         _ if device && code == 0 => ("Done.".into(), false),
         _ if device && code == 3010 => ("Restart Windows to finish.".into(), false),
         _ if device => (format!("Windows refused: {}", refusal_reason(v["output"].as_str().unwrap_or_default(), code)), true),
@@ -1407,10 +1422,48 @@ try {
     'disable-device' { $o = & $pnputil /disable-device $Arg 2>&1 }
     'enable-device' { $o = & $pnputil /enable-device $Arg 2>&1 }
     'restart-device' { $o = & $pnputil /restart-device $Arg 2>&1 }
+    'rollback-device' {
+      # Device Manager's own rollback (DiRollbackDriver), called from a dynamic
+      # assembly that lives only in memory: no file is written and nothing is
+      # compiled to disk. Both DLLs are loaded by their System32 path.
+      $newdev = Join-Path ([Environment]::SystemDirectory) 'newdev.dll'
+      $setupapi = Join-Path ([Environment]::SystemDirectory) 'setupapi.dll'
+      $asm = [AppDomain]::CurrentDomain.DefineDynamicAssembly((New-Object Reflection.AssemblyName 'UpcmRollback'), [Reflection.Emit.AssemblyBuilderAccess]::Run)
+      $tb = $asm.DefineDynamicModule('UpcmRollback').DefineType('Native', 'Public,Class,Sealed,Abstract')
+      $import = [Runtime.InteropServices.DllImportAttribute]
+      $fields = @($import.GetField('SetLastError'), $import.GetField('ExactSpelling'), $import.GetField('CharSet'))
+      $imports = @(
+        @('SetupDiCreateDeviceInfoList', $setupapi, [IntPtr], [Type[]]@([IntPtr], [IntPtr])),
+        @('SetupDiOpenDeviceInfoW', $setupapi, [bool], [Type[]]@([IntPtr], [string], [IntPtr], [uint32], [byte[]])),
+        @('SetupDiDestroyDeviceInfoList', $setupapi, [bool], [Type[]]@([IntPtr])),
+        @('DiRollbackDriver', $newdev, [bool], [Type[]]@([IntPtr], [byte[]], [IntPtr], [uint32], [int].MakeByRefType()))
+      )
+      foreach ($i in $imports) {
+        $m = $tb.DefineMethod($i[0], 'Public,Static', $i[2], $i[3])
+        $m.SetCustomAttribute((New-Object Reflection.Emit.CustomAttributeBuilder($import.GetConstructor([Type[]]@([string])), @($i[1]), $fields, @($true, $true, [Runtime.InteropServices.CharSet]::Unicode))))
+      }
+      $n = $tb.CreateType()
+      # SP_DEVINFO_DATA: cbSize is 28 bytes in a 32-bit process and 32 in a 64-bit one.
+      $data = New-Object byte[] ([IntPtr]::Size * 4 + 12)
+      [BitConverter]::GetBytes([uint32]$data.Length).CopyTo($data, 0)
+      $set = $n::SetupDiCreateDeviceInfoList([IntPtr]::Zero, [IntPtr]::Zero)
+      $err = 0; $reboot = 0
+      if ($set -eq [IntPtr](-1)) { $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+      else {
+        try {
+          if (-not $n::SetupDiOpenDeviceInfoW($set, $Arg, [IntPtr]::Zero, 0, $data)) { $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+          # ROLLBACK_FLAG_NO_UI is 0x00000001 (newdev.h).
+          elseif (-not $n::DiRollbackDriver($set, $data, [IntPtr]::Zero, 1, [ref]$reboot)) { $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+        } finally { [void]$n::SetupDiDestroyDeviceInfoList($set) }
+      }
+      if ($err -ne 0) { $rc = $err; $o = (New-Object ComponentModel.Win32Exception($err)).Message }
+      elseif ($reboot -ne 0) { $rc = 3010; $o = 'Restart Windows to finish.' }
+      else { $rc = 0; $o = 'The previous driver was restored.' }
+    }
     'stop' { $o = & $sc stop $Arg 2>&1 }
     default { throw "Unknown mode $Mode" }
   }
-  $res.code = $LASTEXITCODE
+  if ($null -ne $rc) { $res.code = $rc } else { $res.code = $LASTEXITCODE }
   $res.output = ($o | Out-String).Trim()
   $res.ok = $true
 } catch { $res.error = $_.Exception.Message }
@@ -1744,6 +1797,90 @@ mod tests {
         wait_until_idle(&hub);
         assert_eq!(runner.launches()[1], device_launch(DeviceAction::Restart, false));
         assert_eq!(hub.lock().message, Some(("Done.".to_string(), false)));
+    }
+
+    #[test]
+    fn rolling_back_is_one_elevated_launch_with_the_instance_id_and_the_restore_point_step() {
+        let (hub, runner, _) = install_hub();
+        hub.device_action_with(DeviceAction::Rollback, ID.into(), true);
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches(), vec![device_launch(DeviceAction::Rollback, true)]);
+        match &runner.launches()[0] {
+            Launch::PowerShell { args, .. } => assert!(args.contains(&("Mode".to_string(), "rollback-device".to_string()))),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_rollback_arm_calls_device_managers_api_from_memory_by_system_paths() {
+        let arm = TOOL_SCRIPT.split("'rollback-device' {").nth(1).and_then(|r| r.split("'stop' {").next()).expect("a rollback arm");
+        for needed in ["DiRollbackDriver", "newdev.dll", "setupapi.dll", "SetupDiOpenDeviceInfoW", "SetupDiDestroyDeviceInfoList", "AssemblyBuilderAccess]::Run", "[Environment]::SystemDirectory"] {
+            assert!(arm.contains(needed), "missing {needed}");
+        }
+        // ROLLBACK_FLAG_NO_UI (0x1 in newdev.h) is the flags argument.
+        assert!(arm.contains("[IntPtr]::Zero, 1, [ref]$reboot"), "{arm}");
+        // Nothing is compiled to disk, nothing is written, no other tool runs.
+        for forbidden in ["Add-Type", "csc", "Out-File", "Set-Content", "& $pnputil", "RunAndSave", "AssemblyBuilderAccess]::Save"] {
+            assert!(!arm.contains(forbidden), "{forbidden} must not be in the rollback arm");
+        }
+    }
+
+    #[test]
+    fn rollback_outcomes() {
+        let done = |code, out: &str| tool_outcome("rollback-device", Ok(serde_json::json!({ "ok": true, "code": code, "output": out })));
+        assert_eq!(done(0, "The previous driver was restored.").message, ("Done.".to_string(), false));
+        let restart = done(3010, "Restart Windows to finish.");
+        assert_eq!(restart.message, ("Restart Windows to finish.".to_string(), false));
+        assert!(restart.reboot);
+        assert_eq!(done(259, "No more data is available.").message, ("No previous driver is kept for this device.".to_string(), true));
+        assert_eq!(done(5, "Access is denied.").message, ("Windows refused: Access is denied.".to_string(), true));
+        // Only a rollback reads 259 that way.
+        assert_eq!(tool_outcome("disable-device", Ok(serde_json::json!({ "ok": true, "code": 259, "output": "No." }))).message, ("Windows refused: No.".to_string(), true));
+    }
+
+    #[test]
+    fn a_rollback_without_a_previous_driver_says_so_and_reads_the_list_again() {
+        let (hub, runner, reader) = install_hub();
+        let before = reads(&reader);
+        runner.prepare(crate::platform::When::Nth(0), 0, r#"{"ok":true,"code":259,"output":"No more data is available."}"#);
+        hub.device_action_with(DeviceAction::Rollback, ID.into(), false);
+        wait_until_idle(&hub);
+        assert_eq!(hub.lock().message, Some(("No previous driver is kept for this device.".to_string(), true)));
+        assert_eq!(reads(&reader), before + 1);
+    }
+
+    #[test]
+    fn a_failed_restore_point_stops_a_rollback_and_continue_runs_it_without_one() {
+        let (hub, runner, _) = install_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, &refused("recent"));
+        runner.prepare(crate::platform::When::Nth(1), 0, r#"{"ok":true,"code":0,"output":""}"#);
+        hub.device_action_with(DeviceAction::Rollback, ID.into(), true);
+        wait_until_idle(&hub);
+        assert_eq!(hub.lock().restore_prompt.as_ref().map(|p| p.redo.clone()), Some(Redo::Device(DeviceAction::Rollback, ID.into())));
+        hub.continue_without_restore();
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches()[1], device_launch(DeviceAction::Rollback, false));
+        assert_eq!(hub.lock().message, Some(("Done.".to_string(), false)));
+    }
+
+    #[test]
+    fn a_dismissed_prompt_for_a_rollback_changes_nothing_and_reads_nothing_again() {
+        let (hub, runner, reader) = install_hub();
+        let before = reads(&reader);
+        runner.answer(crate::platform::ELEVATION_CANCELLED);
+        hub.device_action_with(DeviceAction::Rollback, ID.into(), false);
+        wait_until_idle(&hub);
+        assert_eq!(hub.lock().message, Some((CANCELLED_TEXT.to_string(), false)));
+        assert_eq!(reads(&reader), before);
+    }
+
+    #[test]
+    fn a_rollback_gets_the_same_stronger_warning_as_a_disable_on_protected_classes() {
+        for class in ["DiskDrive", "Display", "System"] {
+            assert_eq!(strong_warning(DeviceAction::Rollback, class), strong_warning(DeviceAction::Disable, class), "{class}");
+            assert!(strong_warning(DeviceAction::Rollback, class).is_some());
+        }
+        assert_eq!(strong_warning(DeviceAction::Rollback, "Net"), None);
     }
 
     #[test]
