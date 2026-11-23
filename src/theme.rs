@@ -254,8 +254,7 @@ fn visuals(t: &Theme) -> egui::Visuals {
 /// (headlines lose their weight, not their size); without the body file every
 /// face uses egui's default fonts after its own first choice.
 pub fn install_fonts(ctx: &egui::Context) {
-    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
-    let fonts = std::path::Path::new(&windir).join("Fonts");
+    let fonts = crate::app_folders::windows_dir().join("Fonts");
     ctx.set_fonts(installed_fonts(|file| std::fs::read(fonts.join(file)).ok()));
 }
 
@@ -795,6 +794,27 @@ mod tests {
         for bytes in [regular, semibold] {
             assert_eq!(&bytes[..4], &[0, 1, 0, 0], "a TrueType file starts with version 1.0");
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_bundled_selawik_files_parse_as_fonts_that_lay_out_text() {
+        let (regular_file, semibold_file) = bundled_body().expect("bundled off Windows");
+        let ctx = egui::Context::default();
+        ctx.set_fonts(font_definitions_named("selawik", Some(regular_file), Some(semibold_file)));
+        let mut widths = Vec::new();
+        // The fonts apply from the frame after they are set.
+        for _ in 0..2 {
+            widths.clear();
+            crate::test_ui::run(&ctx, (400.0, 200.0), vec![], |ui| {
+                for family in [FontFamily::Proportional, semibold()] {
+                    let galley = ui.painter().layout_no_wrap("Hamburgefonts".to_string(), egui::FontId::new(16.0, family), egui::Color32::WHITE);
+                    widths.push(galley.size().x);
+                }
+            });
+        }
+        assert!(widths.iter().all(|w| *w > 20.0), "text laid out with the bundled faces has a width: {widths:?}");
+        assert_ne!(widths[0], widths[1], "the semibold face is another font file");
     }
 
     fn args(list: &[&str]) -> Vec<String> {

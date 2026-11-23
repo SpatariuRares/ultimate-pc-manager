@@ -17,19 +17,23 @@
 //!   (`pkexec [env NAME=value ...] program arg ...`). No shell string is
 //!   ever built. A program name that starts with `-` or contains `=` is
 //!   refused, because `pkexec` or `env` would read it as an option or an
-//!   assignment instead of a program.
+//!   assignment instead of a program, and an empty program name is refused.
+//!   A word holding a NUL character is refused on every system (it cannot be
+//!   passed to a process).
 //! * macOS: AppleScript cannot take an argv without a script, so the script
 //!   is fixed text (`on run argv` / `do shell script (item 1 of argv) with
 //!   administrator privileges` / `end run`) and the command is passed as the
 //!   one argument of `osascript`, never spliced into the script. That one
 //!   argument is the only shell string: every word is wrapped in single
 //!   quotes with each embedded `'` written as `'\''`, so the shell sees
-//!   exactly the words typed.
+//!   exactly the words typed. The shell runs the command in the background
+//!   (`... &`), so a program that does not exist is never reported here: the
+//!   launch only fails when the authorisation is refused.
 //!
 //! The pure parts here take the system and the environment as values and
 //! the launch as a closure, so the tests cover every system on any host.
 
-use crate::app_folders::System;
+use crate::system::System;
 
 /// How an elevated launch ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,10 +128,13 @@ pub fn elevated_argv(system: System, cmdline: &str, env: &dyn Fn(&str) -> Option
     let Some(program) = words.first() else {
         return Err("Type the name of a program, folder or document.".into());
     };
+    if words.iter().any(|w| w.contains('\0')) {
+        return Err("A program name or argument can't contain a NUL character.".into());
+    }
     match system {
         System::Windows => Err("Windows asks for administrator permission (UAC) when an action needs it.".into()),
         System::Linux => {
-            if program.starts_with('-') || program.contains('=') {
+            if program.is_empty() || program.starts_with('-') || program.contains('=') {
                 return Err(format!("\"{program}\" can't be started as administrator: type the name or path of a program."));
             }
             let mut argv = vec!["pkexec".to_string()];
@@ -240,6 +247,51 @@ mod tests {
         for s in [System::Linux, System::MacOs] {
             assert_eq!(elevated_argv(s, "   ", &no_env), Err("Type the name of a program, folder or document.".into()));
         }
+    }
+
+    #[test]
+    fn hostile_environment_values_stay_one_assignment_each() {
+        let env = |n: &str| match n {
+            "DISPLAY" => Some("-i\nX=1".to_string()),
+            "XAUTHORITY" => Some("a=b".to_string()),
+            _ => None,
+        };
+        assert_eq!(elevated_argv(System::Linux, "gedit", &env).unwrap(), ["pkexec", "env", "DISPLAY=-i\nX=1", "XAUTHORITY=a=b", "gedit"]);
+    }
+
+    #[test]
+    fn later_words_may_start_with_a_dash_but_the_program_may_not() {
+        assert_eq!(elevated_argv(System::Linux, "ls -- -l", &no_env).unwrap(), ["pkexec", "ls", "--", "-l"]);
+        for bad in ["-", "--", "'-x'", "\\-x", "A=b"] {
+            assert!(elevated_argv(System::Linux, bad, &no_env).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn linux_refuses_an_empty_program_name() {
+        for bad in ["''", "\"\" gedit", "'' ls"] {
+            assert!(elevated_argv(System::Linux, bad, &no_env).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_word_with_a_nul_byte_is_an_error_on_every_system_and_never_a_launch() {
+        for s in [System::Linux, System::MacOs] {
+            assert!(elevated_argv(s, "echo a\0b", &no_env).is_err(), "{s:?}");
+            assert!(run(s, "echo a\0b", &no_env, &|_| panic!("launched")).is_err(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn macos_quotes_a_newline_a_backslash_and_an_empty_word() {
+        let a = elevated_argv(System::MacOs, "echo 'a\nb' c\\\\d ''", &no_env).unwrap();
+        assert_eq!(a[7], "'echo' 'a\nb' 'c\\d' '' >/dev/null 2>&1 &");
+    }
+
+    #[test]
+    fn a_macos_quote_cannot_be_closed_by_a_word() {
+        let a = elevated_argv(System::MacOs, r#"x "'; rm -rf ~ #""#, &no_env).unwrap();
+        assert_eq!(a[7], r#"'x' ''\''; rm -rf ~ #' >/dev/null 2>&1 &"#);
     }
 
     #[test]

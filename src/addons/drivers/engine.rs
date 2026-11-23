@@ -65,7 +65,7 @@ impl DeviceDriver {
         }
     }
     pub fn inf_path(&self) -> String {
-        let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+        let windir = crate::app_folders::windows_dir().to_string_lossy().into_owned();
         format!(r"{windir}\INF\{}", self.inf)
     }
     /// True when Windows Update's hardware ID belongs to this device.

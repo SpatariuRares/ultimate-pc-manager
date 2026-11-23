@@ -21,6 +21,22 @@ use linux as system;
 
 pub use system::{open_power_options, reveal_in_explorer};
 
+/// Starts `launch` (program, then its arguments) without waiting for it: the
+/// one place the Linux and macOS openers start a process.
+#[cfg(not(windows))]
+fn spawn(launch: &[String]) -> Result<(), String> {
+    let (program, args) = launch.split_first().ok_or_else(|| "nothing to run".to_string())?;
+    std::process::Command::new(program).args(args).spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[cfg(all(test, not(windows)))]
+mod spawn_tests {
+    #[test]
+    fn an_empty_launch_is_an_error_not_a_start() {
+        assert_eq!(super::spawn(&[]), Err("nothing to run".to_string()));
+    }
+}
+
 pub fn open_file_location(path: &str) -> Result<(), String> {
     if path.is_empty() {
         return Err("The file location of this process can't be read.".into());

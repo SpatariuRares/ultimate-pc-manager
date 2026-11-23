@@ -24,6 +24,16 @@ pub fn documents(env: Env) -> Option<PathBuf> {
     env("USERPROFILE").map(|h| PathBuf::from(h).join("Documents"))
 }
 
+/// The data folder as a setting shows it: Windows names the variable.
+pub fn shown_data() -> PathBuf {
+    PathBuf::from(r"%APPDATA%\UltimatePCManager")
+}
+
+/// The Windows folder: `%SystemRoot%`, else `%WINDIR%`, else `C:\Windows`.
+pub fn windows_dir(env: Env) -> PathBuf {
+    env("SystemRoot").or_else(|| env("WINDIR")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+}
+
 /// Where the app's folders of its previous name may be: `%APPDATA%` and
 /// `%LOCALAPPDATA%`.
 pub fn legacy_bases(env: Env) -> Vec<PathBuf> {

@@ -35,6 +35,7 @@
 //! gives `None` when the system names no such folder (no `HOME`, say); the
 //! caller picks its own fallback.
 
+use crate::system::System;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -49,26 +50,6 @@ pub const APP_FOLDER: &str = "UltimatePCManager";
 /// An environment lookup: the value of a variable, if it is set. The public
 /// functions read the process environment; tests pass their own values.
 pub type Env<'a> = &'a dyn Fn(&str) -> Option<OsString>;
-
-/// A system whose folder rules the concern knows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum System {
-    Windows,
-    Linux,
-    MacOs,
-}
-
-impl System {
-    /// The system the app runs on.
-    pub const fn current() -> System {
-        #[cfg(windows)]
-        return System::Windows;
-        #[cfg(target_os = "linux")]
-        return System::Linux;
-        #[cfg(target_os = "macos")]
-        return System::MacOs;
-    }
-}
 
 /// A kind of folder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +118,28 @@ pub fn documents() -> Option<PathBuf> {
     resolve(System::current(), Folder::Documents, &process_env)
 }
 
+/// The app's data folder as a setting shows it to the user: on Windows the
+/// variable's name (`%APPDATA%\UltimatePCManager`), elsewhere the real folder
+/// (none: the system names no such folder).
+pub fn shown_data_of(system: System, env: Env) -> Option<PathBuf> {
+    match system {
+        System::Windows => Some(windows::shown_data()),
+        System::Linux | System::MacOs => resolve(system, Folder::Data, env),
+    }
+}
+
+/// See [`shown_data_of`], for the running system.
+pub fn shown_data() -> Option<PathBuf> {
+    shown_data_of(System::current(), &process_env)
+}
+
+/// The Windows folder (fonts, INF files, system programs). Only Windows
+/// code asks for it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn windows_dir() -> PathBuf {
+    windows::windows_dir(&process_env)
+}
+
 /// See [`legacy_bases_of`], for the running system.
 pub fn legacy_bases() -> Vec<PathBuf> {
     legacy_bases_of(System::current(), &process_env)
@@ -158,6 +161,22 @@ mod tests {
         // parts: compare the paths as they read on their own system.
         let path = resolve(system, kind, &env_of(pairs))?;
         Some(if system == System::Windows { path } else { PathBuf::from(path.to_string_lossy().replace('\\', "/")) })
+    }
+
+    #[test]
+    fn a_setting_shows_the_windows_data_folder_by_its_variable_and_the_others_by_their_real_folder() {
+        let env = env_of(&[("APPDATA", r"C:\Users\a\AppData\Roaming"), ("HOME", "/home/a"), ("XDG_DATA_HOME", "/home/a/.local/share")]);
+        assert_eq!(shown_data_of(System::Windows, &env), Some(PathBuf::from(r"%APPDATA%\UltimatePCManager")));
+        assert_eq!(shown_data_of(System::Linux, &env), resolve(System::Linux, Folder::Data, &env));
+        assert_eq!(shown_data_of(System::MacOs, &env_of(&[])), None);
+    }
+
+    #[test]
+    fn the_windows_folder_is_system_root_then_windir_then_the_usual_place() {
+        let dir = |pairs: &[(&str, &str)]| windows::windows_dir(&env_of(pairs));
+        assert_eq!(dir(&[("SystemRoot", r"D:\Win"), ("WINDIR", r"E:\Other")]), PathBuf::from(r"D:\Win"));
+        assert_eq!(dir(&[("WINDIR", r"E:\Other")]), PathBuf::from(r"E:\Other"));
+        assert_eq!(dir(&[]), PathBuf::from(r"C:\Windows"));
     }
 
     #[test]

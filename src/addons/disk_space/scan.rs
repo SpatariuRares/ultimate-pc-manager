@@ -782,6 +782,8 @@ pub(super) mod tests {
         let (p, l, f) = (paused.clone(), listed.clone(), found.clone());
         let (p2, l2) = (paused.clone(), listed.clone());
         let (held, at_pause) = std::sync::mpsc::channel();
+        let before_pause = Arc::new(AtomicUsize::new(0));
+        let before_pause2 = before_pause.clone();
         let mut first = true;
         walk_in_time(
             t.0.clone(),
@@ -794,7 +796,7 @@ pub(super) mod tests {
             },
             move |events| {
                 if std::mem::take(&mut first) {
-                    settled(&l2);
+                    before_pause2.store(settled(&l2), SeqCst);
                     p2.store(true, SeqCst);
                     // Resume from elsewhere once the paused listers settle
                     // (the sink returns now and drains the channel).
@@ -809,7 +811,11 @@ pub(super) mod tests {
             },
         );
         let listed_while_paused = at_pause.recv().unwrap();
-        assert!(listed_while_paused < SMALL, "the pause held the walk ({listed_while_paused} folders listed)");
+        // How many folders were listed before the pause depends on thread
+        // timing; what counts is that, once it is set, no lister takes up
+        // more than the one folder it was about to.
+        let extra = listed_while_paused - before_pause.load(SeqCst);
+        assert!(extra <= WORKERS, "the pause held the walk ({extra} more folders listed after it)");
         assert_eq!(found.load(SeqCst), BATCH + SMALL, "a resumed walk finds every file");
 
         // Stop while the listers are held back: the walk ends early.
