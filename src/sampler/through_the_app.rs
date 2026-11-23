@@ -583,3 +583,24 @@ fn one_reading_gives_a_core_page_and_an_addon_the_same_speed() {
         assert_eq!(top(&app, PerfItem::Cpu, "Speed"), shown, "the core page");
     }
 }
+
+/// The Summary Disk tile of a Linux PC shows the activity and speeds that
+/// `/proc/diskstats` counted, through the real Linux counters provider.
+#[cfg(target_os = "linux")]
+#[test]
+fn on_linux_the_summary_disk_tile_shows_the_activity_of_the_kernel_tallies() {
+    use crate::sensors::system_counters::linux::Counters;
+    let at = Instant::now();
+    // Disk 1 ("sda") had counted 500 ms of work and 5 MB read a second before the fixture's tallies.
+    let before = "   8       0 sda 900 0 10240 400 1900 0 40000 1400 0 500 1900 0 0 0 0\n";
+    let sets = Counters::seeded(crate::fs_root::fixture("disks"), before, at).read_at(at + Duration::from_secs(1)).unwrap();
+    let script = Script::new(sets);
+    let facts = crate::perfdata::StaticInfo { disks: vec![crate::perfdata::DiskInfo { number: 1, model: "Samsung SSD 870 EVO 1TB".into(), bus: "SSD", ..Default::default() }], ..Default::default() };
+    *script.machine.lock().unwrap() = Some(facts);
+    let (mut app, _service) = app_over(&script, NORMAL);
+    pull_until(&mut app, "the disk figures", |a| a.snap.seq >= 1 && a.snap.machine.is_some());
+    let view = app.summary_view();
+    let tile = view.tiles.iter().find(|t| t.kind == crate::summary_tiles::TileKind::Disk(1)).expect("a disk tile");
+    assert_eq!(tile.value_text(), "Active 50.0%", "500 ms busy in 1 s");
+    assert!(tile.lines[1].starts_with("Read 4.77 MB/sec"), "{:?}", tile.lines);
+}
