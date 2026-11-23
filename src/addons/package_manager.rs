@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use egui::{RichText, Ui};
 
-use crate::addons::{is_default, read_settings, write_settings, Addon, Consumption, Requirements};
+use crate::addons::{is_default, read_settings, write_settings, Addon, Consumption, Requirements, CloseWait, Offers};
 use crate::platform::install_queue::{Request, Work};
 use crate::platform::series::{Run, Series};
 use crate::platform::winget::{classify, describe, last_lines, ExitClass};
@@ -753,7 +753,7 @@ impl PackageManager {
             n => format!("{} {n} packages\u{2026}", kind.doing()),
         };
         // The batch exists from the moment the series is accepted (under
-        // the lock `close_question` reads), so closing the app right after
+        // the lock `close_reason` reads), so closing the app right after
         // the start still asks first.
         let batch = Batch { items: items.clone(), kind, ..Batch::default() };
         series.start_with(Some(busy), true, move |st| st.batch = Some(batch), move |run| {
@@ -1011,7 +1011,26 @@ pub fn catalogs_text(catalogs: &Catalogs) -> Option<String> {
     }
 }
 
+impl CloseWait for PackageManager {
+    /// Asked while a series runs: closing lets the current package finish
+    /// and starts no other; the journal offers the rest at the next start.
+    fn close_reason(&self) -> Option<String> {
+        let b = self.state().batch.filter(|b| !b.done)?;
+        let done = b.items.iter().filter(|i| i.status.finished()).count();
+        Some(format!(
+            "A series of {} is running ({done} of {} done). Closing lets the current package finish and starts no other; the rest can be continued at the next start.",
+            b.kind.works(),
+            b.items.len()
+        ))
+    }
+}
+
 impl Addon for PackageManager {
+    /// It gives the reason to wait while a series runs.
+    fn offers(&mut self) -> Offers<'_> {
+        Offers { close_wait: Some(self), ..Offers::default() }
+    }
+
     fn id(&self) -> &'static str {
         ID
     }
@@ -1098,17 +1117,6 @@ impl Addon for PackageManager {
     }
     fn uninterruptible(&self) -> bool {
         self.series.as_ref().is_some_and(|s| s.running())
-    }
-    /// Asked while a series runs: closing lets the current package finish
-    /// and starts no other; the journal offers the rest at the next start.
-    fn close_question(&self) -> Option<String> {
-        let b = self.state().batch.filter(|b| !b.done)?;
-        let done = b.items.iter().filter(|i| i.status.finished()).count();
-        Some(format!(
-            "A series of {} is running ({done} of {} done). Closing lets the current package finish and starts no other; the rest can be continued at the next start.",
-            b.kind.works(),
-            b.items.len()
-        ))
     }
     /// While a run that was interrupted waits for an answer: a link that
     /// opens the page with its offer to continue (also when the page was
@@ -2046,7 +2054,7 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
             statuses(&pm.state),
             named(&[("A", Status::Failed("Package Manager stopped unexpectedly".into())), ("B", Status::NotStarted("Package Manager stopped unexpectedly".into()))])
         );
-        assert_eq!(pm.close_question(), None, "closing the app is not held up");
+        assert_eq!(pm.close_reason(), None, "closing the app is not held up");
         assert_eq!(batch::failed(&batch_of(&pm.state).unwrap().items).len(), 2, "both can be retried");
     }
 

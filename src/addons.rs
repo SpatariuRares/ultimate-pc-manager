@@ -125,24 +125,6 @@ pub trait Addon {
     fn uninterruptible(&self) -> bool {
         false
     }
-    /// What the app asks before it closes while this add-on works (e.g. a
-    /// series of installs); `None`, the default, closes without asking.
-    /// See [`AddonHost::close`].
-    fn close_question(&self) -> Option<String> {
-        None
-    }
-    /// Work that turning it off would lose (e.g. a recording running):
-    /// the question the app asks first, with Save / Discard / Cancel (see
-    /// [`AddonHost::off_question`]). None, the default, turns off at once.
-    fn unsaved_work(&self) -> Option<&'static str> {
-        None
-    }
-    /// Save on that question: keeps the work (e.g. writes it to a file).
-    /// False when it was not saved (dialog cancelled, write failed): the
-    /// add-on then stays on with its work.
-    fn save_work(&mut self) -> bool {
-        true
-    }
     /// How many threads of its own run now (0 by default). Contract-tested:
     /// none once it is off.
     #[cfg_attr(not(test), allow(dead_code))] // read by the contract tests
@@ -244,6 +226,13 @@ pub trait Addon {
     fn offers(&mut self) -> Offers<'_> {
         Offers::default()
     }
+    /// What it offers when `asked` for one capability. An add-on can lend
+    /// itself to one capability at a time, so one that offers several
+    /// answers here for the capability asked; by default this is
+    /// [`Addon::offers`].
+    fn offers_for(&mut self, _asked: Asked) -> Offers<'_> {
+        self.offers()
+    }
     /// Its own settings, opaque to the host (optional). `Null`, the
     /// default, means it keeps none of its own and the host keeps the value
     /// last given to it. Saved with the add-on's entry, kept while it is off.
@@ -264,6 +253,47 @@ pub trait Addon {
 pub struct Offers<'a> {
     /// It records sensors for other add-ons' pages (Flight Recorder).
     pub sensor_recorder: Option<&'a mut dyn SensorRecorder>,
+    /// It holds work that turning it off or closing the app would lose
+    /// (Flight Recorder's recording).
+    pub unsaved_work: Option<&'a mut dyn UnsavedWork>,
+    /// It gives a reason to wait before the app closes (Package Manager's
+    /// series of installs).
+    pub close_wait: Option<&'a mut dyn CloseWait>,
+}
+
+/// The capability the host asks an add-on that offers several for (see
+/// [`Addon::offers_for`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Asked {
+    UnsavedWork,
+    CloseWait,
+}
+
+/// The unsaved work capability: what the app asks about before it turns
+/// the add-on off or closes.
+pub trait UnsavedWork {
+    /// Work that turning it off would lose (e.g. a recording running):
+    /// the question the app asks first, with Save / Discard / Cancel (see
+    /// [`AddonHost::off_question`]). None: nothing would be lost.
+    fn unsaved_work(&self) -> Option<&'static str>;
+    /// Save on that question: keeps the work (e.g. writes it to a file).
+    /// False when it was not saved (dialog cancelled, write failed): the
+    /// add-on then stays on with its work.
+    fn save_work(&mut self) -> bool;
+}
+
+/// The reason to wait before the app closes while the add-on works (e.g. a
+/// series of installs).
+pub trait CloseWait {
+    /// What the app asks before it closes; `None` closes without asking.
+    /// See [`AddonHost::close_questions`].
+    fn close_reason(&self) -> Option<String>;
+}
+
+/// The question about the unsaved work of `entry` (see [`UnsavedWork`]).
+fn unsaved_work_of(entry: &mut Entry) -> Option<&'static str> {
+    let Entry::Addon(addon) = entry else { return None };
+    addon.offers_for(Asked::UnsavedWork).unsaved_work.and_then(|u| u.unsaved_work())
 }
 
 /// The sensor recorder capability: what Power & Freq's "Record" talks to.
@@ -575,7 +605,7 @@ pub struct OffQuestion {
     pub id: &'static str,
     /// The add-on's shown name.
     pub name: &'static str,
-    /// What would be lost (its [`Addon::unsaved_work`]).
+    /// What would be lost (its [`UnsavedWork`]).
     pub question: &'static str,
 }
 
@@ -602,7 +632,7 @@ pub struct AddonHost {
     /// for the answer to its [`OffQuestion`].
     asking: Option<&'static str>,
     /// The app was asked to close while add-ons held unsaved work: it
-    /// waits for the answer to their [`AddonHost::close_question`].
+    /// waits for the answer to their [`AddonHost::close_save_question`].
     closing: bool,
     /// Add-on pages drawn in this frame and in the last one.
     shown: FrameSet,
@@ -795,7 +825,7 @@ impl AddonHost {
     /// the menu with its page open to follow that operation (and is saved
     /// as on) until [`AddonHost::settle`] sees the operation end.
     ///
-    /// An add-on holding unsaved work ([`Addon::unsaved_work`]) is not
+    /// An add-on holding unsaved work ([`UnsavedWork`]) is not
     /// turned off yet: the host asks first ([`AddonHost::off_question`])
     /// and turns it off on the answer ([`AddonHost::answer_off`]).
     pub fn set_enabled(&mut self, id: &str, on: bool) -> bool {
@@ -815,7 +845,7 @@ impl AddonHost {
             if on {
                 addon.start(&self.context);
                 slot.enabled = true;
-            } else if addon.unsaved_work().is_some() {
+            } else if addon.offers_for(Asked::UnsavedWork).unsaved_work.is_some_and(|u| u.unsaved_work().is_some()) {
                 self.asking = Some(addon.id());
             } else {
                 Self::turn_off(slot, &self.context);
@@ -840,10 +870,12 @@ impl AddonHost {
 
     /// The question to ask before turning off an add-on that holds unsaved
     /// work, while it waits for the answer (None once that work is gone).
-    pub fn off_question(&self) -> Option<OffQuestion> {
+    pub fn off_question(&mut self) -> Option<OffQuestion> {
         let id = self.asking?;
-        let Entry::Addon(addon) = &self.slot(id)?.entry else { return None };
-        addon.unsaved_work().map(|question| OffQuestion { id, name: addon.name(), question })
+        let slot = self.slots.iter_mut().find(|s| s.entry.id() == id)?;
+        let question = unsaved_work_of(&mut slot.entry)?;
+        let Entry::Addon(addon) = &slot.entry else { return None };
+        Some(OffQuestion { id, name: addon.name(), question })
     }
 
     /// Answers the [`OffQuestion`]: Save saves the work and turns the
@@ -855,7 +887,7 @@ impl AddonHost {
         let Some(slot) = self.slots.iter_mut().find(|s| s.entry.id() == id) else { return false };
         let Entry::Addon(addon) = &mut slot.entry else { return false };
         let off = match answer {
-            OffAnswer::Save => addon.save_work(),
+            OffAnswer::Save => addon.offers_for(Asked::UnsavedWork).unsaved_work.map_or(true, |u| u.save_work()),
             OffAnswer::Discard => true,
             OffAnswer::Cancel => false,
         };
@@ -866,16 +898,17 @@ impl AddonHost {
     }
 
     /// The first add-on that is on and holds unsaved work, with its question.
-    fn first_unsaved(&self) -> Option<OffQuestion> {
-        self.slots.iter().filter(|s| s.enabled).find_map(|s| match &s.entry {
-            Entry::Addon(addon) => addon.unsaved_work().map(|question| OffQuestion { id: addon.id(), name: addon.name(), question }),
-            Entry::Core(_) => None,
+    fn first_unsaved(&mut self) -> Option<OffQuestion> {
+        self.slots.iter_mut().filter(|s| s.enabled).find_map(|s| {
+            let question = unsaved_work_of(&mut s.entry)?;
+            let Entry::Addon(addon) = &s.entry else { return None };
+            Some(OffQuestion { id: addon.id(), name: addon.name(), question })
         })
     }
 
     /// The app is asked to close (window X, File › Exit, Alt+F4). True
     /// when it may close now; false when an add-on holds unsaved work:
-    /// the app stays open and asks first ([`AddonHost::close_question`]).
+    /// the app stays open and asks first ([`AddonHost::close_save_question`]).
     /// Replaces a pending [`AddonHost::off_question`].
     pub fn request_close(&mut self) -> bool {
         self.asking = None;
@@ -883,9 +916,9 @@ impl AddonHost {
         !self.closing
     }
 
-    /// The question to ask before closing the app: the same as turning off
+    /// The save question to ask before closing the app: the same as turning off
     /// ([`OffQuestion`]), for the next add-on whose work would be lost.
-    pub fn close_question(&self) -> Option<OffQuestion> {
+    pub fn close_save_question(&mut self) -> Option<OffQuestion> {
         if self.closing {
             self.first_unsaved()
         } else {
@@ -893,17 +926,17 @@ impl AddonHost {
         }
     }
 
-    /// Answers the [`AddonHost::close_question`]. Save saves the work
+    /// Answers the [`AddonHost::close_save_question`]. Save saves the work
     /// (stays open when it was not saved), Discard stops the add-on so
     /// its work and threads are gone, Cancel stays open. The add-ons stay
     /// on (saved as they are). True when the app may close now; false
     /// while it stays open or another add-on still has to be asked.
     pub fn answer_close(&mut self, answer: OffAnswer) -> bool {
-        let Some(q) = self.close_question() else { return false };
+        let Some(q) = self.close_save_question() else { return false };
         let Some(slot) = self.slots.iter_mut().find(|s| s.entry.id() == q.id) else { return false };
         let Entry::Addon(addon) = &mut slot.entry else { return false };
         let done = match answer {
-            OffAnswer::Save => addon.save_work(),
+            OffAnswer::Save => addon.offers_for(Asked::UnsavedWork).unsaved_work.map_or(true, |u| u.save_work()),
             OffAnswer::Discard => {
                 addon.stop();
                 self.context.leases().release(addon.id());
@@ -955,9 +988,15 @@ impl AddonHost {
     }
 
     /// What the add-ons that are on ask before the app closes (see
-    /// [`Addon::close_question`]); empty: it closes without asking.
-    pub fn close_questions(&self) -> Vec<String> {
-        self.addons().filter(|(_, on)| *on).filter_map(|(a, _)| a.close_question()).collect()
+    /// [`CloseWait`]); empty: it closes without asking.
+    pub fn close_questions(&mut self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        for slot in self.slots.iter_mut().filter(|s| s.enabled) {
+            if let Entry::Addon(addon) = &mut slot.entry {
+                reasons.extend(addon.offers_for(Asked::CloseWait).close_wait.and_then(|c| c.close_reason()));
+            }
+        }
+        reasons
     }
 
     /// The app is closing: stops every add-on that is on, as turning it off
@@ -1622,6 +1661,15 @@ mod tests {
     /// An add-on that reads the sensors and holds work closing would lose.
     struct LooksAndKeeps(bool);
 
+    impl UnsavedWork for LooksAndKeeps {
+        fn unsaved_work(&self) -> Option<&'static str> {
+            self.0.then_some("Not saved.")
+        }
+        fn save_work(&mut self) -> bool {
+            true
+        }
+    }
+
     impl Addon for LooksAndKeeps {
         test_addon!("keeps", "Keeps", "Reads sensors and holds work.");
         fn ui(&mut self, _: &mut egui::Ui, page: &mut PageContext) {
@@ -1629,8 +1677,8 @@ mod tests {
                 sensors.latest();
             }
         }
-        fn unsaved_work(&self) -> Option<&'static str> {
-            self.0.then_some("Not saved.")
+        fn offers(&mut self) -> Offers<'_> {
+            Offers { unsaved_work: Some(self), ..Offers::default() }
         }
         fn stop(&mut self) {
             self.0 = false; // the work is gone
@@ -1645,6 +1693,35 @@ mod tests {
         assert!(!host.request_close(), "it holds work");
         assert!(host.answer_close(OffAnswer::Discard));
         until("no sensor thread", || sensor_threads(&host) == 0);
+    }
+
+    /// An add-on with a series running: it gives a reason to wait before
+    /// the app closes.
+    struct Series(bool);
+
+    impl CloseWait for Series {
+        fn close_reason(&self) -> Option<String> {
+            self.0.then(|| "A series is running.".to_string())
+        }
+    }
+
+    impl Addon for Series {
+        test_addon!("series", "Series", "Runs a series.");
+        fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
+        fn offers(&mut self) -> Offers<'_> {
+            Offers { close_wait: Some(self), ..Offers::default() }
+        }
+    }
+
+    #[test]
+    fn an_add_on_that_waits_gives_its_reason_to_close_only_while_it_is_on_and_works() {
+        let (mut host, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Series(true)))], &json!({}));
+        assert!(host.close_questions().is_empty(), "off: closing does not wait for it");
+        host.set_enabled("series", true);
+        assert_eq!(host.close_questions(), vec!["A series is running.".to_string()]);
+        let (mut idle, _) = AddonHost::for_tests_with(vec![Entry::Addon(Box::new(Series(false)))], &json!({}));
+        idle.set_enabled("series", true);
+        assert!(idle.close_questions().is_empty(), "nothing runs: closes without asking");
     }
 
     /// An add-on that records sensors for other pages: Ready, or Running
@@ -1669,7 +1746,7 @@ mod tests {
         test_addon!("records", "Records", "Records sensors.");
         fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
         fn offers(&mut self) -> Offers<'_> {
-            Offers { sensor_recorder: Some(self) }
+            Offers { sensor_recorder: Some(self), ..Offers::default() }
         }
     }
 
@@ -1710,7 +1787,7 @@ mod tests {
         }
         fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
         fn offers(&mut self) -> Offers<'_> {
-            Offers { sensor_recorder: Some(self) }
+            Offers { sensor_recorder: Some(self), ..Offers::default() }
         }
     }
 
@@ -1731,7 +1808,7 @@ mod tests {
         test_addon!("keeping-recorder", "Keeping recorder", "Records and holds work.");
         fn ui(&mut self, _: &mut egui::Ui, _: &mut PageContext) {}
         fn offers(&mut self) -> Offers<'_> {
-            Offers { sensor_recorder: Some(self) }
+            Offers { sensor_recorder: Some(self), ..Offers::default() }
         }
         fn uninterruptible(&self) -> bool {
             true
@@ -2775,6 +2852,12 @@ mod tests {
                 n.stopped += 1;
                 n.dirty = false;
             }
+            fn offers(&mut self) -> Offers<'_> {
+                Offers { unsaved_work: Some(self), ..Offers::default() }
+            }
+        }
+
+        impl UnsavedWork for Notebook {
             fn unsaved_work(&self) -> Option<&'static str> {
                 self.0.lock().unwrap().dirty.then_some("The notes are not saved.")
             }
@@ -2874,14 +2957,14 @@ mod tests {
             let (mut host, notes) = notebook(true);
             notes.lock().unwrap().dirty = false;
             assert!(host.request_close());
-            assert_eq!(host.close_question(), None);
+            assert_eq!(host.close_save_question(), None);
         }
 
         #[test]
         fn closing_with_unsaved_work_asks_the_same_question_first() {
             let (mut host, notes) = notebook(true);
             assert!(!host.request_close(), "the app stays open until the user answers");
-            assert_eq!(host.close_question(), Some(OffQuestion { id: "notebook", name: "Notebook", question: "The notes are not saved." }));
+            assert_eq!(host.close_save_question(), Some(OffQuestion { id: "notebook", name: "Notebook", question: "The notes are not saved." }));
             assert_eq!(notes.lock().unwrap().stopped, 0, "nothing stopped yet");
         }
 
@@ -2892,7 +2975,7 @@ mod tests {
             assert!(host.answer_close(OffAnswer::Save));
             assert_eq!(notes.lock().unwrap().saved, 1);
             assert!(host.is_enabled("notebook"), "closing the app does not turn it off");
-            assert_eq!(host.close_question(), None);
+            assert_eq!(host.close_save_question(), None);
             assert!(host.request_close(), "nothing left to lose: the close goes through");
         }
 
@@ -2902,7 +2985,7 @@ mod tests {
             host.request_close();
             assert!(!host.answer_close(OffAnswer::Save));
             assert!(notes.lock().unwrap().dirty, "the work stays unsaved");
-            assert_eq!(host.close_question(), None, "the question is closed");
+            assert_eq!(host.close_save_question(), None, "the question is closed");
         }
 
         #[test]
@@ -2925,7 +3008,7 @@ mod tests {
             let n = notes.lock().unwrap();
             assert_eq!((n.saved, n.stopped, n.dirty), (0, 0, true));
             drop(n);
-            assert_eq!(host.close_question(), None);
+            assert_eq!(host.close_save_question(), None);
         }
 
         #[test]
@@ -2934,7 +3017,7 @@ mod tests {
             host.set_enabled("notebook", false);
             host.request_close();
             assert_eq!(host.off_question(), None, "one question at a time");
-            assert!(host.close_question().is_some());
+            assert!(host.close_save_question().is_some());
         }
 
         #[test]

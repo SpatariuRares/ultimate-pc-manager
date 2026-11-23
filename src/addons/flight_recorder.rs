@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use egui::{RichText, Ui};
 
-use crate::addons::{read_settings, write_settings, Addon, Consumption, Offers, Recording, Requirements, SensorRecorder};
+use crate::addons::{read_settings, write_settings, Addon, Asked, Consumption, Offers, Recording, Requirements, SensorRecorder, UnsavedWork};
 use crate::platform::{Action, AddonContext, PageContext};
 use crate::sampler::Snapshot;
 use crate::sensors::npu;
@@ -528,26 +528,6 @@ impl Addon for FlightRecorder {
         *self = FlightRecorder { prefs, alive, ..FlightRecorder::default() };
     }
 
-    fn unsaved_work(&self) -> Option<&'static str> {
-        if self.is_recording() {
-            Some(OFF_RECORDING)
-        } else if self.has_unsaved() {
-            Some(OFF_UNSAVED)
-        } else {
-            None
-        }
-    }
-
-    /// Save before turning off: stops the recording and opens the Save
-    /// dialog; true only when the trace was written.
-    fn save_work(&mut self) -> bool {
-        let Some(trace) = self.finish().or_else(|| self.unsaved.take()) else {
-            return true;
-        };
-        self.offer_save(trace, &mut Vec::new());
-        !self.has_unsaved()
-    }
-
     fn threads(&self) -> usize {
         Arc::strong_count(&self.alive) - 1
     }
@@ -555,7 +535,15 @@ impl Addon for FlightRecorder {
     /// It records sensors for other pages (Power & Freq's "Record with
     /// Flight Recorder").
     fn offers(&mut self) -> Offers<'_> {
-        Offers { sensor_recorder: Some(self) }
+        Offers { sensor_recorder: Some(self), ..Offers::default() }
+    }
+
+    /// It also holds the recording that turning off or closing would lose.
+    fn offers_for(&mut self, asked: Asked) -> Offers<'_> {
+        match asked {
+            Asked::UnsavedWork => Offers { unsaved_work: Some(self), ..Offers::default() },
+            Asked::CloseWait => self.offers(),
+        }
     }
 
     fn settings(&self) -> serde_json::Value {
@@ -673,6 +661,28 @@ impl Addon for FlightRecorder {
 /// What other pages see of it and ask of it: see [`recording_state`]. Record
 /// (with the sensors) or Stop (which opens the Save dialog), exactly as its
 /// own buttons do.
+impl UnsavedWork for FlightRecorder {
+    fn unsaved_work(&self) -> Option<&'static str> {
+        if self.is_recording() {
+            Some(OFF_RECORDING)
+        } else if self.has_unsaved() {
+            Some(OFF_UNSAVED)
+        } else {
+            None
+        }
+    }
+
+    /// Save before turning off: stops the recording and opens the Save
+    /// dialog; true only when the trace was written.
+    fn save_work(&mut self) -> bool {
+        let Some(trace) = self.finish().or_else(|| self.unsaved.take()) else {
+            return true;
+        };
+        self.offer_save(trace, &mut Vec::new());
+        !self.has_unsaved()
+    }
+}
+
 impl SensorRecorder for FlightRecorder {
     fn sensor_recording(&self, interval_ms: u64) -> Recording {
         recording_state(self.is_recording(), self.is_replaying(), self.record_blocked(interval_ms))
@@ -1475,7 +1485,7 @@ mod tests {
         use crate::addons::OffAnswer;
         let mut host = recording_host();
         assert!(!host.request_close(), "the app stays open");
-        assert_eq!(host.close_question().map(|q| q.question), Some(OFF_RECORDING));
+        assert_eq!(host.close_save_question().map(|q| q.question), Some(OFF_RECORDING));
         assert_eq!(host.threads("flight-recorder"), 1, "still recording while it asks");
         assert!(host.answer_close(OffAnswer::Discard), "the app closes");
         assert_eq!(host.threads("flight-recorder"), 0, "the recorder thread does not outlive closing");
@@ -1489,7 +1499,7 @@ mod tests {
         assert!(!host.answer_close(crate::addons::OffAnswer::Save), "a save that did not happen keeps the app open");
         assert_eq!(host.threads("flight-recorder"), 0);
         assert!(!host.request_close());
-        assert_eq!(host.close_question().map(|q| q.question), Some(OFF_UNSAVED));
+        assert_eq!(host.close_save_question().map(|q| q.question), Some(OFF_UNSAVED));
     }
 
     #[test]
@@ -1498,7 +1508,7 @@ mod tests {
         host.request_close();
         assert!(!host.answer_close(crate::addons::OffAnswer::Cancel));
         assert_eq!(host.threads("flight-recorder"), 1);
-        assert_eq!(host.close_question(), None);
+        assert_eq!(host.close_save_question(), None);
         host.request_close();
         host.answer_close(crate::addons::OffAnswer::Discard);
     }
