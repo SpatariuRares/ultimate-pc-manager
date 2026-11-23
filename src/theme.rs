@@ -799,9 +799,9 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn the_bundled_selawik_files_parse_as_fonts_that_lay_out_text() {
-        let (regular, semibold) = bundled_body().expect("bundled off Windows");
+        let (regular_file, semibold_file) = bundled_body().expect("bundled off Windows");
         let ctx = egui::Context::default();
-        ctx.set_fonts(font_definitions_named("selawik", Some(regular), Some(semibold)));
+        ctx.set_fonts(font_definitions_named("selawik", Some(regular_file), Some(semibold_file)));
         let mut widths = Vec::new();
         // The fonts apply from the frame after they are set.
         for _ in 0..2 {
