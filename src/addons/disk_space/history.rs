@@ -199,8 +199,17 @@ pub const UNREADABLE_FOLDER: &str = "The scan history folder could not be read."
 pub const BAD_ID: &str = "Couldn't save scan history because the scan id is malformed.";
 pub const TOO_MANY: &str = "Couldn't save scan history because its folder contains too many entries to manage safely.";
 pub const NOT_WRITTEN: &str = "Couldn't save scan history: the snapshot file could not be written.";
-/// Where History is kept unless the "History folder" setting says otherwise.
-pub const DEFAULT_FOLDER: &str = "%APPDATA%\\UltimatePCManager\\DiskScans";
+/// Where History is kept unless the "History folder" setting says otherwise,
+/// as the setting shows it (the system's data folder names the place).
+pub fn default_folder() -> String {
+    default_folder_in(crate::app_folders::shown_data())
+}
+
+/// [`default_folder`] for the data folder `data` (none: the system names no
+/// such folder, so the setting says so instead of showing a wrong place).
+fn default_folder_in(data: Option<PathBuf>) -> String {
+    data.map_or_else(|| NO_FOLDER.to_string(), |d| d.join("DiskScans").display().to_string())
+}
 /// History's caption while it is empty.
 pub const EMPTY: &str = "Finished scans are saved here.";
 /// The note beside Start.
@@ -297,8 +306,14 @@ impl Store {
     /// The app's history folder, beside its settings.
     #[cfg_attr(test, allow(dead_code))]
     pub fn app() -> Result<Store, String> {
-        let base = std::env::var_os("APPDATA").ok_or_else(|| NO_FOLDER.to_string())?;
-        Ok(Store::new(std::path::Path::new(&base).join(crate::settings::DATA_FOLDER).join("DiskScans")))
+        Store::in_data_folder(crate::app_folders::data())
+    }
+
+    /// The history folder inside the app's data folder `data` (none: the
+    /// system names no such folder).
+    fn in_data_folder(data: Option<PathBuf>) -> Result<Store, String> {
+        let data = data.ok_or_else(|| NO_FOLDER.to_string())?;
+        Ok(Store::new(data.join("DiskScans")))
     }
 
     /// Writes a finished scan; gives what History lists of it.
@@ -408,6 +423,7 @@ pub(crate) mod tests {
     use super::super::kind::Category;
     use super::super::tree::Event;
     use super::*;
+    use crate::test_paths::{host, host_owned};
     use std::path::Path;
 
     const ID: &str = "0b5c3f7e-1d2a-4c6b-9e8f-112233445566";
@@ -417,13 +433,13 @@ pub(crate) mod tests {
     }
 
     fn sample() -> SpaceTree {
-        let mut t = SpaceTree::new("R:\\", 8);
+        let mut t = SpaceTree::new(host("R:\\"), 8);
         t.apply(vec![
-            Event::File(p("R:\\big\\movie.mkv"), 5000),
-            Event::File(p("R:\\big\\deep\\clip.mp4"), 3000),
-            Event::File(p("R:\\small\\note.txt"), 100),
-            Event::File(p("R:\\loose.bin"), 700),
-            Event::Unreadable(p("R:\\locked")),
+            Event::File(p(host("R:\\big\\movie.mkv")), 5000),
+            Event::File(p(host("R:\\big\\deep\\clip.mp4")), 3000),
+            Event::File(p(host("R:\\small\\note.txt")), 100),
+            Event::File(p(host("R:\\loose.bin")), 700),
+            Event::Unreadable(p(host("R:\\locked"))),
         ]);
         t
     }
@@ -451,30 +467,30 @@ pub(crate) mod tests {
         assert_eq!((back.started, back.finished), (1_000, 1_142));
         let again = back.tree(8);
         assert_eq!(reading(&again), reading(&t));
-        let big = again.find(Path::new("R:\\big")).unwrap();
+        let big = again.find(Path::new(host("R:\\big"))).unwrap();
         assert_eq!(again.bytes(big), 8000);
-        assert_eq!(again.prevalent(again.find(Path::new("R:\\small")).unwrap()), Category::Documents, "a sub-folder keeps its prevalent type");
+        assert_eq!(again.prevalent(again.find(Path::new(host("R:\\small"))).unwrap()), Category::Documents, "a sub-folder keeps its prevalent type");
         assert_eq!(again.category(big, Category::Media), (8000, 2));
-        assert_eq!(again.largest_folders(big, 8), vec![(p("R:\\big\\deep"), 3000)]);
-        assert_eq!(again.largest_files(big, 8), vec![(p("R:\\big\\movie.mkv"), 5000), (p("R:\\big\\deep\\clip.mp4"), 3000)]);
+        assert_eq!(again.largest_folders(big, 8), vec![(p(host("R:\\big\\deep")), 3000)]);
+        assert_eq!(again.largest_files(big, 8), vec![(p(host("R:\\big\\movie.mkv")), 5000), (p(host("R:\\big\\deep\\clip.mp4")), 3000)]);
     }
 
     #[test]
     fn an_all_disks_scan_comes_back_with_its_drives() {
-        let mut t = SpaceTree::virtual_root("All disks", &["C:\\", "D:\\"], 8);
-        t.apply(vec![Event::File(p("C:\\a\\x.bin"), 600), Event::File(p("D:\\y.bin"), 40)]);
+        let mut t = SpaceTree::virtual_root("All disks", &[host("C:\\"), host("D:\\")], 8);
+        t.apply(vec![Event::File(p(host("C:\\a\\x.bin")), 600), Event::File(p(host("D:\\y.bin")), 40)]);
         let back = decode(&encode(&Snapshot::of(&t, ID, 0, 1, LIMIT)).unwrap()).unwrap().tree(8);
         assert_eq!(reading(&back), reading(&t));
-        let c = back.find(Path::new("C:\\")).unwrap();
-        assert_eq!(back.largest_folders(c, 8), vec![(p("C:\\a"), 600)]);
+        let c = back.find(Path::new(host("C:\\"))).unwrap();
+        assert_eq!(back.largest_folders(c, 8), vec![(p(host("C:\\a")), 600)]);
     }
 
     #[test]
     fn a_snapshot_too_large_keeps_the_upper_levels_and_the_largest() {
-        let mut t = SpaceTree::new("R:\\", 8);
+        let mut t = SpaceTree::new(host("R:\\"), 8);
         for i in 0..20u64 {
             for j in 0..20u64 {
-                t.add_file(&p(&format!("R:\\top{i:02}\\sub{j:02}\\deep\\file.bin")), 1000 + i * 100 + j);
+                t.add_file(&p(&host_owned(&format!("R:\\top{i:02}\\sub{j:02}\\deep\\file.bin"))), 1000 + i * 100 + j);
             }
         }
         let full = encode(&Snapshot::of(&t, ID, 0, 1, LIMIT)).unwrap().len();
@@ -489,7 +505,7 @@ pub(crate) mod tests {
         let level2: Vec<&FolderEntry> = s.folders.iter().filter(|f| f.depth == 2).collect();
         assert!(!level2.is_empty() && level2.len() < 400);
         let smallest_kept = level2.iter().map(|f| f.bytes).min().unwrap();
-        assert!(level2.iter().any(|f| f.path.starts_with("R:\\top19")), "the largest folders are kept");
+        assert!(level2.iter().any(|f| f.path.starts_with(host("R:\\top19"))), "the largest folders are kept");
         assert!(smallest_kept > 1019, "the smallest folders (top00's) are dropped first");
         assert_eq!(s.files[..8].iter().map(|f| f.bytes).collect::<Vec<_>>(), (0..8).map(|k| 2919 - k).collect::<Vec<_>>(), "the largest files are kept");
         let back = decode(&text).unwrap().tree(8);
@@ -498,10 +514,10 @@ pub(crate) mod tests {
 
     #[test]
     fn a_huge_scan_is_saved_under_16_mib() {
-        let mut t = SpaceTree::new("R:\\", 8);
+        let mut t = SpaceTree::new(host("R:\\"), 8);
         let long = "x".repeat(180);
         for i in 0..60_000u64 {
-            t.add_file(&p(&format!("R:\\{}\\{long}{i:06}\\{long}.bin", i % 50)), i);
+            t.add_file(&p(&host_owned(&format!("R:\\{}\\{long}{i:06}\\{long}.bin", i % 50))), i);
         }
         let text = encode(&Snapshot::of(&t, ID, 0, 1, LIMIT)).unwrap();
         assert!(text.len() <= LIMIT && text.len() > LIMIT - 1024 * 1024, "{}", text.len());
@@ -532,7 +548,7 @@ pub(crate) mod tests {
         assert_ne!(older.id, newer.id);
         store.0.save(&older).unwrap();
         let summary = store.0.save(&newer).unwrap();
-        assert_eq!(summary, Summary { id: newer.id.clone(), root_path: "R:\\".into(), started: 300, finished: 400, total_bytes: 8800, file_count: 4, unreadable_count: 1 });
+        assert_eq!(summary, Summary { id: newer.id.clone(), root_path: host("R:\\").into(), started: 300, finished: 400, total_bytes: 8800, file_count: 4, unreadable_count: 1 });
         let shelf = store.0.list();
         assert_eq!(shelf.entries.iter().map(|e| e.finished).collect::<Vec<_>>(), vec![400, 200]);
         assert_eq!((shelf.left_out, shelf.error), (0, None));
@@ -562,10 +578,10 @@ pub(crate) mod tests {
         let store = TempStore::new("inconsistent");
         let at = |s: &Snapshot, path: &str| s.folders.iter().position(|f| f.path == path).unwrap();
         let mut bytes = Snapshot::of(&sample(), &new_id(), 100, 200, LIMIT);
-        let big = at(&bytes, "R:\\big");
+        let big = at(&bytes, host("R:\\big"));
         bytes.folders[big].bytes = 100;
         let mut files = Snapshot::of(&sample(), &new_id(), 100, 200, LIMIT);
-        let big = at(&files, "R:\\big");
+        let big = at(&files, host("R:\\big"));
         files.folders[big].files = 0;
         for s in [&bytes, &files] {
             store.0.save(s).unwrap();
@@ -585,6 +601,34 @@ pub(crate) mod tests {
         assert_eq!(clear_text(1), "One saved scan will be removed. This cannot be undone.");
         store.0.clear().unwrap();
         assert_eq!(store.0.list(), Shelf::default());
+    }
+
+    #[test]
+    fn on_linux_the_history_saves_and_reloads_from_the_xdg_data_folder() {
+        use crate::app_folders::{resolve, Folder};
+        use crate::system::System;
+        let home = std::env::temp_dir().join(format!("mtm-disk-history-xdg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let env = |name: &str| (name == "XDG_DATA_HOME").then(|| home.clone().into_os_string());
+        let data = resolve(System::Linux, Folder::Data, &env);
+        let store = Store::in_data_folder(data).unwrap();
+        assert_eq!(store.dir, home.join("UltimatePCManager").join("DiskScans"));
+        let s = Snapshot::of(&sample(), &new_id(), 100, 200, LIMIT);
+        store.save(&s).unwrap();
+        assert_eq!(store.list().entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec![s.id.as_str()]);
+        assert_eq!(store.load(&s.id).unwrap(), s);
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(Store::in_data_folder(None).unwrap_err(), NO_FOLDER);
+    }
+
+    #[test]
+    fn the_setting_shows_the_default_history_folder_or_says_there_is_none() {
+        use std::path::PathBuf;
+        let shown = default_folder_in(Some(PathBuf::from("data")));
+        assert_eq!(PathBuf::from(shown), PathBuf::from("data").join("DiskScans"));
+        assert_eq!(default_folder_in(None), NO_FOLDER, "no data folder: no folder from another system is shown");
+        #[cfg(windows)]
+        assert_eq!(default_folder(), "%APPDATA%\\UltimatePCManager\\DiskScans");
     }
 
     #[test]
@@ -630,7 +674,7 @@ pub(crate) mod tests {
         assert_eq!(v["finished"], "1970-01-01T00:01:00");
         assert_eq!(v["categoryBytes"]["Media"], 8000);
         assert_eq!(v["categoryCounts"]["Documents"], 1);
-        assert_eq!(v["folders"][0], serde_json::json!({ "path": "R:\\", "bytes": 8800, "depth": 0, "files": 4, "unreadable": 1, "categoryBytes": { "Documents": 100, "Media": 8000, "Other": 700 }, "categoryCounts": { "Documents": 1, "Media": 2, "Other": 1 } }));
-        assert_eq!(v["files"][0], serde_json::json!({ "path": "R:\\big\\movie.mkv", "bytes": 5000, "category": "Media" }));
+        assert_eq!(v["folders"][0], serde_json::json!({ "path": host("R:\\"), "bytes": 8800, "depth": 0, "files": 4, "unreadable": 1, "categoryBytes": { "Documents": 100, "Media": 8000, "Other": 700 }, "categoryCounts": { "Documents": 1, "Media": 2, "Other": 1 } }));
+        assert_eq!(v["files"][0], serde_json::json!({ "path": host("R:\\big\\movie.mkv"), "bytes": 5000, "category": "Media" }));
     }
 }

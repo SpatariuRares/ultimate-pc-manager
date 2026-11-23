@@ -387,8 +387,8 @@ type Commands = Arc<Mutex<Vec<Command>>>;
 
 /// Where install logs go: %LOCALAPPDATA%\UltimatePCManager\package-manager\logs.
 fn default_logs() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join(crate::settings::DATA_FOLDER).join(ID).join("logs")
+    let app = crate::app_folders::cache().unwrap_or_else(|| std::env::temp_dir().join(crate::settings::DATA_FOLDER));
+    app.join(ID).join("logs")
 }
 
 /// Where the series' journals go: the add-on's folder beside the app's
@@ -398,14 +398,19 @@ fn default_journals() -> PathBuf {
     if cfg!(test) {
         return readiness::temp_output().with_extension("journal");
     }
-    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join(crate::settings::DATA_FOLDER).join(ID).join("journal")
+    let app = crate::app_folders::data().unwrap_or_else(|| std::env::temp_dir().join(crate::settings::DATA_FOLDER));
+    app.join(ID).join("journal")
 }
 
 /// The bundle folder when none was chosen: the user's Documents.
 fn default_bundle_folder() -> PathBuf {
-    let home = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    home.join("Documents")
+    bundle_folder_in(crate::app_folders::documents())
+}
+
+/// [`default_bundle_folder`] for the Documents folder `documents` (none: the
+/// system names no such folder, so a "Documents" folder in the temporary one).
+fn bundle_folder_in(documents: Option<PathBuf>) -> PathBuf {
+    documents.unwrap_or_else(|| std::env::temp_dir().join("Documents"))
 }
 
 /// A new log file in `logs` for `verb` ("install", "update", "uninstall")
@@ -1055,7 +1060,7 @@ impl Addon for PackageManager {
         "Install, update and remove programs from the winget catalogs."
     }
     fn requirements(&self) -> Requirements {
-        Requirements { admin: true, network: true, programs: &["winget (App Installer)", "PowerShell"], note: Some(NEEDS) }
+        Requirements { admin: true, network: true, programs: &["winget (App Installer)", "PowerShell"], note: Some(NEEDS), ..Requirements::default() }
     }
     fn consumption(&self) -> Consumption {
         Consumption { cpu: "Low", network: "While checking, searching or installing", disk: "While installing", when: "Only while its page is open or a job runs" }
@@ -1167,6 +1172,12 @@ mod tests {
     use crate::settings::Settings;
     use crate::test_ui::{drawn_text, page_text};
     use serde_json::json;
+
+    #[test]
+    fn the_bundle_folder_is_the_documents_folder_or_a_documents_folder_in_the_temporary_one() {
+        assert_eq!(bundle_folder_in(Some(PathBuf::from("docs"))), PathBuf::from("docs"));
+        assert_eq!(bundle_folder_in(None), std::env::temp_dir().join("Documents"));
+    }
 
     /// Runs one windowless egui frame with a page context.
     fn frame(mut f: impl FnMut(&mut egui::Ui, &mut PageContext)) {
@@ -2037,25 +2048,27 @@ VLC media player  VideoLAN.VLC  3.0.21   winget\n";
         let _ = std::fs::remove_dir_all(&logs);
     }
 
+    /// Turned off while its series waits: the queue freeing up afterwards
+    /// never starts an install. (The order is fixed: a release that comes
+    /// before the turn-off may legitimately start the install.)
     #[test]
     fn turned_off_as_the_queue_frees_up_its_series_never_installs() {
-        for n in 0..20 {
-            let logs = scratch(&format!("off-race{n}"));
-            let (mut host, runner, _view, commands) = host_with_logs(&logs);
-            let queue = host.context().install_queue().clone();
-            let held = queue.enter(drivers_request(), |_| {}).unwrap();
-            act(&mut host, &commands, Command::InstallAll(vec![pkg("A")]));
-            until("waiting", || queue.waiting() == 1);
-            let release = std::thread::spawn(move || drop(held));
-            host.set_enabled(ID, false);
-            release.join().unwrap();
-            until("off", || {
-                host.settle();
-                !host.is_stopping(ID)
-            });
-            assert!(installed_ids(&runner).is_empty(), "run {n}: it installed after being turned off");
-            let _ = std::fs::remove_dir_all(&logs);
-        }
+        let logs = scratch("off-race");
+        let (mut host, runner, _view, commands) = host_with_logs(&logs);
+        let queue = host.context().install_queue().clone();
+        let held = queue.enter(drivers_request(), |_| {}).unwrap();
+        act(&mut host, &commands, Command::InstallAll(vec![pkg("A")]));
+        until("waiting", || queue.waiting() == 1);
+        host.set_enabled(ID, false);
+        drop(held);
+        until("off", || {
+            host.settle();
+            !host.is_stopping(ID)
+        });
+        // Give a series that wrongly went on time to start its install.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(installed_ids(&runner).is_empty(), "it installed after being turned off");
+        let _ = std::fs::remove_dir_all(&logs);
     }
 
     #[test]

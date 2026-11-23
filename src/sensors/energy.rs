@@ -86,8 +86,7 @@ pub fn readings(channels: &[(String, f64)], cpu_name: &str, at: Instant) -> Vec<
 
 /// The Energy Meter provider. Built on its worker thread (holds a PDH query).
 pub struct EnergyMeter {
-    #[cfg(windows)]
-    query: Option<super::pdh::Query>,
+    counters: imp::Counters,
     name: String,
     /// The channels of the last read, in milliwatts (see [`Provider::counted`]).
     counted: Vec<CounterSet>,
@@ -96,8 +95,7 @@ pub struct EnergyMeter {
 impl EnergyMeter {
     pub fn new() -> Self {
         EnergyMeter {
-            #[cfg(windows)]
-            query: super::pdh::Query::open(&[(crate::perfdata::counter::POWER, r"\Energy Meter(*)\Power")]),
+            counters: imp::Counters::open(),
             name: super::cpu::cpu_name(),
             counted: Vec::new(),
         }
@@ -110,13 +108,7 @@ impl Provider for EnergyMeter {
     }
 
     fn availability(&mut self) -> Result<(), String> {
-        #[cfg(windows)]
-        return match self.query {
-            Some(_) => Ok(()),
-            None => Err("performance counters are off on this PC".into()),
-        };
-        #[cfg(not(windows))]
-        Err(crate::availability::unavailable_error(crate::availability::Feature::HardwareSensors))
+        self.counters.availability()
     }
 
     fn counted(&mut self) -> Vec<CounterSet> {
@@ -124,21 +116,26 @@ impl Provider for EnergyMeter {
     }
 
     fn read(&mut self, at: Instant) -> Vec<Reading> {
-        #[cfg(windows)]
-        let set = match self.query.as_mut() {
-            Some(q) => {
-                q.collect();
-                q.counted(crate::perfdata::counter::POWER, false)
-            }
-            None => CounterSet::new(crate::perfdata::counter::POWER, Vec::new()),
-        };
-        #[cfg(not(windows))]
-        let set = CounterSet::new(crate::perfdata::counter::POWER, Vec::new());
+        let set = self.counters.read();
         let channels: Vec<(String, f64)> = set.instances.iter().map(|i| (i.name.clone(), i.value)).collect();
         self.counted = vec![set];
         readings(&channels, &self.name, at)
     }
 }
+
+#[cfg(windows)]
+mod windows;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(windows)]
+use windows as imp;
+#[cfg(target_os = "linux")]
+use linux as imp;
+#[cfg(target_os = "macos")]
+use macos as imp;
 
 #[cfg(test)]
 mod tests {

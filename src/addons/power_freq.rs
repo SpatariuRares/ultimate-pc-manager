@@ -668,7 +668,7 @@ impl Addon for PowerFreq {
     /// Administrator only for some sensors (S.M.A.R.T., AMD's SDK); no
     /// internet; the hardware makers' libraries when they are installed.
     fn requirements(&self) -> Requirements {
-        Requirements { admin: true, network: false, programs: &[VENDOR_LIBRARIES], note: None }
+        Requirements { admin: true, network: false, programs: &[VENDOR_LIBRARIES], note: None, ..Requirements::default() }
     }
     fn consumption(&self) -> Consumption {
         Consumption { cpu: "Low", network: "None", disk: "None", when: "While its page or its Summary tile is shown, or while an alert is set" }

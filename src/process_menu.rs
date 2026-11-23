@@ -5,9 +5,10 @@
 use egui::{RichText, Ui};
 
 use crate::app::Action;
+use crate::availability::{is_available, Feature};
 use crate::page_processes::ProcView;
 use crate::sampler::ProcRow;
-use crate::winsys::{self, PRIORITIES};
+use crate::process_actions::{self, PRIORITIES};
 use crate::widgets::parts;
 
 /// One of the end items at the top of a process's menu.
@@ -115,6 +116,20 @@ pub enum MenuSlot {
     CopyName,
 }
 
+impl MenuSlot {
+    /// The system feature the item needs, if it needs one; an item whose
+    /// feature the system lacks is hidden.
+    fn feature(self) -> Option<Feature> {
+        match self {
+            MenuSlot::EfficiencyMode => Some(Feature::ProcessEfficiency),
+            MenuSlot::AnalyzeWaitChain => Some(Feature::ProcessWaitChain),
+            MenuSlot::UacVirtualization => Some(Feature::ProcessUacVirtualization),
+            MenuSlot::CreateDump => Some(Feature::ProcessDump),
+            _ => None,
+        }
+    }
+}
+
 /// A line of a process's menu layout: an item's place or a separator.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MenuLine {
@@ -214,7 +229,7 @@ pub struct MenuState<'a> {
     /// The processor affinity of the row right-clicked, ticked in Set
     /// affinity (read by [`process_menu`] when None; still None greys the
     /// item, as when the process cannot be opened).
-    pub affinity: Option<winsys::Affinity>,
+    pub affinity: Option<process_actions::Affinity>,
     /// Whether the row right-clicked has any visible top-level window
     /// (read by [`process_menu`] when None; still None reads as whether
     /// it is listed under Apps).
@@ -259,6 +274,9 @@ pub fn menu_entries(p: &ProcRow, rows: &[&ProcRow], state: &MenuState) -> Vec<Me
             }
             MenuLine::Item(slot) => *slot,
         };
+        if slot.feature().is_some_and(|f| !is_available(f)) {
+            continue;
+        }
         let entry = match slot {
             MenuSlot::Inspect if single => {
                 MenuEntry::Item { label: INSPECT.into(), bold: true, enabled: true, checked: None, actions: vec![Action::Inspect(p.pid)] }
@@ -378,12 +396,12 @@ pub fn menu_entries(p: &ProcRow, rows: &[&ProcRow], state: &MenuState) -> Vec<Me
 /// sends the mask with that processor toggled, or says [`AFFINITY_LAST`]
 /// instead of clearing the last one. Several processor groups give one
 /// greyed [`AFFINITY_GROUPS`]; an unread affinity greys the item.
-fn affinity_entry(pids: &[u32], read: Option<winsys::Affinity>) -> MenuEntry {
+fn affinity_entry(pids: &[u32], read: Option<process_actions::Affinity>) -> MenuEntry {
     let item = |label: String, enabled: bool, checked: Option<bool>, actions: Vec<Action>| MenuEntry::Item { label, bold: false, enabled, checked, actions };
     let items = match read {
         None => return item("Set affinity".into(), false, None, Vec::new()),
-        Some(winsys::Affinity::ManyGroups) => vec![item(AFFINITY_GROUPS.into(), false, None, Vec::new())],
-        Some(winsys::Affinity::Mask { process, system }) => {
+        Some(process_actions::Affinity::ManyGroups) => vec![item(AFFINITY_GROUPS.into(), false, None, Vec::new())],
+        Some(process_actions::Affinity::Mask { process, system }) => {
             let process = process & system;
             let mut items = vec![item(AFFINITY_ALL.into(), true, Some(process == system), vec![Action::Affinity(pids.to_vec(), system)]), MenuEntry::Separator];
             for n in (0..64).filter(|n| system & (1u64 << n) != 0) {

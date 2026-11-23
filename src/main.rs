@@ -1,6 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+compile_error!("supported systems: Windows, Linux, macOS");
+
+mod action_elevation;
 mod app;
+mod app_folders;
+mod system;
+mod system_info;
+mod fs_root;
+mod linux_facts;
 mod availability;
 mod core_page;
 mod page_summary;
@@ -34,12 +43,21 @@ mod summary_tiles;
 mod system_actions;
 mod signature;
 #[cfg(test)]
+mod test_paths;
+#[cfg(test)]
 mod test_ui;
 mod theme;
 mod version_info;
 mod wait_chain;
 mod widgets;
-mod winsys;
+mod file_description;
+mod long_path;
+mod process_actions;
+mod run_open;
+mod services;
+mod startup_entries;
+#[cfg(windows)]
+mod win_ffi;
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();

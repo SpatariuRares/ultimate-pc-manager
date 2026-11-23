@@ -65,7 +65,7 @@ impl DeviceDriver {
         }
     }
     pub fn inf_path(&self) -> String {
-        let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+        let windir = crate::app_folders::windows_dir().to_string_lossy().into_owned();
         format!(r"{windir}\INF\{}", self.inf)
     }
     /// True when Windows Update's hardware ID belongs to this device.
@@ -1903,7 +1903,7 @@ fn publish_check(st: &mut State, found: Result<Vec<DriverUpdate>, String>, by_ha
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addons::drivers::windows::WindowsListing;
+    use crate::addons::drivers::SystemListing;
     use crate::platform::Launch;
 
     #[test]
@@ -1944,7 +1944,7 @@ mod tests {
     #[test]
     fn checking_windows_update_runs_powershell_through_the_context() {
         let (ctx, runner) = AddonContext::recording();
-        let hub = Hub::new(ctx, Arc::new(WindowsListing));
+        let hub = Hub::new(ctx, Arc::new(SystemListing));
         hub.check_updates();
         wait_until_idle(&hub);
         assert_eq!(runner.launches(), vec![Launch::PowerShell { script: SEARCH_SCRIPT.into(), args: vec![], elevated: false }]);
@@ -1954,7 +1954,7 @@ mod tests {
     #[test]
     fn scanning_asks_for_an_elevated_powershell_through_the_context() {
         let (ctx, runner) = AddonContext::recording();
-        let hub = Hub::new(ctx, Arc::new(WindowsListing));
+        let hub = Hub::new(ctx, Arc::new(SystemListing));
         hub.scan();
         wait_until_idle(&hub);
         assert_eq!(
@@ -2730,7 +2730,7 @@ mod tests {
     #[test]
     #[ignore]
     fn the_rollback_arm_builds_its_assembly_and_opens_a_present_device_on_this_pc() {
-        let device = WindowsListing.devices().expect("devices listed").into_iter().find(|d| d.present && !d.instance_id.is_empty()).expect("a present device");
+        let device = SystemListing.devices().expect("devices listed").into_iter().find(|d| d.present && !d.instance_id.is_empty()).expect("a present device");
         let arm = TOOL_SCRIPT.split("'rollback-device' {").nth(1).and_then(|r| r.split("'stop' {").next()).expect("a rollback arm");
         let call = "elseif (-not $n::DiRollbackDriver($set, $data, [IntPtr]::Zero, 1, [ref]$reboot))";
         assert!(arm.contains(call), "the rollback call changed: update this test");
@@ -2757,8 +2757,8 @@ mod tests {
     #[test]
     #[ignore]
     fn lists_this_pc() {
-        let devices = WindowsListing.devices().expect("devices listed");
-        let kernel = WindowsListing.kernel().expect("driver services listed");
+        let devices = SystemListing.devices().expect("devices listed");
+        let kernel = SystemListing.kernel().expect("driver services listed");
         let present = devices.iter().filter(|d| d.present).count();
         println!("devices with a driver: {} ({} present)", devices.len(), present);
         for d in devices.iter().filter(|d| d.present && d.third_party()).take(12) {
@@ -2779,7 +2779,7 @@ mod tests {
     #[test]
     #[ignore]
     fn checks_windows_update() {
-        let devices = WindowsListing.devices().expect("devices listed");
+        let devices = SystemListing.devices().expect("devices listed");
         let v = AddonContext::system().powershell(SEARCH_SCRIPT, &[], false).expect("script ran");
         let mut list = parse_search(&v).expect("search ok");
         match_updates(&devices, &mut list);
@@ -3203,7 +3203,7 @@ mod listing_tests {
 #[cfg(test)]
 mod outcome_tests {
     use super::*;
-    use crate::addons::drivers::windows::WindowsListing;
+    use crate::addons::drivers::SystemListing;
     use crate::platform::ELEVATION_CANCELLED;
     use serde_json::json;
 
@@ -3366,7 +3366,7 @@ mod outcome_tests {
     fn the_page_tells_a_dismissed_prompt_apart_from_a_failed_install() {
         let (ctx, runner) = AddonContext::recording();
         runner.answer(ELEVATION_CANCELLED);
-        let hub = Hub::new(ctx, Arc::new(WindowsListing));
+        let hub = Hub::new(ctx, Arc::new(SystemListing));
         hub.install_inf(r"C:\drivers\x.inf".into());
         wait_until_idle(&hub);
         assert_eq!(hub.lock().message, Some((CANCELLED.to_string(), false)));
@@ -3459,7 +3459,7 @@ mod outcome_tests {
 mod security_tests {
     use super::*;
     use crate::addons::drivers::filters::{FilterDriver, FilterRead, NEEDS_ADMIN};
-    use crate::addons::drivers::windows::WindowsListing;
+    use crate::addons::drivers::SystemListing;
     use crate::addons::until;
     use std::sync::atomic::AtomicUsize;
 
@@ -3670,7 +3670,7 @@ mod security_tests {
     #[test]
     #[ignore]
     fn reads_the_loaded_filters_of_this_pc() {
-        let read = WindowsListing.filters();
+        let read = SystemListing.filters();
         println!("{read:?}");
         match read {
             FilterRead::Filters(list) => assert!(list.iter().any(|f| !f.name.is_empty() && f.altitude.parse::<f64>().is_ok()), "{list:?}"),
@@ -3722,7 +3722,7 @@ mod security_tests {
     #[test]
     #[ignore]
     fn reads_the_security_values_of_this_pc() {
-        let r = WindowsListing.security();
+        let r = SystemListing.security();
         println!("memory integrity: {:?} -> {:?}", r.memory_integrity, setting_of(&r.memory_integrity));
         println!("blocklist: {:?} -> {:?}", r.blocklist, setting_of(&r.blocklist));
         println!("{:?}", security_view(Some(&r)));
@@ -3862,7 +3862,7 @@ mod store_tests {
     fn reads_the_driver_store_of_this_pc() {
         use crate::addons::drivers::store::{classify, StoreFigures};
         let started = std::time::Instant::now();
-        let list = crate::addons::drivers::windows::WindowsListing.store().expect("the store is read with normal rights");
+        let list = crate::addons::drivers::SystemListing.store().expect("the store is read with normal rights");
         println!("{} packages in {:?}", list.len(), started.elapsed());
         let measured = list.iter().filter(|p| p.size.is_some()).count();
         println!("{measured} with a size");

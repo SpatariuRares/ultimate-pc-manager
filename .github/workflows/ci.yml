@@ -1,15 +1,21 @@
 name: CI
 
-# Kept minimal to use few Actions minutes: pull requests only, code changes
-# only, one job that compiles once (cargo test) and nothing else.
+# Builds and tests the app on Windows, Linux and macOS (Apple Silicon) with the
+# toolchain pinned in rust-toolchain.toml. Pull requests run only for code
+# changes; pushes to main always run.
 on:
   pull_request:
     paths:
       - 'src/**'
       - 'assets/**'
+      - 'tests/**'
+      - 'build.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'rust-toolchain.toml'
       - '.github/workflows/ci.yml'
+  push:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -18,11 +24,26 @@ concurrency:
 
 jobs:
   test:
-    runs-on: windows-latest
-    timeout-minutes: 30
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the pinned toolchain
+        shell: bash
+        run: rustup toolchain install && rustc --version
+      - name: Install GUI build packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev libegl1-mesa-dev \
+            libfontconfig1-dev libssl-dev libudev-dev libdbus-1-dev procps
       - uses: Swatinem/rust-cache@v2
       # Tests that read the real PC are #[ignore] and are skipped.
       - run: cargo test --release --locked

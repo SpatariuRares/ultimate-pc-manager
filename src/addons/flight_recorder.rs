@@ -1536,7 +1536,7 @@ mod tests {
         assert!(fr.exportable().is_none(), "no trace kept");
         fr.start(&AddonContext::recording().0);
         assert_eq!(fr.settings(), before, "its settings are back");
-        assert_eq!(before["replayFolder"], serde_json::json!(std::env::temp_dir().to_string_lossy().trim_end_matches('\\')));
+        assert_eq!(before["replayFolder"], serde_json::json!(std::env::temp_dir().to_string_lossy().trim_end_matches(['\\', '/'])));
     }
 
     #[test]

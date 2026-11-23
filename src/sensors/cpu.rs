@@ -5,7 +5,7 @@
 //! same query: `% Performance Limit` and `Performance Limit Flags`, and so
 //! does the Idle states group: `% C1 Time`, `% C2 Time`, `% C3 Time`.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::model::{CounterSet, Device, Group, Reading, Unit};
 use super::provider::Provider;
@@ -181,20 +181,13 @@ impl CpuSample {
     }
 }
 
-/// Rate counters need this much time between two collections.
-#[cfg_attr(not(windows), allow(dead_code))]
-const MIN_SPAN: Duration = Duration::from_millis(200);
 
 /// The CPU provider. Built on its worker thread (holds a PDH query).
 pub struct CpuCounters {
-    #[cfg(windows)]
-    query: Option<super::pdh::Query>,
-    #[cfg(windows)]
-    collected: Instant,
+    counters: imp::Counters,
     name: String,
     /// The processor's rated clock in MHz (0 if unknown): the first of the
     /// base clock's sources.
-    #[cfg_attr(not(windows), allow(dead_code))]
     machine_mhz: u32,
     /// What the last read counted (see [`Provider::counted`]).
     counted: Vec<CounterSet>,
@@ -209,72 +202,17 @@ impl CpuCounters {
     pub fn with_base_mhz(machine_mhz: u32) -> Self {
         CpuCounters {
             machine_mhz,
-            #[cfg(windows)]
-            query: super::pdh::Query::open(&[
-                ("perf", r"\Processor Information(*)\% Processor Performance"),
-                ("freq", r"\Processor Information(*)\Processor Frequency"),
-                ("park", r"\Processor Information(*)\Parking Status"),
-                ("util", r"\Processor Information(*)\% Processor Utility"),
-                ("limit", r"\Processor Information(*)\% Performance Limit"),
-                ("flags", r"\Processor Information(*)\Performance Limit Flags"),
-                ("c1", r"\Processor Information(*)\% C1 Time"),
-                ("c2", r"\Processor Information(*)\% C2 Time"),
-                ("c3", r"\Processor Information(*)\% C3 Time"),
-            ]),
-            #[cfg(windows)]
-            collected: Instant::now(),
-            name: cpu_name(),
+            counters: imp::Counters::open(),
+            name: imp::cpu_name(),
             counted: Vec::new(),
         }
     }
 
     /// The base clock in MHz: the machine's rated clock, else the counter's,
     /// else the power API's maximum (the one order, see `metrics`).
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[allow(dead_code)] // the Windows reader and the tests use it
     fn base_clock(machine_mhz: u32, counter: Option<f64>, power_max: Option<f64>) -> Option<f64> {
         crate::metrics::base_clock_mhz(Some(machine_mhz as f64), counter, power_max)
-    }
-
-    #[cfg(windows)]
-    fn sample(&mut self) -> CpuSample {
-        let mut s = CpuSample { name: self.name.clone(), ..Default::default() };
-        let power = processor_power();
-        s.cores = power.iter().map(|&(max, cur)| CoreSample { current_mhz: Some(cur), max_mhz: Some(max), ..Default::default() }).collect();
-        let machine_mhz = self.machine_mhz;
-        let Some(q) = self.query.as_mut() else { return s };
-        let wait = MIN_SPAN.saturating_sub(self.collected.elapsed());
-        if !wait.is_zero() {
-            std::thread::sleep(wait);
-        }
-        q.collect();
-        self.collected = Instant::now();
-        // The performance level is also reported as counted (the core pages
-        // read it from the frame), once.
-        let perf = q.counted(crate::perfdata::counter::PERF, false);
-        let total = |key: &str| q.values(key).into_iter().find(|(n, _)| n == "_Total").map(|(_, v)| v);
-        s.base_mhz = Self::base_clock(machine_mhz, total("freq"), power.first().map(|p| p.0));
-        s.performance_percent = perf.instance("_Total").map(|i| i.value);
-        self.counted = vec![perf];
-        s.utilization_percent = total("util");
-        for (key, set) in [
-            ("park", (|c: &mut CoreSample, v: f64| c.parked = Some(v != 0.0)) as fn(&mut CoreSample, f64)),
-            ("util", |c, v| c.utilization_percent = Some(v)),
-            ("limit", |c, v| c.performance_limit_percent = Some(v)),
-            ("flags", |c, v| c.limit_flags = Some(v as u32)),
-            ("c1", |c, v| c.c1_percent = Some(v)),
-            ("c2", |c, v| c.c2_percent = Some(v)),
-            ("c3", |c, v| c.c3_percent = Some(v)),
-        ] {
-            for (inst, v) in q.values(key) {
-                if let Some(i) = logical_index(&inst) {
-                    if s.cores.len() <= i {
-                        s.cores.resize(i + 1, CoreSample::default());
-                    }
-                    set(&mut s.cores[i], v);
-                }
-            }
-        }
-        s
     }
 }
 
@@ -284,13 +222,7 @@ impl Provider for CpuCounters {
     }
 
     fn availability(&mut self) -> Result<(), String> {
-        #[cfg(windows)]
-        return match self.query {
-            Some(_) => Ok(()),
-            None => Err("performance counters are off on this PC".into()),
-        };
-        #[cfg(not(windows))]
-        Err(crate::availability::unavailable_error(crate::availability::Feature::HardwareSensors))
+        self.counters.availability()
     }
 
     fn counted(&mut self) -> Vec<CounterSet> {
@@ -298,10 +230,7 @@ impl Provider for CpuCounters {
     }
 
     fn read(&mut self, at: Instant) -> Vec<Reading> {
-        #[cfg(windows)]
-        return self.sample().readings(at);
-        #[cfg(not(windows))]
-        CpuSample { name: self.name.clone(), ..Default::default() }.readings(at)
+        self.counters.sample(&self.name, self.machine_mhz, &mut self.counted).readings(at)
     }
 }
 
@@ -332,33 +261,22 @@ pub fn made_up() -> super::provider::Factory {
 
 /// The processor's marketing name, from the registry.
 pub(super) fn cpu_name() -> String {
-    #[cfg(windows)]
-    {
-        use winreg::enums::HKEY_LOCAL_MACHINE;
-        let key = winreg::RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0");
-        if let Ok(name) = key.and_then(|k| k.get_value::<String, _>("ProcessorNameString")) {
-            return name.trim().to_string();
-        }
-    }
-    String::new()
+    imp::cpu_name()
 }
 
-/// (MaximumMhz, CurrentMhz) of every logical processor.
 #[cfg(windows)]
-fn processor_power() -> Vec<(f64, f64)> {
-    use windows_sys::Win32::System::Power::{CallNtPowerInformation, ProcessorInformation, PROCESSOR_POWER_INFORMATION};
-    use windows_sys::Win32::System::Threading::{GetActiveProcessorCount, ALL_PROCESSOR_GROUPS};
-    // SAFETY: the buffer holds `n` entries and its size is passed.
-    unsafe {
-        let n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) as usize;
-        let mut buf: Vec<PROCESSOR_POWER_INFORMATION> = vec![std::mem::zeroed(); n];
-        let size = (n * std::mem::size_of::<PROCESSOR_POWER_INFORMATION>()) as u32;
-        if CallNtPowerInformation(ProcessorInformation, std::ptr::null(), 0, buf.as_mut_ptr().cast(), size) != 0 {
-            return Vec::new();
-        }
-        buf.iter().map(|p| (p.MaxMhz as f64, p.CurrentMhz as f64)).collect()
-    }
-}
+mod windows;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(windows)]
+use windows as imp;
+#[cfg(target_os = "linux")]
+use linux as imp;
+#[cfg(target_os = "macos")]
+use macos as imp;
 
 #[cfg(test)]
 mod tests {

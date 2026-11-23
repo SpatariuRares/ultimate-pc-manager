@@ -166,7 +166,7 @@ A good test checks the behavior visible from outside (which value, which text, w
 - Overclocking, fan curves, LED control.
 - Export or logging of the sensors (belongs to Flight Recorder).
 - Permanent graphs. Pinning sensors to the Summary tile is now in scope (#193, see "Pinned sensors" above).
-- The macOS "Apple Silicon" version of the page (ANE, SoC-only power): the app is Windows only.
+- The macOS "Apple Silicon" version of the page (ANE, SoC-only power) and the Linux version: this page describes the Windows version; the other supported systems get their own native readings in later specs.
 - Redistributing the AMD Ryzen Master SDK: the user installs it from AMD.
 
 ## Further Notes

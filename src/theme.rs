@@ -244,36 +244,66 @@ fn visuals(t: &Theme) -> egui::Visuals {
     v
 }
 
-/// Installs the theme's faces: Segoe UI for text and Segoe UI Semibold for
-/// band headlines, both read from Windows (not bundled), and Michroma, a
-/// wide display face (SIL Open Font License, see assets/), for
-/// titles and figures.
+/// Installs the theme's faces: on Windows Segoe UI for text and Segoe UI
+/// Semibold for band headlines, both read from the system (not bundled); on
+/// Linux and macOS the bundled Selawik (SIL Open Font License, see assets/),
+/// which has Segoe UI's metrics, so labels take the same space everywhere.
+/// Michroma, a wide display face (same licence), draws titles and figures.
 ///
-/// Fallback: without Segoe UI Semibold the band face is Segoe UI (headlines
-/// lose their weight, not their size); without Segoe UI every face uses
-/// egui's default fonts after its own first choice.
+/// Fallback: without the semibold file the band face is the body face
+/// (headlines lose their weight, not their size); without the body file every
+/// face uses egui's default fonts after its own first choice.
 pub fn install_fonts(ctx: &egui::Context) {
-    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
-    let fonts = std::path::Path::new(&windir).join("Fonts");
-    let read = |file: &str| std::fs::read(fonts.join(file)).ok();
-    ctx.set_fonts(font_definitions(read("segoeui.ttf"), read("seguisb.ttf")));
+    let fonts = crate::app_folders::windows_dir().join("Fonts");
+    ctx.set_fonts(installed_fonts(|file| std::fs::read(fonts.join(file)).ok()));
+}
+
+/// The font set for this system: elsewhere than Windows the bundled
+/// Selawik, on Windows Segoe UI read through `read`.
+fn installed_fonts(read: impl Fn(&str) -> Option<Vec<u8>>) -> egui::FontDefinitions {
+    match bundled_body() {
+        Some((regular, semibold)) => font_definitions_named("selawik", Some(regular), Some(semibold)),
+        None => font_definitions(read("segoeui.ttf"), read("seguisb.ttf")),
+    }
+}
+
+/// The bundled body faces (regular, semibold); only off Windows, so the
+/// Windows binary does not carry them.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bundled_body() -> Option<(Vec<u8>, Vec<u8>)> {
+    Some((
+        include_bytes!("../assets/Selawik-Regular.ttf").to_vec(),
+        include_bytes!("../assets/Selawik-Semibold.ttf").to_vec(),
+    ))
+}
+
+#[cfg(windows)]
+fn bundled_body() -> Option<(Vec<u8>, Vec<u8>)> {
+    None
 }
 
 /// The font set from the Segoe UI and Segoe UI Semibold files, if found.
 fn font_definitions(segoe: Option<Vec<u8>>, segoe_semibold: Option<Vec<u8>>) -> egui::FontDefinitions {
+    font_definitions_named("segoe", segoe, segoe_semibold)
+}
+
+/// The font set from a body face and its semibold (named `<name>` and
+/// `<name>-semibold`), if given.
+fn font_definitions_named(name: &str, body: Option<Vec<u8>>, semibold_file: Option<Vec<u8>>) -> egui::FontDefinitions {
     use std::sync::Arc;
     let mut fonts = egui::FontDefinitions::default();
-    if let Some(bytes) = segoe {
-        fonts.font_data.insert("segoe".into(), Arc::new(egui::FontData::from_owned(bytes)));
+    if let Some(bytes) = body {
+        fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
         if let Some(f) = fonts.families.get_mut(&FontFamily::Proportional) {
-            f.insert(0, "segoe".into());
+            f.insert(0, name.into());
         }
     }
     let proportional = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     let mut band = Vec::new();
-    if let Some(bytes) = segoe_semibold {
-        fonts.font_data.insert("segoe-semibold".into(), Arc::new(egui::FontData::from_owned(bytes)));
-        band.push("segoe-semibold".to_string());
+    if let Some(bytes) = semibold_file {
+        let semi = format!("{name}-semibold");
+        fonts.font_data.insert(semi.clone(), Arc::new(egui::FontData::from_owned(bytes)));
+        band.push(semi);
     }
     band.extend(proportional.iter().cloned());
     fonts.families.insert(semibold(), band);
@@ -295,7 +325,8 @@ pub fn display() -> FontFamily {
     FontFamily::Name("display".into())
 }
 
-/// The face of band headlines (Segoe UI Semibold, or Segoe UI if missing).
+/// The face of band headlines (Segoe UI Semibold, or Selawik Semibold off
+/// Windows; the body face if missing).
 pub fn semibold() -> FontFamily {
     FontFamily::Name("semibold".into())
 }
@@ -735,6 +766,55 @@ mod tests {
         assert!(!proportional.is_empty() && !proportional.contains(&"segoe".to_string()));
         assert_eq!(family(&f, semibold()), proportional);
         assert_eq!(family(&f, display())[0], "michroma");
+    }
+
+    #[test]
+    fn selawik_is_the_body_face_off_windows_and_segoe_on_windows() {
+        let f = installed_fonts(|_| Some(vec![1]));
+        #[cfg(windows)]
+        let (body, semi) = ("segoe", "segoe-semibold");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let (body, semi) = ("selawik", "selawik-semibold");
+        assert_eq!(family(&f, FontFamily::Proportional)[0], body);
+        assert_eq!(family(&f, semibold())[0], semi);
+        assert_eq!(family(&f, display())[0], "michroma");
+    }
+
+    #[test]
+    fn the_selawik_face_has_a_regular_and_a_semibold_file() {
+        let f = font_definitions_named("selawik", Some(vec![1]), Some(vec![2]));
+        assert_eq!(family(&f, FontFamily::Proportional)[0], "selawik");
+        assert_eq!(family(&f, semibold())[0], "selawik-semibold");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_bundled_selawik_files_are_truetype_fonts() {
+        let (regular, semibold) = bundled_body().expect("bundled off Windows");
+        for bytes in [regular, semibold] {
+            assert_eq!(&bytes[..4], &[0, 1, 0, 0], "a TrueType file starts with version 1.0");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_bundled_selawik_files_parse_as_fonts_that_lay_out_text() {
+        let (regular_file, semibold_file) = bundled_body().expect("bundled off Windows");
+        let ctx = egui::Context::default();
+        ctx.set_fonts(font_definitions_named("selawik", Some(regular_file), Some(semibold_file)));
+        let mut widths = Vec::new();
+        // The fonts apply from the frame after they are set.
+        for _ in 0..2 {
+            widths.clear();
+            crate::test_ui::run(&ctx, (400.0, 200.0), vec![], |ui| {
+                for family in [FontFamily::Proportional, semibold()] {
+                    let galley = ui.painter().layout_no_wrap("Hamburgefonts".to_string(), egui::FontId::new(16.0, family), egui::Color32::WHITE);
+                    widths.push(galley.size().x);
+                }
+            });
+        }
+        assert!(widths.iter().all(|w| *w > 20.0), "text laid out with the bundled faces has a width: {widths:?}");
+        assert_ne!(widths[0], widths[1], "the semibold face is another font file");
     }
 
     fn args(list: &[&str]) -> Vec<String> {

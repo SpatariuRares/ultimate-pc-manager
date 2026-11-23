@@ -845,7 +845,7 @@ impl ProcessesPage {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                done.push(Err(crate::winsys::DUMP_FAILED.to_string()));
+                done.push(Err(crate::process_actions::DUMP_FAILED.to_string()));
                 false
             }
         });
@@ -1000,6 +1000,20 @@ pub const PROC_COLUMNS: [ProcColumn; 19] = [
     addition(ProcCol::Description, "description", "Description", 160.0),
 ];
 
+/// The system feature a standard column needs, if it needs one; a column
+/// whose feature the system lacks is not offered at all.
+fn column_feature(col: ProcCol) -> Option<crate::availability::Feature> {
+    use crate::availability::Feature;
+    match col {
+        ProcCol::Gpu => Some(Feature::ProcessGpuUsage),
+        ProcCol::Handles => Some(Feature::ProcessHandleCounts),
+        ProcCol::Arch => Some(Feature::ProcessArchitecture),
+        ProcCol::Publisher => Some(Feature::FileSignatures),
+        ProcCol::Description => Some(Feature::FileVersionInfo),
+        _ => None,
+    }
+}
+
 /// The narrowest a column can be dragged.
 const MIN_COLUMN_WIDTH: f32 = 40.0;
 
@@ -1027,6 +1041,7 @@ const ADDON_COLUMN_WIDTH: f32 = 90.0;
 pub fn columns_with(addons: &[(&'static str, crate::addons::ProcessColumn)]) -> Vec<ProcColumn> {
     PROC_COLUMNS
         .iter()
+        .filter(|c| column_feature(c.col).is_none_or(crate::availability::is_available))
         .map(|c| ProcColumn { ..*c })
         .chain(addons.iter().map(|(id, c)| ProcColumn { col: ProcCol::Addon(id), key: id, title: c.title, width: ADDON_COLUMN_WIDTH, hidden: true }))
         .collect()
@@ -2415,6 +2430,61 @@ pub(crate) mod tests {
         assert_eq!(labels(&menu_entries(&p, &[&p], &no_view_state(&view))), ["Inspect", "", "Open file location", "Search online", "Copy process name"]);
     }
 
+    const WINDOWS_ONLY_ITEMS: [&str; 4] = ["Efficiency mode", "Analyze wait chain", "UAC virtualization", "Create memory dump file"];
+    const WINDOWS_ONLY_COLUMNS: [&str; 5] = ["GPU", "Handles", "Architecture", "Publisher", "Description"];
+
+    fn windows_only_features() -> Vec<crate::availability::Feature> {
+        use crate::availability::Feature::*;
+        vec![ProcessEfficiency, ProcessWaitChain, ProcessUacVirtualization, ProcessDump, ProcessGpuUsage, ProcessHandleCounts, ProcessArchitecture, FileSignatures, FileVersionInfo]
+    }
+
+    #[test]
+    fn without_the_windows_only_features_their_menu_items_are_hidden_and_the_rest_stays() {
+        let app = Shown::headless(crate::settings::Settings::default(), tree_sample());
+        let view = process_view_items(&app.settings);
+        let mut p = proc(7, "Code.exe", "spata", 0.0, 0);
+        p.exe = "C:/Code/Code.exe".into();
+        let entries = menu_entries(&p, &[&p], &no_view_state(&view));
+        let with = labels(&entries);
+        assert!(WINDOWS_ONLY_ITEMS.iter().all(|i| with.contains(i)), "available: every item shows, as before");
+        let _unavailable = crate::availability::unavailable_in_test(&windows_only_features());
+        let entries = menu_entries(&p, &[&p], &no_view_state(&view));
+        let without = labels(&entries);
+        assert!(WINDOWS_ONLY_ITEMS.iter().all(|i| !without.contains(i)), "{without:?}");
+        assert_eq!(
+            without,
+            [
+                "Inspect", "", "End task", "Force quit", "End process tree", "Force quit process tree", "", "Suspend", "Resume", "", "View", "Follow process", "",
+                "Resource values", "", "Set priority", "Set affinity", "File activity", "", "Go to service(s)", "Bring to front", "Open file location",
+                "Search online", "Copy process name",
+            ],
+            "hidden, not greyed, and no separator doubles"
+        );
+        let q = proc(8, "node.exe", "spata", 0.0, 0);
+        let entries = menu_entries(&p, &[&p, &q], &no_view_state(&view));
+        let many = labels(&entries);
+        assert!(many.iter().all(|l| !l.starts_with("Efficiency mode") && *l != "UAC virtualization" && *l != "Analyze wait chain"), "{many:?}");
+    }
+
+    #[test]
+    fn without_the_windows_only_features_their_columns_are_hidden_and_the_others_stay() {
+        let mut app = Shown::headless(crate::settings::Settings::default(), disk_sample());
+        for c in WINDOWS_ONLY_COLUMNS {
+            let col = PROC_COLUMNS.iter().find(|x| x.title == c).unwrap().col;
+            set_column_shown(&mut app.settings.process_table, col, true);
+        }
+        let with = headings_drawn(&mut app);
+        assert!(WINDOWS_ONLY_COLUMNS.iter().all(|c| with.iter().any(|t| t == c)), "available: shown, as before");
+        let _unavailable = crate::availability::unavailable_in_test(&windows_only_features());
+        let without = headings_drawn(&mut app);
+        let expected: Vec<&String> = with.iter().filter(|t| !WINDOWS_ONLY_COLUMNS.contains(&t.as_str())).collect();
+        assert_eq!(without.iter().collect::<Vec<_>>(), expected, "only the Windows-only columns go");
+        let cols = columns_with(&[]);
+        let choices = column_choices_in(&cols, &app.settings.process_table);
+        assert!(choices.iter().all(|c| !WINDOWS_ONLY_COLUMNS.contains(&c.title)), "nor a line in the chooser");
+        assert!(app.settings.process_table.column_order.iter().any(|k| k == "handles"), "the saved slot is kept");
+    }
+
     #[test]
     fn analyze_wait_chain_analyses_the_right_clicked_process_with_one_or_several_rows() {
         let app = Shown::headless(crate::settings::Settings::default(), tree_sample());
@@ -2644,7 +2714,7 @@ pub(crate) mod tests {
     }
 
     /// Code.exe's Set affinity submenu read as `affinity`.
-    fn affinity_menu(affinity: Option<crate::winsys::Affinity>, rows: usize) -> Vec<MenuEntry> {
+    fn affinity_menu(affinity: Option<crate::process_actions::Affinity>, rows: usize) -> Vec<MenuEntry> {
         let p = proc(7, "Code.exe", "spata", 0.0, 0);
         let q = proc(8, "node.exe", "spata", 0.0, 0);
         let state = MenuState { affinity, ..no_view_state(&[]) };
@@ -2658,7 +2728,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_process_menu_reads_priority_affinity_and_window_through_the_seam() {
-        use crate::winsys::Affinity;
+        use crate::process_actions::Affinity;
         let app = Shown::headless(crate::settings::Settings::default(), tree_sample());
         let seam = app.system.clone();
         let (p, q) = (proc(4_000_000_001, "a.exe", "spata", 0.0, 0), proc(4_000_000_002, "b.exe", "spata", 0.0, 0));
@@ -2691,7 +2761,7 @@ pub(crate) mod tests {
 
     #[test]
     fn set_affinity_lists_every_logical_cpu_ticked_from_the_mask() {
-        use crate::winsys::Affinity;
+        use crate::process_actions::Affinity;
         // Four logical processors, the process on CPU 0 and CPU 2.
         let sub = affinity_menu(Some(Affinity::Mask { process: 0b0101, system: 0b1111 }), 1);
         assert_eq!(labels(&sub), ["All processors", "", "CPU 0", "CPU 1", "CPU 2", "CPU 3"]);
@@ -2718,13 +2788,13 @@ pub(crate) mod tests {
 
     #[test]
     fn clearing_the_last_cpu_is_refused_with_the_message() {
-        let sub = affinity_menu(Some(crate::winsys::Affinity::Mask { process: 0b0100, system: 0b1111 }), 1);
+        let sub = affinity_menu(Some(crate::process_actions::Affinity::Mask { process: 0b0100, system: 0b1111 }), 1);
         assert_eq!(menu_item(&sub, "CPU 2"), (true, vec![Action::Say("At least one processor must remain selected.".into())]));
     }
 
     #[test]
     fn set_affinity_is_greyed_for_several_processor_groups_and_for_a_process_it_cannot_open() {
-        let sub = affinity_menu(Some(crate::winsys::Affinity::ManyGroups), 1);
+        let sub = affinity_menu(Some(crate::process_actions::Affinity::ManyGroups), 1);
         assert_eq!(labels(&sub), ["Unavailable for this processor-group topology"]);
         assert_eq!(menu_item(&sub, "Unavailable for this processor-group topology"), (false, vec![]));
         let item = affinity_menu(None, 1);
@@ -2981,6 +3051,8 @@ pub(crate) mod tests {
         assert!(in_column("3", "many.exe") && in_column("1", "one.exe") && in_column("0", "none.exe"), "{spots:?}");
     }
 
+    // Windows only: signatures and version resources of an executable.
+    #[cfg(windows)]
     #[test]
     fn publisher_and_description_are_hidden_until_chosen_then_show_the_programs_signer_and_description() {
         // The test's own executable: build.rs gives it a description, and

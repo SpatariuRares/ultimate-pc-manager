@@ -9,7 +9,7 @@ If you find the app useful, you can support its development on
 [Buy me a coffee](https://buymeacoffee.com/spatariurares). Settings has a
 **GitHub** button (the repository) and a **Buy me a coffee** button too.
 
-Task manager for Windows written in Rust with [egui](https://github.com/emilk/egui).
+Task manager for Windows, Linux and macOS written in Rust with [egui](https://github.com/emilk/egui).
 It includes the Summary, Performance, Processes, System Info, App history,
 Startup apps, Users, Services, Power & Freq, Flight Recorder, Connections,
 Installed Apps, Drivers, Disk Space, Benchmarks, Package Manager, Settings and
@@ -27,15 +27,34 @@ The brand assets (icon, symbol, wordmarks, banner and palette) are in
 Space Grotesk (SIL Open Font License, `assets/brand/OFL-SpaceGrotesk.txt`); the
 app draws the wordmark from PNG files and does not load the font.
 
+## Supported systems
+
+- **Windows 11** (x86_64; ARM64 best effort).
+- **Linux** with glibc 2.17+ and kernel 3.10+, on Wayland and X11 (ARM best
+  effort; musl is not supported).
+- **macOS 13+** on Apple Silicon.
+
+Building on any other system stops with "supported systems: Windows, Linux,
+macOS". The decision is recorded in [ADR 0001](docs/adr/0001-three-supported-systems.md).
+Some pages do not have native data on Linux and macOS yet; the app lists only
+what works on the system it runs on.
+
 ## Requirements
 
-- **Windows 10 or 11, 64-bit.** The pages read Windows data (registry,
-  performance counters, services, drivers); it is the only supported system.
-- **Stable Rust with the MSVC toolchain**, installed with [rustup](https://rustup.rs).
-  Tested with Rust 1.96.0 (`stable-x86_64-pc-windows-msvc`).
-- **Visual Studio Build Tools** with the *Desktop development with C++*
+- **Stable Rust**, installed with [rustup](https://rustup.rs). Tested with
+  Rust 1.96.0.
+- **Windows:** the MSVC toolchain (`stable-x86_64-pc-windows-msvc`) and
+  **Visual Studio Build Tools** with the *Desktop development with C++*
   workload: this provides the MSVC linker and the Windows SDK. The rustup
   installer offers it if it is missing.
+- **Linux:** the system packages the GUI build needs. On Debian and Ubuntu:
+
+  ```bash
+  sudo apt install pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+    libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev libfontconfig1-dev
+  ```
+
+- **macOS:** Rust only; no extra tools or Windows SDK are needed.
 
 Optional, only for some features:
 
@@ -51,7 +70,10 @@ Optional, only for some features:
 cargo build --release
 ```
 
-The executable is `target\release\ultimate-pc-manager.exe`. The first build downloads
+On Linux and macOS the command is the same and the executable is
+`target/release/ultimate-pc-manager`.
+
+On Windows the executable is `target\release\ultimate-pc-manager.exe`. The first build downloads
 the dependencies and takes a few minutes; later builds are incremental.
 
 The debug build (`cargo build`) also opens a console window, useful for reading
@@ -128,15 +150,15 @@ $env:APPS_DUMP = "$env:TEMP\apps.json"; cargo test --release apps::tests::lists_
 
 ## CI/CD
 
-GitHub Actions on `windows-latest` (the app only builds with MSVC), kept to a
-minimum of runner minutes:
+GitHub Actions on Windows, Linux and macOS (Apple Silicon), with the Rust
+compiler pinned in `rust-toolchain.toml`:
 
 | Workflow | When | What it does |
 |---|---|---|
-| `.github/workflows/ci.yml` | pull requests that change `src/`, `assets/`, `Cargo.toml`/`Cargo.lock` or the workflow; manual | `cargo test --release` only (tests that read the real PC are `#[ignore]` and skipped). Doc-only changes and pushes to `main` do not run it. |
-| `.github/workflows/release.yml` | push of a `v*` tag | `cargo build --release` and a GitHub Release with `UltimatePCManager.zip` (`Ultimate PC Manager.exe`, README, font license). |
+| `.github/workflows/ci.yml` | pull requests that change `src/`, `assets/`, `tests/`, `build.rs`, `Cargo.toml`/`Cargo.lock`, `rust-toolchain.toml` or the workflow; every push to `main`; manual | `cargo test --release --locked` on `windows-latest`, `ubuntu-latest` and `macos-latest` (tests that read the real PC are `#[ignore]` and skipped; Linux installs the GUI build packages first). Doc-only pull requests do not run it. |
+| `.github/workflows/release.yml` | push of a `v*` tag; manual (builds the files, publishes nothing) | One release build per system, no tests, published as one GitHub Release: `UltimatePCManager.zip` (Windows: `Ultimate PC Manager.exe`, README, font licenses), `UltimatePCManager-x86_64.AppImage` and `UltimatePCManager-linux-x86_64.tar.gz` (Linux, built with zig against glibc 2.17 and checked for the newest glibc symbol it needs). |
 
-Both have a 30-minute timeout and reuse the Cargo cache. To publish a version:
+CI has a 45-minute timeout per system; the release has 30 minutes for the Windows job and 45 for the Linux job. Both reuse the Cargo cache and the toolchain pinned in `rust-toolchain.toml`. To publish a version:
 
 ```powershell
 git tag v0.2.0
@@ -152,6 +174,17 @@ git push origin v0.2.0
 | `%LOCALAPPDATA%\UltimatePCManager\jobs\` | Temporary PowerShell scripts for Windows Update, pnputil and the Store app list. They are deleted when the job finishes. |
 | `<test folder>\.ultimate-pc-manager-disk-benchmark-<pid>` | Hidden 256 MB file used by the disk benchmark (by default in the temporary folder). It is deleted at the end of the test; files left behind by an interrupted run are deleted at the next test. |
 | `Documents\flight-recording-*.csv` | Flight Recorder recordings saved by the user. |
+
+The folders above are Windows ones. On Linux and macOS the app keeps the same
+files in the system's own folders (`src/app_folders.rs` is the one place that
+names them):
+
+| What | Windows | Linux | macOS |
+|---|---|---|---|
+| Settings | `%APPDATA%\UltimatePCManager` | `$XDG_CONFIG_HOME/UltimatePCManager`, else `~/.config/UltimatePCManager` | `~/Library/Application Support/UltimatePCManager` |
+| Saved data (histories, journals) | `%APPDATA%\UltimatePCManager` | `$XDG_DATA_HOME/UltimatePCManager`, else `~/.local/share/UltimatePCManager` | `~/Library/Application Support/UltimatePCManager` |
+| Logs and scratch files | `%LOCALAPPDATA%\UltimatePCManager` | `$XDG_CACHE_HOME/UltimatePCManager`, else `~/.cache/UltimatePCManager` | `~/Library/Caches/UltimatePCManager` |
+| Documents (recordings, bundles) | `%USERPROFILE%\Documents` | `$XDG_DOCUMENTS_DIR`, else `~/Documents` | `~/Documents` |
 
 ## Code structure
 
@@ -180,6 +213,7 @@ git push origin v0.2.0
 | `src/page_services.rs`, `src/page_startup.rs`, `src/page_history.rs`, `src/list_pages.rs` | Services, Startup apps, App history, and what the three share (`list_pages.rs`). |
 | `src/addons.rs`, `src/addons/` | Add-on registry and their pages: Power & Freq, Flight Recorder, Connections, Installed Apps, Drivers, Disk Space, Benchmarks. |
 | `src/platform.rs`, `src/sensors.rs`, `src/sensors/` | Services shared by the add-ons (actions, PowerShell, sensors). |
-| `src/winsys.rs` | Services, automatic startup, priorities and other Windows actions. |
+| `src/services.rs`, `src/startup_entries.rs`, `src/process_actions.rs`, `src/system_actions/` | Services, automatic startup entries, process actions (priority, affinity, dump, end) and the actions the menus start (open a file location, Run new task, power settings). |
+| `src/cpu_topology.rs`, `src/system_lists.rs`, `src/run_open.rs`, `src/action_elevation.rs`, `src/app_folders.rs`, `src/system_info.rs`, `src/system.rs` | Cores and caches, the lists of users and sessions, opening things, starting one program with administrator rights, the app's folders, System Info's own facts, and the supported systems. Each concern keeps a `windows`, `linux` and `macos` submodule beside its shared code (see `docs/adr/0001-three-supported-systems.md`). |
 | `src/widgets.rs` | Charts, icons and parts of the app frame. |
 | `src/widgets/parts.rs` | Shared parts of design A: buttons, filter groups, status band, tables, side panel. |

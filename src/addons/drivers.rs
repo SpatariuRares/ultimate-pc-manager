@@ -19,8 +19,21 @@ pub mod problems;
 pub mod signature;
 /// The driver store: reading and classifying the packages.
 pub mod store;
-/// The Windows reader of the listing.
-pub mod windows;
+// The reader of the listing: one module per system.
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(target_os = "linux")]
+use linux as system;
+#[cfg(target_os = "macos")]
+use macos as system;
+#[cfg(windows)]
+use windows as system;
+pub use system::SystemListing;
 
 use crate::addons::{checked_tile_lines, is_default, plural, read_settings, summary_tile, write_settings, Addon, Consumption, Requirements};
 use crate::platform::{Action, AddonContext, PageContext};
@@ -175,7 +188,7 @@ impl Prefs {
 
 impl Default for Drivers {
     fn default() -> Self {
-        Drivers { reader: Arc::new(windows::WindowsListing), page: None, prefs: Prefs::default(), from_command_line: None, scope_error: None }
+        Drivers { reader: Arc::new(SystemListing), page: None, prefs: Prefs::default(), from_command_line: None, scope_error: None }
     }
 }
 
@@ -256,7 +269,7 @@ impl Addon for Drivers {
     /// The internet and Windows Update for the search; administrator
     /// rights only to install, scan and unload.
     fn requirements(&self) -> Requirements {
-        Requirements { admin: true, network: true, programs: &["PowerShell", "pnputil", "sc"], note: Some(NEEDS) }
+        Requirements { admin: true, network: true, programs: &["PowerShell", "pnputil", "sc"], note: Some(NEEDS), ..Requirements::default() }
     }
     fn consumption(&self) -> Consumption {
         Consumption { cpu: "Medium", network: "On update checks", disk: "On install", when: "On open and on your actions" }

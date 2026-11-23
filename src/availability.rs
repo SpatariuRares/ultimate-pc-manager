@@ -10,8 +10,11 @@
 //! the second through this module and never as an empty list, and hide an
 //! unavailable feature while its page stays.
 //!
-//! Tests can make a feature unavailable with [`unavailable_in_test`], so the
-//! unavailable state of a page can be exercised on Windows too.
+//! In the app's own tests every feature is available (the tests give the add-ons
+//! their data through seams, as on Windows), whatever system they run on;
+//! [`unavailable_in_test`] makes a feature unavailable, so the unavailable
+//! state of a page is exercised on every system. What the running system
+//! really has is [`system_has`], tested on its own.
 
 /// Declares [`Feature`] together with [`Feature::ALL`], so the list of every
 /// feature cannot fall out of step with the enum.
@@ -45,6 +48,24 @@ features! {
     ServiceControl,
     /// Priority, affinity, suspend and efficiency of processes.
     ProcessControl,
+    /// Efficiency mode: lowering a process's priority and power use.
+    ProcessEfficiency,
+    /// Analysing the wait chain of a process's threads.
+    ProcessWaitChain,
+    /// Turning file and registry virtualisation of a process on or off.
+    ProcessUacVirtualization,
+    /// Writing a process's memory to a dump file.
+    ProcessDump,
+    /// The graphics usage of each process.
+    ProcessGpuUsage,
+    /// The count of handles each process holds.
+    ProcessHandleCounts,
+    /// The architecture a process was built for, as the system tells it.
+    ProcessArchitecture,
+    /// The verified signer of a program file.
+    FileSignatures,
+    /// The description in a program file's version details.
+    FileVersionInfo,
     /// The entries that start with the system.
     StartupEntries,
     /// The system's power options panel.
@@ -71,16 +92,19 @@ fn reason(feature: Feature) -> Option<&'static str> {
 }
 
 /// Whether this system has the feature at all.
-fn system_has(_feature: Feature) -> bool {
-    cfg!(windows)
+pub(crate) fn system_has(_feature: Feature) -> bool {
+    #[cfg(windows)]
+    return true;
+    // No current feature has a Linux or macOS implementation yet.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    return false;
 }
 
 /// Is the feature available on this system.
 pub fn is_available(feature: Feature) -> bool {
     #[cfg(test)]
-    if test_override::hides(feature) {
-        return false;
-    }
+    return !test_override::hides(feature);
+    #[cfg(not(test))]
     system_has(feature)
 }
 
@@ -151,20 +175,28 @@ mod tests {
     #[test]
     fn every_current_feature_is_available_on_windows() {
         for &feature in Feature::ALL {
+            assert!(system_has(feature), "{feature:?}");
             assert!(is_available(feature), "{feature:?}");
             assert_eq!(unavailable_text(feature), None);
         }
         assert_eq!(unavailable_features(), Vec::<Feature>::new());
     }
 
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn no_current_feature_is_available_off_windows() {
+    fn no_current_feature_is_in_the_system_off_windows() {
         for &feature in Feature::ALL {
-            assert!(!is_available(feature), "{feature:?}");
-            assert!(unavailable_text(feature).is_some());
+            assert!(!system_has(feature), "{feature:?}");
         }
-        assert_eq!(unavailable_features(), Feature::ALL);
+    }
+
+    #[test]
+    fn in_a_test_every_feature_is_available_whatever_the_system() {
+        for &feature in Feature::ALL {
+            assert!(is_available(feature), "{feature:?}");
+            assert_eq!(unavailable_text(feature), None);
+        }
+        assert_eq!(unavailable_features(), Vec::<Feature>::new());
     }
 
     #[test]
@@ -181,9 +213,9 @@ mod tests {
             let _guard = unavailable_in_test(&[Feature::DeviceSetupApi]);
             assert!(!is_available(Feature::DeviceSetupApi));
             assert_eq!(unavailable_text(Feature::DeviceSetupApi).as_deref(), Some("Not available on this system."));
-            assert_eq!(is_available(Feature::Winget), cfg!(windows), "others keep the system's answer");
+            assert!(is_available(Feature::Winget), "the others stay available");
         }
-        assert_eq!(is_available(Feature::DeviceSetupApi), cfg!(windows));
+        assert!(is_available(Feature::DeviceSetupApi));
     }
 
     #[test]
@@ -192,7 +224,7 @@ mod tests {
         let _guard = unavailable_in_test(&[Feature::Winget, Feature::Elevation]);
         let lacking = unavailable_features();
         assert!(lacking.contains(&Feature::Winget) && lacking.contains(&Feature::Elevation), "{lacking:?}");
-        assert_eq!(lacking.len() - lacking_here.len(), if cfg!(windows) { 2 } else { 0 }, "only the named ones are added");
+        assert_eq!(lacking.len() - lacking_here.len(), 2, "only the named ones are added");
         assert!(lacking.iter().all(|f| Feature::ALL.contains(f)));
     }
 }

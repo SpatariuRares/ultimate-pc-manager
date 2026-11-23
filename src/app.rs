@@ -15,7 +15,7 @@ use crate::sampler::{Sampler, Snapshot};
 use crate::settings::{Settings, SPEEDS};
 use crate::widgets::{local_ip, logo, nav_entry_back, nav_heading, push, refresh_button};
 use crate::system_lists::SystemLists;
-use crate::winsys;
+use crate::process_actions;
 
 /// The open page: one of the core pages, or the page of an add-on (by its
 /// registry id; the add-on draws it through the host).
@@ -220,6 +220,17 @@ pub struct TaskApp {
     /// Who signed each program file, checked off the UI thread.
     pub signatures: crate::signature::Signatures,
     pub run_dialog: Option<String>,
+    /// "Create this task with administrator privileges" is ticked.
+    pub run_dialog_admin: bool,
+    /// Why the last start from the dialog failed; shown in the dialog until
+    /// the text is edited or the dialog closes.
+    run_dialog_error: Option<String>,
+    /// The text the pending administrator start was asked for, so a refusal
+    /// reopens the dialog with it.
+    run_admin_text: Option<String>,
+    /// The answer of a task started as administrator, which waits for the
+    /// permission prompt on its own thread.
+    run_admin_pending: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     pub message: Option<(String, Instant)>,
     /// What the app asks of the system (see [`crate::system_actions`]): the
     /// Windows adapter, or in tests a recording one that acts on nothing.
@@ -300,6 +311,10 @@ impl TaskApp {
             system,
             signatures: Default::default(),
             run_dialog: None,
+            run_dialog_admin: false,
+            run_dialog_error: None,
+            run_admin_text: None,
+            run_admin_pending: None,
             message: None,
             actions,
             #[cfg(test)]
@@ -1030,6 +1045,25 @@ impl TaskApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        if let Some(rx) = &self.run_admin_pending {
+            match rx.try_recv() {
+                Ok(Err(e)) => {
+                    self.run_admin_pending = None;
+                    // The dialog comes back with the typed text and the reason.
+                    if let Some(text) = self.run_admin_text.take() {
+                        self.run_dialog = Some(text);
+                        self.run_dialog_error = Some(e.clone());
+                    }
+                    self.say(e);
+                }
+                Ok(Ok(())) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.run_admin_pending = None;
+                    self.run_admin_text = None;
+                    self.run_dialog_admin = false; // elevation is asked for each task
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+            }
+        }
         if let Some(mut text) = self.run_dialog.take() {
             let mut open = true;
             let mut done = false;
@@ -1040,9 +1074,18 @@ impl TaskApp {
                 .show(ctx, |ui| {
                     ui.label("Type the name of a program, folder, document or Internet resource, and it will open for you.");
                     let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(380.0).hint_text("notepad"));
+                    if r.changed() {
+                        self.run_dialog_error = None;
+                    }
+                    if let Some(why) = &self.run_dialog_error {
+                        ui.colored_label(ui.visuals().error_fg_color, why);
+                    }
                     let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if !r.has_focus() && !enter {
                         r.request_focus();
+                    }
+                    if self.actions.offers_run_as_admin() {
+                        ui.checkbox(&mut self.run_dialog_admin, "Create this task with administrator privileges");
                     }
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() || enter {
@@ -1053,13 +1096,46 @@ impl TaskApp {
                         }
                     });
                 });
-            if done {
+            if done && self.run_dialog_admin && self.actions.offers_run_as_admin() {
+                // The permission prompt waits for the user: off the UI thread.
+                let (tx, rx) = std::sync::mpsc::channel();
+                let system = self.actions.clone();
+                let cmdline = text.clone();
+                let ctx = ctx.clone();
+                let spawned = std::thread::Builder::new().name("run-as-admin".into()).spawn(move || {
+                    let _ = tx.send(system.run_new_task_as_admin(&cmdline));
+                    ctx.request_repaint();
+                });
+                match spawned {
+                    Ok(_) => {
+                        self.run_admin_pending = Some(rx);
+                        self.run_admin_text = Some(text.clone());
+                        self.run_dialog_error = None;
+                        self.say(format!("Asking for administrator permission to start \"{}\"", text.trim()));
+                    }
+                    Err(e) => self.say(e.to_string()),
+                }
+            } else if done {
                 match self.actions.run_new_task(&text) {
-                    Ok(()) => self.say(format!("Started \"{}\"", text.trim())),
-                    Err(e) => self.say(e),
+                    Ok(()) => {
+                        self.run_dialog_error = None;
+                        self.say(format!("Started \"{}\"", text.trim()));
+                    }
+                    Err(e) => {
+                        // The dialog stays open with the reason, to edit and try again.
+                        self.run_dialog_error = Some(e.clone());
+                        self.run_dialog = Some(text);
+                        self.say(e);
+                    }
                 }
             } else if open {
                 self.run_dialog = Some(text);
+            }
+            if self.run_dialog.is_none() {
+                self.run_dialog_error = None;
+                if self.run_admin_pending.is_none() {
+                    self.run_dialog_admin = false; // elevation is asked for each task
+                }
             }
         }
         let processes = ProcessInputs::new(&self.signatures, &*self.actions);
@@ -1335,7 +1411,7 @@ impl TaskApp {
                 });
                 match spawned {
                     Ok(_) => self.pages.processes.watch_dump(rx),
-                    Err(_) => self.say(winsys::DUMP_FAILED),
+                    Err(_) => self.say(process_actions::DUMP_FAILED),
                 }
             }
             Action::UacVirtualization(pids) => {
@@ -1913,6 +1989,63 @@ mod tests {
         assert_eq!(said(&app).as_deref(), Some("Windows cannot find 'nope'."));
     }
 
+    #[test]
+    fn run_new_task_as_administrator_asks_off_the_ui_thread_and_says_a_refusal() {
+        use crate::system_actions::Request;
+        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        let mut app = app_with_three_processes();
+        app.recording().fail(Request::RunNewTaskAsAdmin("gparted".into()), "Administrator permission was refused.");
+        app.run_dialog = Some("gparted".into());
+        app.run_dialog_admin = true;
+        let enter = || egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        for events in [vec![], vec![enter()]] {
+            crate::test_ui::run(&ctx, (800.0, 600.0), events, |ui| app.dialogs(ui.ctx(), &mut Vec::new()));
+        }
+        assert_eq!(app.recording().requests().iter().filter(|r| matches!(r, Request::RunNewTask(_))).count(), 0, "not the plain start");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while said(&app).as_deref() != Some("Administrator permission was refused.") {
+            assert!(std::time::Instant::now() < until, "said {:?}", said(&app));
+            crate::test_ui::run(&ctx, (800.0, 600.0), vec![], |ui| app.dialogs(ui.ctx(), &mut Vec::new()));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.recording().requests(), [Request::RunNewTaskAsAdmin("gparted".into())]);
+        assert_eq!(app.run_dialog.as_deref(), Some("gparted"), "the dialog comes back with the typed text");
+    }
+
+    #[test]
+    fn the_run_dialog_itself_shows_why_a_start_failed_and_stays_open() {
+        use crate::system_actions::Request;
+        let ctx = crate::test_ui::context(crate::theme::Mode::Dark);
+        let mut app = app_with_three_processes();
+        let reason = "Running as administrator needs pkexec, which is not installed.";
+        app.recording().fail(Request::RunNewTask("nope".into()), "Windows cannot find 'nope'.");
+        app.run_dialog = Some("nope".into());
+        let enter = || egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        let mut last = Vec::new();
+        for events in [vec![], vec![enter()], vec![]] {
+            last = crate::test_ui::texts(&crate::test_ui::run(&ctx, (800.0, 600.0), events, |ui| app.dialogs(ui.ctx(), &mut Vec::new())));
+        }
+        assert_eq!(app.run_dialog.as_deref(), Some("nope"), "the dialog stays open");
+        assert!(last.iter().any(|t| t == "Windows cannot find 'nope'."), "the dialog says why: {last:?}");
+        // The administrator path says it in the dialog too.
+        app.recording().fail(Request::RunNewTaskAsAdmin("gparted".into()), reason);
+        app.run_dialog = Some("gparted".into());
+        app.run_dialog_admin = true;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        for events in [vec![], vec![enter()]] {
+            crate::test_ui::run(&ctx, (800.0, 600.0), events, |ui| app.dialogs(ui.ctx(), &mut Vec::new()));
+        }
+        loop {
+            assert!(std::time::Instant::now() < until, "no refusal shown");
+            last = crate::test_ui::texts(&crate::test_ui::run(&ctx, (800.0, 600.0), vec![], |ui| app.dialogs(ui.ctx(), &mut Vec::new())));
+            if last.iter().any(|t| t == reason) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.run_dialog.as_deref(), Some("gparted"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_headless_app_never_acts_on_a_real_process() {
@@ -2054,9 +2187,9 @@ mod tests {
         let mut app = with_windows_process(false);
         app.message = None;
         let asked = Request::Dump { pid: 4242, name: "Code.exe".into(), dir: std::env::temp_dir() };
-        app.recording().fail(asked.clone(), winsys::DUMP_FAILED);
+        app.recording().fail(asked.clone(), process_actions::DUMP_FAILED);
         app.run_action(&ctx, Action::Dump { pid: 4242, name: "Code.exe".into() });
-        assert_eq!(frames_until_said(&mut app).as_deref(), Some(winsys::DUMP_FAILED));
+        assert_eq!(frames_until_said(&mut app).as_deref(), Some(process_actions::DUMP_FAILED));
         assert_eq!(app.pages.processes.dump_question, None);
         assert_eq!(app.recording().requests(), [asked]);
     }

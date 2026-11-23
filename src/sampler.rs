@@ -44,7 +44,7 @@ pub struct ProcRow {
     pub page_faults: u32,
     /// Kernel plus user time spent on the processors.
     pub cpu_time: Duration,
-    /// A priority class from `winsys::PRIORITIES` ("Normal", "High", ...).
+    /// A priority class from `process_actions::PRIORITIES` ("Normal", "High", ...).
     pub priority: &'static str,
     /// "x64", "x86", "ARM64" or "ARM".
     pub arch: &'static str,
@@ -218,7 +218,7 @@ fn merge_gpu(procs: &mut [ProcRow], by_pid: &std::collections::HashMap<u32, f32>
 /// each names its host ("svchost.exe (2148)"), the svchost group from the
 /// host's "-k" argument, its registration and its description from
 /// `descriptions` (by service name; empty when unknown).
-fn services_by_host(running: &[crate::winsys::RunningService], procs: &[ProcRow], descriptions: &HashMap<String, String>) -> HashMap<u32, Vec<ServiceInfo>> {
+fn services_by_host(running: &[crate::services::RunningService], procs: &[ProcRow], descriptions: &HashMap<String, String>) -> HashMap<u32, Vec<ServiceInfo>> {
     let hosts: HashMap<u32, &ProcRow> = procs.iter().map(|p| (p.pid, p)).collect();
     let mut out: HashMap<u32, Vec<ServiceInfo>> = HashMap::new();
     for s in running {
@@ -462,10 +462,10 @@ fn system_fill() -> Fill {
             facts.fill(&mut snap.procs);
             // The services under their hosts; a description is read once per
             // service.
-            let running = crate::winsys::running_services();
+            let running = crate::services::running_services();
             for s in &running {
                 if !descriptions.contains_key(&s.name) {
-                    descriptions.insert(s.name.clone(), crate::winsys::service_description(&s.name));
+                    descriptions.insert(s.name.clone(), crate::services::service_description(&s.name));
                 }
             }
             snap.services = Arc::new(services_by_host(&running, &snap.procs, &descriptions));
@@ -613,7 +613,7 @@ mod tests {
     fn each_service_names_its_host_group_registration_and_description() {
         let svchost = ProcRow { pid: 2148, name: "svchost.exe".into(), cmd: r"C:\Windows\system32\svchost.exe -k netsvcs -p".into(), ..Default::default() };
         let spooler = ProcRow { pid: 3000, name: "spoolsv.exe".into(), ..Default::default() };
-        let running = |pid, name: &str, display: &str, shared| crate::winsys::RunningService { pid, name: name.into(), display: display.into(), shared };
+        let running = |pid, name: &str, display: &str, shared| crate::services::RunningService { pid, name: name.into(), display: display.into(), shared };
         let services = [running(2148, "Winmgmt", "Windows Management Instrumentation", true), running(3000, "Spooler", "Print Spooler", false), running(9, "Gone", "No host", false)];
         let descriptions = [("Winmgmt".to_string(), "Provides a common interface.".to_string())].into_iter().collect();
         let by_host = services_by_host(&services, &[svchost, spooler], &descriptions);

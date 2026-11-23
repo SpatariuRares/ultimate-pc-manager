@@ -159,7 +159,7 @@ pub fn subtitle(rows: &[Row], owner_of: impl Fn(u32) -> Owner, windir: &str) -> 
 
 /// The Windows folder (`%SystemRoot%`).
 fn windir() -> String {
-    std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())
+    crate::app_folders::windows_dir().to_string_lossy().into_owned()
 }
 
 /// Draws the band for `inventory` (nothing while there is none or it could
