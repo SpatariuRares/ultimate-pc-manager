@@ -146,6 +146,14 @@ Windows Update installs and INF installs offer "Create a restore point first" in
 - When it is not created, the job stops before the change (nothing was changed) and the page asks "Continue without a new restore point?" with Continue and Cancel. Continue runs the change again without a restore point (a second UAC prompt, only on this path); Cancel says "Cancelled: nothing was changed.". When it is created its message leads the outcome message.
 - Unload and Scan make no restore point. The job is an uninterruptible elevated job like the others: turning the add-on off waits for it.
 
+### Device actions: Disable, Enable, Restart (spec #11, #30)
+The device context menu and the side panel offer "Disable device" (or "Enable device" for a device Windows reports as disabled, problem code 22) and "Restart device", with the administrator shield. They are greyed out while another driver job runs.
+- Each asks first: the dialog says what will happen ("The device stops working until you enable it again.", "Windows starts the device again.", "The device stops for a moment and starts again.") and carries the restore point option.
+- Protected classes (disk drives and storage controllers, display adapters, system devices; the boot disk and its controller are in the storage group) need a stronger warning for Disable and Restart: "This is a <kind>: you may lose your screen or your boot disk until Windows restarts." The confirm button stays off until the user ticks "I understand, continue anyway". Enable never asks for it.
+- The job is `pnputil /disable-device`, `/enable-device` or `/restart-device` with the instance ID, from the System32 folder, elevated, in the same one-UAC-prompt job as the optional restore point step (modes `disable-device`, `enable-device`, `restart-device` of the tool script). It is uninterruptible like the other elevated jobs.
+- Outcomes: "Done.", "Restart Windows to finish." (pnputil code 3010) or "Windows refused: <reason>" (the last line pnputil printed, or its exit code). The list is read again after each outcome except a dismissed UAC prompt, which changed nothing.
+- Roll back driver (#31) will sit first in the same menu group and panel section.
+
 ### Filter drivers (spec #11, #33)
 A "Filter drivers" tab lists the loaded file-system minifilters read-only: name, altitude, instances and frame, highest altitude first like `fltmc filters`, with a "Filter name" search.
 - They are read in process with `FilterFindFirst`/`FilterFindNext` (Filter Manager user API), in the same read as the driver listing, with normal rights.

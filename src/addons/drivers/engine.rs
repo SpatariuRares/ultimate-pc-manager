@@ -520,6 +520,82 @@ pub struct RestorePrompt {
 pub enum Redo {
     Updates(Vec<String>),
     Inf(String),
+    /// A device action on the device with this instance ID.
+    Device(DeviceAction, String),
+}
+
+/// What a device can be asked to do through pnputil, with the instance ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceAction {
+    Disable,
+    Enable,
+    Restart,
+}
+
+impl DeviceAction {
+    /// The mode of the elevated tool script (and the job's change name).
+    pub fn mode(self) -> &'static str {
+        match self {
+            DeviceAction::Disable => "disable-device",
+            DeviceAction::Enable => "enable-device",
+            DeviceAction::Restart => "restart-device",
+        }
+    }
+
+    fn from_mode(mode: &str) -> Option<DeviceAction> {
+        [DeviceAction::Disable, DeviceAction::Enable, DeviceAction::Restart].into_iter().find(|a| a.mode() == mode)
+    }
+
+    /// The button and menu label.
+    pub fn label(self) -> &'static str {
+        match self {
+            DeviceAction::Disable => "Disable device",
+            DeviceAction::Enable => "Enable device",
+            DeviceAction::Restart => "Restart device",
+        }
+    }
+
+    /// What the confirm dialog says will happen.
+    pub fn consequence(self) -> &'static str {
+        match self {
+            DeviceAction::Disable => "The device stops working until you enable it again.",
+            DeviceAction::Enable => "Windows starts the device again.",
+            DeviceAction::Restart => "The device stops for a moment and starts again.",
+        }
+    }
+
+    /// Enabling is never risky; disabling or restarting a protected device is.
+    pub fn needs_strong_warning(self) -> bool {
+        self != DeviceAction::Enable
+    }
+
+    /// Disable or Enable: a disabled device (problem code 22) is offered Enable.
+    pub fn toggle_for(d: &DeviceDriver) -> DeviceAction {
+        if d.problem == 22 {
+            DeviceAction::Enable
+        } else {
+            DeviceAction::Disable
+        }
+    }
+}
+
+/// The kind of protected device a class belongs to: disk drives and storage
+/// controllers, display adapters and system devices. These get the stronger
+/// warning (the boot disk and its controller are in the storage group).
+pub fn protected_kind(class: &str) -> Option<&'static str> {
+    match class.to_ascii_lowercase().as_str() {
+        "diskdrive" | "scmdisk" | "scsiadapter" | "hdc" | "volume" | "volumesnapshot" => Some("storage device"),
+        "display" => Some("display adapter"),
+        "system" | "processor" | "computer" | "firmware" => Some("system device"),
+        _ => None,
+    }
+}
+
+/// The stronger warning the user must tick before `action` runs on a device
+/// of `class`; `None` when the action needs no more than the ordinary question.
+pub fn strong_warning(action: DeviceAction, class: &str) -> Option<String> {
+    let kind = protected_kind(class).filter(|_| action.needs_strong_warning())?;
+    Some(format!("This is a {kind}: you may lose your screen or your boot disk until Windows restarts."))
 }
 
 #[derive(Clone)]
@@ -869,6 +945,7 @@ impl Hub {
         match prompt.map(|p| p.redo) {
             Some(Redo::Updates(ids)) => self.install_with(ids, false),
             Some(Redo::Inf(path)) => self.install_inf_with(path, false),
+            Some(Redo::Device(action, id)) => self.device_action_with(action, id, false),
             None => {}
         }
     }
@@ -879,6 +956,18 @@ impl Hub {
         if st.restore_prompt.take().is_some() {
             st.message = Some(("Cancelled: nothing was changed.".into(), false));
         }
+    }
+
+    /// Disables, enables or restarts the device with this instance ID
+    /// (pnputil, elevated). `restore_point` makes the same elevated job
+    /// create a restore point first; one job at a time, like every other.
+    pub fn device_action_with(&self, action: DeviceAction, instance_id: String, restore_point: bool) {
+        let busy = match action {
+            DeviceAction::Disable => "Disabling the device \u{2014} confirm the Windows prompt\u{2026}",
+            DeviceAction::Enable => "Enabling the device \u{2014} confirm the Windows prompt\u{2026}",
+            DeviceAction::Restart => "Restarting the device \u{2014} confirm the Windows prompt\u{2026}",
+        };
+        self.pnputil(action.mode(), instance_id, true, busy, restore_point);
     }
 
     /// Asks Windows to look for new or removed hardware (pnputil /scan-devices).
@@ -912,6 +1001,7 @@ impl Hub {
     /// not (their outcome is dropped when the add-on is turned off).
     fn pnputil(&self, mode: &'static str, arg: String, uninterruptible: bool, busy: &str, restore_point: bool) {
         self.spawn(Some(busy.into()), uninterruptible, move |hub, run| {
+            let device = DeviceAction::from_mode(mode);
             // Only adding a driver package installs something.
             let turn = match mode {
                 "inf" => match run.queue(hub.ctx.install_queue(), queue_request(vec![("inf".to_string(), arg.clone())])) {
@@ -920,13 +1010,17 @@ impl Hub {
                 },
                 _ => None,
             };
-            let steps = if mode == "inf" { restore_steps(restore_point) } else { Vec::new() };
-            let ran = hub.run_job(TOOL_SCRIPT, "inf", &[("Mode", mode), ("Arg", arg.as_str())], &steps);
+            let steps = if mode == "inf" || device.is_some() { restore_steps(restore_point) } else { Vec::new() };
+            let ran = hub.run_job(TOOL_SCRIPT, mode, &[("Mode", mode), ("Arg", arg.as_str())], &steps);
             drop(turn);
             let (result, restore_note) = match ran {
                 JobRun::Done { result, note } => (result, note),
                 JobRun::Refused(reason) => {
-                    hub.refuse(run, reason, Redo::Inf(arg));
+                    let redo = match device {
+                        Some(action) => Redo::Device(action, arg),
+                        None => Redo::Inf(arg),
+                    };
+                    hub.refuse(run, reason, redo);
                     return;
                 }
             };
@@ -944,7 +1038,10 @@ impl Hub {
                 }
                 st.message = Some(outcome.message);
             }
-            hub.refresh_now();
+            // A dismissed prompt changed nothing: the list stays as it was.
+            if !outcome.cancelled || device.is_none() {
+                hub.refresh_now();
+            }
         });
     }
 }
@@ -1113,7 +1210,11 @@ pub fn tool_outcome(mode: &str, result: Result<serde_json::Value, String>) -> To
         return ToolOutcome { message, output: String::new(), reboot: false, cancelled: false };
     }
     let code = v["code"].as_i64().unwrap_or(0);
+    let device = DeviceAction::from_mode(mode).is_some();
     let message: (String, bool) = match (mode, code) {
+        _ if device && code == 0 => ("Done.".into(), false),
+        _ if device && code == 3010 => ("Restart Windows to finish.".into(), false),
+        _ if device => (format!("Windows refused: {}", refusal_reason(v["output"].as_str().unwrap_or_default(), code)), true),
         (_, 3010) => ("Done. Restart Windows to finish.".into(), false),
         ("inf", 0) => ("Driver package installed.".into(), false),
         ("inf", 259) => ("The package was added, but no device needed it (its driver is not newer or does not match).".into(), false),
@@ -1125,6 +1226,15 @@ pub fn tool_outcome(mode: &str, result: Result<serde_json::Value, String>) -> To
         (_, c) => (format!("Finished with code {c}. See the output below."), true),
     };
     ToolOutcome { message, output: v["output"].as_str().unwrap_or_default().to_string(), reboot: code == 3010, cancelled: false }
+}
+
+/// Why pnputil refused: the last line it printed (it ends with the
+/// reason, for example "Access is denied."), or its exit code.
+fn refusal_reason(output: &str, code: i64) -> String {
+    match output.lines().map(str::trim).rev().find(|l| !l.is_empty()) {
+        Some(line) => line.to_string(),
+        None => format!("pnputil exited with code {code}."),
+    }
 }
 
 fn parse_search(v: &serde_json::Value) -> Result<Vec<DriverUpdate>, String> {
@@ -1294,6 +1404,9 @@ try {
       }
     }
     'scan' { $o = & $pnputil /scan-devices 2>&1 }
+    'disable-device' { $o = & $pnputil /disable-device $Arg 2>&1 }
+    'enable-device' { $o = & $pnputil /enable-device $Arg 2>&1 }
+    'restart-device' { $o = & $pnputil /restart-device $Arg 2>&1 }
     'stop' { $o = & $sc stop $Arg 2>&1 }
     default { throw "Unknown mode $Mode" }
   }
@@ -1529,6 +1642,146 @@ mod tests {
             runner.launches(),
             vec![Launch::PowerShell { script: TOOL_SCRIPT.into(), args: vec![("Mode".into(), "scan".into()), ("Arg".into(), String::new())], elevated: true }]
         );
+    }
+
+    const ID: &str = r"PCI\VEN_10DE&DEV_2504\4&1A2B3C&0&0008";
+
+    fn device_launch(action: DeviceAction, steps: bool) -> Launch {
+        let mut args = vec![("Mode".to_string(), action.mode().to_string()), ("Arg".to_string(), ID.to_string())];
+        let script = if steps {
+            args.push(("Steps".into(), format!("restore-point,{}", action.mode())));
+            with_steps(TOOL_SCRIPT, &[&RESTORE_POINT])
+        } else {
+            TOOL_SCRIPT.to_string()
+        };
+        Launch::PowerShell { script, args, elevated: true }
+    }
+
+    #[test]
+    fn each_device_action_is_one_elevated_launch_with_the_instance_id() {
+        for action in [DeviceAction::Disable, DeviceAction::Enable, DeviceAction::Restart] {
+            let (hub, runner, _) = install_hub();
+            hub.device_action_with(action, ID.into(), false);
+            wait_until_idle(&hub);
+            assert_eq!(runner.launches(), vec![device_launch(action, false)], "{action:?}");
+        }
+    }
+
+    #[test]
+    fn the_tool_script_runs_each_device_action_through_pnputil_by_its_system_path() {
+        for (mode, switch) in [("disable-device", "/disable-device"), ("enable-device", "/enable-device"), ("restart-device", "/restart-device")] {
+            let line = TOOL_SCRIPT.lines().find(|l| l.contains(&format!("'{mode}'"))).unwrap_or_else(|| panic!("no {mode} arm"));
+            assert!(line.contains(&format!("& $pnputil {switch} $Arg")), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_device_action_with_a_restore_point_is_one_launch_with_the_ordered_steps() {
+        let (hub, runner, _) = install_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, r#"{"ok":true,"code":0,"output":"","steps":{"restore-point":{"state":"created","drive":"C:"}}}"#);
+        hub.device_action_with(DeviceAction::Disable, ID.into(), true);
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches(), vec![device_launch(DeviceAction::Disable, true)]);
+        assert_eq!(hub.lock().message, Some(("Restore point created. Done.".to_string(), false)));
+    }
+
+    #[test]
+    fn a_finished_device_action_says_done_and_reads_the_list_again() {
+        let (hub, runner, reader) = install_hub();
+        let before = reads(&reader);
+        runner.prepare(crate::platform::When::Nth(0), 0, r#"{"ok":true,"code":0,"output":"Device disabled successfully."}"#);
+        hub.device_action_with(DeviceAction::Disable, ID.into(), false);
+        wait_until_idle(&hub);
+        assert_eq!(hub.lock().message, Some(("Done.".to_string(), false)));
+        assert_eq!(reads(&reader), before + 1);
+    }
+
+    #[test]
+    fn a_refused_device_action_says_why_and_still_reads_the_list_again() {
+        let (hub, runner, reader) = install_hub();
+        let before = reads(&reader);
+        runner.prepare(crate::platform::When::Nth(0), 0, r#"{"ok":true,"code":5,"output":"Failed to disable device.\r\n\r\nAccess is denied.\r\n"}"#);
+        hub.device_action_with(DeviceAction::Disable, ID.into(), false);
+        wait_until_idle(&hub);
+        assert_eq!(hub.lock().message, Some(("Windows refused: Access is denied.".to_string(), true)));
+        assert_eq!(reads(&reader), before + 1);
+    }
+
+    #[test]
+    fn a_dismissed_prompt_for_a_device_action_changes_nothing_and_reads_nothing_again() {
+        let (hub, runner, reader) = install_hub();
+        let before = reads(&reader);
+        runner.answer(crate::platform::ELEVATION_CANCELLED);
+        hub.device_action_with(DeviceAction::Restart, ID.into(), false);
+        wait_until_idle(&hub);
+        assert_eq!(hub.lock().message, Some((CANCELLED_TEXT.to_string(), false)));
+        assert_eq!(reads(&reader), before);
+        assert_eq!(runner.launches().len(), 1);
+    }
+
+    #[test]
+    fn device_action_outcomes() {
+        let done = |mode, code, out: &str| tool_outcome(mode, Ok(serde_json::json!({ "ok": true, "code": code, "output": out })));
+        for mode in ["disable-device", "enable-device", "restart-device"] {
+            assert_eq!(done(mode, 0, "ok").message, ("Done.".to_string(), false));
+            let restart = done(mode, 3010, "ok");
+            assert_eq!(restart.message, ("Restart Windows to finish.".to_string(), false));
+            assert!(restart.reboot);
+            assert_eq!(done(mode, 1, "Failed.\nThe device is in use.").message, ("Windows refused: The device is in use.".to_string(), true));
+            assert_eq!(done(mode, 1, "").message, ("Windows refused: pnputil exited with code 1.".to_string(), true));
+        }
+    }
+
+    #[test]
+    fn a_failed_restore_point_stops_a_device_action_and_continue_runs_it_without_one() {
+        let (hub, runner, _) = install_hub();
+        runner.prepare(crate::platform::When::Nth(0), 0, &refused("recent"));
+        runner.prepare(crate::platform::When::Nth(1), 0, r#"{"ok":true,"code":0,"output":""}"#);
+        hub.device_action_with(DeviceAction::Restart, ID.into(), true);
+        wait_until_idle(&hub);
+        assert_eq!(hub.lock().restore_prompt.as_ref().map(|p| p.redo.clone()), Some(Redo::Device(DeviceAction::Restart, ID.into())));
+        hub.continue_without_restore();
+        wait_until_idle(&hub);
+        assert_eq!(runner.launches()[1], device_launch(DeviceAction::Restart, false));
+        assert_eq!(hub.lock().message, Some(("Done.".to_string(), false)));
+    }
+
+    #[test]
+    fn only_one_device_job_runs_at_a_time() {
+        let (hub, runner, _) = install_hub();
+        hub.lock().busy = Some("Installing\u{2026}".into());
+        hub.device_action_with(DeviceAction::Disable, ID.into(), false);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(runner.launches().is_empty(), "nothing starts while another job holds the page");
+    }
+
+    #[test]
+    fn protected_classes_are_disk_storage_display_and_system() {
+        for class in ["DiskDrive", "SCSIAdapter", "hdc", "Volume", "Display", "System", "Processor"] {
+            assert!(protected_kind(class).is_some(), "{class}");
+        }
+        for class in ["Net", "Mouse", "USB", "Media", "Bluetooth", ""] {
+            assert!(protected_kind(class).is_none(), "{class}");
+        }
+    }
+
+    #[test]
+    fn the_stronger_warning_covers_disable_and_restart_but_not_enable() {
+        assert_eq!(
+            strong_warning(DeviceAction::Disable, "Display").as_deref(),
+            Some("This is a display adapter: you may lose your screen or your boot disk until Windows restarts.")
+        );
+        assert!(strong_warning(DeviceAction::Restart, "DiskDrive").unwrap().contains("storage device"));
+        assert!(strong_warning(DeviceAction::Restart, "System").unwrap().contains("system device"));
+        assert_eq!(strong_warning(DeviceAction::Enable, "Display"), None);
+        assert_eq!(strong_warning(DeviceAction::Disable, "Net"), None);
+    }
+
+    #[test]
+    fn a_disabled_device_is_offered_enable_and_the_others_disable() {
+        let off = DeviceDriver { problem: 22, ..Default::default() };
+        assert_eq!(DeviceAction::toggle_for(&off), DeviceAction::Enable);
+        assert_eq!(DeviceAction::toggle_for(&DeviceDriver::default()), DeviceAction::Disable);
     }
 
     /// A reader that only counts its reads.

@@ -38,6 +38,32 @@ pub enum Scope {
     Filters,
 }
 
+/// Shown in a confirm dialog while another driver job holds the page.
+const BUSY_TEXT: &str = "Another driver job is running. Wait for it to finish.";
+
+/// A device action the user asked for and has not yet confirmed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceConfirm {
+    pub action: drivers::DeviceAction,
+    pub instance_id: String,
+    pub name: String,
+    /// The stronger warning, for a protected class; the confirm button stays
+    /// off until `understood` is ticked.
+    pub warning: Option<String>,
+    pub understood: bool,
+}
+
+impl DeviceConfirm {
+    pub fn new(action: drivers::DeviceAction, d: &DeviceDriver) -> Self {
+        DeviceConfirm { action, instance_id: d.instance_id.clone(), name: d.name.clone(), warning: drivers::strong_warning(action, &d.class), understood: false }
+    }
+
+    /// May the action run: no warning, or the user ticked it.
+    pub fn confirmable(&self) -> bool {
+        self.warning.is_none() || self.understood
+    }
+}
+
 /// What the page remembers between frames.
 #[derive(Default)]
 pub struct DriversUi {
@@ -58,6 +84,8 @@ pub struct DriversUi {
     pub confirm_older: Option<DriverUpdate>,
     /// An install waiting for its confirm dialog (with the restore point option).
     pub confirm_job: Option<drivers::Redo>,
+    /// A device action waiting for its confirm dialog.
+    pub confirm_device: Option<DeviceConfirm>,
     /// Bring the selected row into view on the next frame.
     pub scroll_to_selected: bool,
     pub started: bool,
@@ -834,7 +862,7 @@ impl DriversPage {
                 if let Some(note) = note {
                     show_note(&mut list_ui, &note, scope);
                 } else {
-                    self.device_list(&mut list_ui, actions, &view);
+                    self.device_list(&mut list_ui, actions, &view, idle);
                 }
                 self.device_side(&mut side_ui, actions, &devices, updates.as_deref(), &signatures, idle);
             }
@@ -1028,7 +1056,7 @@ impl DriversPage {
 
     /// The device list: only the rows in view are built, the rest of the
     /// scroll area is reserved from the heights worked out with the rows.
-    fn device_list(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, view: &Derived) {
+    fn device_list(&mut self, ui: &mut Ui, actions: &mut Vec<Action>, view: &Derived, idle: bool) {
         let th = theme::of_ui(ui);
         let updates = view.updates.as_deref();
 
@@ -1051,6 +1079,7 @@ impl DriversPage {
         ui.painter().rect_filled(Rect::from_min_size(Pos2::new(hr.left(), hr.bottom() - 1.0), vec2(w, 1.0)), CornerRadius::ZERO, th.line);
 
         let mut clicked: Option<String> = None;
+        let mut device_pick: Option<DeviceConfirm> = None;
         let gap_y = ui.spacing().item_spacing.y;
         let items = &view.items;
         let top = |i: usize| view.tops[i] + i as f32 * gap_y;
@@ -1136,6 +1165,7 @@ impl DriversPage {
                 let details = device_details(d, upd, device_signature(d, &view.signatures));
                 let inf = d.inf_path();
                 let name = d.name.clone();
+                let offered = [drivers::DeviceAction::toggle_for(d), drivers::DeviceAction::Restart];
                 resp.context_menu(|ui| {
                     if ui.button("Open the driver's folder").clicked() {
                         actions.push(Action::OpenLocation(inf.clone()));
@@ -1149,11 +1179,23 @@ impl DriversPage {
                         actions.push(Action::SearchOnline(format!("{name} driver")));
                         ui.close();
                     }
+                    ui.separator();
+                    ui.label(RichText::new("Device").size(11.5).color(th.faint));
+                    // Roll back driver (#31) goes first in this group.
+                    for action in offered {
+                        if crate::widgets::admin_menu_item(ui, action.label(), idle).clicked() {
+                            device_pick = Some(DeviceConfirm::new(action, d));
+                            ui.close();
+                        }
+                    }
                 });
             }
         });
         if let Some(id) = clicked {
             self.drv_ui.selected_device = Some(id);
+        }
+        if device_pick.is_some() {
+            self.drv_ui.confirm_device = device_pick;
         }
     }
 
@@ -1241,6 +1283,22 @@ impl DriversPage {
                 if ui.link("Search for a newer driver").clicked() {
                     actions.push(Action::SearchOnline(format!("{} {} driver", d.provider, d.name)));
                 }
+            }
+            ui.add_space(8.0);
+            separator(ui);
+            ui.add_space(8.0);
+            ui.label(RichText::new("Device").strong().color(th.soft));
+            ui.add_space(4.0);
+            ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
+                // Roll back driver (#31) goes first in this group.
+                for action in [drivers::DeviceAction::toggle_for(d), drivers::DeviceAction::Restart] {
+                    if parts::admin_button(ui, action.label(), false, idle).clicked() {
+                        self.drv_ui.confirm_device = Some(DeviceConfirm::new(action, d));
+                    }
+                }
+            });
+            if let Some(kind) = drivers::protected_kind(&d.class) {
+                ui.label(RichText::new(format!("This is a {kind}: disabling or restarting it asks for a stronger confirmation.")).size(11.5).color(th.amber));
             }
             ui.add_space(10.0);
             ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
@@ -1663,10 +1721,46 @@ impl DriversPage {
                 self.drv_ui.confirm_older = None;
             }
         }
+        if let Some(mut confirm) = self.drv_ui.confirm_device.clone() {
+            let idle = self.drv.lock().busy.is_none();
+            let mut decided = None;
+            egui::Window::new(format!("{} {}?", confirm.action.label().split(' ').next().unwrap_or_default(), confirm.name))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(RichText::new(confirm.action.consequence()).color(th.soft));
+                    if let Some(warning) = confirm.warning.clone() {
+                        crate::widgets::strong_confirm(ui, &warning, &mut confirm.understood);
+                    }
+                    crate::widgets::restore_point_option(ui, &mut self.restore_point);
+                    if !idle {
+                        ui.label(RichText::new(BUSY_TEXT).color(th.amber));
+                    }
+                    ui.horizontal(|ui| {
+                        if parts::admin_button(ui, confirm.action.label(), false, idle && confirm.confirmable()).clicked() {
+                            decided = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            decided = Some(false);
+                        }
+                    });
+                });
+            match decided {
+                Some(true) => {
+                    self.drv.device_action_with(confirm.action, confirm.instance_id.clone(), self.restore_point);
+                    self.drv_ui.confirm_device = None;
+                }
+                Some(false) => self.drv_ui.confirm_device = None,
+                None => self.drv_ui.confirm_device = Some(confirm),
+            }
+        }
         if let Some(job) = self.drv_ui.confirm_job.clone() {
             let (title, what, label) = match &job {
                 drivers::Redo::Updates(ids) => ("Install driver updates?", format!("Windows Update will download and install {}.", plural(ids.len(), "driver update")), "Install"),
                 drivers::Redo::Inf(path) => ("Install this driver package?", format!("{path} will be added and installed on matching devices."), "Install"),
+                // Device actions have their own dialog (`confirm_device`).
+                drivers::Redo::Device(action, _) => (action.label(), action.consequence().to_string(), action.label()),
             };
             let mut decided = None;
             egui::Window::new(title).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ui.ctx(), |ui| {
@@ -1685,6 +1779,7 @@ impl DriversPage {
                 match job {
                     drivers::Redo::Updates(ids) => self.drv.install_with(ids, self.restore_point),
                     drivers::Redo::Inf(path) => self.drv.install_inf_with(path, self.restore_point),
+                    drivers::Redo::Device(action, id) => self.drv.device_action_with(action, id, self.restore_point),
                 }
             }
             if decided.is_some() {
@@ -2689,6 +2784,147 @@ use super::tests::{gpu, page_and_runner, page_with};
         let (row, items) = opened_menu(&mut screen, &mut page);
         screen.click(&mut page, Pos2::new(row.x + 10.0, items[0].0 + 4.0), egui::PointerButton::Primary);
         assert_eq!(screen.actions, vec![Action::Say(r"The file C:\no\such\acme.sys was not found.".into())]);
+    }
+
+    /// Like [`at`], for a button whose words follow the shield's room.
+    fn at_button(texts: &[(Pos2, String)], what: &str) -> Pos2 {
+        texts.iter().find(|(_, t)| t.trim() == what).unwrap_or_else(|| panic!("{what:?} is not drawn: {texts:?}")).0 + vec2(20.0, 4.0)
+    }
+
+    fn drawn(texts: &[(Pos2, String)], what: &str) -> bool {
+        texts.iter().any(|(_, t)| t.trim() == what)
+    }
+
+    fn device(name: &str, class: &str) -> DeviceDriver {
+        DeviceDriver { class: class.into(), instance_id: format!(r"ROOT\{name}\0000"), ..gpu(name) }
+    }
+
+    /// Right click on the only device row; every text drawn afterwards.
+    fn device_menu(screen: &mut Screen, page: &mut DriversPage, name: &str) -> Vec<(Pos2, String)> {
+        let row = at(&screen.settle(page), name);
+        screen.click(page, row, egui::PointerButton::Secondary)
+    }
+
+    fn wait_for_launches(runner: &crate::platform::RecordingRunner, n: usize) {
+        for _ in 0..200 {
+            if runner.launches().len() >= n {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn the_device_menu_offers_disable_and_restart_and_a_disabled_device_offers_enable() {
+        let (mut page, mut screen) = (page_with(vec![device("Alpha NIC", "Net")], vec![]), Screen::new());
+        let shown = device_menu(&mut screen, &mut page, "Alpha NIC");
+        assert!(drawn(&shown, "Disable device") && drawn(&shown, "Restart device") && !drawn(&shown, "Enable device"), "{shown:?}");
+        for old in ["Open the driver's folder", "Copy details", "Search online"] {
+            assert!(drawn(&shown, old), "{old} is still in the menu");
+        }
+
+        let off = DeviceDriver { problem: 22, ..device("Beta NIC", "Net") };
+        let (mut page, mut screen) = (page_with(vec![off], vec![]), Screen::new());
+        let shown = device_menu(&mut screen, &mut page, "Beta NIC");
+        assert!(drawn(&shown, "Enable device") && drawn(&shown, "Restart device") && !drawn(&shown, "Disable device"), "{shown:?}");
+    }
+
+    #[test]
+    fn the_panel_offers_the_device_actions_with_the_same_words() {
+        let (mut page, mut screen) = (page_with(vec![device("Alpha NIC", "Net")], vec![]), Screen::new());
+        page.drv_ui.selected_device = Some(r"ROOT\Alpha NIC\0000".into());
+        let shown = screen.settle(&mut page);
+        assert!(drawn(&shown, "Disable device") && drawn(&shown, "Restart device"), "{shown:?}");
+        assert!(!shown.iter().any(|(_, t)| t.contains("stronger confirmation")), "an ordinary device has no stronger warning");
+    }
+
+    #[test]
+    fn the_panel_says_a_protected_device_asks_for_a_stronger_confirmation() {
+        let (mut page, mut screen) = (page_with(vec![device("Alpha GPU", "Display")], vec![]), Screen::new());
+        page.drv_ui.selected_device = Some(r"ROOT\Alpha GPU\0000".into());
+        let shown = screen.settle(&mut page);
+        assert!(shown.iter().any(|(_, t)| t.starts_with("This is a display adapter") && t.contains("stronger confirmation")), "{shown:?}");
+    }
+
+    #[test]
+    fn a_device_action_asks_first_saying_what_will_happen_and_launches_nothing_before_the_answer() {
+        let ((mut page, runner), mut screen) = (page_and_runner(vec![device("Alpha NIC", "Net")], vec![]), Screen::new());
+        let shown = device_menu(&mut screen, &mut page, "Alpha NIC");
+        screen.click(&mut page, at_button(&shown, "Disable device"), egui::PointerButton::Primary);
+        let dialog = screen.settle(&mut page);
+        assert!(drawn(&dialog, "The device stops working until you enable it again."), "{dialog:?}");
+        assert!(drawn(&dialog, "Create a restore point first") || dialog.iter().any(|(_, t)| t.contains("restore point")), "{dialog:?}");
+        assert!(runner.launches().is_empty());
+        screen.click(&mut page, at(&dialog, "Cancel"), egui::PointerButton::Primary);
+        assert!(page.drv_ui.confirm_device.is_none());
+        assert!(runner.launches().is_empty(), "cancel changes nothing");
+    }
+
+    #[test]
+    fn confirming_an_ordinary_device_action_launches_the_job_with_the_restore_point_option() {
+        let ((mut page, runner), mut screen) = (page_and_runner(vec![device("Alpha NIC", "Net")], vec![]), Screen::new());
+        let shown = device_menu(&mut screen, &mut page, "Alpha NIC");
+        screen.click(&mut page, at_button(&shown, "Restart device"), egui::PointerButton::Primary);
+        let dialog = screen.settle(&mut page);
+        screen.click(&mut page, at_button(&dialog, "Restart device"), egui::PointerButton::Primary);
+        wait_for_launches(&runner, 1);
+        let launches = runner.launches();
+        assert_eq!(launches.len(), 1, "{launches:?}");
+        match &launches[0] {
+            crate::platform::Launch::PowerShell { args, elevated, .. } => {
+                assert!(*elevated);
+                assert!(args.contains(&("Mode".to_string(), "restart-device".to_string())));
+                assert!(args.contains(&("Arg".to_string(), r"ROOT\Alpha NIC\0000".to_string())));
+                assert!(args.contains(&("Steps".to_string(), "restore-point,restart-device".to_string())), "the option is on by default");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_protected_device_needs_the_stronger_warning_ticked_before_the_confirm_button_works() {
+        let ((mut page, runner), mut screen) = (page_and_runner(vec![device("Alpha GPU", "Display")], vec![]), Screen::new());
+        let shown = device_menu(&mut screen, &mut page, "Alpha GPU");
+        screen.click(&mut page, at_button(&shown, "Disable device"), egui::PointerButton::Primary);
+        let dialog = screen.settle(&mut page);
+        assert!(
+            drawn(&dialog, "This is a display adapter: you may lose your screen or your boot disk until Windows restarts."),
+            "{dialog:?}"
+        );
+        // The button is off until the box is ticked: a click launches nothing.
+        screen.click(&mut page, at_button(&dialog, "Disable device"), egui::PointerButton::Primary);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(runner.launches().is_empty(), "the confirm button is inert before the explicit tick");
+        assert!(page.drv_ui.confirm_device.is_some(), "the dialog stays open");
+
+        let dialog = screen.settle(&mut page);
+        screen.click(&mut page, at(&dialog, "I understand, continue anyway"), egui::PointerButton::Primary);
+        assert!(page.drv_ui.confirm_device.as_ref().is_some_and(|c| c.understood));
+        let dialog = screen.settle(&mut page);
+        screen.click(&mut page, at_button(&dialog, "Disable device"), egui::PointerButton::Primary);
+        wait_for_launches(&runner, 1);
+        assert_eq!(runner.launches().len(), 1);
+    }
+
+    #[test]
+    fn enabling_a_protected_device_needs_no_stronger_warning() {
+        let off = DeviceDriver { problem: 22, ..device("Alpha GPU", "Display") };
+        let mut page = page_with(vec![off.clone()], vec![]);
+        page.drv_ui.confirm_device = Some(DeviceConfirm::new(drivers::DeviceAction::Enable, &off));
+        assert!(page.drv_ui.confirm_device.as_ref().unwrap().confirmable());
+        let restart = DeviceConfirm::new(drivers::DeviceAction::Restart, &off);
+        assert!(!restart.confirmable(), "restarting it does");
+    }
+
+    #[test]
+    fn the_device_actions_are_off_while_another_job_runs() {
+        let ((mut page, runner), mut screen) = (page_and_runner(vec![device("Alpha NIC", "Net")], vec![]), Screen::new());
+        page.drv.lock().busy = Some("Installing\u{2026}".into());
+        let shown = device_menu(&mut screen, &mut page, "Alpha NIC");
+        screen.click(&mut page, at_button(&shown, "Disable device"), egui::PointerButton::Primary);
+        screen.settle(&mut page);
+        assert!(page.drv_ui.confirm_device.is_none(), "a disabled entry opens nothing");
+        assert!(runner.launches().is_empty());
     }
 
     #[test]

@@ -746,6 +746,24 @@ pub fn restore_point_option(ui: &mut Ui, on: &mut bool) -> egui::Response {
     .inner
 }
 
+/// A context-menu entry that asks Windows for administrator permission: the
+/// UAC shield sits before the words. Greyed out while `enabled` is false.
+pub fn admin_menu_item(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
+    let r = ui.add_enabled(enabled, egui::Button::new(format!("      {label}")));
+    let ink = if enabled { icons::Ink::Theme } else { icons::Ink::Faded };
+    parts::shield(ui.painter(), Pos2::new(r.rect.left() + 16.0, r.rect.center().y), ink);
+    r
+}
+
+/// The stronger warning of a risky action: the warning in red and a box the
+/// user must tick ("I understand, continue anyway") before going on. The
+/// caller keeps its confirm button off until `understood` is true.
+pub fn strong_confirm(ui: &mut Ui, warning: &str, understood: &mut bool) -> egui::Response {
+    let th = crate::theme::of_ui(ui);
+    ui.label(egui::RichText::new(warning).strong().color(th.red));
+    ui.checkbox(understood, "I understand, continue anyway")
+}
+
 /// A search field with the magnifier glyph, up to `width` wide. The
 /// magnifier stays on the left in a right-to-left header too.
 pub fn search_field(ui: &mut Ui, text: &mut String, hint: &str, width: f32) -> egui::Response {
