@@ -659,6 +659,9 @@ fn signed_files(st: &State) -> Vec<String> {
     kernel.chain(devices).filter(|p| !p.trim().is_empty() && seen.insert(p.trim().to_lowercase())).collect()
 }
 
+/// Said when a job is asked for while another one runs (one job at a time).
+pub const BUSY_TEXT: &str = "Another driver job is running. Wait for it to finish.";
+
 impl Hub {
     pub fn new(ctx: AddonContext, reader: Arc<dyn ListingReader>) -> Self {
         let st = Arc::new(Mutex::new(State::default()));
@@ -713,10 +716,37 @@ impl Hub {
 
     /// Runs `job` in a thread unless the hub was stopped or another job
     /// holds the busy text (see [`Series::start`]). An uninterruptible job
-    /// counts in [`Hub::running`] until it ends.
+    /// counts in [`Hub::running`] until it ends. This is the one place the
+    /// one-job-at-a-time rule is kept: a job refused because another one
+    /// runs says [`BUSY_TEXT`] (see [`Hub::start_job`]).
     fn spawn(&self, busy: Option<String>, uninterruptible: bool, job: impl FnOnce(&Hub, &Run<State>) + Send + 'static) -> bool {
+        self.start_job(busy, uninterruptible, true, job)
+    }
+
+    /// [`Hub::spawn`]; `announce` tells whether a refusal for a busy hub
+    /// says [`BUSY_TEXT`]: a job the user did not ask for stays silent.
+    fn start_job(&self, busy: Option<String>, uninterruptible: bool, announce: bool, job: impl FnOnce(&Hub, &Run<State>) + Send + 'static) -> bool {
         let hub = self.clone();
-        self.series.start(busy, uninterruptible, move |run| job(&hub, run))
+        let claims = busy.is_some();
+        let started = self.series.start_with(
+            busy,
+            uninterruptible,
+            |st| {
+                // A refusal told while the last job ran is old by now.
+                if st.message.as_ref().is_some_and(|(m, _)| m == BUSY_TEXT) {
+                    st.message = None;
+                }
+            },
+            move |run| job(&hub, run),
+        );
+        if !started && announce && claims {
+            if let Some(mut st) = self.live() {
+                if st.busy.is_some() {
+                    st.message = Some((BUSY_TEXT.into(), true));
+                }
+            }
+        }
+        started
     }
 
     /// Re-reads devices and kernel drivers.
@@ -849,7 +879,8 @@ impl Hub {
     }
 
     fn check(&self, by_hand: bool) {
-        self.spawn(Some("Checking Windows Update for driver updates\u{2026}".into()), false, move |hub, run| {
+        // A search the page starts by itself never tells the user it was refused.
+        self.start_job(Some("Checking Windows Update for driver updates\u{2026}".into()), false, by_hand, move |hub, run| {
             // Turning the add-on off ends the search's PowerShell at once.
             let result = hub.ctx.powershell_until(SEARCH_SCRIPT, &[], &hub.halt);
             let Some(mut st) = hub.live() else { return };
@@ -1937,6 +1968,25 @@ mod tests {
         assert_eq!(hub.lock().message, Some(("Done.".to_string(), false)));
     }
 
+    /// Every job a user can start, each by its own entry point; the flag
+    /// tells whether it launches the elevated runner.
+    fn every_job() -> Vec<(&'static str, fn(&Hub), bool)> {
+        vec![
+            ("check", |h| h.check_updates(), true),
+            ("install", |h| h.install(vec!["id-1".into()]), true),
+            ("install from an INF file", |h| h.install_inf(r"C:\d\a.inf".into()), true),
+            ("scan", |h| h.scan(), true),
+            ("unload", |h| h.unload("beep".into()), true),
+            ("remove", |h| h.remove_packages(vec!["oem1.inf".into()], false), true),
+            ("remove old", |h| h.remove_old(false), true),
+            ("remove forced", |h| h.remove_forced("oem3.inf".into(), false), true),
+            ("backup", |h| h.back_up(None, r"D:\B\Drivers".into()), true),
+            ("device action", |h| h.device_action_with(DeviceAction::Disable, ID.into(), false), true),
+            ("rollback", |h| h.device_action_with(DeviceAction::Rollback, ID.into(), false), true),
+            ("hash", |h| h.hash_file(r"C:\no\such\file.sys".into(), HashFor::VirusTotal), false),
+        ]
+    }
+
     #[test]
     fn rolling_back_is_one_elevated_launch_with_the_instance_id_and_the_restore_point_step() {
         let (hub, runner, _) = install_hub();
@@ -2021,13 +2071,53 @@ mod tests {
         assert_eq!(strong_warning(DeviceAction::Rollback, "Net"), None);
     }
 
+
     #[test]
-    fn only_one_device_job_runs_at_a_time() {
+    fn a_second_job_while_one_runs_starts_nothing_and_says_so() {
+        for (name, start, _) in every_job() {
+            let (hub, runner, _) = store_hub();
+            hub.lock().busy = Some("Installing\u{2026}".into());
+            start(&hub);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            assert!(runner.launches().is_empty(), "{name}: nothing starts while another job holds the page");
+            let st = hub.lock();
+            assert_eq!(st.message, Some((BUSY_TEXT.to_string(), true)), "{name}: the user is told");
+            assert_eq!(st.busy.as_deref(), Some("Installing\u{2026}"), "{name}: the running job is not affected");
+        }
+        assert_eq!(BUSY_TEXT, "Another driver job is running. Wait for it to finish.");
+    }
+
+    #[test]
+    fn continuing_without_a_restore_point_is_a_job_too() {
+        let (hub, runner, _) = install_hub();
+        hub.lock().restore_prompt = Some(RestorePrompt { reason: "x".into(), redo: Redo::Updates(vec!["id-1".into()]) });
+        hub.lock().busy = Some("Installing\u{2026}".into());
+        hub.continue_without_restore();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(runner.launches().is_empty());
+        assert_eq!(hub.lock().message, Some((BUSY_TEXT.to_string(), true)));
+    }
+
+    #[test]
+    fn every_job_still_starts_when_nothing_runs_and_the_busy_notice_goes() {
+        for (name, start, launches) in every_job() {
+            let (hub, runner, _) = store_hub();
+            hub.lock().message = Some((BUSY_TEXT.to_string(), true));
+            start(&hub);
+            wait_until_idle(&hub);
+            assert_ne!(hub.lock().message, Some((BUSY_TEXT.to_string(), true)), "{name}: an old refusal is not shown for a job that runs");
+            assert_eq!(!runner.launches().is_empty(), launches, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_search_the_page_starts_by_itself_is_refused_silently() {
         let (hub, runner, _) = install_hub();
         hub.lock().busy = Some("Installing\u{2026}".into());
-        hub.device_action_with(DeviceAction::Disable, ID.into(), false);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(runner.launches().is_empty(), "nothing starts while another job holds the page");
+        hub.check_updates_on_open();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(runner.launches().is_empty());
+        assert_eq!(hub.lock().message, None);
     }
 
     #[test]

@@ -760,6 +760,15 @@ pub fn restore_point_option(ui: &mut Ui, on: &mut bool) -> egui::Response {
     .inner
 }
 
+/// What a confirm dialog says while another job runs (one job at a time):
+/// nothing when `idle`. The dialog disables its confirm button alongside.
+pub fn busy_note(ui: &mut Ui, text: &str, idle: bool) {
+    if !idle {
+        let th = crate::theme::of_ui(ui);
+        ui.label(egui::RichText::new(text).color(th.amber));
+    }
+}
+
 /// A context-menu entry that asks Windows for administrator permission: the
 /// UAC shield sits before the words. Greyed out while `enabled` is false.
 pub fn admin_menu_item(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
