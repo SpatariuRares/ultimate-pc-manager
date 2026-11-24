@@ -103,7 +103,9 @@ pub(crate) fn system_has(feature: Feature) -> bool {
     // Linux: signals, nice values and affinity work through kill, renice and taskset;
     // the startup entries are read from the XDG autostart folders; the service
     // list and its control come from its sources (they say when no service manager is there);
-    // the open-file count and the architecture are read from /proc (the program's ELF header).
+    // the open-file count and the architecture are read from /proc (the program's ELF header);
+    // the owning package (in place of a signer) comes from the package database and the
+    // description from the program's desktop entry.
     #[cfg(target_os = "linux")]
     return matches!(
         feature,
@@ -113,6 +115,8 @@ pub(crate) fn system_has(feature: Feature) -> bool {
             | Feature::ServiceControl
             | Feature::ProcessHandleCounts
             | Feature::ProcessArchitecture
+            | Feature::FileSignatures
+            | Feature::FileVersionInfo
     );
     // No current feature has a macOS implementation yet.
     #[cfg(target_os = "macos")]
@@ -214,7 +218,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn on_linux_process_control_startup_entries_services_and_the_proc_facts_are_in_the_system_so_far() {
+    fn on_linux_process_control_startup_entries_services_the_proc_facts_and_the_file_texts_are_in_the_system_so_far() {
         let here = [
             Feature::ProcessControl,
             Feature::StartupEntries,
@@ -222,6 +226,8 @@ mod tests {
             Feature::ServiceControl,
             Feature::ProcessHandleCounts,
             Feature::ProcessArchitecture,
+            Feature::FileSignatures,
+            Feature::FileVersionInfo,
         ];
         for &feature in Feature::ALL {
             assert_eq!(system_has(feature), here.contains(&feature), "{feature:?}");

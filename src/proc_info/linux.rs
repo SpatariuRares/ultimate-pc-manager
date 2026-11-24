@@ -399,6 +399,33 @@ pub fn windows_in(root: &FsRoot) -> Windows {
     Windows { apps, ..Windows::default() }
 }
 
+/// The systemd service unit a process runs in: the last component of its
+/// cgroup path when it is a `*.service` that is not a desktop application's.
+pub fn service_unit_of(cgroup: &str) -> Option<&str> {
+    cgroup.rsplit('/').next().filter(|c| c.ends_with(".service") && !is_app_unit(c))
+}
+
+/// The service units that run, each with the process that hosts it: the
+/// lowest PID of the processes in its cgroup (the daemon starts before the
+/// workers it forks). Sorted by PID.
+pub fn hosted_units_in(root: &FsRoot) -> Vec<(u32, String)> {
+    let mut hosts: HashMap<String, u32> = HashMap::new();
+    for pid in pids(root) {
+        let Some(cgroup) = ProcFiles::new(root, pid).cgroup() else { continue };
+        let Some(unit) = service_unit_of(&cgroup) else { continue };
+        let host = hosts.entry(unit.to_string()).or_insert(pid);
+        *host = (*host).min(pid);
+    }
+    let mut hosted: Vec<(u32, String)> = hosts.into_iter().map(|(unit, pid)| (pid, unit)).collect();
+    hosted.sort();
+    hosted
+}
+
+/// The service units that run, with their host processes.
+pub fn hosted_units() -> Vec<(u32, String)> {
+    hosted_units_in(&FsRoot::system())
+}
+
 /// The command line (words joined by spaces) and the environment of one process.
 pub fn command_line_and_environment_in(root: &FsRoot, pid: u32) -> CommandAndEnvironment {
     let files = ProcFiles::new(root, pid);
@@ -539,6 +566,23 @@ mod tests {
         let v1 = "12:cpu,cpuacct:/user\n1:name=systemd:/user.slice/app-x-1.scope\n";
         assert_eq!(cgroup_path(v1).as_deref(), Some("/user.slice/app-x-1.scope"));
         assert_eq!(cgroup_path("12:cpu:/user\n"), None);
+    }
+
+    #[test]
+    fn a_daemon_hosts_the_systemd_unit_of_its_cgroup() {
+        assert_eq!(service_unit_of("/system.slice/ssh.service"), Some("ssh.service"));
+        assert_eq!(service_unit_of("/user.slice/user-1000.slice/user@1000.service/session.slice/pipewire.service"), Some("pipewire.service"));
+        assert_eq!(service_unit_of("/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-x-1.service"), None, "a desktop application is an app");
+        assert_eq!(service_unit_of("/user.slice/user-1000.slice/session-3.scope"), None);
+        assert_eq!(service_unit_of("/system.slice/docker.service/kubepods"), None, "only the unit itself");
+        let hosted = hosted_units_in(&fixture("desktop"));
+        assert_eq!(hosted, [(1001, "pipewire.service".to_string()), (1003, "ssh.service".to_string())]);
+    }
+
+    #[test]
+    fn the_host_of_a_unit_is_the_lowest_pid_of_its_processes() {
+        let hosted = hosted_units_in(&fixture("units"));
+        assert_eq!(hosted, [(100, "pipewire.service".to_string()), (300, "nginx.service".to_string())]);
     }
 
     #[test]
