@@ -42,7 +42,7 @@ pub fn disk_info() -> Vec<DiskInfo> {
 }
 
 fn disks_of(root: &FsRoot) -> Vec<DiskInfo> {
-    crate::linux_disks::physical_disks(root).into_iter().map(|d| DiskInfo { number: d.number, model: d.model, bus: d.kind, capacity: d.capacity, ..DiskInfo::default() }).collect()
+    crate::linux_disks::physical_disks(root).into_iter().map(|d| DiskInfo { number: d.number, model: d.model, bus: d.kind.label(), capacity: d.capacity, ..DiskInfo::default() }).collect()
 }
 
 /// The raw SMBIOS table: none, not available yet.

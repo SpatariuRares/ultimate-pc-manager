@@ -346,13 +346,7 @@ pub fn open_resources(pid: u32, each: Duration) -> Result<Vec<Resource>, Missing
 
 /// The working folder of the process, where the system tells it (Linux).
 pub fn working_folder(pid: u32) -> Option<String> {
-    #[cfg(target_os = "linux")]
-    return imp::working_folder(pid);
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
-    }
+    imp::working_folder(pid)
 }
 
 /// A kernel path as the user knows it: "\Device\HarddiskVolume3\x" →
@@ -410,6 +404,12 @@ use macos as imp;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_does_not_tell_the_working_folder() {
+        assert_eq!(working_folder(std::process::id()), None);
+    }
 
     #[cfg(windows)]
     #[test]

@@ -19,8 +19,9 @@ fn sources() -> Vec<Box<dyn ServiceSource>> {
     vec![Box::new(Systemd), Box::new(OpenRc), Box::new(Runit::new(FsRoot::system()))]
 }
 
-/// The services of every source present, or why none could be read.
-pub fn list_services() -> Result<Vec<ServiceRow>, String> {
+/// The services of every source present, with a notice for each source that
+/// could not be read, or why none could be read.
+pub fn list_services_noticed() -> Result<(Vec<ServiceRow>, Vec<String>), String> {
     list_all(&sources(), &SystemRunner)
 }
 

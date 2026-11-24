@@ -35,6 +35,8 @@ pub trait Driver {
     fn cards(&self) -> Vec<Adapter>;
     fn sample(&self, card: usize) -> GpuSample;
     fn extras(&self, card: usize) -> Extras;
+    /// The card's own memory in bytes, `(used, total)`, when the library says.
+    fn memory(&self, card: usize) -> Option<(u64, u64)>;
 }
 
 /// The provider's NVML session: a started library, or why there is none.
@@ -80,10 +82,22 @@ impl Reader {
             .flat_map(|(i, card)| {
                 let mut readings = s.driver.sample(i).readings(card, SOURCE, NOT_REPORTED, at);
                 readings.extend(s.driver.extras(i).readings(card, at));
+                readings.extend(memory_readings(card, s.driver.memory(i), at));
                 readings
             })
             .collect()
     }
+}
+
+/// The card's dedicated memory in use and in all (bytes), as two rows of the
+/// card; grey with the reason when the library did not say.
+fn memory_readings(card: &crate::sensors::model::Device, memory: Option<(u64, u64)>, at: Instant) -> Vec<Reading> {
+    use crate::sensors::model::{Group, Unit};
+    let why = "NVML reports no memory figures";
+    [("memory.dedicated_used_bytes", "Dedicated Memory Used", memory.map(|m| m.0)), ("memory.dedicated_total_bytes", "Dedicated Memory", memory.map(|m| m.1))]
+        .into_iter()
+        .map(|(what, name, bytes)| Reading::measure(&gpu::metric(card, what), card.clone(), Group::General, name, Unit::Bytes, SOURCE, at).with(bytes.map(|b| b as f64), why))
+        .collect()
 }
 
 /// Whether this PC has an NVIDIA card (the kernel lists its vendor), the one
@@ -109,11 +123,20 @@ type Value = unsafe extern "C" fn(Dev, *mut u32) -> u32;
 type Utilization = unsafe extern "C" fn(Dev, *mut [u32; 2]) -> u32;
 type Codec = unsafe extern "C" fn(Dev, *mut u32, *mut u32) -> u32;
 type Mask = unsafe extern "C" fn(Dev, *mut u64) -> u32;
+type MemoryInfo = unsafe extern "C" fn(Dev, *mut MemoryCounts) -> u32;
 
 const NVML_SUCCESS: u32 = 0;
 const CLOCK_GRAPHICS: u32 = 0;
 const CLOCK_MEM: u32 = 2;
 const TEMPERATURE_GPU: u32 = 0;
+
+/// nvmlMemory_t: the card's memory in bytes.
+#[repr(C)]
+struct MemoryCounts {
+    total: u64,
+    free: u64,
+    used: u64,
+}
 
 /// nvmlPciInfo_t (only the PCI ids are read).
 #[repr(C)]
@@ -149,6 +172,7 @@ pub struct Library {
     pcie_width: Option<Value>,
     pcie_max_gen: Option<Value>,
     pcie_max_width: Option<Value>,
+    memory: Option<MemoryInfo>,
     handles: Vec<Dev>,
     seen: Vec<Adapter>,
 }
@@ -193,6 +217,7 @@ impl Library {
                 pcie_width: sym(lib, c"nvmlDeviceGetCurrPcieLinkWidth"),
                 pcie_max_gen: sym(lib, c"nvmlDeviceGetMaxPcieLinkGeneration"),
                 pcie_max_width: sym(lib, c"nvmlDeviceGetMaxPcieLinkWidth"),
+                memory: sym(lib, c"nvmlDeviceGetMemoryInfo"),
                 handles: Vec::new(),
                 seen: Vec::new(),
             };
@@ -278,6 +303,13 @@ impl Driver for Library {
         }
     }
 
+    fn memory(&self, card: usize) -> Option<(u64, u64)> {
+        let d = self.handles[card];
+        let mut counts = MemoryCounts { total: 0, free: 0, used: 0 };
+        // SAFETY: `d` is a handle of this library; the out-pointer is valid.
+        self.memory.filter(|f| unsafe { f(d, &mut counts) } == NVML_SUCCESS).map(|_| (counts.used, counts.total))
+    }
+
     fn extras(&self, card: usize) -> Extras {
         let d = self.handles[card];
         // SAFETY: `d` is a handle of this library; out-pointers are valid.
@@ -340,6 +372,9 @@ mod tests {
         fn extras(&self, _card: usize) -> Extras {
             Extras { clock_reasons: Ok(0x4), pstate: Ok(2), pcie: Ok(((4, 16), Some((4, 16)))) }
         }
+        fn memory(&self, card: usize) -> Option<(u64, u64)> {
+            (card == 0).then_some((6_000_000_000, 16_000_000_000))
+        }
     }
 
     fn nvidia(name: &str) -> Adapter {
@@ -361,6 +396,16 @@ mod tests {
         assert_eq!(text("gpu.nvidia0.clock.limit_reasons"), "Power cap");
         assert_eq!(text("gpu.nvidia0.pcie.link"), "Gen 4 x16 of Gen 4 x16");
         assert!(frame.readings().all(|r| r.source == SOURCE));
+    }
+
+    #[test]
+    fn the_cards_dedicated_memory_in_use_and_in_all_is_read_through_the_library() {
+        let reader = Reader::with(Ok(Box::new(Fake { cards: vec![nvidia("NVIDIA GeForce RTX 4080"), nvidia("NVIDIA GeForce RTX 3060")] })));
+        let frame = Frame::build(0, &[reader.read(Instant::now())], Vec::new());
+        let text = |id: &str| frame.reading(id).unwrap_or_else(|| panic!("no {id}")).text();
+        assert_eq!(text("gpu.nvidia0.memory.dedicated_used_bytes"), "6.0 GB");
+        assert_eq!(text("gpu.nvidia0.memory.dedicated_total_bytes"), "16.0 GB");
+        assert_eq!(text("gpu.nvidia1.memory.dedicated_used_bytes"), "NVML reports no memory figures", "a card the library gave no figures for is grey, never zero");
     }
 
     #[test]

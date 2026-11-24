@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=abs-present
+Exec=abs-present --go
+TryExec=/opt/app/bin/abs-tool

@@ -3,6 +3,11 @@
 use super::StartupEntry;
 use crate::availability::{unavailable_error, Feature};
 
+/// Where the list comes from, as the page's band says it.
+pub fn sources_note() -> &'static str {
+    "From the startup entries of this system"
+}
+
 /// No startup entries.
 pub fn list_startup() -> Vec<StartupEntry> {
     Vec::new()

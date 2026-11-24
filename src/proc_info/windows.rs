@@ -372,6 +372,11 @@ unsafe fn visible_window_pid(hwnd: windows_sys::Win32::Foundation::HWND) -> Opti
     }
 }
 
+/// The working folder of the process: this system does not tell it.
+pub fn working_folder(_pid: u32) -> Option<String> {
+    None
+}
+
 /// Brings up the first window of `pid` that [`app_window_pid`] counts,
 /// else its first visible one (restored when minimized); false when it
 /// has none or Windows refuses.

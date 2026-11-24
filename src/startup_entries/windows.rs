@@ -16,6 +16,11 @@ fn approved(hive: &RegKey, key: &str, name: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// Where the list comes from, as the page's band says it.
+pub fn sources_note() -> &'static str {
+    "From the Run keys and Startup folders"
+}
+
 pub fn list_startup() -> Vec<StartupEntry> {
     let mut out = Vec::new();
     for (hkcu, hive, label) in [

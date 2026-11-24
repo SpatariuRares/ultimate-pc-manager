@@ -269,15 +269,35 @@ fn renice(h: &Host, pid: u32, class: &str) -> Result<(), String> {
     let nice = NICE_OF[index];
     // Lowering one's own priority is free; raising it is not.
     let raises = stat_of(h, pid).is_some_and(|(_, now)| nice < now);
-    let argv = ["renice".to_string(), "-n".into(), nice.to_string(), "-p".into(), pid.to_string()];
+    // The nice value belongs to each thread: every thread of the process gets it.
+    let mut argv = vec!["renice".to_string(), "-n".into(), nice.to_string(), "-p".into(), pid.to_string()];
+    argv.extend(threads_of(h, pid).into_iter().map(|tid| tid.to_string()));
     run(h, &argv, raises || is_foreign(h, pid))
+}
+
+/// The threads of `pid` other than its main one (`proc/<pid>/task/<tid>`), by id.
+fn threads_of(h: &Host, pid: u32) -> Vec<u32> {
+    let mut tids: Vec<u32> = h.root.list_dir(&format!("proc/{pid}/task")).iter().filter_map(|n| n.parse().ok()).filter(|tid| *tid != pid).collect();
+    tids.sort_unstable();
+    tids
 }
 
 fn taskset(h: &Host, pid: u32, mask: u64) -> Result<(), String> {
     if mask == 0 {
         return Err("A process must be allowed to run on at least one processor.".into());
     }
-    let argv = ["taskset".to_string(), "-a".into(), "-p".into(), format!("{mask:x}"), pid.to_string()];
+    let cpus: Vec<u32> = (0..64).filter(|cpu| mask & (1u64 << cpu) != 0).collect();
+    taskset_cpus(h, pid, &cpus)
+}
+
+/// Lets every thread of `pid` run only on `cpus`, as the CPU list `taskset -c`
+/// takes (it has no limit of 64 processors, as a mask has).
+fn taskset_cpus(h: &Host, pid: u32, cpus: &[u32]) -> Result<(), String> {
+    if cpus.is_empty() {
+        return Err("A process must be allowed to run on at least one processor.".into());
+    }
+    let list = cpus.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let argv = ["taskset".to_string(), "-a".into(), "-p".into(), "-c".into(), list, pid.to_string()];
     run(h, &argv, is_foreign(h, pid))
 }
 
@@ -428,6 +448,16 @@ mod tests {
     }
 
     #[test]
+    fn set_priority_reaches_every_thread_of_the_process_in_one_command_line() {
+        let (r, calls) = with_host(ok(), |h| renice(h, 101, "Below normal"));
+        assert_eq!((r, lines(&calls)), (Ok(()), vec!["renice -n 5 -p 101 151 152".to_string()]));
+        let (_, calls) = with_host(ok(), |h| renice(h, 101, "High"));
+        assert_eq!(lines(&calls), ["pkexec renice -n -10 -p 101 151 152"], "the elevated line carries the threads too");
+        let (_, calls) = with_host(ok(), |h| renice(h, 100, "Below normal"));
+        assert_eq!(lines(&calls), ["renice -n 5 -p 100"], "a process with no task folder read gets its own id only");
+    }
+
+    #[test]
     fn the_priority_is_the_class_of_the_nice_value() {
         let (p, _) = with_host(ok(), |h| (priority_of(h, 100), priority_of(h, 300), priority_of(h, 999)));
         assert_eq!(p, (Some("Normal"), Some("Low"), None));
@@ -446,11 +476,17 @@ mod tests {
     }
 
     #[test]
-    fn set_affinity_runs_taskset_with_a_hex_mask_and_asks_for_another_users_process() {
+    fn set_affinity_runs_taskset_with_a_cpu_list_and_asks_for_another_users_process() {
         let (r, calls) = with_host(ok(), |h| taskset(h, 100, 0x5));
-        assert_eq!((r, lines(&calls)), (Ok(()), vec!["taskset -a -p 5 100".to_string()]));
+        assert_eq!((r, lines(&calls)), (Ok(()), vec!["taskset -a -p -c 0,2 100".to_string()]));
         let (_, calls) = with_host(ok(), |h| taskset(h, 200, 0xff));
-        assert_eq!(lines(&calls), ["pkexec taskset -a -p ff 200"]);
+        assert_eq!(lines(&calls), ["pkexec taskset -a -p -c 0,1,2,3,4,5,6,7 200"]);
+        let (_, calls) = with_host(ok(), |h| taskset(h, 100, 1 << 63));
+        assert_eq!(lines(&calls), ["taskset -a -p -c 63 100"], "the top bit of a mask is a CPU too");
+        let (_, calls) = with_host(ok(), |h| taskset_cpus(h, 100, &[0, 2, 65]));
+        assert_eq!(lines(&calls), ["taskset -a -p -c 0,2,65 100"], "a CPU of 64 or more can be chosen");
+        let (r, calls) = with_host(ok(), |h| taskset_cpus(h, 100, &[]));
+        assert!(r.is_err() && calls.is_empty());
         let (r, calls) = with_host(ok(), |h| taskset(h, 100, 0));
         assert_eq!((r.is_err(), calls.len()), (true, 0), "no processor at all is refused before any launch");
     }

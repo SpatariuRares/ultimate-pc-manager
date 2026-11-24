@@ -231,7 +231,7 @@ mod tests {
         runner.prepare(When::Nth(0), 0, STATUS);
         runner.prepare(When::Nth(1), 0, UPDATE);
         let sources: Vec<Box<dyn ServiceSource>> = vec![Box::new(OpenRc)];
-        let rows = list_all(&sources, &runner).unwrap();
+        let rows = list_all(&sources, &runner).unwrap().0;
         assert!(rows.iter().all(|r| ["start", "stop", "restart", "enable", "disable"].into_iter().all(|a| r.can(a))));
     }
 

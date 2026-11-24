@@ -28,8 +28,8 @@ use crate::sensors::model::{CounterSet, Instance};
 /// The GPU counters query, over a root.
 pub struct Counters {
     fs: FsRoot,
-    /// Busy nanoseconds of the last read, per process, client and engine.
-    last: Option<(Instant, HashMap<Key, u64>)>,
+    /// What each process's client counted of each engine at the last read.
+    last: Option<(Instant, HashMap<Key, Busy>)>,
 }
 
 /// A process's client of a card and one engine of it.
@@ -39,6 +39,16 @@ struct Key {
     client: String,
     card: u32,
     engine: String,
+}
+
+/// What a client counted of one engine: its busy nanoseconds
+/// (`drm-engine-<name>`), or its busy cycles with the cycles the engine ran
+/// in all (`drm-cycles-<name>` and `drm-total-cycles-<name>`, the xe driver's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Busy {
+    busy: u64,
+    /// The cycles in all, when the driver counts cycles instead of time.
+    total: Option<u64>,
 }
 
 /// One card of `/sys/class/drm`.
@@ -108,7 +118,12 @@ impl Counters {
             keys.sort_by(|a, b| (a.card, &a.engine, a.pid, &a.client).cmp(&(b.card, &b.engine, b.pid, &b.client)));
             for key in keys {
                 let Some(earlier) = before.get(key) else { continue };
-                let percent = percent_of(busy[key].saturating_sub(*earlier), span);
+                let now = busy[key];
+                let percent = match (now.total, earlier.total) {
+                    // Cycles: the share of the engine's own cycles in between.
+                    (Some(now_total), Some(was_total)) => percent_of(now.busy.saturating_sub(earlier.busy), now_total.saturating_sub(was_total) as f64),
+                    _ => percent_of(now.busy.saturating_sub(earlier.busy), span),
+                };
                 let number = numbers[&key.card].iter().position(|n| *n == key.engine).unwrap_or(0) + 1;
                 let name = format!("pid_{}_{}_eng_{number}_engtype_{}", key.pid, luid(key.card), engine_type(&key.engine));
                 engines.push(Instance::new(&name, percent));
@@ -137,9 +152,10 @@ fn luid(card: u32) -> String {
 fn engine_type(drm: &str) -> String {
     match drm {
         "render" | "gfx" => "3D",
-        "compute" => "Compute",
-        "copy" | "dma" | "blitter" => "Copy",
-        "video" => "Video",
+        "compute" | "ccs" => "Compute",
+        "rcs" => "3D",
+        "copy" | "dma" | "blitter" | "bcs" => "Copy",
+        "video" | "vcs" => "Video",
         "dec" => "VideoDecode",
         "enc" => "VideoEncode",
         "video-enhance" | "vecs" => "VideoProcessing",
@@ -177,7 +193,7 @@ fn cards(fs: &FsRoot) -> Vec<Card> {
 /// The busy nanoseconds of every process's clients of `cards`, per engine,
 /// from `proc/<pid>/fdinfo`. Several descriptors of one client count once; a
 /// process whose files cannot be read is left out.
-fn clients(fs: &FsRoot, cards: &[Card]) -> HashMap<Key, u64> {
+fn clients(fs: &FsRoot, cards: &[Card]) -> HashMap<Key, Busy> {
     let mut found = HashMap::new();
     let Ok(procs) = std::fs::read_dir(fs.path("proc")) else { return found };
     for process in procs.flatten() {
@@ -191,6 +207,15 @@ fn clients(fs: &FsRoot, cards: &[Card]) -> HashMap<Key, u64> {
             let field = |name: &str| text.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix(':').map(str::trim));
             let (Some(pdev), Some(client)) = (field("drm-pdev"), field("drm-client-id")) else { continue };
             let Some(card) = cards.iter().find(|c| c.pci.as_deref() == Some(pdev)) else { continue };
+            // The xe driver counts cycles: an engine's busy and total cycles are two lines.
+            for line in text.lines() {
+                let Some(rest) = line.strip_prefix("drm-cycles-") else { continue };
+                let Some((engine, value)) = rest.split_once(':') else { continue };
+                let Some(busy) = value.trim().parse::<u64>().ok() else { continue };
+                let total_line = format!("drm-total-cycles-{engine}:");
+                let total = text.lines().find_map(|l| l.strip_prefix(total_line.as_str())).and_then(|t| t.trim().parse::<u64>().ok());
+                found.insert(Key { pid, client: client.to_string(), card: card.index, engine: engine.to_string() }, Busy { busy, total });
+            }
             for line in text.lines() {
                 let Some(rest) = line.strip_prefix("drm-engine-") else { continue };
                 let Some((engine, value)) = rest.split_once(':') else { continue };
@@ -199,7 +224,7 @@ fn clients(fs: &FsRoot, cards: &[Card]) -> HashMap<Key, u64> {
                     continue;
                 }
                 let Some(ns) = value.split_whitespace().next().and_then(|n| n.parse::<u64>().ok()) else { continue };
-                found.insert(Key { pid, client: client.to_string(), card: card.index, engine: engine.to_string() }, ns);
+                found.insert(Key { pid, client: client.to_string(), card: card.index, engine: engine.to_string() }, Busy { busy: ns, total: None });
             }
         }
     }
@@ -265,6 +290,20 @@ mod tests {
         assert_eq!(adapters[1].util, 25.0);
         let by_pid = crate::perfdata::gpu_by_pid(&pairs(counter::GPU));
         assert_eq!((by_pid[&4242], by_pid[&300]), (50.0, 25.0), "each process's share of its card");
+    }
+
+    #[test]
+    fn an_xe_clients_engines_are_the_share_of_the_cycles_the_engine_ran_between_two_reads() {
+        let mut counters = Counters::over(fixture("gpu-xe"));
+        let t = Instant::now();
+        assert_eq!(counted(&counters.read_at(t).expect("cards"), counter::GPU), vec![], "the first read has nothing to compare with");
+        counters.fs = fixture("gpu-xe-later");
+        // One second passed, but the engine ran 8000 cycles: 1600 of them busy is 20 %, whatever the clock says.
+        let gpu = counted(&counters.read_at(t + Duration::from_secs(1)).expect("cards"), counter::GPU);
+        let value = |name: &str| gpu.iter().find(|(n, _)| n == name).unwrap_or_else(|| panic!("no {name} in {gpu:?}")).1;
+        assert_eq!(value("pid_500_luid_0x00000000_0x00000000_phys_0_eng_1_engtype_3D"), 20.0);
+        assert_eq!(value("pid_500_luid_0x00000000_0x00000000_phys_0_eng_2_engtype_Video"), 0.0);
+        assert_eq!(gpu.len(), 2, "{gpu:?}");
     }
 
     #[test]

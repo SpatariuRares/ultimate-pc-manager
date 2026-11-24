@@ -262,7 +262,7 @@ mod tests {
         let runner = RecordingRunner::default();
         runner.prepare(When::Nth(0), 1, STATUS);
         let sources: Vec<Box<dyn ServiceSource>> = vec![Box::new(Runit::new(fixture("runit")))];
-        let rows = list_all(&sources, &runner).unwrap();
+        let rows = list_all(&sources, &runner).unwrap().0;
         assert!(rows.iter().all(|r| ["start", "stop", "restart", "enable", "disable"].into_iter().all(|a| r.can(a))));
     }
 
@@ -284,7 +284,7 @@ mod tests {
         runner.prepare(When::Nth(0), 1, "rc-status: broken");
         runner.prepare(When::Nth(1), 0, STATUS);
         let sources: Vec<Box<dyn ServiceSource>> = vec![Box::new(OpenRc), Box::new(Runit::new(fixture("runit")))];
-        let rows = list_all(&sources, &runner).unwrap();
+        let rows = list_all(&sources, &runner).unwrap().0;
         assert_eq!(rows.iter().map(|r| r.source.as_str()).collect::<Vec<_>>(), ["runit", "runit", "runit"]);
     }
 

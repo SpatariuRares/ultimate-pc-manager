@@ -162,7 +162,7 @@ impl<'a> ProcFiles<'a> {
             })
             .collect();
         links.sort();
-        let sockets = SocketNames::read(self.root);
+        let sockets = SocketNames::read(self.root, self.pid);
         let mut list: Vec<Resource> = links.into_iter().filter_map(|(_, target)| resource_of(&target, &sockets)).collect();
         list.sort();
         list.dedup();
@@ -399,7 +399,6 @@ fn counts_of(files: &ProcFiles) -> Option<Counts> {
     Some(c)
 }
 
-#[cfg(test)]
 /// The IDs of the processes under the root.
 fn pids(root: &FsRoot) -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir(root.path("proc")) else { return Vec::new() };
@@ -534,18 +533,21 @@ fn resource_of(target: &str, sockets: &SocketNames) -> Option<Resource> {
     target.starts_with('/').then(|| Resource { kind: ResourceKind::File, name: target.to_string() })
 }
 
-/// The names of the system's sockets by inode, from `/proc/net`.
+/// The names of a process's sockets by inode, from the socket tables of the
+/// network namespace it lives in (`/proc/<pid>/net/...`; a container's
+/// sockets are not in the host's tables), else the system's `/proc/net`.
 struct SocketNames(HashMap<String, String>);
 
 impl SocketNames {
-    fn read(root: &FsRoot) -> Self {
+    fn read(root: &FsRoot, pid: u32) -> Self {
         let mut names = HashMap::new();
+        let table = |file: &str| root.read(&format!("proc/{pid}/net/{file}")).or_else(|| root.read(&format!("proc/net/{file}")));
         for (file, protocol) in [("tcp", "TCP"), ("tcp6", "TCP"), ("udp", "UDP"), ("udp6", "UDP")] {
-            if let Some(text) = root.read(&format!("proc/net/{file}")) {
+            if let Some(text) = table(file) {
                 parse_inet_sockets(&text, protocol, &mut names);
             }
         }
-        if let Some(text) = root.read("proc/net/unix") {
+        if let Some(text) = table("unix") {
             parse_unix_sockets(&text, &mut names);
         }
         SocketNames(names)
@@ -840,6 +842,22 @@ mod tests {
             ],
             "sorted by kind and name; anonymous kernel objects left out; an unknown socket keeps the kernel's name"
         );
+    }
+
+    #[test]
+    fn a_process_in_another_network_namespace_names_its_sockets_from_its_own_tables() {
+        let dir = resources_root("namespace");
+        std::fs::create_dir_all(dir.join("proc/42/net")).unwrap();
+        let own = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000  0        0 222 1 0000 100 0 0 10 0
+";
+        std::fs::write(dir.join("proc/42/net/tcp"), own).unwrap();
+        let list = open_resources_in(&FsRoot::at(&dir), 42).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let names: Vec<&str> = list.iter().filter(|r| r.kind == ResourceKind::Socket).map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"TCP 127.0.0.1:53 listening"), "inode 222 is in the process's own table: {names:?}");
+        assert!(names.contains(&"socket:[111]"), "the host's table is not read for a file the namespace has: {names:?}");
+        assert!(names.contains(&"Unix socket /run/user/1000/bus"), "a table it does not have falls back to /proc/net: {names:?}");
     }
 
     #[test]

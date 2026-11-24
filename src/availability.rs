@@ -103,12 +103,15 @@ pub(crate) fn system_has(feature: Feature) -> bool {
         true
     };
     // Linux: signals, nice values and affinity work through kill, renice and taskset;
-    // the startup entries are read from the XDG autostart folders; the service
-    // list and its control come from its sources (they say when no service manager is there);
-    // the open-file count and the architecture are read from /proc (the program's ELF header);
-    // the owning package (in place of a signer) comes from the package database and the
-    // description from the program's desktop entry.
-    // the open files and sockets are read from /proc/<pid>/fd (there are no registry keys).
+    // the startup entries are read from the XDG autostart folders and the user's
+    // systemd units; the service list and its control come from its sources (they
+    // say when no service manager is there); the open-file count and the
+    // architecture are read from /proc (the program's ELF header); the owning
+    // package (in place of a signer) comes from the package database and the
+    // description from the program's desktop entry; the open files and sockets are
+    // read from /proc/<pid>/fd (there are no registry keys); the machine's fixed
+    // facts come from /proc, /sys and the firmware tables, and the graphics usage
+    // of each process from the DRM interface.
     #[cfg(target_os = "linux")]
     return matches!(
         feature,
@@ -121,6 +124,8 @@ pub(crate) fn system_has(feature: Feature) -> bool {
             | Feature::FileSignatures
             | Feature::FileVersionInfo
             | Feature::OpenHandles
+            | Feature::MachineInformation
+            | Feature::ProcessGpuUsage
     );
     // No current feature has a macOS implementation yet.
     #[cfg(target_os = "macos")]
@@ -222,7 +227,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn on_linux_process_control_startup_entries_services_the_proc_facts_and_the_file_texts_are_in_the_system_so_far() {
+    fn on_linux_every_feature_with_a_linux_reader_is_in_the_system_so_far() {
         let here = [
             Feature::ProcessControl,
             Feature::StartupEntries,
@@ -233,6 +238,8 @@ mod tests {
             Feature::FileSignatures,
             Feature::FileVersionInfo,
             Feature::OpenHandles,
+            Feature::MachineInformation,
+            Feature::ProcessGpuUsage,
         ];
         for &feature in Feature::ALL {
             assert_eq!(system_has(feature), here.contains(&feature), "{feature:?}");

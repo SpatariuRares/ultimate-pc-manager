@@ -50,6 +50,8 @@ fn names(key: &ServiceKey, row: &ServiceRow) -> bool {
 pub struct ServicesPage {
     /// The list as last read; `None` until the page is first shown.
     list: Option<Result<Vec<ServiceRow>, String>>,
+    /// The sources that could not be read at the last read, and why.
+    notices: Vec<String>,
     /// The chosen service.
     selected: Option<ServiceKey>,
     /// The filter text.
@@ -60,7 +62,9 @@ impl ServicesPage {
     /// The one place the services list is read: every reader (first draw,
     /// Refresh, F5, the sidebar, Go to services, a control) comes here.
     pub fn reload(&mut self, system: &dyn SystemLists) {
-        self.list = Some(system.list_services());
+        let read = system.list_services();
+        self.notices = read.as_ref().map(|r| r.notices.clone()).unwrap_or_default();
+        self.list = Some(read.map(|r| r.rows));
     }
 
     /// Whether the list has been read yet.
@@ -134,6 +138,10 @@ impl CorePage for ServicesPage {
             "From the Service Control Manager, read when the page opens, on Refresh and after each start, stop or restart."
         };
         summary_band(ui, Mark::None, &services_headline(&list), source_note);
+        for notice in &self.notices {
+            let t = theme::of_ui(ui);
+            ui.label(egui::RichText::new(format!("Could not read {notice}")).color(t.red).size(12.5));
+        }
         let q = self.search.trim().to_lowercase();
         // By name or display name, or by the PID of the host (Go to
         // service(s) from Processes filters by it).
@@ -159,8 +167,9 @@ impl CorePage for ServicesPage {
                         .column(Column::initial(100.0).clip(true));
                     let mut headings = vec!["Name", "PID", "Description", "Status", "Start type"];
                     if scoped {
-                        table = table.column(Column::initial(70.0));
+                        table = table.column(Column::initial(70.0)).column(Column::initial(70.0));
                         headings.push("Scope");
+                        headings.push("Source");
                     }
                     table
                         .header(TABLE_HEADER_HEIGHT, |mut h| {
@@ -192,6 +201,9 @@ impl CorePage for ServicesPage {
                                 if scoped {
                                     row.col(|ui| {
                                         cell_text(ui, &s.scope, CellInk::Soft, on);
+                                    });
+                                    row.col(|ui| {
+                                        cell_text(ui, &s.source, CellInk::Soft, on);
                                     });
                                 }
                                 let r = row.response();
@@ -368,6 +380,31 @@ mod tests {
         }
         let windows_like = texts(&ui_ctx(), &mut ServicesPage::default(), &Env::new().ctx());
         assert!(!has(&windows_like, "Scope"), "a list without scopes keeps the Windows columns: {windows_like:?}");
+    }
+
+    #[test]
+    fn the_list_names_the_manager_of_every_row_in_a_source_column() {
+        let env = Env::new();
+        let openrc = ServiceRow { source: "OpenRC".into(), ..systemd_row("sshd", "System", 0) };
+        env.system.script_services(vec![systemd_row("ssh.service", "System", 812), openrc]);
+        let shown = texts(&ui_ctx(), &mut ServicesPage::default(), &env.ctx());
+        for w in ["Source", "systemd", "OpenRC"] {
+            assert!(has(&shown, w), "{w} in {shown:?} (nothing is chosen: not the panel's)");
+        }
+        let windows_like = Env::new();
+        windows_like.system.script_services(vec![service("Running")]);
+        let shown = texts(&ui_ctx(), &mut ServicesPage::default(), &windows_like.ctx());
+        assert!(!has(&shown, "Source"), "the Windows list keeps its columns: {shown:?}");
+    }
+
+    #[test]
+    fn a_source_that_could_not_be_read_is_told_beside_the_rows_of_the_others() {
+        let env = Env::new();
+        env.system.script_services(vec![systemd_row("ssh.service", "System", 812)]);
+        env.system.script_service_notices(vec!["OpenRC: rc-status failed".into()]);
+        let shown = texts(&ui_ctx(), &mut ServicesPage::default(), &env.ctx());
+        assert!(has(&shown, "ssh.service"), "{shown:?}");
+        assert!(has(&shown, "Could not read OpenRC: rc-status failed"), "{shown:?}");
     }
 
     #[test]
