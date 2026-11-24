@@ -157,6 +157,37 @@ fn a_folder_deeper_than_260_characters_is_measured_shown_and_copied() {
 }
 
 #[test]
+fn move_to_trash_runs_gio_on_the_item_and_says_the_result() {
+    let t = TempTree::new("addon-trash");
+    t.file("old/big.iso", 4000);
+    let file = t.0.join("old").join("big.iso");
+    let (ctx, runner) = AddonContext::recording();
+    let mut d = DiskSpace::default();
+    d.start(&ctx);
+    d.scan(&t.0, None);
+    wait_idle(&d);
+    let key = nav::Key::File(file.clone());
+    let said = with_page(|page| {
+        d.act(actions::Verb::MoveToTrash, &key, page);
+        std::mem::take(&mut page.actions)
+    });
+    let launches = runner.launches();
+    assert!(
+        matches!(&launches[..], [crate::platform::Launch::Run { program, args, .. }] if program == "gio" && args[..2] == ["trash", "--"] && args[2] == file.display().to_string()),
+        "{launches:?}"
+    );
+    // The recording runner has no prepared answer, so the tool "could not start".
+    assert!(matches!(&said[..], [Action::Say(s)] if s == actions::NO_TRASH_TOOL), "{said:?}");
+    let gone = nav::Key::File(t.0.join("gone.bin"));
+    let said = with_page(|page| {
+        d.act(actions::Verb::MoveToTrash, &gone, page);
+        std::mem::take(&mut page.actions)
+    });
+    assert!(matches!(&said[..], [Action::Say(s)] if s == actions::MOVED), "a vanished item is not sent to the trash");
+    assert_eq!(runner.launches().len(), 1, "nothing more was run");
+}
+
+#[test]
 fn the_status_strip_gives_the_last_scans_time_or_not_scanned() {
     assert_eq!(View::default().strip_last(), "Not scanned");
     let d = DiskSpace::default();

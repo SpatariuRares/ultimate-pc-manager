@@ -959,6 +959,13 @@ impl DiskSpace {
             actions::Outcome::Open(path) => self.navigate(nav::Move::Open(path)),
             actions::Outcome::Reveal(path) => page.actions.push(Action::ShowInExplorer(path)),
             actions::Outcome::Copy(text) => page.actions.push(Action::Copy(text)),
+            actions::Outcome::Trash(path) => {
+                let done = match &self.context {
+                    Some(context) => actions::move_to_trash(context, &path),
+                    None => Err(actions::NO_TRASH_TOOL.to_string()),
+                };
+                page.actions.push(Action::Say(done.unwrap_or_else(|e| e)));
+            }
             actions::Outcome::Say(why) => page.actions.push(Action::Say(why.into())),
         }
     }

@@ -463,7 +463,7 @@ fn item_actions(ui: &mut Ui, key: &nav::Key, owner: Option<&Owner>) -> Option<As
 /// [`item_actions`], each one drawn by `add`.
 fn item_actions_as(ui: &mut Ui, key: &nav::Key, owner: Option<&Owner>, mut add: impl FnMut(&mut Ui, &str) -> egui::Response) -> Option<Ask> {
     let mut asked = None;
-    for verb in actions::Verb::ALL {
+    for verb in actions::Verb::offered_on(crate::system::System::current()) {
         if add(ui, verb.label()).clicked() {
             asked = Some(Ask::Act(verb, key.clone()));
         }
