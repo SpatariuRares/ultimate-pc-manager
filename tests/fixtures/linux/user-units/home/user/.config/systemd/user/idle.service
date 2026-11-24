@@ -1,0 +1,8 @@
+[Unit]
+Description=Idle helper
+
+[Service]
+ExecStart=/usr/bin/idle
+
+[Install]
+WantedBy=default.target

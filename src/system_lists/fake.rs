@@ -4,16 +4,18 @@
 
 use std::sync::Mutex;
 
-use super::{ServiceKey, ServiceRow, StartupRow, SystemLists};
+use super::{ServiceKey, ServiceList, ServiceRow, StartupList, StartupRow, SystemLists};
 
 struct State {
     services: Result<Vec<ServiceRow>, String>,
+    service_notices: Vec<String>,
     service_reads: usize,
     service_control: Result<(), String>,
     service_requests: Vec<(String, String)>,
     service_targets: Vec<ServiceKey>,
 
     startup: Vec<StartupRow>,
+    startup_notices: Vec<String>,
     startup_reads: usize,
     startup_outcome: Result<(), String>,
     startup_requests: Vec<(String, bool)>,
@@ -29,11 +31,13 @@ impl Default for FakeSystem {
         FakeSystem {
             state: Mutex::new(State {
                 services: Ok(Vec::new()),
+                service_notices: Vec::new(),
                 service_reads: 0,
                 service_control: Ok(()),
                 service_requests: Vec::new(),
                 service_targets: Vec::new(),
                 startup: Vec::new(),
+                startup_notices: Vec::new(),
                 startup_reads: 0,
                 startup_outcome: Ok(()),
                 startup_requests: Vec::new(),
@@ -46,6 +50,16 @@ impl FakeSystem {
     /// The list the next services reads return.
     pub fn script_services(&self, rows: Vec<ServiceRow>) {
         self.state.lock().unwrap().services = Ok(rows);
+    }
+
+    /// The notices (sources that could not be read) the next services reads carry.
+    pub fn script_service_notices(&self, notices: Vec<String>) {
+        self.state.lock().unwrap().service_notices = notices;
+    }
+
+    /// The notices the next startup reads carry.
+    pub fn script_startup_notices(&self, notices: Vec<String>) {
+        self.state.lock().unwrap().startup_notices = notices;
     }
 
     /// Makes the next services reads fail with `reason`.
@@ -95,10 +109,10 @@ impl FakeSystem {
 }
 
 impl SystemLists for FakeSystem {
-    fn list_services(&self) -> Result<Vec<ServiceRow>, String> {
+    fn list_services(&self) -> Result<ServiceList, String> {
         let mut s = self.state.lock().unwrap();
         s.service_reads += 1;
-        s.services.clone()
+        s.services.clone().map(|rows| ServiceList { rows, notices: s.service_notices.clone() })
     }
 
     fn control_service(&self, service: &ServiceKey, action: &str) -> Result<(), String> {
@@ -108,10 +122,10 @@ impl SystemLists for FakeSystem {
         s.service_control.clone()
     }
 
-    fn list_startup(&self) -> Vec<StartupRow> {
+    fn list_startup(&self) -> StartupList {
         let mut s = self.state.lock().unwrap();
         s.startup_reads += 1;
-        s.startup.clone()
+        StartupList { rows: s.startup.clone(), notices: s.startup_notices.clone() }
     }
 
     fn set_startup_enabled(&self, id: &str, enable: bool) -> Result<(), String> {

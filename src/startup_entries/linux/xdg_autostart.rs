@@ -31,6 +31,9 @@ pub struct XdgAutostart {
     system_dirs: Vec<String>,
     /// `XDG_CURRENT_DESKTOP`, split at `:`.
     desktops: Vec<String>,
+    /// The folders of `PATH` (as paths under the root), where a `TryExec`
+    /// program is looked for.
+    path_dirs: Vec<String>,
 }
 
 /// `path` without its leading slash, as an [`FsRoot`] path.
@@ -52,6 +55,9 @@ impl XdgAutostart {
             user_dir: xdg_config_home(env).map(|c| format!("{}/autostart", rel(&c))),
             system_dirs,
             desktops: text("XDG_CURRENT_DESKTOP").map(|d| d.split(':').map(str::to_string).collect()).unwrap_or_default(),
+            path_dirs: text("PATH")
+                .map(|p| p.split(':').filter(|d| d.starts_with('/')).map(|d| rel(std::path::Path::new(d))).collect())
+                .unwrap_or_else(|| ["usr/local/bin", "usr/bin", "bin"].map(String::from).to_vec()),
         }
     }
 
@@ -69,8 +75,22 @@ impl XdgAutostart {
         self.system_dirs.iter().map(|d| self.root.path(&format!("{d}/{key}"))).find(|p| p.is_file())
     }
 
+    /// Whether the entry's `TryExec` program is there (an entry without one
+    /// is not asked): an absolute path must exist, a bare name must be in a
+    /// folder of `PATH`. The desktop skips an entry whose program is missing.
+    fn program_found(&self, d: &Desktop) -> bool {
+        let Some(program) = d.try_exec.as_deref().filter(|p| !p.is_empty()) else { return true };
+        if program.starts_with('/') {
+            return self.root.path(program).is_file();
+        }
+        self.path_dirs.iter().any(|dir| self.root.path(&format!("{dir}/{program}")).is_file())
+    }
+
     /// Whether the desktop running would start an entry with these filters.
     fn shown_here(&self, d: &Desktop) -> bool {
+        if !self.program_found(d) {
+            return false;
+        }
         let named = |list: &[String]| list.iter().any(|w| self.desktops.contains(w));
         if let Some(only) = &d.only_show_in {
             if !named(only) {
@@ -197,6 +217,7 @@ fn write_user(path: &std::path::Path, text: &str) -> std::io::Result<()> {
 struct Desktop {
     name: Option<String>,
     exec: Option<String>,
+    try_exec: Option<String>,
     hidden: bool,
     /// `X-GNOME-Autostart-enabled`: on unless it says `false`.
     gnome_enabled: bool,
@@ -219,6 +240,7 @@ impl Desktop {
             match k {
                 "Name" => d.name = Some(v.to_string()),
                 "Exec" => d.exec = Some(v.to_string()),
+                "TryExec" => d.try_exec = Some(v.to_string()),
                 HIDDEN => d.hidden = v == "true",
                 GNOME_ENABLED => d.gnome_enabled = v != "false",
                 "OnlyShowIn" => d.only_show_in = Some(list()),
@@ -359,6 +381,21 @@ mod tests {
         assert_eq!(notes.command, "/home/user/bin/notes --background");
         assert_eq!(notes.key, "notes.desktop");
         assert!(notes.file.ends_with("home/user/.config/autostart/notes.desktop"), "{}", notes.file);
+    }
+
+    #[test]
+    fn an_entry_whose_tryexec_program_is_not_found_is_skipped() {
+        let env = |name: &str| (name == "HOME").then(|| std::ffi::OsString::from("/home/user"));
+        let rows = XdgAutostart::new(fixture("autostart-tryexec"), &env).list().unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["abs-present", "no-tryexec", "path-present"], "a missing absolute path or a name not on PATH hides the entry; no TryExec is not asked");
+        let narrow = |name: &str| match name {
+            "HOME" => Some("/home/user".into()),
+            "PATH" => Some("/opt/app/bin".into()),
+            _ => None,
+        };
+        let rows = XdgAutostart::new(fixture("autostart-tryexec"), &narrow).list().unwrap();
+        assert!(rows.iter().all(|r| r.name != "path-present"), "PATH is read from the environment: {:?}", rows.iter().map(|r| &r.name).collect::<Vec<_>>());
     }
 
     #[test]

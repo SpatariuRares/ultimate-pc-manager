@@ -20,6 +20,8 @@ use crate::widgets::{first_path, refresh_button};
 pub struct StartupPage {
     /// The list as last read; `None` until the page is first shown.
     list: Option<Vec<StartupRow>>,
+    /// The sources that could not be read at the last read, and why.
+    notices: Vec<String>,
     /// The chosen entry, by position in the list.
     selected: Option<usize>,
 }
@@ -29,7 +31,9 @@ impl StartupPage {
     /// Refresh, F5, the sidebar, an Enable or Disable) comes here.
     pub fn reload(&mut self, system: &dyn SystemLists) {
         // A system without startup entries has nothing to read; the page says so.
-        self.list = Some(if is_available(Feature::StartupEntries) { system.list_startup() } else { Vec::new() });
+        let read = if is_available(Feature::StartupEntries) { system.list_startup() } else { Default::default() };
+        self.list = Some(read.rows);
+        self.notices = read.notices;
     }
 
     /// Whether the list has been read yet.
@@ -74,8 +78,12 @@ impl CorePage for StartupPage {
             return;
         }
         let off = list.iter().filter(|r| !r.enabled).count();
-        let sub = format!("{off} of them are turned off. {}, read when the page opens and on Refresh.", startup_sources());
+        let sub = format!("{off} of them are turned off. {}, read when the page opens and on Refresh.", crate::startup_entries::sources_note());
         summary_band(ui, Mark::None, &startup_headline(&list), &sub);
+        for notice in &self.notices {
+            let t = theme::of_ui(ui);
+            ui.label(egui::RichText::new(format!("Could not read {notice}")).color(t.red).size(12.5));
+        }
         let selected = self.selected;
         let mut panel_action = None;
         let new_sel = list_with_panel(
@@ -174,15 +182,6 @@ fn location_target(r: &StartupRow) -> String {
     }
 }
 
-/// Where the list comes from, as the band says it.
-fn startup_sources() -> &'static str {
-    if cfg!(windows) {
-        "From the Run keys and Startup folders"
-    } else {
-        "From the autostart folders of the user and the system"
-    }
-}
-
 /// "9 of 32 startup apps are enabled".
 fn startup_headline(rows: &[StartupRow]) -> String {
     let on = rows.iter().filter(|r| r.enabled).count();
@@ -260,6 +259,40 @@ mod tests {
         assert!(has(&shown, "Not available on this system."), "{shown:?}");
         assert!(!has(&shown, "Steam") && !shown.iter().any(|w| w.contains("startup apps are enabled")), "not an empty or a real list: {shown:?}");
         assert_eq!(env.system.startup_reads(), 0, "nothing is read");
+    }
+
+    #[test]
+    fn a_startup_source_that_could_not_be_read_is_told_on_the_page_beside_the_others_entries() {
+        let env = Env::new();
+        env.system.script_startup(vec![entry("a", "Steam", true)]);
+        env.system.script_startup_notices(vec!["systemd user services: boom".into()]);
+        let shown = texts(&ui_ctx(), &mut StartupPage::default(), &env.ctx());
+        assert!(has(&shown, "Steam"), "{shown:?}");
+        assert!(has(&shown, "Could not read systemd user services: boom"), "{shown:?}");
+        let clean = Env::new();
+        clean.system.script_startup(vec![entry("a", "Steam", true)]);
+        let shown = texts(&ui_ctx(), &mut StartupPage::default(), &clean.ctx());
+        assert!(!shown.iter().any(|w| w.starts_with("Could not read")), "{shown:?}");
+    }
+
+    #[test]
+    fn the_startup_table_has_no_impact_column() {
+        let env = Env::new();
+        env.system.script_startup(vec![entry("a", "Steam", true)]);
+        let shown = texts(&ui_ctx(), &mut StartupPage::default(), &env.ctx());
+        for heading in ["Name", "Status", "Location", "Command"] {
+            assert!(has(&shown, heading), "{heading} in {shown:?}");
+        }
+        assert!(!shown.iter().any(|w| w.to_lowercase().contains("impact")), "no blank or invented impact: {shown:?}");
+    }
+
+    #[test]
+    fn the_startup_band_names_where_the_list_comes_from() {
+        let env = Env::new();
+        env.system.script_startup(vec![entry("a", "Steam", true)]);
+        let shown = texts(&ui_ctx(), &mut StartupPage::default(), &env.ctx());
+        let note = crate::startup_entries::sources_note();
+        assert!(shown.iter().any(|w| w.contains(note)), "{note} in {shown:?}");
     }
 
     #[test]

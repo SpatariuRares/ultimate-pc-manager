@@ -96,10 +96,11 @@ pub fn control(sources: &[Box<dyn ServiceSource>], host: &ControlHost, service: 
     }
 }
 
-/// The services of every source, sorted by name. A source that is absent is
+/// The services of every source, sorted by name, with a notice ("source:
+/// why") for each source that could not be read. A source that is absent is
 /// skipped and one that fails does not hide the others; the list is an error
 /// only when no source is present at all, or every present one failed.
-pub fn list_all(sources: &[Box<dyn ServiceSource>], runner: &dyn ProcessRunner) -> Result<Vec<ServiceRow>, String> {
+pub fn list_all(sources: &[Box<dyn ServiceSource>], runner: &dyn ProcessRunner) -> Result<(Vec<ServiceRow>, Vec<String>), String> {
     let mut rows = Vec::new();
     let mut failures = Vec::new();
     let mut present = 0;
@@ -127,7 +128,7 @@ pub fn list_all(sources: &[Box<dyn ServiceSource>], runner: &dyn ProcessRunner) 
         return Err(failures.join("; "));
     }
     rows.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.scope.cmp(&b.scope)));
-    Ok(rows)
+    Ok((rows, failures))
 }
 
 /// How a program ended: its exit code and its output, or that it could not
@@ -224,9 +225,10 @@ mod tests {
     #[test]
     fn a_failing_source_does_not_hide_the_others() {
         let sources = boxed(vec![Fixed("a", Ok(vec![row("zeta", "a")])), Fixed("b", Err(SourceError::Failed("boom".into()))), Fixed("c", Ok(vec![row("Alpha", "c")]))]);
-        let rows = list_all(&sources, &RecordingRunner::default()).unwrap();
+        let (rows, notices) = list_all(&sources, &RecordingRunner::default()).unwrap();
         let names: Vec<_> = rows.iter().map(|r| (r.name.as_str(), r.source.as_str())).collect();
         assert_eq!(names, [("Alpha", "c"), ("zeta", "a")], "sorted by name, each row keeps its source");
+        assert_eq!(notices, ["b: boom"], "the failure is told, not dropped");
     }
 
     #[test]
@@ -238,7 +240,7 @@ mod tests {
     #[test]
     fn rows_of_a_source_that_cannot_control_offer_no_action() {
         let sources = boxed(vec![Fixed("a", Ok(vec![row("x", "a")]))]);
-        let rows = list_all(&sources, &RecordingRunner::default()).unwrap();
+        let rows = list_all(&sources, &RecordingRunner::default()).unwrap().0;
         assert!(ALL_ACTIONS.iter().all(|a| !rows[0].can(a)), "{rows:?}");
     }
 
@@ -251,6 +253,7 @@ mod tests {
     #[test]
     fn a_present_source_with_no_services_is_an_empty_list_not_an_error() {
         let sources = boxed(vec![Fixed("a", Ok(Vec::new())), Fixed("b", Err(SourceError::Absent))]);
-        assert!(list_all(&sources, &RecordingRunner::default()).unwrap().is_empty());
+        let (rows, notices) = list_all(&sources, &RecordingRunner::default()).unwrap();
+        assert!(rows.is_empty() && notices.is_empty());
     }
 }

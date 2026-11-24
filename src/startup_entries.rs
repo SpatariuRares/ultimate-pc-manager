@@ -26,7 +26,18 @@ mod sources;
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub use sources::{list_all, set_enabled_in, StartupSource};
 
-pub use system::{list_startup, set_startup_enabled};
+pub use system::{set_startup_enabled, sources_note};
+#[cfg(not(target_os = "linux"))]
+pub use system::list_startup;
+#[cfg(target_os = "linux")]
+pub use system::list_startup_noticed;
+
+/// The entries, with a notice for each source that could not be read (only
+/// the system's several sources can fail apart).
+#[cfg(not(target_os = "linux"))]
+pub fn list_startup_noticed() -> (Vec<StartupEntry>, Vec<String>) {
+    (list_startup(), Vec::new())
+}
 
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(not(windows), allow(dead_code))]

@@ -70,10 +70,26 @@ impl From<&str> for ServiceKey {
     }
 }
 
+/// The services read, and a notice for each source that could not be read
+/// (the rows of the others are still here).
+#[derive(Clone, Debug, Default)]
+pub struct ServiceList {
+    pub rows: Vec<ServiceRow>,
+    pub notices: Vec<String>,
+}
+
+/// The startup entries read, and a notice for each source that could not be
+/// read (the entries of the others are still here).
+#[derive(Clone, Debug, Default)]
+pub struct StartupList {
+    pub rows: Vec<StartupRow>,
+    pub notices: Vec<String>,
+}
+
 /// What the Services and Startup apps pages ask of the machine.
 pub trait SystemLists {
     /// Every service with its state, or why the list could not be read.
-    fn list_services(&self) -> Result<Vec<ServiceRow>, String>;
+    fn list_services(&self) -> Result<ServiceList, String>;
 
     /// Starts, stops or restarts a service, or turns it on or off at boot
     /// (`action` is "start", "stop", "restart", "enable" or "disable"), or
@@ -81,8 +97,8 @@ pub trait SystemLists {
     fn control_service(&self, service: &ServiceKey, action: &str) -> Result<(), String>;
 
     /// Every startup entry with its state. Startup has no error state: a
-    /// location that cannot be read simply lists nothing.
-    fn list_startup(&self) -> Vec<StartupRow>;
+    /// location that cannot be read lists nothing and is told in a notice.
+    fn list_startup(&self) -> StartupList;
 
     /// Enables or disables the startup entry named by `id` (a
     /// [`StartupRow::id`]), or says why it could not.
