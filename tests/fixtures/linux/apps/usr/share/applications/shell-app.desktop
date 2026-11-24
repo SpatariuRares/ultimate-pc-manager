@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Shell App
+Comment=A shell wrapper
+Exec=env FOO=1 sh -c "tool-x"

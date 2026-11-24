@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=abs-missing
+Exec=abs-missing --go
+TryExec=/opt/nowhere/missing-tool

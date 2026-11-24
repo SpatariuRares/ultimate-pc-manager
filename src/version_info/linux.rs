@@ -92,9 +92,11 @@ impl DesktopEntry {
         [&self.comment, &self.generic_name, &self.name].into_iter().find(|t| !t.is_empty()).cloned()
     }
 
-    /// The programs the entry launches.
+    /// The programs the entry launches, leaving out the generic launchers:
+    /// an entry that starts `flatpak` or `python3` describes what it was
+    /// given to run, not every process of that program.
     fn programs(&self) -> Vec<String> {
-        [exec_program(&self.exec), exec_program(&self.try_exec)].into_iter().flatten().collect()
+        [exec_program(&self.exec), exec_program(&self.try_exec)].into_iter().flatten().filter(|p| !is_generic_launcher(p)).collect()
     }
 }
 
@@ -132,6 +134,19 @@ fn exec_program(exec: &str) -> Option<String> {
     words.find(|w| !w.is_empty() && !is_assignment(w))
 }
 
+/// Programs that start other programs (shells, `env`, interpreters, package
+/// launchers): a desktop entry naming one says nothing about the program.
+fn is_generic_launcher(program: &str) -> bool {
+    const LAUNCHERS: [&str; 24] = [
+        "env", "sh", "bash", "dash", "zsh", "fish", "flatpak", "snap", "python", "python2", "python3", "perl", "ruby", "node", "nodejs", "java", "wine", "mono", "dotnet", "sudo", "pkexec", "xdg-open",
+        "gio", "systemd-run",
+    ];
+    let name = program.rsplit('/').next().unwrap_or(program);
+    // `python3.12`, `python3.12.1`: the interpreter with its version.
+    let family = name.strip_prefix("python").is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'));
+    LAUNCHERS.contains(&name) || family
+}
+
 /// `NAME=value`, the words `env` takes before the program.
 fn is_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(name, _)| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
@@ -167,6 +182,14 @@ mod tests {
     fn a_full_path_match_wins_over_a_file_name_match() {
         assert_eq!(describe("/opt/tool/tool").as_deref(), Some("The tool in /opt"));
         assert_eq!(describe("/usr/bin/tool").as_deref(), Some("A tool by name"));
+    }
+
+    #[test]
+    fn an_entry_that_starts_a_generic_launcher_gives_its_description_to_no_program_of_that_name() {
+        for program in ["/usr/bin/flatpak", "/usr/bin/python3.12", "/usr/bin/sh", "/usr/bin/env"] {
+            assert_eq!(describe(program), None, "{program}");
+        }
+        assert_eq!(describe("/usr/bin/gedit").as_deref(), Some("Text Editor"), "an entry that names its own program still describes it");
     }
 
     #[test]
