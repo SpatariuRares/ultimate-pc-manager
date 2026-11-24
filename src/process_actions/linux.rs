@@ -16,6 +16,7 @@ use super::{Affinity, DUMP_FAILED, PRIORITIES, UAC_FAILED};
 use crate::action_elevation::{self, Spawned};
 use crate::availability::{unavailable_error, Feature};
 use crate::fs_root::FsRoot;
+use crate::proc_fast::{self, Capabilities, Kernel, SystemKernel};
 use crate::system::System;
 
 /// The nice value each entry of [`PRIORITIES`] sets, in the same order.
@@ -27,13 +28,17 @@ struct Host<'a> {
     root: &'a FsRoot,
     launch: &'a dyn Fn(&[String]) -> Spawned,
     env: &'a dyn Fn(&str) -> Option<String>,
+    /// The kernel and what the probe found in it: the process-descriptor
+    /// signals are used only when the probe found them.
+    kernel: &'a dyn Kernel,
+    caps: Capabilities,
 }
 
 /// Runs `f` on the running system.
 fn on_system<T>(f: impl FnOnce(&Host) -> T) -> T {
     let root = FsRoot::system();
     let env = |name: &str| std::env::var(name).ok();
-    f(&Host { root: &root, launch: &action_elevation::spawn_and_wait, env: &env })
+    f(&Host { root: &root, launch: &action_elevation::spawn_and_wait, env: &env, kernel: &SystemKernel, caps: proc_fast::system_capabilities() })
 }
 
 /// Dumps cannot be written: an error.
@@ -232,8 +237,13 @@ fn run(h: &Host, argv: &[String], elevate: bool) -> Result<(), String> {
 
 /// Sends the signal named `name` (`TERM`, `KILL`, `STOP`, `CONT`) to `pid`:
 /// the one place a signal reaches a process. Another user's process is
-/// signalled through `pkexec`.
+/// signalled through `pkexec`. Where the kernel has process descriptors the
+/// signal goes through one; if that is not there, or fails, `kill` does it
+/// and words the failure.
 fn signal(h: &Host, pid: u32, name: &str) -> Result<(), String> {
+    if !is_foreign(h, pid) && proc_fast::signal_fast(h.kernel, h.caps, pid, name).is_some() {
+        return Ok(());
+    }
     let argv = ["kill".to_string(), "-s".into(), name.into(), pid.to_string()];
     run(h, &argv, is_foreign(h, pid))
 }
@@ -287,8 +297,54 @@ mod tests {
         };
         let env = |_: &str| None;
         let root = crate::fs_root::fixture("procs");
-        let out = f(&Host { root: &root, launch: &launch, env: &env });
+        let out = f(&Host { root: &root, launch: &launch, env: &env, kernel: &NO_KERNEL, caps: Capabilities::default() });
         (out, calls.into_inner())
+    }
+
+    /// A kernel without any faster interface.
+    static NO_KERNEL: crate::proc_fast::tests::FakeKernel = crate::proc_fast::tests::FakeKernel {
+        pidfd: false,
+        events: std::sync::Mutex::new(None),
+        signals: std::sync::Mutex::new(Vec::new()),
+        fail: false,
+    };
+
+    /// Like [`with_host`] with a kernel that has process descriptors.
+    fn with_pidfd<T>(kernel: &crate::proc_fast::tests::FakeKernel, f: impl FnOnce(&Host) -> T) -> (T, Vec<Vec<String>>) {
+        let calls = RefCell::new(Vec::new());
+        let launch = |argv: &[String]| {
+            calls.borrow_mut().push(argv.to_vec());
+            ok()
+        };
+        let env = |_: &str| None;
+        let root = crate::fs_root::fixture("procs");
+        let out = f(&Host { root: &root, launch: &launch, env: &env, kernel, caps: Capabilities { pidfd: true, events: false } });
+        (out, calls.into_inner())
+    }
+
+    #[test]
+    fn with_process_descriptors_a_signal_starts_no_program_and_the_result_is_the_same() {
+        let kernel = crate::proc_fast::tests::kernel(true, None);
+        let (r, calls) = with_pidfd(&kernel, |h| end(h, 100, true, true));
+        assert_eq!((r, calls.len()), (Ok(()), 0));
+        assert_eq!(*kernel.signals.lock().unwrap(), vec![(102, 9), (101, 9), (100, 9)], "the same order as the fallback's kill commands");
+        let (_, calls) = with_pidfd(&kernel, |h| signal(h, 100, "STOP"));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn another_users_process_still_goes_through_pkexec_with_process_descriptors() {
+        let kernel = crate::proc_fast::tests::kernel(true, None);
+        let (_, calls) = with_pidfd(&kernel, |h| signal(h, 200, "TERM"));
+        assert_eq!(lines(&calls), ["pkexec kill -s TERM 200"]);
+        assert!(kernel.signals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_process_descriptor_signal_falls_back_to_kill() {
+        let kernel = crate::proc_fast::tests::FakeKernel { pidfd: true, fail: true, ..Default::default() };
+        let (r, calls) = with_pidfd(&kernel, |h| signal(h, 100, "TERM"));
+        assert_eq!((r, lines(&calls)), (Ok(()), vec!["kill -s TERM 100".to_string()]));
     }
 
     fn ok() -> Spawned {
@@ -404,7 +460,7 @@ mod tests {
         let root = crate::fs_root::FsRoot::at(std::env::temp_dir().join("upm-no-such-root"));
         let launch = |_: &[String]| ok();
         let env = |_: &str| None;
-        assert!(!is_foreign(&Host { root: &root, launch: &launch, env: &env }, 5));
+        assert!(!is_foreign(&Host { root: &root, launch: &launch, env: &env, kernel: &NO_KERNEL, caps: Capabilities::default() }, 5));
     }
 
     #[test]
