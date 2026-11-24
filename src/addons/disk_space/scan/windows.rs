@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use super::{descends, file_key, Entry, Listing};
+use super::{descends, file_key, Entry, Listing, Mounts};
 
 /// The listing of folder `dir` (without "." and ".."): what was read
 /// before any error, incomplete when it could not be read to the end
@@ -17,8 +17,8 @@ use super::{descends, file_key, Entry, Listing};
 /// `links`, each file's volume serial number and file ID are kept too (see
 /// [`Links`]). `buf` is the reusable read buffer. `fail_after` makes the
 /// listing fail once that many entries were read, `no_ids` makes the class
-/// with file IDs rejected (test seams).
-pub fn list(dir: &Path, through: bool, links: bool, buf: &mut Vec<u64>, fail_after: Option<usize>, no_ids: bool) -> Listing {
+/// with file IDs rejected (test seams). Mounts are a Linux notion: `_mounts` is not used.
+pub fn list(dir: &Path, through: bool, links: bool, buf: &mut Vec<u64>, fail_after: Option<usize>, no_ids: bool, _mounts: &Mounts) -> Listing {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -118,7 +118,7 @@ pub fn list(dir: &Path, through: bool, links: bool, buf: &mut Vec<u64>, fail_aft
                         unsafe { GetVolumeInformationByHandleW(handle.0, std::ptr::null_mut(), 0, &mut n, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0) };
                         n
                     });
-                    file_key(serial, id)
+                    file_key(u64::from(serial), id)
                 });
                 out.push(Entry { name: std::ffi::OsString::from_wide(name), folder, link: folder && reparse && !descends(tag), size: allocated.max(0) as u64, id });
             }
@@ -131,6 +131,11 @@ pub fn list(dir: &Path, through: bool, links: bool, buf: &mut Vec<u64>, fail_aft
             offset += next as usize;
         }
     }
+}
+
+/// Windows has no mount points to keep out of: a volume is entered as any folder.
+pub fn mounts() -> Mounts {
+    Mounts::default()
 }
 
 /// Lowers the calling thread's CPU priority (below normal) for the rest

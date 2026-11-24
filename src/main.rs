@@ -8,6 +8,7 @@ mod app;
 mod app_folders;
 mod system;
 mod system_info;
+mod disks;
 mod fs_root;
 mod linux_facts;
 #[cfg(target_os = "linux")]

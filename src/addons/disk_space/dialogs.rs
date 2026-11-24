@@ -4,9 +4,11 @@
 use egui::{Align, Layout, RichText, Ui};
 
 use super::{target, Command, DiskSpace, Drawing, Group};
+use crate::platform::PageContext;
 use crate::sampler::DiskRow;
 use crate::theme;
 use crate::widgets::parts::{destructive_button, outline_button, primary_button};
+use crate::widgets::{confirm_window, ConfirmWindow};
 
 impl DiskSpace {
     /// The Stop confirmation, while it is open: Stop Scanning / Keep
@@ -33,6 +35,21 @@ impl DiskSpace {
         if let Some(stop) = decided {
             let dont_ask = q.dont_ask;
             self.answer_stop(stop, dont_ask);
+        }
+    }
+
+    /// The Move to trash confirmation, while it is open: the item and its
+    /// size, Move to trash / Cancel.
+    pub(super) fn trash_dialog(&mut self, ui: &mut Ui, page: &mut PageContext) {
+        let Some((title, text)) = self.trash_question() else { return };
+        let decided = confirm_window(ui.ctx(), ConfirmWindow::new(title, "Move to trash"), |ui| {
+            let t = theme::of_ui(ui);
+            ui.set_max_width(400.0);
+            ui.label(RichText::new(text).size(13.0).color(t.soft));
+            ui.add_space(8.0);
+        });
+        if let Some(yes) = decided {
+            self.answer_trash(yes, page);
         }
     }
 

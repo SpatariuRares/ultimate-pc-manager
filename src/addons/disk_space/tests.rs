@@ -156,35 +156,102 @@ fn a_folder_deeper_than_260_characters_is_measured_shown_and_copied() {
     assert!(matches!(&said[..], [Action::ShowInExplorer(p), Action::Copy(s)] if *p == deep && *s == deep.display().to_string()), "{said:?}");
 }
 
-#[test]
-fn move_to_trash_runs_gio_on_the_item_and_says_the_result() {
-    let t = TempTree::new("addon-trash");
+/// A scan of a temp tree holding `old/big.iso`, entered at `old`, with a recording runner.
+fn trash_fixture(name: &str) -> (TempTree, DiskSpace, std::sync::Arc<crate::platform::RecordingRunner>, nav::Key) {
+    let t = TempTree::new(name);
     t.file("old/big.iso", 4000);
-    let file = t.0.join("old").join("big.iso");
     let (ctx, runner) = AddonContext::recording();
     let mut d = DiskSpace::default();
     d.start(&ctx);
     d.scan(&t.0, None);
     wait_idle(&d);
-    let key = nav::Key::File(file.clone());
-    let said = with_page(|page| {
-        d.act(actions::Verb::MoveToTrash, &key, page);
+    d.navigate(nav::Move::Open(t.0.join("old")));
+    let key = nav::Key::File(t.0.join("old").join("big.iso"));
+    (t, d, runner, key)
+}
+
+fn said_by(d: &mut DiskSpace, f: impl FnOnce(&mut DiskSpace, &mut PageContext)) -> Vec<Action> {
+    with_page(|page| {
+        f(d, page);
         std::mem::take(&mut page.actions)
-    });
+    })
+}
+
+fn key_path(key: &nav::Key) -> &Path {
+    match key {
+        nav::Key::File(p) | nav::Key::Folder(p) => p,
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn move_to_trash_asks_first_naming_the_item_and_its_size() {
+    let (_t, mut d, runner, key) = trash_fixture("addon-trash-asks");
+    let size = text::size(d.view().largest.iter().find(|(p, _)| Path::new(p) == key_path(&key)).expect("the file is among the largest").1);
+    let said = said_by(&mut d, |d, page| d.act(actions::Verb::MoveToTrash, &key, page));
+    assert!(said.is_empty(), "nothing is said before the answer: {said:?}");
+    assert!(runner.launches().is_empty(), "nothing is run before the answer");
+    let (title, question) = d.trash_question().expect("the confirmation is open");
+    assert_eq!(title, "Move to trash?");
+    assert!(question.contains("big.iso") && question.contains(&size), "{question}");
+    // Cancel: nothing runs, nothing is said, the question is gone.
+    let said = said_by(&mut d, |d, page| d.answer_trash(false, page));
+    assert!(said.is_empty() && runner.launches().is_empty() && d.trash_question().is_none(), "{said:?}");
+}
+
+#[test]
+fn a_confirmed_trash_runs_gio_on_the_item_and_says_the_result() {
+    use crate::platform::{Launch, When};
+    let (t, mut d, runner, key) = trash_fixture("addon-trash-runs");
+    let file = t.0.join("old").join("big.iso");
+    runner.prepare(When::Nth(0), 0, "");
+    said_by(&mut d, |d, page| d.act(actions::Verb::MoveToTrash, &key, page));
+    let said = said_by(&mut d, |d, page| d.answer_trash(true, page));
     let launches = runner.launches();
-    assert!(
-        matches!(&launches[..], [crate::platform::Launch::Run { program, args, .. }] if program == "gio" && args[..2] == ["trash", "--"] && args[2] == file.display().to_string()),
-        "{launches:?}"
-    );
-    // The recording runner has no prepared answer, so the tool "could not start".
-    assert!(matches!(&said[..], [Action::Say(s)] if s == actions::NO_TRASH_TOOL), "{said:?}");
+    assert!(matches!(&launches[..], [Launch::Run { program, args, .. }] if program == "gio" && args[..2] == ["trash", "--"] && args[2] == file.display().to_string()), "{launches:?}");
+    assert!(matches!(&said[..], [Action::Say(s)] if *s == format!("Moved to the trash: {}. Rescan to update the sizes.", file.display())), "{said:?}");
+    // The tool could not be started (the recording runner has no answer): the way to a missing gio.
+    said_by(&mut d, |d, page| d.act(actions::Verb::MoveToTrash, &key, page));
+    let said = said_by(&mut d, |d, page| d.answer_trash(true, page));
+    assert!(matches!(&said[..], [Action::Say(s)] if s.contains("gio") && !s.contains("cancel")), "{said:?}");
+    // A vanished item is not even asked about.
     let gone = nav::Key::File(t.0.join("gone.bin"));
-    let said = with_page(|page| {
-        d.act(actions::Verb::MoveToTrash, &gone, page);
-        std::mem::take(&mut page.actions)
-    });
-    assert!(matches!(&said[..], [Action::Say(s)] if s == actions::MOVED), "a vanished item is not sent to the trash");
-    assert_eq!(runner.launches().len(), 1, "nothing more was run");
+    let said = said_by(&mut d, |d, page| d.act(actions::Verb::MoveToTrash, &gone, page));
+    assert!(matches!(&said[..], [Action::Say(s)] if s == actions::MOVED), "{said:?}");
+    assert!(d.trash_question().is_none());
+    assert_eq!(runner.launches().len(), 2, "nothing more was run");
+}
+
+#[test]
+fn the_scanned_folder_is_never_moved_to_the_trash() {
+    let (t, mut d, runner, _) = trash_fixture("addon-trash-root");
+    d.navigate(nav::Move::Open(t.0.clone()));
+    let said = said_by(&mut d, |d, page| d.act(actions::Verb::MoveToTrash, &nav::Key::ThisFolder, page));
+    assert!(matches!(&said[..], [Action::Say(s)] if s == actions::NOT_TRASHABLE), "{said:?}");
+    assert!(d.trash_question().is_none() && runner.launches().is_empty());
+    let said = said_by(&mut d, |d, page| d.act(actions::Verb::MoveToTrash, &nav::Key::Folder(PathBuf::from("/")), page));
+    assert!(matches!(&said[..], [Action::Say(_)]), "a filesystem root: said, not asked: {said:?}");
+    assert!(d.trash_question().is_none());
+}
+
+#[test]
+fn where_the_system_has_no_trash_the_action_says_so_through_availability() {
+    let (_t, mut d, runner, key) = trash_fixture("addon-trash-hidden");
+    let _off = crate::availability::unavailable_in_test(&[crate::availability::Feature::MoveToTrash]);
+    let said = said_by(&mut d, |d, page| d.act(actions::Verb::MoveToTrash, &key, page));
+    assert!(matches!(&said[..], [Action::Say(s)] if *s == crate::availability::unavailable_error(crate::availability::Feature::MoveToTrash)), "{said:?}");
+    assert!(d.trash_question().is_none() && runner.launches().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn open_location_on_linux_launches_the_file_manager_on_the_folder_holding_the_item() {
+    let (t, mut d, _, key) = trash_fixture("addon-open-location");
+    let said = said_by(&mut d, |d, page| d.act(actions::Verb::ShowInExplorer, &key, page));
+    let [Action::ShowInExplorer(path)] = &said[..] else { panic!("{said:?}") };
+    let (opened, launches) = crate::run_open::recorded::launches(|| crate::run_open::reveal_in_explorer(path));
+    assert_eq!(opened, Ok(()));
+    assert_eq!(launches, [vec!["xdg-open".to_string(), t.0.join("old").display().to_string()]]);
 }
 
 #[test]

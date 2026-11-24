@@ -2,11 +2,11 @@
 
 use std::path::Path;
 
-use super::{Entry, Listing};
+use super::{Entry, Listing, Mounts};
 
 /// Outside Windows: the standard listing, links not followed, sizes as
 /// the length of each file.
-pub fn list(dir: &Path, _through: bool, _links: bool, _buf: &mut Vec<u64>, fail_after: Option<usize>, _no_ids: bool) -> Listing {
+pub fn list(dir: &Path, _through: bool, _links: bool, _buf: &mut Vec<u64>, fail_after: Option<usize>, _no_ids: bool, _mounts: &Mounts) -> Listing {
     let Ok(read) = std::fs::read_dir(dir) else {
         return Listing::default();
     };

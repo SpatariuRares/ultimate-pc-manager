@@ -148,12 +148,14 @@ From the user's point of view:
 - `settings`: target, group, view, `diskSpaceSuppressStopConfirm`, size of the lists, how many scans to keep; kept under the id even when off.
 - `summary_tile` (optional): free space per drive and last scan.
 
-**Decisions already taken.** Canvas layout design A of P14: three drop-down menus instead of segmented controls, "Start" button, Balls canvas colored by type, panel in the order drive card / File Type / Largest Folders / History, status strip with LEDs, "Idle", "Not scanned", paths written as "C:\", category "Code". No file deletion (the page only shows the item in File Explorer). No link to Windows Storage settings and no installed-app sizes on this page (they were inventions of the previous mock; apps remain in Installed Apps). Used/free bar and Copy path are our kept additions.
+**Decisions already taken.** Canvas layout design A of P14: three drop-down menus instead of segmented controls, "Start" button, Balls canvas colored by type, panel in the order drive card / File Type / Largest Folders / History, status strip with LEDs, "Idle", "Not scanned", paths written as "C:\", category "Code". No file deletion on Windows (the page only shows the item in File Explorer); on Linux the only removal is Move to trash, with a confirmation (see the Linux section). No link to Windows Storage settings and no installed-app sizes on this page (they were inventions of the previous mock; apps remain in Installed Apps). Used/free bar and Copy path are our kept additions.
 
 ### Linux (spec #41, decided in #75)
 
 - Drives are the mounted real filesystems (no proc, sysfs or other pseudo filesystems), one entry per device: when the same filesystem is mounted more than once (bind mounts, several btrfs subvolumes of one filesystem), only the mount closest to `/` is listed, so the same space is never shown twice.
-- A scan always stays on the filesystem it started on; there is no option to cross into other mounts. A mount found inside the scanned folder is not entered; it can be scanned by choosing it as its own drive.
+- A scan always stays on the filesystem it started on; there is no option to cross into other mounts. The boundary is a **mount point** in the mount table, not a different device number: a folder that is a mount point (another filesystem, a bind mount of the same one, or a pseudo filesystem such as `/proc`) is not entered, while a nested btrfs subvolume that is not mounted has a device number of its own but is part of the same filesystem and is scanned. A mount that is not entered can be scanned by choosing it as its own drive. If the mount table cannot be read, a folder on another device than its parent is not entered instead.
+- The action that shows an item in the file manager is worded **Open location** (it opens the folder holding the item with `xdg-open`); on Windows it stays "Show in File Explorer".
+- **Move to trash** is offered on Linux only (through the shared availability rule, so it is hidden where it cannot work). It asks first, naming the item and its size, then runs `gio trash` (the FreeDesktop trash of the item's own drive, so it can be restored). It is never offered for the scanned folder or a drive's root. It does not delete anything for good. The scan's results are not changed afterwards: the message says "Rescan to update the sizes."
 - Sizes are allocated blocks, hard links are counted once (device and inode), and folders the user cannot read are counted as skipped.
 
 ## Testing Decisions
@@ -174,7 +176,7 @@ Modules tested: space tree, type classification, drawing layouts, history format
 
 ## Out of Scope
 
-- Deleting, moving or compressing files from the app (only "Show in File Explorer").
+- Deleting, moving or compressing files from the app (only "Show in File Explorer"; on Linux also Move to trash, which asks first and never deletes for good).
 - Installed app sizes and uninstalling: they remain in Installed Apps (at most a link).
 - Link to Windows Storage settings / Storage Sense.
 - Disk activity lights: they belong to the notification area icon and to Performance › Disk.

@@ -496,14 +496,7 @@ fn system_fill() -> Fill {
             snap.net.sort_by(|a, b| {
                 (b.total_rx + b.total_tx).cmp(&(a.total_rx + a.total_tx))
             });
-            // Linux lists real filesystems only, one drive per filesystem.
-            #[cfg(target_os = "linux")]
-            let real = crate::linux_mounts::drives(&crate::fs_root::FsRoot::system());
-            for d in disks.list() {
-                #[cfg(target_os = "linux")]
-                if !real.is_empty() && !real.iter().any(|m| std::path::Path::new(&m.path) == d.mount_point()) {
-                    continue;
-                }
+            for d in crate::disks::real_drives(disks.list().iter().collect(), |d| d.mount_point().to_string_lossy().into_owned()) {
                 snap.disks.push(DiskRow {
                     name: d.name().to_string_lossy().into_owned(),
                     mount: d.mount_point().display().to_string(),

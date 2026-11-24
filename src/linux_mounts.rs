@@ -56,6 +56,28 @@ pub fn drives_in(table: &str) -> Vec<Mount> {
     found.into_iter().map(|(_, _, _, m)| m).collect()
 }
 
+/// Every mount point in the mount table (pseudo filesystems and bind mounts
+/// too), unescaped; None when the table cannot be read.
+pub fn mount_points(root: &FsRoot) -> Option<Vec<String>> {
+    Some(mount_points_in(&root.read(MOUNTINFO)?))
+}
+
+/// The mount points listed in the text of a mount table.
+pub fn mount_points_in(table: &str) -> Vec<String> {
+    table.lines().filter_map(parse).map(|p| p.mount.path).collect()
+}
+
+/// A mount path as the table writes it or as another reader gives it, in one
+/// form to compare: the table's octal escapes undone and no trailing slash
+/// (except for "/").
+pub fn normalize(path: &str) -> String {
+    let path = unescape(path);
+    match path.trim_end_matches('/') {
+        "" if path.starts_with('/') => "/".to_string(),
+        trimmed => trimmed.to_string(),
+    }
+}
+
 /// Whether a mount is a real filesystem on a device.
 fn is_drive(m: &Mount) -> bool {
     !NOT_DRIVES.contains(&m.fs.as_str()) && (m.source.starts_with("/dev/") || m.fs == "zfs")
@@ -143,6 +165,23 @@ mod tests {
         assert_eq!(paths(&drives_in(table)), ["/mnt/a"]);
         let table = "20 1 8:1 /data /mnt/bind rw - ext4 /dev/sda1 rw\n30 1 8:1 / /mnt/deep/real rw - ext4 /dev/sda1 rw\n";
         assert_eq!(paths(&drives_in(table)), ["/mnt/bind"]);
+    }
+
+    #[test]
+    fn every_mount_point_is_listed_with_its_escapes_undone() {
+        let all = mount_points(&fixture("disk-mounts")).unwrap();
+        for p in ["/", "/proc", "/srv", "/home/user/.snapshots", "/mnt/data space", "/var/lib/docker/overlay2/x/merged"] {
+            assert!(all.iter().any(|m| m == p), "{p}: {all:?}");
+        }
+        assert_eq!(mount_points(&fixture("memory")), None, "no table, no answer");
+    }
+
+    #[test]
+    fn mount_paths_compare_in_one_form() {
+        assert_eq!(normalize("/mnt/data\\040space/"), "/mnt/data space");
+        assert_eq!(normalize("/mnt/data space"), "/mnt/data space");
+        assert_eq!(normalize("/"), "/");
+        assert_eq!(normalize("//"), "/");
     }
 
     #[test]

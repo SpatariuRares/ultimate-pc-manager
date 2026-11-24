@@ -28,9 +28,9 @@ struct Entry {
     id: Option<FileKey>,
 }
 
-/// A file's volume serial number and 128-bit file ID: the same for every
-/// hard link of the file.
-type FileKey = (u32, [u64; 2]);
+/// A file's volume serial number (on Linux the whole 64-bit device number)
+/// and 128-bit file ID: the same for every hard link of the file.
+type FileKey = (u64, [u64; 2]);
 
 /// How many hard-linked files a scan tracks: past it, further links are counted again and the scan says so.
 pub const LINK_CAP: usize = 262_144;
@@ -39,7 +39,7 @@ pub const LINK_CAP: usize = 262_144;
 /// file ID `id`; None for a zero or invalid ID (FILE_INVALID_FILE_ID),
 /// which some file systems give: such a file is never deduplicated.
 #[allow(dead_code)]
-fn file_key(serial: u32, id: u128) -> Option<FileKey> {
+fn file_key(serial: u64, id: u128) -> Option<FileKey> {
     (id != 0 && id != u64::MAX as u128 && id != u128::MAX).then(|| (serial, [id as u64, (id >> 64) as u64]))
 }
 
@@ -64,7 +64,7 @@ const SHARDS: usize = 64;
 struct Links {
     cap: usize,
     /// The volume serial number of the walk's first file met.
-    volume: std::sync::OnceLock<u32>,
+    volume: std::sync::OnceLock<u64>,
     /// The files met, split by file ID.
     shards: Box<[std::sync::Mutex<Shard>]>,
     /// How many hard-linked files are tracked.
@@ -246,6 +246,13 @@ pub fn walk_without_file_ids(root: &Path, keep_going: &(dyn Fn() -> bool + Sync)
     walk_faulty(WORKERS, Some(LINK_CAP), Faults { no_ids: true, ..Faults::default() }, root, keep_going, sink);
 }
 
+/// [`walk`] where `mounts` are the machine's mount points. Test seam (a
+/// mount cannot be made in a test).
+#[cfg(all(test, target_os = "linux"))]
+pub fn walk_with_mounts(mounts: Mounts, root: &Path, sink: &mut dyn FnMut(Vec<Event>)) {
+    walk_faulty(WORKERS, Some(LINK_CAP), Faults { mounts: Some(mounts), ..Faults::default() }, root, &|| true, sink);
+}
+
 /// Failures injected into a walk (test seams).
 #[derive(Clone, Default)]
 struct Faults {
@@ -254,6 +261,8 @@ struct Faults {
     fail: Option<(PathBuf, usize)>,
     /// Every listing with file IDs is rejected (see [`walk_without_file_ids`]).
     no_ids: bool,
+    /// The mount points the walk keeps out of, instead of the machine's (see [`walk_with_mounts`]).
+    mounts: Option<Mounts>,
 }
 
 /// [`walk_links`] with optional injected failures (see [`Faults`]).
@@ -262,6 +271,8 @@ fn walk_faulty(workers: usize, cap: Option<usize>, faults: Faults, root: &Path, 
     let faults = &faults;
     let links = cap.map(Links::new);
     let links = links.as_ref();
+    let mounts = std::sync::Arc::new(faults.mounts.clone().unwrap_or_else(system::mounts));
+    let mounts = &mounts;
     let queue = Mutex::new(Queue { folders: vec![root.to_path_buf()], busy: 0, stopped: false });
     let wake = Condvar::new();
     // Each listed folder's events, from the listers to this thread; a
@@ -272,7 +283,7 @@ fn walk_faulty(workers: usize, cap: Option<usize>, faults: Faults, root: &Path, 
             let (tx, queue, wake) = (tx.clone(), &queue, &wake);
             scope.spawn(move || {
                 lower_priority();
-                let mut lister = Lister { links: links.is_some(), faults: faults.clone(), ..Lister::default() };
+                let mut lister = Lister { links: links.is_some(), faults: faults.clone(), mounts: mounts.clone(), ..Lister::default() };
                 loop {
                     let dir = {
                         let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -405,6 +416,8 @@ struct Lister {
     links: bool,
     /// Failures injected (test seams).
     faults: Faults,
+    /// Where the scan's filesystems are mounted (see [`Mounts`]).
+    mounts: std::sync::Arc<Mounts>,
 }
 
 impl Lister {
@@ -412,7 +425,7 @@ impl Lister {
     /// `dir` through its link when it is one (the scan's root).
     fn list(&mut self, dir: &Path, through: bool) -> Listing {
         let fail_after = self.faults.fail.as_ref().filter(|(d, _)| d == dir).map(|(_, n)| *n);
-        list(dir, through, self.links, &mut self.buf, fail_after, self.faults.no_ids)
+        list(dir, through, self.links, &mut self.buf, fail_after, self.faults.no_ids, &self.mounts)
     }
 }
 
@@ -422,8 +435,32 @@ impl Lister {
 /// folder itself is opened. With `links`, each file's identity is kept too (see
 /// [`Links`]). `buf` is the reusable read buffer. `fail_after` makes the listing
 /// fail once that many entries were read, `no_ids` makes the class with file IDs
-/// rejected (test seams).
+/// rejected (test seams). `mounts` tells which folders are mounts of other
+/// filesystems (Linux; the other systems ignore it).
 use system::list;
+
+/// The mount points of the system a scan runs on: a folder that is one is
+/// another filesystem (or a pseudo one such as /proc), and the walk does not
+/// enter it. Only Linux fills it; on the other systems it stays empty.
+#[derive(Clone, Default)]
+pub struct Mounts {
+    /// The mount points; None when the mount table could not be read.
+    points: Option<std::collections::HashSet<PathBuf>>,
+}
+
+impl Mounts {
+    /// The mounts listed by these mount points.
+    #[allow(dead_code)]
+    pub fn of(points: impl IntoIterator<Item = String>) -> Self {
+        Mounts { points: Some(points.into_iter().map(PathBuf::from).collect()) }
+    }
+
+    /// Whether `path` is a mount point; None when the mount table is not known.
+    #[allow(dead_code)]
+    fn is_mount(&self, path: &Path) -> Option<bool> {
+        self.points.as_ref().map(|p| p.contains(path))
+    }
+}
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -638,7 +675,7 @@ pub(super) mod tests {
     fn hard_link_tracking_memory_per_file() {
         use crate::addons::disk_space::tree::tests::private_bytes;
         // NTFS file IDs: a record number with a sequence number on top.
-        let id = |i: u64| (0x1234_5678u32, [i | ((i % 7 + 1) << 48), 0]);
+        let id = |i: u64| (0x1234_5678u64, [i | ((i % 7 + 1) << 48), 0]);
         let before = private_bytes();
         let links = Links::new(LINK_CAP);
         let mut events = Vec::new();

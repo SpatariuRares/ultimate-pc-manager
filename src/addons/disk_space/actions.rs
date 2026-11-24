@@ -1,15 +1,21 @@
 //! The actions on a chosen item (pure: no UI, nothing launched but the
-//! trash command): "Show in File Explorer" ("Open location" on Linux),
-//! "Open the folder", "Copy path" and, on Linux, "Move to trash". Each one is turned
-//! into an [`Outcome`] the add-on carries out: a move inside Disk Space,
-//! a shared action the app runs, or a message.
+//! trash command): "Show in File Explorer" ("Open location" off Windows),
+//! "Open the folder", "Copy path" and, where the system has a trash,
+//! "Move to trash". Each one is turned into an [`Outcome`] the add-on
+//! carries out: a move inside Disk Space, a shared action the app runs, or
+//! a message. The system's own wording is in `actions/{windows,linux,macos}.rs`.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::nav::Key;
+use crate::availability::{is_available, unavailable_error, Feature};
 use crate::platform::{AddonContext, Owner, Ran};
 use crate::system::System;
+
+mod linux;
+mod macos;
+mod windows;
 
 /// Said when the item is no longer where the scan found it.
 pub const MOVED: &str = "This item may have moved or been deleted since the scan.";
@@ -25,7 +31,7 @@ pub enum Verb {
     OpenFolder,
     /// The item's full path goes to the clipboard.
     CopyPath,
-    /// The item goes to the desktop's trash (Linux only).
+    /// The item goes to the desktop's trash (where the system has one).
     MoveToTrash,
 }
 
@@ -33,9 +39,11 @@ impl Verb {
     /// Every action, in the order they are offered.
     pub const ALL: [Verb; 4] = [Verb::ShowInExplorer, Verb::OpenFolder, Verb::CopyPath, Verb::MoveToTrash];
 
-    /// The actions this system offers, in order: the trash is Linux's.
-    pub fn offered_on(system: System) -> Vec<Verb> {
-        Verb::ALL.into_iter().filter(|v| *v != Verb::MoveToTrash || system == System::Linux).collect()
+    /// The actions offered for an item, in order. The trash is offered when
+    /// the system has one ([`Feature::MoveToTrash`]) and `trashable` (see
+    /// [`trashable`]).
+    pub fn offered(trashable: bool) -> Vec<Verb> {
+        Verb::ALL.into_iter().filter(|v| *v != Verb::MoveToTrash || (trashable && is_available(Feature::MoveToTrash))).collect()
     }
 
     /// Its words on the button and in the context menu on this system.
@@ -45,12 +53,15 @@ impl Verb {
 
     /// Its words on `system`.
     pub fn label_on(self, system: System) -> &'static str {
-        match (self, system) {
-            (Verb::ShowInExplorer, System::Windows) => "Show in File Explorer",
-            (Verb::ShowInExplorer, _) => "Open location",
-            (Verb::OpenFolder, _) => "Open the folder",
-            (Verb::CopyPath, _) => "Copy path",
-            (Verb::MoveToTrash, _) => "Move to trash",
+        match self {
+            Verb::ShowInExplorer => match system {
+                System::Windows => windows::reveal_label(),
+                System::Linux => linux::reveal_label(),
+                System::MacOs => macos::reveal_label(),
+            },
+            Verb::OpenFolder => "Open the folder",
+            Verb::CopyPath => "Copy path",
+            Verb::MoveToTrash => "Move to trash",
         }
     }
 }
@@ -98,8 +109,20 @@ pub fn outcome(verb: Verb, item: Option<&Path>, exists: impl Fn(&Path) -> bool) 
     }
 }
 
-/// Said when the trash tool is not there.
-pub const NO_TRASH_TOOL: &str = "Couldn't move the item to the trash because the gio tool is not installed.";
+/// Said for the scan's folder and a drive, which are never moved to the trash.
+pub const NOT_TRASHABLE: &str = "The scanned folder and the drives can't be moved to the trash.";
+
+/// Said when the trash command ended before it was done (its run was stopped).
+pub const TRASH_CANCELLED: &str = "Couldn't move the item to the trash: it was cancelled.";
+
+/// Said when the trash can't be reached at all (no add-on context to run it).
+pub const TRASH_FAILED: &str = "Couldn't move the item to the trash.";
+
+/// Whether `path` may be moved to the trash: not one of `protected` (the
+/// scan's folder and the drives' roots) and not the root of a filesystem.
+pub fn trashable(path: &Path, protected: &[PathBuf]) -> bool {
+    path.parent().is_some() && !protected.iter().any(|p| p == path)
+}
 
 /// The program and arguments that move `path` to the trash. `gio trash`
 /// follows the FreeDesktop trash rules (the trash of the item's own drive,
@@ -113,18 +136,28 @@ pub fn trash_command(path: &Path) -> (&'static str, Vec<String>) {
 pub fn move_to_trash(context: &AddonContext, path: &Path) -> Result<String, String> {
     let (program, args) = trash_command(path);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    // The runner takes a file for the program's output (it has no capture without one); the lines it
+    // gives `on_line` are all that is read, and the scratch file is removed once the program ended.
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let output = std::env::temp_dir().join(format!("upm-trash-{}-{nanos}.log", std::process::id()));
     let mut said = Vec::new();
     let ran = context.run(program, &args, &output, &std::sync::atomic::AtomicBool::new(false), &mut |l| said.push(l.to_string()));
     let _ = std::fs::remove_file(&output);
+    trash_result(path, ran, &said)
+}
+
+/// What to say about how the trash command for `path` went (`said` is what
+/// it wrote). The scan tree cannot drop an item, so the sizes are not
+/// updated and the message says to rescan.
+fn trash_result(path: &Path, ran: Ran, said: &[String]) -> Result<String, String> {
     match ran {
-        Ran::Exited(0) => Ok(format!("Moved to the trash: {}", path.display())),
+        Ran::Exited(0) => Ok(format!("Moved to the trash: {}. Rescan to update the sizes.", path.display())),
         Ran::Exited(_) => {
-            let why = said.into_iter().find(|l| !l.trim().is_empty()).unwrap_or_default();
+            let why = said.iter().find(|l| !l.trim().is_empty()).cloned().unwrap_or_default();
             Err(format!("Couldn't move the item to the trash. {why}").trim_end().to_string())
         }
-        Ran::NotStarted(_) | Ran::Stopped => Err(NO_TRASH_TOOL.to_string()),
+        Ran::NotStarted(_) => Err(format!("Couldn't move the item to the trash. {}", unavailable_error(Feature::MoveToTrash))),
+        Ran::Stopped => Err(TRASH_CANCELLED.to_string()),
     }
 }
 
@@ -221,11 +254,38 @@ mod tests {
     }
 
     #[test]
-    fn the_labels_name_each_action() {
-        let words = |system| Verb::offered_on(system).into_iter().map(|v| v.label_on(system)).collect::<Vec<_>>();
-        assert_eq!(words(System::Windows), ["Show in File Explorer", "Open the folder", "Copy path"], "Windows is as it was");
+    fn the_labels_name_each_action_in_the_words_of_each_system() {
+        let words = |system| Verb::ALL.into_iter().map(|v| v.label_on(system)).collect::<Vec<_>>();
+        assert_eq!(words(System::Windows), ["Show in File Explorer", "Open the folder", "Copy path", "Move to trash"], "Windows is as it was");
         assert_eq!(words(System::Linux), ["Open location", "Open the folder", "Copy path", "Move to trash"]);
-        assert_eq!(words(System::MacOs), ["Open location", "Open the folder", "Copy path"]);
+        assert_eq!(words(System::MacOs), ["Open location", "Open the folder", "Copy path", "Move to trash"]);
+    }
+
+    #[test]
+    fn the_trash_is_offered_for_an_item_that_can_go_there_and_where_the_system_has_one() {
+        assert_eq!(Verb::offered(true), Verb::ALL);
+        assert_eq!(Verb::offered(false), [Verb::ShowInExplorer, Verb::OpenFolder, Verb::CopyPath], "not for the scanned folder or a drive");
+        let _off = crate::availability::unavailable_in_test(&[Feature::MoveToTrash]);
+        assert_eq!(Verb::offered(true), [Verb::ShowInExplorer, Verb::OpenFolder, Verb::CopyPath], "hidden where the system has no trash");
+    }
+
+    #[test]
+    fn the_scanned_folder_and_the_drives_are_not_trashable() {
+        let protected = [PathBuf::from("/home/a"), PathBuf::from("/mnt/data")];
+        assert!(!trashable(Path::new("/home/a"), &protected), "the scan's folder");
+        assert!(!trashable(Path::new("/mnt/data"), &protected), "a drive's root");
+        assert!(!trashable(Path::new("/"), &protected), "the filesystem root");
+        assert!(trashable(Path::new("/home/a/movie.mkv"), &protected));
+    }
+
+    #[test]
+    fn a_cancelled_trash_is_not_a_missing_tool_and_a_missing_tool_says_so_through_availability() {
+        let path = Path::new("/home/a/movie.mkv");
+        assert_eq!(trash_result(path, Ran::Stopped, &[]), Err(TRASH_CANCELLED.to_string()));
+        assert!(!TRASH_CANCELLED.contains("gio"));
+        let missing = trash_result(path, Ran::NotStarted("no such file".into()), &[]).unwrap_err();
+        assert!(missing.ends_with(&unavailable_error(Feature::MoveToTrash)), "{missing}");
+        assert!(missing.contains("gio"), "{missing}");
     }
 
     #[test]
@@ -252,11 +312,12 @@ mod tests {
             (result, runner.launches())
         };
         let (done, launches) = run(0, "");
-        assert_eq!(done, Ok("Moved to the trash: /home/a/movie.mkv".to_string()));
+        assert_eq!(done, Ok("Moved to the trash: /home/a/movie.mkv. Rescan to update the sizes.".to_string()));
         assert!(matches!(&launches[..], [Launch::Run { program, args, .. }] if program == "gio" && args == &["trash", "--", "/home/a/movie.mkv"]), "{launches:?}");
         let (failed, _) = run(1, "gio: /home/a/movie.mkv: Unable to trash file: Permission denied");
         assert_eq!(failed, Err("Couldn't move the item to the trash. gio: /home/a/movie.mkv: Unable to trash file: Permission denied".to_string()));
         let (ctx, _) = AddonContext::recording();
-        assert_eq!(move_to_trash(&ctx, path), Err(NO_TRASH_TOOL.to_string()), "the tool could not be started");
+        let missing = move_to_trash(&ctx, path).unwrap_err();
+        assert!(missing.contains("gio") && !missing.contains("cancel"), "the tool could not be started: {missing}");
     }
 }
