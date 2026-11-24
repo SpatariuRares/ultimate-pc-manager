@@ -84,6 +84,8 @@ features! {
     ProcessRegistryKeys,
     /// The machine's fixed facts: processor, memory, disks, graphics.
     MachineInformation,
+    /// Moving a file or folder to the desktop's trash (the `gio` tool).
+    MoveToTrash,
 }
 
 /// The reason the app knows for a feature, when it has a specific one.
@@ -91,17 +93,16 @@ fn reason(feature: Feature) -> Option<&'static str> {
     match feature {
         Feature::Winget => Some("needs winget"),
         Feature::PowerOptionsPanel => Some("a Windows panel"),
+        Feature::MoveToTrash => Some("needs gio"),
         _ => None,
     }
 }
 
 /// Whether this system has the feature at all.
 pub(crate) fn system_has(feature: Feature) -> bool {
+    // Windows has the trash too, but through its own file manager: Disk Space does not offer it there.
     #[cfg(windows)]
-    return {
-        let _ = feature;
-        true
-    };
+    return feature != Feature::MoveToTrash;
     // Linux: signals, nice values and affinity work through kill, renice and taskset;
     // the startup entries are read from the XDG autostart folders and the user's
     // systemd units; the service list and its control come from its sources (they
@@ -110,8 +111,8 @@ pub(crate) fn system_has(feature: Feature) -> bool {
     // package (in place of a signer) comes from the package database and the
     // description from the program's desktop entry; the open files and sockets are
     // read from /proc/<pid>/fd (there are no registry keys); the machine's fixed
-    // facts come from /proc, /sys and the firmware tables, and the graphics usage
-    // of each process from the DRM interface.
+    // facts come from /proc, /sys and the firmware tables, the graphics usage
+    // of each process from the DRM interface, and the trash is moved to with `gio trash`.
     #[cfg(target_os = "linux")]
     return matches!(
         feature,
@@ -126,6 +127,7 @@ pub(crate) fn system_has(feature: Feature) -> bool {
             | Feature::OpenHandles
             | Feature::MachineInformation
             | Feature::ProcessGpuUsage
+            | Feature::MoveToTrash
     );
     // No current feature has a macOS implementation yet.
     #[cfg(target_os = "macos")]
@@ -208,9 +210,9 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn every_current_feature_is_available_on_windows() {
+    fn every_current_feature_is_available_on_windows_but_the_trash_of_disk_space() {
         for &feature in Feature::ALL {
-            assert!(system_has(feature), "{feature:?}");
+            assert_eq!(system_has(feature), feature != Feature::MoveToTrash, "{feature:?}");
             assert!(is_available(feature), "{feature:?}");
             assert_eq!(unavailable_text(feature), None);
         }
@@ -240,6 +242,7 @@ mod tests {
             Feature::OpenHandles,
             Feature::MachineInformation,
             Feature::ProcessGpuUsage,
+            Feature::MoveToTrash,
         ];
         for &feature in Feature::ALL {
             assert_eq!(system_has(feature), here.contains(&feature), "{feature:?}");
@@ -261,6 +264,7 @@ mod tests {
         assert_eq!(unavailable_error(Feature::Winget), "Not available on this system: needs winget.");
         assert_eq!(unavailable_error(Feature::PowerOptionsPanel), "Not available on this system: a Windows panel.");
         assert_eq!(unavailable_error(Feature::HardwareSensors), "Not available on this system.");
+        assert_eq!(unavailable_error(Feature::MoveToTrash), "Not available on this system: needs gio.");
     }
 
     #[test]

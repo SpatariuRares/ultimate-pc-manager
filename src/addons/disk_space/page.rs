@@ -33,6 +33,8 @@ impl DiskSpace {
     pub(super) fn draw_page(&mut self, ui: &mut Ui, page: &mut PageContext) {
         self.page_seen();
         let disks = &page.sample.disks;
+        // Never offered the trash: the scanned folder and the drives' roots.
+        self.protected = disks.iter().map(|d| PathBuf::from(&d.mount)).chain(self.view().root.map(PathBuf::from)).collect();
         let t = theme::of_ui(ui);
         if self.target.is_none() {
             self.target = disks.first().map(|d| Target::Drive(d.mount.clone()));
@@ -78,6 +80,7 @@ impl DiskSpace {
         }
         self.stop_dialog(ui);
         self.clear_dialog(ui);
+        self.trash_dialog(ui, page);
 
         status_strip(ui, &v, &t);
 
@@ -128,8 +131,8 @@ impl DiskSpace {
     /// The status band with the main button; gives whether the
     /// skipped-items note was dismissed and the command clicked.
     fn band(&mut self, ui: &mut Ui, page: &PageContext, v: &View, m: &Menu, now: Instant, asked: &mut Option<Ask>) -> (bool, Option<Command>) {
-        let links = &mut self.links;
-        let mut link = |p: &Path| links.get(p, now, |p| page.owner_of(p));
+        let (links, protected) = (&mut self.links, &self.protected);
+        let mut link = |p: &Path| item_info(links, p, now, page, protected);
         status_band(ui, v, m, &mut link, asked)
     }
 
@@ -139,10 +142,13 @@ impl DiskSpace {
         ui.spacing_mut().item_spacing.y = 6.0;
         if v.root.is_some() {
             let selected = self.selected();
-            let (state, links) = (&self.state, &mut self.links);
+            let (state, links, protected) = (&self.state, &mut self.links, &self.protected);
             let mut menu = |ui: &mut Ui, key: &nav::Key| {
-                let owner = item_of(state, key).and_then(|p| links.get(&p, now, |p| page.owner_of(p)));
-                if let Some(a) = item_actions(ui, key, owner.as_ref()) {
+                let item = match item_of(state, key) {
+                    Some(p) => item_info(links, &p, now, page, protected),
+                    None => Item::default(),
+                };
+                if let Some(a) = item_actions(ui, key, &item) {
                     *asked = Some(a);
                     ui.close();
                 }
@@ -157,8 +163,8 @@ impl DiskSpace {
             }
             let n = self.list_length();
             let selected = self.selected();
-            let links = &mut self.links;
-            let mut link = |p: &Path| links.get(p, now, |p| page.owner_of(p));
+            let (links, protected) = (&mut self.links, &self.protected);
+            let mut link = |p: &Path| item_info(links, p, now, page, protected);
             grouped_list(ui, v, self.group, n, selected.as_ref(), t, &mut link, asked);
         } else if let (None, Some(t), Some(plan)) = (&v.running, self.target.clone(), ready) {
             // The veil before the first scan: clicked, or Enter/Space
@@ -182,8 +188,8 @@ impl DiskSpace {
         section_title(ui, &format!("Largest {} folders", self.list_length()));
         let selected = self.selected();
         {
-            let links = &mut self.links;
-            let mut link = |p: &Path| links.get(p, now, |p| page.owner_of(p));
+            let (links, protected) = (&mut self.links, &self.protected);
+            let mut link = |p: &Path| item_info(links, p, now, page, protected);
             if v.root.is_none() {
                 ui.label(RichText::new("Nothing measured yet.").size(13.0).color(t.label));
             }
@@ -196,9 +202,12 @@ impl DiskSpace {
         }
         if let Some(key) = selected {
             let path = item_of(&self.state, &key);
-            let owner = path.as_ref().and_then(|p| self.links.get(p, now, |p| page.owner_of(p)));
+            let item = match &path {
+                Some(p) => item_info(&mut self.links, p, now, page, &self.protected),
+                None => Item::default(),
+            };
             ui.add_space(10.0);
-            selected_panel(ui, v, &key, path.as_deref(), owner.as_ref(), t, asked);
+            selected_panel(ui, v, &key, path.as_deref(), &item, t, asked);
         }
         rule(ui, t);
         history_section(ui, self, v.running.is_some(), t)
@@ -451,24 +460,39 @@ enum Ask {
     ShowOwner(nav::Key),
 }
 
-/// Who owns a path among the other add-ons that are on (cached).
-type Link<'a> = &'a mut dyn FnMut(&Path) -> Option<Owner>;
+/// What the page knows of an item that decides its actions.
+#[derive(Default)]
+struct Item {
+    /// The row of another add-on that owns it (Installed Apps), when one does.
+    owner: Option<Owner>,
+    /// It may be moved to the trash (not the scanned folder nor a drive).
+    trashable: bool,
+}
+
+/// What the actions of the item at `path` depend on: who owns it among the
+/// other add-ons that are on (cached), and whether it may go to the trash.
+fn item_info(links: &mut actions::Links, path: &Path, now: Instant, page: &PageContext, protected: &[PathBuf]) -> Item {
+    Item { owner: links.get(path, now, |p| page.owner_of(p)), trashable: actions::trashable(path, protected) }
+}
+
+/// The item behind a path, asked for by its rows (see [`item_info`]).
+type Link<'a> = &'a mut dyn FnMut(&Path) -> Item;
 
 /// The item actions (links in the panel, buttons in a context menu),
 /// then the link to the item's row in another add-on when one owns it.
-fn item_actions(ui: &mut Ui, key: &nav::Key, owner: Option<&Owner>) -> Option<Ask> {
-    item_actions_as(ui, key, owner, |ui, words| ui.button(words))
+fn item_actions(ui: &mut Ui, key: &nav::Key, item: &Item) -> Option<Ask> {
+    item_actions_as(ui, key, item, |ui, words| ui.button(words))
 }
 
 /// [`item_actions`], each one drawn by `add`.
-fn item_actions_as(ui: &mut Ui, key: &nav::Key, owner: Option<&Owner>, mut add: impl FnMut(&mut Ui, &str) -> egui::Response) -> Option<Ask> {
+fn item_actions_as(ui: &mut Ui, key: &nav::Key, item: &Item, mut add: impl FnMut(&mut Ui, &str) -> egui::Response) -> Option<Ask> {
     let mut asked = None;
-    for verb in actions::Verb::ALL {
+    for verb in actions::Verb::offered(item.trashable) {
         if add(ui, verb.label()).clicked() {
             asked = Some(Ask::Act(verb, key.clone()));
         }
     }
-    if let Some(o) = owner {
+    if let Some(o) = &item.owner {
         if add(ui, &format!("See {} in {}", o.label, o.page)).clicked() {
             asked = Some(Ask::ShowOwner(key.clone()));
         }
@@ -478,7 +502,7 @@ fn item_actions_as(ui: &mut Ui, key: &nav::Key, owner: Option<&Owner>, mut add: 
 
 /// The chosen piece in a box: "Selected", its name and size, where it is,
 /// and its actions.
-fn selected_panel(ui: &mut Ui, v: &View, key: &nav::Key, path: Option<&Path>, owner: Option<&Owner>, t: &Theme, asked: &mut Option<Ask>) {
+fn selected_panel(ui: &mut Ui, v: &View, key: &nav::Key, path: Option<&Path>, item: &Item, t: &Theme, asked: &mut Option<Ask>) {
     let piece = v.pieces.iter().find(|p| &p.key == key);
     egui::Frame::new().stroke(Stroke::new(1.0, t.line)).corner_radius(CornerRadius::same(6)).inner_margin(Margin::symmetric(12, 10)).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -497,7 +521,7 @@ fn selected_panel(ui: &mut Ui, v: &View, key: &nav::Key, path: Option<&Path>, ow
         }
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(14.0, 6.0);
-            if let Some(a) = item_actions_as(ui, key, owner, link_button) {
+            if let Some(a) = item_actions_as(ui, key, item, link_button) {
                 *asked = Some(a);
             }
         });
@@ -684,8 +708,8 @@ fn list_row(ui: &mut Ui, cells: &Cells, selected: bool, sense: bool, t: &Theme) 
 fn item_row(ui: &mut Ui, cells: &Cells, key: nav::Key, selected: bool, t: &Theme, link: Link, asked: &mut Option<Ask>) {
     let path = cells.text.to_string();
     list_row(ui, cells, selected, true, t).context_menu(|ui| {
-        let owner = link(Path::new(&path));
-        if let Some(a) = item_actions(ui, &key, owner.as_ref()) {
+        let item = link(Path::new(&path));
+        if let Some(a) = item_actions(ui, &key, &item) {
             *asked = Some(a);
             ui.close();
         }

@@ -26,7 +26,35 @@ pub use system::{open_power_options, reveal_in_explorer};
 #[cfg(not(windows))]
 fn spawn(launch: &[String]) -> Result<(), String> {
     let (program, args) = launch.split_first().ok_or_else(|| "nothing to run".to_string())?;
+    #[cfg(test)]
+    if recorded::note(launch) {
+        return Ok(());
+    }
     std::process::Command::new(program).args(args).spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Test seam: what [`spawn`] was asked to start, without starting it.
+#[cfg(all(test, not(windows)))]
+pub(crate) mod recorded {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LAUNCHES: RefCell<Option<Vec<Vec<String>>>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `f` with every launch of this thread recorded, not started; gives
+    /// `f`'s result and the launches (program, then arguments).
+    pub fn launches<T>(f: impl FnOnce() -> T) -> (T, Vec<Vec<String>>) {
+        LAUNCHES.with(|l| *l.borrow_mut() = Some(Vec::new()));
+        let result = f();
+        let launches = LAUNCHES.with(|l| l.borrow_mut().take()).unwrap_or_default();
+        (result, launches)
+    }
+
+    /// Notes a launch when recording; whether it was.
+    pub(super) fn note(launch: &[String]) -> bool {
+        LAUNCHES.with(|l| l.borrow_mut().as_mut().map(|v| v.push(launch.to_vec())).is_some())
+    }
 }
 
 #[cfg(all(test, not(windows)))]

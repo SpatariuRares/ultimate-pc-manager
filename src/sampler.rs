@@ -496,7 +496,7 @@ fn system_fill() -> Fill {
             snap.net.sort_by(|a, b| {
                 (b.total_rx + b.total_tx).cmp(&(a.total_rx + a.total_tx))
             });
-            for d in disks.list() {
+            for d in crate::disks::real_drives(disks.list().iter().collect(), |d| d.mount_point().to_string_lossy().into_owned()) {
                 snap.disks.push(DiskRow {
                     name: d.name().to_string_lossy().into_owned(),
                     mount: d.mount_point().display().to_string(),

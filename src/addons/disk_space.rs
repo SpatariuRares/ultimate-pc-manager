@@ -361,6 +361,10 @@ pub struct DiskSpace {
     long_after: Option<u64>,
     /// The Stop confirmation, while it is open.
     confirm: Option<StopQuestion>,
+    /// The Move to trash confirmation, while it is open.
+    trash_asked: Option<TrashQuestion>,
+    /// What the page last found never to move to the trash: the scanned folder and the drives' roots.
+    protected: Vec<PathBuf>,
     /// The "History folder" setting (None = the app's folder).
     history_folder: Option<String>,
     /// The history folder (None until started; never the real one in tests).
@@ -425,6 +429,15 @@ impl Drop for Alive {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// The open Move to trash confirmation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrashQuestion {
+    /// The item that would go to the trash.
+    path: PathBuf,
+    /// Its size in the scan, when the page showed it.
+    bytes: Option<u64>,
 }
 
 /// The open Stop confirmation.
@@ -959,8 +972,48 @@ impl DiskSpace {
             actions::Outcome::Open(path) => self.navigate(nav::Move::Open(path)),
             actions::Outcome::Reveal(path) => page.actions.push(Action::ShowInExplorer(path)),
             actions::Outcome::Copy(text) => page.actions.push(Action::Copy(text)),
+            actions::Outcome::Trash(path) => self.ask_trash(key, path, page),
             actions::Outcome::Say(why) => page.actions.push(Action::Say(why.into())),
         }
+    }
+
+    /// Move to trash: asks first, naming the item and its size; says why
+    /// not for the scanned folder, a drive's root, or a system without a trash.
+    fn ask_trash(&mut self, key: &nav::Key, path: PathBuf, page: &mut PageContext) {
+        use crate::availability::{is_available, unavailable_error, Feature};
+        let view = self.view();
+        let mut protected = self.protected.clone();
+        protected.extend(view.root.map(PathBuf::from));
+        if !is_available(Feature::MoveToTrash) {
+            page.actions.push(Action::Say(unavailable_error(Feature::MoveToTrash)));
+        } else if !actions::trashable(&path, &protected) {
+            page.actions.push(Action::Say(actions::NOT_TRASHABLE.into()));
+        } else {
+            // The piece the page shows, else the item among the level's largest files and folders.
+            let listed = |rows: &[(String, u64)]| rows.iter().find(|(p, _)| Path::new(p) == path).map(|(_, b)| *b);
+            let bytes = view.pieces.iter().find(|p| &p.key == key).map(|p| p.bytes).or_else(|| listed(&view.largest)).or_else(|| listed(&view.level));
+            self.trash_asked = Some(TrashQuestion { path, bytes });
+        }
+    }
+
+    /// The open Move to trash confirmation (title, text).
+    pub fn trash_question(&self) -> Option<(&'static str, String)> {
+        let q = self.trash_asked.as_ref()?;
+        let size = q.bytes.map(|b| format!(" ({})", text::size(b))).unwrap_or_default();
+        Some(("Move to trash?", format!("Move \"{}\"{size} to the trash?\n{}", short_name(&q.path), q.path.display())))
+    }
+
+    /// The answer to Move to trash: moves the item when `yes`, and says how it went.
+    pub fn answer_trash(&mut self, yes: bool, page: &mut PageContext) {
+        let Some(q) = self.trash_asked.take() else { return };
+        if !yes {
+            return;
+        }
+        let done = match &self.context {
+            Some(context) => actions::move_to_trash(context, &q.path),
+            None => Err(actions::TRASH_FAILED.to_string()),
+        };
+        page.actions.push(Action::Say(done.unwrap_or_else(|e| e)));
     }
 
     /// The row of another add-on that is on (Installed Apps) that owns the
