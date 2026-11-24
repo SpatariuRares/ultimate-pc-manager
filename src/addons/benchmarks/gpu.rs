@@ -1,9 +1,11 @@
-//! The GPU test: Direct3D 11 on the video card the user chose (DXGI lists
-//! them). The compute part runs our own `cs_5_0` shader, eight independent
-//! multiply-add chains per thread, and reports Compute in GFLOPS; the graphics part then
-//! draws full-target triangles with a vertex + pixel shader pair whose pixel
-//! shader runs a 64-step loop, and reports Graphics in Gpixels/sec. Both are
-//! run in batches timed with GPU timestamp queries.
+//! The GPU test: wgpu on the video card the user chose, through the native
+//! backend of the system (Direct3D 12, Vulkan or Metal). The compute part
+//! runs our own WGSL shader, eight independent multiply-add chains per
+//! thread, and reports Compute in GFLOPS; the graphics part then draws
+//! full-target triangles with a vertex + fragment shader pair whose
+//! fragment shader runs a 64-step loop, and reports Graphics in
+//! Gpixels/sec. Both are run in batches timed with GPU timestamps, or with
+//! the CPU clock (waiting for each batch) when the device has none.
 
 use std::time::Instant;
 
@@ -22,15 +24,13 @@ pub const TESTING_COMPUTE: &str = "Testing GPU compute";
 /// The graphics phase.
 pub const TESTING_GRAPHICS: &str = "Testing GPU graphics";
 
-/// The GPU test's error messages.
-pub const NO_GPU: &str = "A hardware Direct3D 11 GPU is unavailable on this system.";
-pub const SHADERS_NOT_COMPILED: &str = "The Direct3D benchmark shaders could not be compiled.";
-pub const PIPELINES_NOT_CREATED: &str = "The Direct3D benchmark pipelines could not be created.";
-pub const RESOURCES_NOT_ALLOCATED: &str = "The Direct3D benchmark resources could not be allocated.";
-pub const SYNC_UNAVAILABLE: &str = "Direct3D GPU synchronization is unavailable.";
-pub const COMPUTE_FAILED: &str = "Direct3D compute work failed.";
+/// The GPU test's error messages (`NO_GPU` and `NO_CARD` say it per system).
+pub const SHADERS_NOT_COMPILED: &str = "The GPU benchmark shaders could not be compiled.";
+pub const PIPELINES_NOT_CREATED: &str = "The GPU benchmark pipelines could not be created.";
+pub const RESOURCES_NOT_ALLOCATED: &str = "The GPU benchmark resources could not be allocated.";
+pub const COMPUTE_FAILED: &str = "GPU compute work failed.";
 /// Failed drawing: the compute message, said of graphics.
-pub const GRAPHICS_FAILED: &str = "Direct3D graphics work failed.";
+pub const GRAPHICS_FAILED: &str = "GPU graphics work failed.";
 
 /// The compute shader's entry point.
 pub const COMPUTE_ENTRY: &str = "MeasureFma";
@@ -45,26 +45,31 @@ pub const CHAINS: u32 = 8;
 /// Multiply-adds in each chain.
 pub const STEPS: u32 = 160;
 
-/// The compute shader (this app's own): each thread runs eight independent
-/// multiply-add chains, as two float4 registers, for `STEPS` unrolled steps,
-/// so the GPU can overlap them and the arithmetic units stay busy. The
-/// multiplier comes from the thread id, so the compiler cannot fold the
-/// chains; their sum is written out so it cannot drop them either.
+/// The compute shader (this app's own, WGSL): each thread runs eight
+/// independent multiply-add chains, as two vec4 registers, for `STEPS`
+/// unrolled steps, so the GPU can overlap them and the arithmetic units
+/// stay busy. The multiplier comes from the thread id, so the compiler
+/// cannot fold the chains; their sum is written out so it cannot drop them
+/// either.
 pub fn compute_shader() -> String {
+    let mut steps = String::new();
+    for _ in 0..STEPS {
+        steps.push_str("  left = fma(left, factor, vec4<f32>(0.0031, 0.0047, 0.0059, 0.0071));
+");
+        steps.push_str("  right = fma(right, factor, vec4<f32>(0.0083, 0.0097, 0.0109, 0.0127));
+");
+    }
     format!(
-        r#"RWStructuredBuffer<float> results : register(u0);
+        r#"@group(0) @binding(0) var<storage, read_write> results: array<f32>;
 
-[numthreads({GROUP_THREADS}, 1, 1)]
-void {COMPUTE_ENTRY}(uint3 thread : SV_DispatchThreadID) {{
+@compute @workgroup_size({GROUP_THREADS}, 1, 1)
+fn {COMPUTE_ENTRY}(@builtin(global_invocation_id) thread: vec3<u32>) {{
   // Below 1, so every chain settles instead of growing without bound.
-  float scale = 0.998f + float(thread.x % 251u) * 0.0000075f;
-  float4 left = scale;
-  float4 right = scale;
-  [unroll] for (uint step = 0; step < {STEPS}; ++step) {{
-    left = mad(left, scale, float4(0.0031f, 0.0047f, 0.0059f, 0.0071f));
-    right = mad(right, scale, float4(0.0083f, 0.0097f, 0.0109f, 0.0127f));
-  }}
-  float4 total = left + right;
+  let scale = 0.998 + f32(thread.x % 251u) * 0.0000075;
+  let factor = vec4<f32>(scale);
+  var left = vec4<f32>(scale);
+  var right = vec4<f32>(scale);
+{steps}  let total = left + right;
   results[thread.x] = (total.x + total.y) + (total.z + total.w);
 }}
 "#
@@ -73,34 +78,42 @@ void {COMPUTE_ENTRY}(uint3 thread : SV_DispatchThreadID) {{
 
 /// The vertex shader's entry point.
 pub const VERTEX_ENTRY: &str = "CoverTarget";
-/// The pixel shader's entry point.
+/// The fragment (pixel) shader's entry point.
 pub const PIXEL_ENTRY: &str = "ShadePixel";
+/// Steps of the fragment shader's loop.
+pub const PIXEL_STEPS: u32 = 64;
 
-/// The graphics shaders (this app's own): the vertex shader makes one
+/// The graphics shaders (this app's own, WGSL): the vertex shader makes one
 /// triangle that covers the whole target from the vertex index alone (no
-/// vertex buffer); the pixel shader runs 64 steps of colour arithmetic.
-pub const GRAPHICS_SHADERS: &str = r#"struct Interpolants {
-  float4 position : SV_Position;
-  float2 uv : TEXCOORD0;
-};
+/// vertex buffer); the fragment shader runs 64 steps of colour arithmetic.
+pub fn graphics_shaders() -> String {
+    format!(
+        r#"struct Interpolants {{
+  @builtin(position) position: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+}}
 
-Interpolants CoverTarget(uint id : SV_VertexID) {
+@vertex
+fn {VERTEX_ENTRY}(@builtin(vertex_index) id: u32) -> Interpolants {{
   // Vertices (0,0), (2,0), (0,2) in uv: a triangle twice the target's size.
-  float2 uv = float2(float(id == 1u) * 2.0f, float(id == 2u) * 2.0f);
-  Interpolants o;
-  o.position = float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 0.0f, 1.0f);
+  let uv = vec2<f32>(f32(id == 1u) * 2.0, f32(id == 2u) * 2.0);
+  var o: Interpolants;
+  o.position = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
   o.uv = uv;
   return o;
-}
+}}
 
-float4 ShadePixel(Interpolants i) : SV_Target {
-  float3 tint = float3(i.uv, 0.5f);
-  [unroll] for (uint step = 0; step < 64; ++step) {
-    tint = mad(tint, float3(0.9993f, 0.9995f, 0.9997f), tint.zxy * 0.0004f);
-  }
-  return float4(tint, 1.0f);
+@fragment
+fn {PIXEL_ENTRY}(i: Interpolants) -> @location(0) vec4<f32> {{
+  var tint = vec3<f32>(i.uv, 0.5);
+  for (var step = 0u; step < {PIXEL_STEPS}u; step++) {{
+    tint = fma(tint, vec3<f32>(0.9993, 0.9995, 0.9997), tint.zxy * 0.0004);
+  }}
+  return vec4<f32>(tint, 1.0);
+}}
+"#
+    )
 }
-"#;
 
 /// Floating-point operations counted for one shader thread: its chains'
 /// multiply-adds, two FLOPs each (a multiply and an add). The setup and the
@@ -117,19 +130,110 @@ const MAX_BATCH: u32 = 10_000;
 /// A part stops measuring after this many times its GPU time in wall time.
 const WALL_FACTOR: f64 = 5.0;
 
-/// A video card DXGI lists.
+/// A video card wgpu lists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Adapter {
     /// "NVIDIA GeForce RTX 4080".
     pub name: String,
-    /// Its locally unique id, which tells two equal cards apart.
-    pub luid: i64,
+    /// Tells two equal cards apart (made from the card's name and ids).
+    pub id: i64,
 }
 
-/// The card to test: the one chosen (by its LUID) if it is still listed,
+/// What kind of device an adapter is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Discrete,
+    Integrated,
+    Virtual,
+    /// A software renderer (llvmpipe, lavapipe, WARP...): never listed.
+    Software,
+    Other,
+}
+
+/// An adapter as the backend reports it, before filtering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Found {
+    pub name: String,
+    pub vendor: u32,
+    pub device: u32,
+    pub kind: Kind,
+}
+
+/// Software renderers some drivers report as ordinary devices.
+const SOFTWARE_NAMES: [&str; 4] = ["llvmpipe", "lavapipe", "swiftshader", "basic render driver"];
+
+fn is_software(found: &Found) -> bool {
+    let name = found.name.to_lowercase();
+    found.kind == Kind::Software || SOFTWARE_NAMES.iter().any(|s| name.contains(s))
+}
+
+/// The id of the `nth` adapter with this name and device ids.
+fn adapter_id(found: &Found, nth: u32) -> i64 {
+    // FNV-1a, kept positive.
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut put = |bytes: &[u8]| {
+        for b in bytes {
+            h = (h ^ *b as u64).wrapping_mul(0x100000001b3);
+        }
+    };
+    put(found.name.as_bytes());
+    put(&found.vendor.to_le_bytes());
+    put(&found.device.to_le_bytes());
+    ((h >> 1) as i64).wrapping_add(nth as i64) & i64::MAX
+}
+
+/// The hardware cards among `found`, the high-performance one first (a
+/// discrete card before an integrated one; equal kinds keep the backend's
+/// order), each with its index in `found`. Software renderers are dropped.
+pub fn listed(found: &[Found]) -> Vec<(Adapter, usize)> {
+    let mut cards: Vec<(usize, &Found)> = found.iter().enumerate().filter(|(_, f)| !is_software(f)).collect();
+    let rank = |k: Kind| match k {
+        Kind::Discrete => 0,
+        Kind::Integrated => 1,
+        Kind::Virtual => 2,
+        _ => 3,
+    };
+    cards.sort_by_key(|(_, f)| rank(f.kind));
+    let mut seen: Vec<(&str, u32, u32)> = Vec::new();
+    cards
+        .into_iter()
+        .map(|(index, f)| {
+            let key = (f.name.as_str(), f.vendor, f.device);
+            let nth = seen.iter().filter(|k| **k == key).count() as u32;
+            seen.push(key);
+            (Adapter { name: f.name.clone(), id: adapter_id(f, nth) }, index)
+        })
+        .collect()
+}
+
+/// The card to test: the one chosen (by its id) if it is still listed,
 /// else the first listed (the high-performance one), else none.
 pub fn chosen(adapters: &[Adapter], choice: Option<i64>) -> Option<&Adapter> {
-    adapters.iter().find(|a| Some(a.luid) == choice).or(adapters.first())
+    adapters.iter().find(|a| Some(a.id) == choice).or(adapters.first())
+}
+
+/// How a batch is timed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Timing {
+    /// GPU timestamp queries, a tick lasting this many nanoseconds.
+    Timestamps(f32),
+    /// The CPU clock, waiting for each batch to finish.
+    CpuClock,
+}
+
+/// GPU timestamps when the device has them (and says how long a tick is),
+/// else the CPU clock.
+pub fn timing_for(has_timestamps: bool, tick_nanos: f32) -> Timing {
+    if has_timestamps && tick_nanos.is_finite() && tick_nanos > 0.0 {
+        Timing::Timestamps(tick_nanos)
+    } else {
+        Timing::CpuClock
+    }
+}
+
+/// The seconds between two timestamps, or none when they are not valid.
+pub fn timestamp_seconds(begin: u64, end: u64, tick_nanos: f32) -> Option<f64> {
+    (end > begin).then(|| (end - begin) as f64 * tick_nanos as f64 / 1e9)
 }
 
 /// The compute shader ready to run on one card.
@@ -261,29 +365,23 @@ fn unit_with_seconds(
 /// The test's name, as in "%1 test failed: %2".
 pub const NAME: &str = "GPU";
 
-/// The engine unit of the GPU test on `adapter`, with Direct3D 11.
+/// The engine unit of the GPU test on `adapter`, with wgpu.
 pub fn unit(adapter: Option<Adapter>) -> Unit {
     unit_with(adapter, open)
 }
 
-/// The cards with their dedicated video memory, the high-performance one
-/// (the most memory: a discrete card before an integrated one) first; cards
-/// with equal memory keep DXGI's order.
-fn high_performance_first(mut cards: Vec<(Adapter, u64)>) -> Vec<Adapter> {
-    cards.sort_by_key(|(_, memory)| std::cmp::Reverse(*memory));
-    cards.into_iter().map(|(card, _)| card).collect()
-}
-
-/// The hardware video cards, the high-performance one first (none without
-/// DXGI).
+/// The hardware video cards, the high-performance one first (none when the
+/// system has no driver for the backend).
 pub fn adapters() -> Vec<Adapter> {
-    system::adapters()
+    listed(&device::found()).into_iter().map(|(a, _)| a).collect()
 }
 
-/// Both parts' shaders on `adapter`, with Direct3D 11.
+/// Both parts' shaders on `adapter`.
 fn open(adapter: &Adapter, cancel: Cancel) -> Result<Box<dyn Gpu>, String> {
-    system::open(adapter, cancel)
+    Ok(Box::new(device::Device::open(adapter, cancel, false)?))
 }
+
+mod device;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -299,6 +397,7 @@ use macos as system;
 #[cfg(windows)]
 use windows as system;
 
+pub use system::{NO_CARD, NO_GPU};
 
 #[cfg(test)]
 mod tests {
@@ -307,8 +406,8 @@ mod tests {
     use std::sync::mpsc::{channel, Receiver, Sender};
     use std::time::Duration;
 
-    fn card(name: &str, luid: i64) -> Adapter {
-        Adapter { name: name.into(), luid }
+    fn card(name: &str, id: i64) -> Adapter {
+        Adapter { name: name.into(), id }
     }
 
     /// A card where every dispatch of a million threads takes `per` GPU
@@ -401,12 +500,66 @@ mod tests {
         assert_eq!(chosen(&[], Some(9)), None);
     }
 
+    fn found(name: &str, kind: Kind) -> Found {
+        Found { name: name.into(), vendor: 0x10de, device: 0x2704, kind }
+    }
+
+    fn names(found: &[Found]) -> Vec<String> {
+        listed(found).into_iter().map(|(a, _)| a.name).collect()
+    }
+
     #[test]
-    fn the_card_with_the_most_video_memory_comes_first() {
-        let gib = 1u64 << 30;
-        let listed = vec![(card("AMD Radeon(TM) Graphics", 7), 512 << 20), (card("NVIDIA GeForce RTX 4080", 9), 16 * gib), (card("Second 4080", 11), 16 * gib)];
-        let names: Vec<_> = high_performance_first(listed).into_iter().map(|a| a.name).collect();
-        assert_eq!(names, ["NVIDIA GeForce RTX 4080", "Second 4080", "AMD Radeon(TM) Graphics"], "equal cards keep DXGI's order");
+    fn software_adapters_are_not_listed() {
+        let all = [
+            found("llvmpipe (LLVM 17.0.6, 256 bits)", Kind::Software),
+            found("Microsoft Basic Render Driver", Kind::Software),
+            found("NVIDIA GeForce RTX 4080", Kind::Discrete),
+            // A driver that reports a software renderer as an ordinary device.
+            found("lavapipe", Kind::Other),
+            found("SwiftShader Device (Subzero)", Kind::Integrated),
+        ];
+        assert_eq!(names(&all), ["NVIDIA GeForce RTX 4080"]);
+        assert!(listed(&[found("llvmpipe", Kind::Software)]).is_empty(), "only software: nothing to list");
+    }
+
+    #[test]
+    fn a_discrete_card_comes_before_an_integrated_one() {
+        let all = [
+            found("AMD Radeon(TM) Graphics", Kind::Integrated),
+            found("NVIDIA GeForce RTX 4080", Kind::Discrete),
+            found("Second 4080", Kind::Discrete),
+            found("Virtual GPU", Kind::Virtual),
+        ];
+        assert_eq!(names(&all), ["NVIDIA GeForce RTX 4080", "Second 4080", "AMD Radeon(TM) Graphics", "Virtual GPU"], "equal kinds keep the backend's order");
+        let indexes: Vec<_> = listed(&all).into_iter().map(|(_, i)| i).collect();
+        assert_eq!(indexes, [1, 2, 0, 3], "each card says where it is in the backend's list");
+    }
+
+    #[test]
+    fn two_equal_cards_get_different_ids_that_stay_the_same_between_listings() {
+        let all = [found("NVIDIA GeForce RTX 4080", Kind::Discrete), found("NVIDIA GeForce RTX 4080", Kind::Discrete), found("AMD Radeon(TM) Graphics", Kind::Integrated)];
+        let ids: Vec<_> = listed(&all).into_iter().map(|(a, _)| a.id).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2], "{ids:?}");
+        assert!(ids.iter().all(|i| *i >= 0));
+        let again: Vec<_> = listed(&all).into_iter().map(|(a, _)| a.id).collect();
+        assert_eq!(ids, again);
+    }
+
+    #[test]
+    fn batches_use_gpu_timestamps_when_the_device_has_them_else_the_cpu_clock() {
+        assert_eq!(timing_for(true, 1.0), Timing::Timestamps(1.0));
+        assert_eq!(timing_for(false, 1.0), Timing::CpuClock, "no timestamp feature");
+        assert_eq!(timing_for(true, 0.0), Timing::CpuClock, "a tick of no duration");
+        assert_eq!(timing_for(true, f32::NAN), Timing::CpuClock);
+    }
+
+    #[test]
+    fn timestamps_become_seconds_and_a_backwards_clock_is_not_valid() {
+        // 1,000,000 ticks of 10 ns: 10 ms.
+        assert!((timestamp_seconds(500, 1_000_500, 10.0).unwrap() - 0.01).abs() < 1e-12);
+        assert_eq!(timestamp_seconds(7, 7, 10.0), None);
+        assert_eq!(timestamp_seconds(9, 7, 10.0), None);
     }
 
     #[test]
@@ -439,7 +592,7 @@ mod tests {
     fn failed_compute_work_fails_the_test_with_its_message() {
         let fake = Fake { fail_at: Some((3, COMPUTE_FAILED)), ..Fake::new(0.001) };
         let s = run_fake(fake, 1.0);
-        assert_eq!(s.status().as_deref(), Some("GPU test failed: Direct3D compute work failed."));
+        assert_eq!(s.status().as_deref(), Some(format!("GPU test failed: {COMPUTE_FAILED}").as_str()));
         assert!(s.results("GPU").is_empty());
     }
 
@@ -448,12 +601,12 @@ mod tests {
         let mut engine = Engine::default();
         engine.start(vec![unit_with(Some(card("Card", 1)), |_, _| Err(SHADERS_NOT_COMPILED.into()))]);
         let s = wait_idle(&engine);
-        assert_eq!(s.status().as_deref(), Some("GPU test failed: The Direct3D benchmark shaders could not be compiled."));
+        assert_eq!(s.status().as_deref(), Some(format!("GPU test failed: {SHADERS_NOT_COMPILED}").as_str()));
 
         let mut engine = Engine::default();
         engine.start(vec![unit_with(None, |_, _| unreachable!("no card to open"))]);
         let s = wait_idle(&engine);
-        assert_eq!(s.status().as_deref(), Some("GPU test failed: A hardware Direct3D 11 GPU is unavailable on this system."));
+        assert_eq!(s.status().as_deref(), Some(format!("GPU test failed: {NO_GPU}").as_str()));
     }
 
     #[test]
@@ -535,7 +688,7 @@ mod tests {
     fn failed_graphics_work_fails_the_test_with_its_message() {
         let fake = Fake { draw_fail: Some(GRAPHICS_FAILED), ..Fake::new(0.001) };
         let s = wait_idle(&run_unit(fake, 0.1));
-        assert_eq!(s.status().as_deref(), Some("GPU test failed: Direct3D graphics work failed."));
+        assert_eq!(s.status().as_deref(), Some(format!("GPU test failed: {GRAPHICS_FAILED}").as_str()));
         assert!(s.results("GPU").is_empty());
     }
 
@@ -543,7 +696,7 @@ mod tests {
     fn graphics_that_never_times_validly_fails_the_test() {
         let fake = Fake { per_draw: 0.0, ..Fake::new(0.001) };
         let s = wait_idle(&run_unit(fake, 0.1));
-        assert_eq!(s.status().as_deref(), Some("GPU test failed: Direct3D graphics work failed."));
+        assert_eq!(s.status().as_deref(), Some(format!("GPU test failed: {GRAPHICS_FAILED}").as_str()));
     }
 
     /// A card whose timing query never answers: like the real device, it
@@ -596,30 +749,34 @@ mod tests {
     }
 
     #[test]
-    fn the_graphics_shaders_are_a_vertex_and_pixel_pair_with_a_64_step_loop() {
-        assert!(GRAPHICS_SHADERS.contains(&format!("{VERTEX_ENTRY}(uint id : SV_VertexID)")));
-        assert!(GRAPHICS_SHADERS.contains(&format!("float4 {PIXEL_ENTRY}(")));
-        assert!(GRAPHICS_SHADERS.contains("for (uint step = 0; step < 64; ++step)"));
+    fn the_graphics_shaders_are_a_vertex_and_fragment_pair_with_a_64_step_loop() {
+        let source = graphics_shaders();
+        assert!(source.contains(&format!("fn {VERTEX_ENTRY}(@builtin(vertex_index) id: u32)")));
+        assert!(source.contains(&format!("fn {PIXEL_ENTRY}(")));
+        assert!(source.contains("@vertex") && source.contains("@fragment"));
+        assert!(source.contains("for (var step = 0u; step < 64u; step++)"));
+        assert_eq!(PIXEL_STEPS, 64);
     }
 
-    /// Lists this PC's cards and runs the GPU test (compute, then
-    /// graphics) on the chosen one:
-    /// `BENCH_GPU` (part of its name) picks it, else the high-performance card.
+    /// Lists this PC's cards and runs the GPU test (compute, then graphics)
+    /// on the chosen one, with GPU timestamps and then with the CPU clock:
+    /// `BENCH_GPU` (part of its name) picks the card, else the
+    /// high-performance one is used.
     /// `cargo test --release gpu_test_on_this_pc -- --ignored --nocapture`
     #[test]
-    #[ignore = "needs a real Direct3D 11 GPU"]
+    #[ignore = "needs a real GPU"]
     fn gpu_test_on_this_pc() {
         let cards = adapters();
         for a in &cards {
-            println!("adapter: {} (LUID {:#x})", a.name, a.luid);
+            println!("adapter: {} (id {})", a.name, a.id);
         }
-        assert!(!cards.is_empty(), "no hardware Direct3D 11 card listed");
+        assert!(!cards.is_empty(), "no hardware GPU listed: {NO_GPU}");
         let wanted = std::env::var("BENCH_GPU").ok();
-        let choice = wanted.and_then(|w| cards.iter().find(|a| a.name.contains(&w)).map(|a| a.luid));
+        let choice = wanted.and_then(|w| cards.iter().find(|a| a.name.contains(&w)).map(|a| a.id));
         let card = chosen(&cards, choice).cloned();
         println!("tested: {}", card.as_ref().unwrap().name);
         let mut engine = Engine::default();
-        engine.start(vec![unit(card)]);
+        engine.start(vec![unit(card.clone())]);
         let s = wait_idle(&engine);
         assert_eq!(s.status().as_deref(), Some("Test complete"), "{:?}", s.outcome);
         let figures = s.results("GPU");
@@ -628,6 +785,17 @@ mod tests {
         }
         assert_eq!(figures.iter().map(|f| f.name).collect::<Vec<_>>(), ["Compute", "Graphics"]);
         assert!(figures.iter().all(|f| f.value > 0.0));
+
+        // The same test timed with the CPU clock.
+        let mut engine = Engine::default();
+        let card = card.unwrap();
+        engine.start(vec![unit_with(Some(card), |a, cancel| Ok(Box::new(device::Device::open(a, cancel, true)?)))]);
+        let s = wait_idle(&engine);
+        assert_eq!(s.status().as_deref(), Some("Test complete"), "{:?}", s.outcome);
+        for f in s.results("GPU") {
+            println!("CPU clock {}: {}", f.name, f.text());
+            assert!(f.value > 0.0);
+        }
     }
 
     #[test]
@@ -642,9 +810,15 @@ mod tests {
     #[test]
     fn the_compute_shader_is_built_from_the_counted_shape() {
         let source = compute_shader();
-        assert!(source.contains(&format!("void {COMPUTE_ENTRY}(uint3 thread : SV_DispatchThreadID)")));
-        assert!(source.contains("[numthreads(128, 1, 1)]"));
-        assert!(source.contains("for (uint step = 0; step < 160; ++step)"));
-        assert_eq!(source.matches("= mad(").count(), 2, "two float4 chains, four lanes each");
+        assert!(source.contains(&format!("fn {COMPUTE_ENTRY}(@builtin(global_invocation_id) thread: vec3<u32>)")));
+        assert!(source.contains("@workgroup_size(128, 1, 1)"));
+        // Two vec4 chains (four lanes each) with 160 unrolled steps each.
+        assert_eq!(source.matches("left = fma(").count(), 160);
+        assert_eq!(source.matches("right = fma(").count(), 160);
+    }
+
+    #[test]
+    fn every_system_says_what_a_missing_gpu_means() {
+        assert!(NO_GPU.len() > 20 && NO_CARD.len() > 5);
     }
 }

@@ -105,6 +105,14 @@ fn process_env(name: &str) -> Option<OsString> {
 pub fn xdg_config_home(env: Env) -> Option<PathBuf> {
     linux::config(env)
 }
+
+/// The user's own cache folder on Linux (`XDG_CACHE_HOME`, else `~/.cache`),
+/// not the app's.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn xdg_cache_home(env: Env) -> Option<PathBuf> {
+    linux::cache(env)
+}
+
 /// The app's settings folder.
 pub fn config() -> Option<PathBuf> {
     resolve(System::current(), Folder::Config, &process_env)

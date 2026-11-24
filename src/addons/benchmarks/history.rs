@@ -10,6 +10,17 @@ use serde::{Deserialize, Serialize};
 /// The history file's name, in the app's data folder.
 pub const FILE: &str = "benchmark-history.json";
 
+/// The revision of the GPU test whose results the file holds. A file
+/// without the number was written when the GPU test used Direct3D 11
+/// (revision 0); the wgpu test is revision 1.
+pub const GPU_TEST_REVISION: u32 = 1;
+
+/// The name the GPU test's runs are saved under.
+const GPU_TEST: &str = "GPU";
+
+/// The one-time line shown after older GPU results were removed.
+pub const GPU_PURGED_NOTICE: &str = "Older GPU results were removed: the GPU test changed";
+
 /// What the history panel says while a test has no runs.
 pub const EMPTY: &str = "Benchmark runs will appear here as they complete.";
 
@@ -44,6 +55,9 @@ pub struct Run {
 #[derive(Default, Serialize, Deserialize)]
 struct Saved {
     runs: Vec<Run>,
+    /// The GPU test revision the runs were made with (absent: 0).
+    #[serde(default)]
+    gpu_test: u32,
 }
 
 /// The runs, and the file they are kept in (none: kept in memory only).
@@ -51,27 +65,38 @@ struct Saved {
 pub struct History {
     path: Option<PathBuf>,
     runs: Vec<Run>,
+    /// The GPU test revision the runs in the file belong to.
+    gpu_test: u32,
+    /// The one-time line for a purge made by `open`.
+    notice: Option<String>,
 }
 
 impl History {
+    /// An empty history at the current GPU test revision.
+    fn current(path: Option<PathBuf>) -> History {
+        History { path, gpu_test: GPU_TEST_REVISION, ..History::default() }
+    }
+
     /// Reads the history at `path` (none: in memory only). A missing file
     /// is an empty history; a file that cannot be read is renamed beside
     /// itself, a new empty one is written, and the warning tells so.
     pub fn open(path: Option<PathBuf>) -> (History, Option<String>) {
-        let Some(path) = path else { return (History::default(), None) };
+        let Some(path) = path else { return (History::current(None), None) };
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (History { path: Some(path), runs: Vec::new() }, None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (History::current(Some(path)), None),
             Err(e) => {
                 // Not even readable: keep it in place, keep runs in memory.
-                return (History::default(), Some(format!("The benchmark history could not be read ({e}); new runs will not be saved.")));
+                return (History::current(None), Some(format!("The benchmark history could not be read ({e}); new runs will not be saved.")));
             }
         };
         if let Ok(saved) = serde_json::from_str::<Saved>(&text) {
-            return (History { path: Some(path), runs: saved.runs }, None);
+            let mut history = History { path: Some(path), runs: saved.runs, gpu_test: saved.gpu_test, notice: None };
+            let warning = history.purge_old_gpu_results();
+            return (history, warning);
         }
         let aside = set_aside_name(&path, crate::platform::local_secs());
-        let history = History { path: Some(path.clone()), runs: Vec::new() };
+        let history = History::current(Some(path.clone()));
         let warning = match std::fs::rename(&path, &aside).map_err(|e| e.to_string()).and_then(|_| history.write()) {
             Ok(()) => format!(
                 "The benchmark history could not be read. It was set aside as {} and a new one was started.",
@@ -82,8 +107,48 @@ impl History {
         (history, Some(warning))
     }
 
-    /// Adds a completed run and saves the file.
+    /// Removes, once, the GPU runs made by the old GPU test: when the file
+    /// belongs to an older GPU test revision, its "GPU" runs go and the
+    /// file is saved with the current revision. Every other run stays. The
+    /// file is replaced only by a complete new one (temp file, then rename),
+    /// so a failed save leaves it as it was; the runs and the revision then
+    /// stay as they were too and the purge is tried again at the next start.
+    /// Returns a warning when the save failed.
+    fn purge_old_gpu_results(&mut self) -> Option<String> {
+        if self.gpu_test >= GPU_TEST_REVISION {
+            return None;
+        }
+        let before = self.runs.len();
+        let kept: Vec<Run> = self.runs.iter().filter(|r| r.test != GPU_TEST).cloned().collect();
+        let removed = kept.len() != before;
+        let purged = History { runs: kept, ..History::current(self.path.clone()) };
+        match purged.write() {
+            Ok(()) => {
+                self.runs = purged.runs;
+                self.gpu_test = GPU_TEST_REVISION;
+                if removed {
+                    self.notice = Some(GPU_PURGED_NOTICE.to_string());
+                }
+                None
+            }
+            Err(e) => Some(format!("Older GPU results could not be removed ({e}); they stay for now.")),
+        }
+    }
+
+    /// The one-time line about the GPU results `open` removed, if any.
+    pub fn take_notice(&mut self) -> Option<String> {
+        self.notice.take()
+    }
+
+    /// Adds a completed run and saves the file. A history whose removal of
+    /// the old GPU results failed at start drops them now, so the file
+    /// never pairs a new GPU run with the old revision (which the next
+    /// start would remove).
     pub fn add(&mut self, run: Run) -> Result<(), String> {
+        if self.gpu_test < GPU_TEST_REVISION {
+            self.runs.retain(|r| r.test != GPU_TEST);
+            self.gpu_test = GPU_TEST_REVISION;
+        }
         self.runs.push(run);
         self.write()
     }
@@ -103,7 +168,7 @@ impl History {
     /// Writes the file (a temp file, then renamed over it).
     fn write(&self) -> Result<(), String> {
         let Some(path) = &self.path else { return Ok(()) };
-        let text = serde_json::to_string_pretty(&Saved { runs: self.runs.clone() }).map_err(|e| e.to_string())?;
+        let text = serde_json::to_string_pretty(&Saved { runs: self.runs.clone(), gpu_test: self.gpu_test }).map_err(|e| e.to_string())?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
@@ -217,5 +282,137 @@ pub(crate) mod tests {
         assert_eq!(warning, None);
         h.add(run("CPU", "2026-11-17T21:30:00", 1.0)).unwrap();
         assert_eq!(h.runs("CPU").len(), 1);
+    }
+
+    /// A history file as the version with the Direct3D 11 GPU test wrote it:
+    /// no GPU test revision in it.
+    const OLD_FILE: &str = r#"{
+  "runs": [
+    {"test": "CPU", "date": "2026-11-10T10:00:00", "figures": [{"name": "Single core", "value": 1.0, "unit": "Mops/sec"}], "score": 100.0, "version": "0.3.1", "platform": "windows x86_64", "hardware": "CPU"},
+    {"test": "GPU", "date": "2026-11-11T10:00:00", "figures": [{"name": "Triangles", "value": 2.0, "unit": "Gtri/sec"}], "score": 900.0, "version": "0.3.1", "platform": "windows x86_64", "hardware": "Card"},
+    {"test": "Memory", "date": "2026-11-12T10:00:00", "figures": [], "version": "0.3.1", "platform": "windows x86_64", "hardware": "RAM"},
+    {"test": "GPU", "date": "2026-11-13T10:00:00", "figures": [], "score": 950.0, "version": "0.3.2", "platform": "windows x86_64", "hardware": "Card"},
+    {"test": "Disk", "date": "2026-11-14T10:00:00", "figures": [], "version": "0.3.1", "platform": "windows x86_64", "hardware": "SSD"},
+    {"test": "Internet", "date": "2026-11-15T10:00:00", "figures": [], "version": "0.3.1", "platform": "windows x86_64", "hardware": "Net"}
+  ]
+}"#;
+
+    fn open_old(name: &str) -> (TempDir, History, Option<String>) {
+        let dir = TempDir::new(name);
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(dir.file(), OLD_FILE).unwrap();
+        let (h, warning) = History::open(Some(dir.file()));
+        (dir, h, warning)
+    }
+
+    #[test]
+    fn the_first_open_removes_only_the_old_gpu_results() {
+        let (dir, mut h, warning) = open_old("purge-only-gpu");
+        assert_eq!(warning, None);
+        assert!(h.runs("GPU").is_empty(), "old GPU results are gone");
+        for test in ["CPU", "Memory", "Disk", "Internet"] {
+            assert_eq!(h.runs(test).len(), 1, "{test} stays");
+        }
+        assert_eq!(h.take_notice().as_deref(), Some("Older GPU results were removed: the GPU test changed"));
+        // The removal is saved.
+        let (again, _) = History::open(Some(dir.file()));
+        assert!(again.runs("GPU").is_empty());
+        assert_eq!(again.runs("CPU")[0].score, Some(100.0), "kept runs are unchanged");
+    }
+
+    #[test]
+    fn the_removal_happens_once() {
+        let (dir, mut h, _) = open_old("purge-once");
+        assert!(h.take_notice().is_some());
+        // A GPU run made by the new test is kept by every later start.
+        h.add(run("GPU", "2026-11-20T10:00:00", 5.0)).unwrap();
+        let (mut later, warning) = History::open(Some(dir.file()));
+        assert_eq!(warning, None);
+        assert_eq!(later.runs("GPU").len(), 1, "later starts remove nothing");
+        assert_eq!(later.take_notice(), None);
+        let (third, _) = History::open(Some(dir.file()));
+        assert_eq!(third.runs("GPU").len(), 1);
+    }
+
+    #[test]
+    fn the_line_is_shown_once_after_the_removal() {
+        let (_dir, mut h, _) = open_old("purge-notice");
+        assert!(h.take_notice().is_some());
+        assert_eq!(h.take_notice(), None, "it is taken only once");
+    }
+
+    #[test]
+    fn no_line_when_there_was_nothing_to_remove() {
+        let dir = TempDir::new("purge-nothing");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let cpu_only = OLD_FILE.lines().filter(|l| !l.contains("\"GPU\"")).collect::<Vec<_>>().join("
+");
+        std::fs::write(dir.file(), cpu_only).unwrap();
+        let (mut h, warning) = History::open(Some(dir.file()));
+        assert_eq!(warning, None);
+        assert_eq!(h.runs("CPU").len(), 1);
+        assert_eq!(h.take_notice(), None);
+    }
+
+    #[test]
+    fn a_new_history_has_no_line_and_keeps_its_first_gpu_run_at_the_next_start() {
+        let dir = TempDir::new("purge-fresh");
+        let (mut h, warning) = History::open(Some(dir.file()));
+        assert_eq!((warning, h.take_notice()), (None, None));
+        h.add(run("GPU", "2026-11-20T10:00:00", 5.0)).unwrap();
+        let (again, _) = History::open(Some(dir.file()));
+        assert_eq!(again.runs("GPU").len(), 1);
+    }
+
+    #[test]
+    fn a_failed_removal_keeps_the_file_and_its_runs_and_is_tried_again() {
+        let dir = TempDir::new("purge-fails");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(dir.file(), OLD_FILE).unwrap();
+        // The temp file cannot be created: its name is a folder.
+        std::fs::create_dir_all(dir.0.join("benchmark-history.json.tmp")).unwrap();
+        let (mut h, warning) = History::open(Some(dir.file()));
+        assert!(warning.is_some_and(|w| w.starts_with("Older GPU results could not be removed")));
+        assert_eq!(std::fs::read_to_string(dir.file()).unwrap(), OLD_FILE, "the file is untouched");
+        assert_eq!(h.runs("GPU").len(), 2, "no half removal in memory");
+        assert_eq!(h.take_notice(), None, "nothing was removed");
+
+        // The next start, with the obstacle gone, removes them.
+        std::fs::remove_dir_all(dir.0.join("benchmark-history.json.tmp")).unwrap();
+        let (mut next, warning) = History::open(Some(dir.file()));
+        assert_eq!(warning, None);
+        assert!(next.runs("GPU").is_empty());
+        assert!(next.take_notice().is_some());
+    }
+
+    #[test]
+    fn a_new_gpu_run_saved_after_a_failed_removal_is_kept_by_the_next_start() {
+        let dir = TempDir::new("purge-fails-then-add");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(dir.file(), OLD_FILE).unwrap();
+        std::fs::create_dir_all(dir.0.join("benchmark-history.json.tmp")).unwrap();
+        let (mut h, warning) = History::open(Some(dir.file()));
+        assert!(warning.is_some());
+
+        // The obstacle goes, and a run of the new GPU test is saved.
+        std::fs::remove_dir_all(dir.0.join("benchmark-history.json.tmp")).unwrap();
+        h.add(run("GPU", "2026-11-20T10:00:00", 5.0)).unwrap();
+        let other_tests = h.runs.iter().filter(|r| r.test != "GPU").count();
+
+        let (next, warning) = History::open(Some(dir.file()));
+        assert_eq!(warning, None);
+        let gpu = next.runs("GPU");
+        assert_eq!(gpu.len(), 1, "only the new GPU run is left");
+        assert_eq!(gpu[0].date, "2026-11-20T10:00:00");
+        assert_eq!(next.runs.iter().filter(|r| r.test != "GPU").count(), other_tests, "other tests keep their runs");
+    }
+
+    #[test]
+    fn an_unreadable_file_is_still_set_aside_not_purged() {
+        let dir = TempDir::new("purge-corrupt");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(dir.file(), "{ not json").unwrap();
+        let (mut h, _) = History::open(Some(dir.file()));
+        assert_eq!(h.take_notice(), None);
     }
 }

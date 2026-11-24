@@ -24,6 +24,7 @@ use crate::widgets::{self, parts};
 
 use disk::DiskJob;
 use engine::{Engine, Measure, Probe, Unit, GBS, GOPS, MBITS, MBS, MOPS};
+use gpu::NO_CARD;
 use history::History;
 use page::View;
 
@@ -53,7 +54,7 @@ impl Test {
     pub fn about(self) -> &'static str {
         match self {
             Test::Cpu => "Math on one core for 2 seconds, then on every core for 2 seconds.",
-            Test::Gpu => "Runs a Direct3D 11 compute shader, then draws with a pixel shader, on the chosen video card: about 4 seconds.",
+            Test::Gpu => "Runs a compute shader, then draws with a pixel shader, on the chosen video card: about 4 seconds.",
             Test::Memory => "Copies a 256 MB block eight times.",
             Test::Disk => "Writes and reads a 256 MB file in the test folder, then deletes it.",
             Test::Internet => "Downloads, then uploads, blocks of growing size. Only when you press Start.",
@@ -77,10 +78,15 @@ impl Test {
             Test::Cpu => Unit::new(self.name(), |p| cpu(p, CPU_SECONDS)),
             Test::Gpu => gpu::unit(gpu::adapters().into_iter().next()),
             Test::Memory => Unit::new(self.name(), |p| memory(p, MEMORY_BLOCK, MEMORY_ROUNDS)),
-            Test::Disk => disk_unit(disk::test_folder(None, std::env::temp_dir())),
+            Test::Disk => disk_unit(test_folder(None)),
             Test::Internet => Unit::new(self.name(), |p| internet::run(p, &mut internet::Cloudflare::new(), &internet::PLAN)),
         }
     }
+}
+
+/// The folder the disk test writes in: the chosen one, else this system's default.
+fn test_folder(chosen: Option<&str>) -> Result<PathBuf, &'static str> {
+    disk::test_folder(chosen, disk::default_folder())
 }
 
 /// The tests "Run All Benchmarks" runs, in order.
@@ -141,6 +147,8 @@ pub struct Benchmarks {
     history_file: Option<PathBuf>,
     /// Why the history could not be read or saved, shown in the band.
     history_warning: Option<String>,
+    /// The one-time line about GPU results removed at this start.
+    history_notice: Option<String>,
     /// The Clear History confirmation is open (for the selected test).
     clear_asked: bool,
     /// A debug build, whose numbers mean nothing: its runs are shown but
@@ -181,7 +189,7 @@ impl Benchmarks {
 
     /// The disk test's folder: the chosen one, else the temp folder.
     fn test_folder(&self) -> Result<std::path::PathBuf, &'static str> {
-        disk::test_folder(self.disk_folder.as_deref(), std::env::temp_dir())
+        test_folder(self.disk_folder.as_deref())
     }
 
     /// The video cards, listed on first use.
@@ -193,13 +201,13 @@ impl Benchmarks {
     fn gpu_card(&mut self) -> Option<gpu::Adapter> {
         let (choice, name) = (self.gpu_choice, self.gpu_name.clone());
         let cards = self.adapters();
-        let choice = choice.or_else(|| cards.iter().find(|c| Some(&c.name) == name.as_ref()).map(|c| c.luid));
+        let choice = choice.or_else(|| cards.iter().find(|c| Some(&c.name) == name.as_ref()).map(|c| c.id));
         gpu::chosen(cards, choice).cloned()
     }
 
     /// Chooses `card` for the GPU test (saved by its name).
     fn choose_card(&mut self, card: &gpu::Adapter) {
-        self.gpu_choice = Some(card.luid);
+        self.gpu_choice = Some(card.id);
         self.gpu_name = Some(card.name.clone());
     }
 
@@ -325,6 +333,7 @@ impl Benchmarks {
     fn read_history(&mut self) {
         let (history, warning) = History::open(self.history_file.clone().or_else(app_history_file));
         self.history = history;
+        self.history_notice = self.history.take_notice();
         self.history_warning = warning;
     }
 
@@ -704,20 +713,20 @@ impl Benchmarks {
         }
     }
 
-    /// The "Video card" choice of the GPU view (when DXGI lists more than
+    /// The "Video card" choice of the GPU view (when wgpu lists more than
     /// one card it matters which one is tested).
     fn card_choice(&mut self, ui: &mut Ui, enabled: bool) {
         let cards = self.adapters().to_vec();
         let Some(current) = self.gpu_card() else { return };
-        let mut choice = current.luid;
+        let mut choice = current.id;
         ui.add_enabled_ui(enabled, |ui| {
             parts::setting_combo(ui, "benchmarks-card", "Video card", Some("The card the video card test runs on"), current.name.as_str(), |ui| {
                 for card in &cards {
-                    ui.selectable_value(&mut choice, card.luid, card.name.as_str());
+                    ui.selectable_value(&mut choice, card.id, card.name.as_str());
                 }
             });
         });
-        if let Some(card) = cards.iter().find(|c| c.luid == choice && choice != current.luid) {
+        if let Some(card) = cards.iter().find(|c| c.id == choice && choice != current.id) {
             self.choose_card(card);
         }
     }
@@ -873,9 +882,6 @@ impl Benchmarks {
         }
     }
 }
-
-/// The GPU view's hardware line when DXGI lists no hardware card.
-const NO_CARD: &str = "No Direct3D 11 GPU found";
 
 impl Benchmarks {
     /// Under the test folder: its free space, "Choose…", and the refusal
@@ -1180,6 +1186,9 @@ impl Addon for Benchmarks {
         if let Some(warning) = self.history_warning.clone() {
             parts::alert_banner(ui, &warning);
         }
+        if let Some(notice) = &self.history_notice {
+            ui.label(RichText::new(notice).size(12.0).color(t.label));
+        }
         self.band(ui, &st);
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 20.0;
@@ -1455,8 +1464,8 @@ mod tests {
 
     pub(super) fn cards() -> Vec<gpu::Adapter> {
         vec![
-            gpu::Adapter { name: "AMD Radeon(TM) Graphics".into(), luid: 7 },
-            gpu::Adapter { name: "NVIDIA GeForce RTX 4080".into(), luid: 9 },
+            gpu::Adapter { name: "AMD Radeon(TM) Graphics".into(), id: 7 },
+            gpu::Adapter { name: "NVIDIA GeForce RTX 4080".into(), id: 9 },
         ]
     }
 
@@ -1495,10 +1504,10 @@ mod tests {
     #[test]
     fn without_a_card_the_gpu_test_fails_with_its_message() {
         let mut b = Benchmarks { adapters: Some(vec![]), ..Default::default() };
-        assert_eq!(b.hardware_line(View::Gpu, 0).as_deref(), Some("No Direct3D 11 GPU found \u{b7} Not run yet"));
+        assert_eq!(b.hardware_line(View::Gpu, 0).as_deref(), Some(format!("{NO_CARD} \u{b7} Not run yet").as_str()));
         assert!(b.run(Test::Gpu));
         let s = wait_idle(&b.engine);
-        assert_eq!(s.status().as_deref(), Some("GPU test failed: A hardware Direct3D 11 GPU is unavailable on this system."));
+        assert_eq!(s.status().as_deref(), Some(format!("GPU test failed: {}", gpu::NO_GPU).as_str()));
     }
 
     #[test]
@@ -1558,7 +1567,7 @@ mod tests {
     fn the_chosen_test_folder_is_remembered_and_survives_turning_off() {
         let mut b = Benchmarks::default();
         assert_eq!(b.settings(), serde_json::Value::Null, "nothing saved while nothing was chosen");
-        assert_eq!(b.test_folder().ok(), Some(std::env::temp_dir()), "the temp folder by default");
+        assert_eq!(b.test_folder().ok(), disk::default_folder(), "this system's default folder");
         b.load_settings(&serde_json::json!({ "diskBenchmarkFolder": "D:\\Bench", "other": 1 }));
         assert_eq!(b.test_folder().ok(), Some(std::path::PathBuf::from("D:\\Bench")));
         b.stop();
@@ -1568,9 +1577,9 @@ mod tests {
     #[test]
     fn without_a_temp_folder_the_disk_test_fails_with_its_message() {
         let mut engine = Engine::default();
-        engine.start(vec![disk_unit(Err(disk::NO_TEMP_FOLDER))]);
+        engine.start(vec![disk_unit(Err(disk::NO_DEFAULT_FOLDER))]);
         let s = wait_idle(&engine);
-        assert_eq!(s.status().as_deref(), Some("Disk test failed: Windows could not locate the temporary folder."));
+        assert_eq!(s.status().as_deref(), Some(format!("Disk test failed: {}", disk::NO_DEFAULT_FOLDER).as_str()));
     }
 
     #[test]
@@ -1655,7 +1664,7 @@ mod tests {
 
     #[test]
     fn the_gpu_test_and_the_addon_say_they_test_compute_and_graphics() {
-        assert_eq!(Test::Gpu.about(), "Runs a Direct3D 11 compute shader, then draws with a pixel shader, on the chosen video card: about 4 seconds.");
+        assert_eq!(Test::Gpu.about(), "Runs a compute shader, then draws with a pixel shader, on the chosen video card: about 4 seconds.");
         assert_eq!(Benchmarks::default().description(), "Quick CPU, GPU, memory, disk and Internet speed tests.");
     }
 
@@ -1789,6 +1798,27 @@ mod tests {
     }
 
     #[test]
+    fn older_gpu_results_are_removed_once_and_the_line_is_kept_for_the_page() {
+        let dir = history::tests::TempDir::new("addon-gpu-purge");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(
+            dir.file(),
+            r#"{"runs": [
+{"test": "GPU", "date": "2026-11-11T10:00:00", "figures": [], "score": 900.0, "version": "0.3.1", "platform": "windows x86_64", "hardware": "Card"},
+{"test": "CPU", "date": "2026-11-10T10:00:00", "figures": [], "score": 100.0, "version": "0.3.1", "platform": "windows x86_64", "hardware": "CPU"}
+]}"#,
+        )
+        .unwrap();
+        let b = with_history(&dir);
+        assert_eq!(b.history_notice.as_deref(), Some("Older GPU results were removed: the GPU test changed"));
+        assert!(b.history.runs("GPU").is_empty());
+        assert_eq!(b.history.runs("CPU").len(), 1);
+        let again = with_history(&dir);
+        assert_eq!(again.history_notice, None, "the next start shows no line");
+        assert_eq!(again.history.runs("CPU").len(), 1);
+    }
+
+    #[test]
     fn an_unreadable_history_warns_without_blocking_the_page() {
         let dir = history::tests::TempDir::new("addon-corrupt");
         std::fs::create_dir_all(&dir.0).unwrap();
@@ -1853,9 +1883,9 @@ mod settings_tests {
 
         // The next run of the app: the card is found again by its name (its
         // LUID changes on every boot).
-        let mut next = Benchmarks { adapters: Some(vec![gpu::Adapter { name: "NVIDIA GeForce RTX 4080".into(), luid: 42 }, cards()[0].clone()]), ..Default::default() };
+        let mut next = Benchmarks { adapters: Some(vec![gpu::Adapter { name: "NVIDIA GeForce RTX 4080".into(), id: 42 }, cards()[0].clone()]), ..Default::default() };
         next.load_settings(&json!({ "gpuAdapter": "NVIDIA GeForce RTX 4080", "selectedTest": "memory", "fromANewerVersion": 1 }));
-        assert_eq!(next.gpu_card().map(|c| c.luid), Some(42));
+        assert_eq!(next.gpu_card().map(|c| c.id), Some(42));
         assert_eq!(next.selected, View::Memory);
         assert_eq!(next.settings()["fromANewerVersion"], 1, "fields it does not know are kept");
     }
@@ -1977,7 +2007,7 @@ mod score_tests {
             assert!(texts.iter().any(|t| t == wanted), "{wanted:?} not drawn in {texts:?}");
         }
         let note = "100 is the reference machine: an AMD Ryzen 5 7600X with an NVIDIA GeForce RTX 4080 and a Samsung 980 PRO. \
-            Score comparisons are valid only per version, per platform. Internet and Memory have no score.";
+            Score comparisons are valid only per version. Internet and Memory have no score.";
         assert!(texts.iter().any(|t| t == note), "one paragraph: {texts:?}");
     }
 

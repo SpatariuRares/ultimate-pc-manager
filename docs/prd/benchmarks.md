@@ -82,7 +82,7 @@ Score
 
 38. As a user, I want a score for CPU, GPU and disk with base 100 relative to a reference machine, and the sentence that says which machine that is, so that I can tell whether my PC is faster or slower than the reference (the reference machine is our own).
 39. As a user, I want the "Score" entry in the sidebar with the overall score and the per-test scores, with a bar marking the base's 100, so that I can see it in one place.
-40. As a user, I want the note "Score comparisons are valid only per version, per platform.", so that I don't compare numbers that cannot be compared.
+40. As a user, I want the note "Score comparisons are valid only per version.", so that I don't compare numbers that cannot be compared.
 
 History
 
@@ -111,7 +111,7 @@ Add-on behavior
 
 - **Benchmark engine.** One thread at a time; each test is a unit with a name, phases, progress from 0 to 1, figures and units, and cooperative cancellation. Interface: start a single test or all of them in sequence, cancel, read the state (current test and phase, progress, partial results, error). Replaces `start_benchmark` / `BenchState` of the pro module, which today uses text keys and cannot be cancelled.
 - **CPU test.** The current workload (a mix of integer and floating-point work, 2 s on one core and 2 s on all cores) stays, with results expressed in Mops/sec and Gop/sec.
-- **GPU test.** Direct3D 11 (DXGI to choose the adapter): our compute shader (eight independent multiply-add chains per thread, 2 FLOP per multiply-add) and our vertex/pixel shader pair (a 64-step loop), with time measured by GPU queries. The Direct3D / DXGI functions need to be added to the Windows functions the project uses.
+- **GPU test.** wgpu on the native backend of each system (Direct3D 12, Vulkan, Metal; hardware cards only): our WGSL compute shader (eight independent multiply-add chains per thread, 2 FLOP per multiply-add) and our vertex/fragment shader pair (a 64-step loop), timed with GPU timestamps or, when the device has none, with the CPU clock around each waited batch. The score note is "Score comparisons are valid only per version."
 - **Disk test.** Test file in the chosen folder, write and read without the Windows cache (write-through writes and unbuffered reads), a free-space check before starting, guaranteed deletion.
 - **Internet test.** HTTPS to speed.cloudflare.com (downloads in increasing blocks, upload), with a timeout and the network error messages of story 28; the HTTP client respects the system proxy. An HTTP client is needed: the choice of library is to be made during implementation (e.g. Windows WinHTTP, so we don't write our own TLS).
 - **Memory test.** The current one, marked as an addition.
@@ -153,7 +153,7 @@ What is checked is the external behavior (results, messages, history contents), 
 
 Open questions:
 - The unit for the GPU test is to be decided.
-- The location of the history and its columns: the Version column follows from "Score comparisons are valid only per version, per platform".
+- The location of the history and its columns: the Version column follows from "Score comparisons are valid only per version".
 - Whether the history is per test or global (the stories assume per test).
 - All scores on the canvas are placeholders.
 - To be decided with the owner: the reference machine for 100, the name of the score, the HTTP library for the Internet test.

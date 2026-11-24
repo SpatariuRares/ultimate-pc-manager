@@ -273,7 +273,8 @@ fn tls(error: &rustls::Error) -> Failure {
 }
 
 /// The real service: HTTPS to speed.cloudflare.com, through the proxy of
-/// the `HTTPS_PROXY`-style variables or else the Windows system proxy.
+/// the proxy of the `HTTPS_PROXY`-style variables (Linux: with `no_proxy`) or
+/// else the Windows system proxy.
 pub struct Cloudflare {
     agent: ureq::Agent,
 }
@@ -287,7 +288,7 @@ const BLOCK_TIMEOUT: Duration = Duration::from_secs(90);
 
 impl Cloudflare {
     pub fn new() -> Cloudflare {
-        let proxy = ureq::Proxy::try_from_env().or_else(|| system_proxy().and_then(|url| ureq::Proxy::new(&url).ok()));
+        let proxy = system::env_proxy().or_else(|| system_proxy().and_then(|url| ureq::Proxy::new(&url).ok()));
         let config = ureq::Agent::config_builder()
             .proxy(proxy)
             .http_status_as_error(false)
