@@ -1,13 +1,10 @@
-//! Linux: no graphics card is listed and none can be tested yet.
+//! Linux: wgpu runs on Vulkan, with hardware cards only.
 
-use super::{Adapter, Cancel, Gpu, NO_GPU};
+/// The backend the GPU test uses.
+pub const BACKENDS: wgpu::Backends = wgpu::Backends::VULKAN;
 
-/// The hardware video cards: none are listed yet.
-pub fn adapters() -> Vec<Adapter> {
-    Vec::new()
-}
+/// The GPU test's error when no card can be tested.
+pub const NO_GPU: &str = "No hardware Vulkan GPU was found. Install your distribution's Vulkan driver for your video card.";
 
-/// No device can be opened yet.
-pub fn open(_adapter: &Adapter, _cancel: Cancel) -> Result<Box<dyn Gpu>, String> {
-    Err(NO_GPU.into())
-}
+/// The GPU view's hardware line when no card is listed.
+pub const NO_CARD: &str = "No Vulkan GPU found: install your distribution's Vulkan driver";

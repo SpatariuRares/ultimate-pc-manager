@@ -133,7 +133,8 @@ cargo test --release cpu_test_on_this_pc -- --ignored --nocapture
 # Disk: writes and reads a 256 MB file in the temporary folder, then deletes it
 cargo test --release disk_test_on_this_pc -- --ignored --nocapture
 
-# GPU (Direct3D 11): lists the cards and tests the high-performance one;
+# GPU (wgpu: Direct3D 12, Vulkan or Metal): lists the hardware cards and tests the high-performance one,
+# timed with GPU timestamps and then with the CPU clock;
 # BENCH_GPU (part of the name) chooses a different one
 $env:BENCH_GPU = "Radeon"; cargo test --release gpu_test_on_this_pc -- --ignored --nocapture
 

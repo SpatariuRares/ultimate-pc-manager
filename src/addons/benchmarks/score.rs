@@ -21,7 +21,7 @@ pub const REFERENCE: &str =
     "100 is the reference machine: an AMD Ryzen 5 7600X with an NVIDIA GeForce RTX 4080 and a Samsung 980 PRO.";
 
 /// The note under the score.
-pub const NOTE: &str = "Score comparisons are valid only per version, per platform.";
+pub const NOTE: &str = "Score comparisons are valid only per version.";
 
 /// The tests that have a score, in the rail's order.
 pub const SCORED: [Test; 3] = [Test::Cpu, Test::Gpu, Test::Disk];
@@ -183,6 +183,6 @@ mod tests {
         assert_eq!(NAME, "Ultimate score");
         assert_eq!(text(123.4), "123");
         assert!(REFERENCE.contains("AMD Ryzen 5 7600X") && REFERENCE.contains("RTX 4080") && REFERENCE.contains("Samsung 980 PRO"));
-        assert_eq!(NOTE, "Score comparisons are valid only per version, per platform.");
+        assert_eq!(NOTE, "Score comparisons are valid only per version.");
     }
 }

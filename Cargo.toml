@@ -23,15 +23,8 @@ rustls = { version = "0.23", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
-# Direct3D 11 / DXGI COM interfaces for the GPU benchmark (windows-sys has no COM).
-windows = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D_Fxc",
-    "Win32_Graphics_Direct3D11",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-] }
+# GPU benchmark: wgpu with the native backend of the system (Direct3D 12).
+wgpu = { version = "27", default-features = false, features = ["std", "parking_lot", "wgsl", "dx12"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
@@ -71,9 +64,13 @@ windows-sys = { version = "0.61", features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+# GPU benchmark: wgpu on Vulkan.
+wgpu = { version = "27", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 winit = "0.30"
+# GPU benchmark: wgpu on Metal.
+wgpu = { version = "27", default-features = false, features = ["std", "parking_lot", "wgsl", "metal"] }
 
 [profile.dev.package."*"]
 opt-level = 2

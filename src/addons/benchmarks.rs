@@ -53,7 +53,7 @@ impl Test {
     pub fn about(self) -> &'static str {
         match self {
             Test::Cpu => "Math on one core for 2 seconds, then on every core for 2 seconds.",
-            Test::Gpu => "Runs a Direct3D 11 compute shader, then draws with a pixel shader, on the chosen video card: about 4 seconds.",
+            Test::Gpu => "Runs a compute shader, then draws with a pixel shader, on the chosen video card: about 4 seconds.",
             Test::Memory => "Copies a 256 MB block eight times.",
             Test::Disk => "Writes and reads a 256 MB file in the test folder, then deletes it.",
             Test::Internet => "Downloads, then uploads, blocks of growing size. Only when you press Start.",
@@ -193,13 +193,13 @@ impl Benchmarks {
     fn gpu_card(&mut self) -> Option<gpu::Adapter> {
         let (choice, name) = (self.gpu_choice, self.gpu_name.clone());
         let cards = self.adapters();
-        let choice = choice.or_else(|| cards.iter().find(|c| Some(&c.name) == name.as_ref()).map(|c| c.luid));
+        let choice = choice.or_else(|| cards.iter().find(|c| Some(&c.name) == name.as_ref()).map(|c| c.id));
         gpu::chosen(cards, choice).cloned()
     }
 
     /// Chooses `card` for the GPU test (saved by its name).
     fn choose_card(&mut self, card: &gpu::Adapter) {
-        self.gpu_choice = Some(card.luid);
+        self.gpu_choice = Some(card.id);
         self.gpu_name = Some(card.name.clone());
     }
 
@@ -704,20 +704,20 @@ impl Benchmarks {
         }
     }
 
-    /// The "Video card" choice of the GPU view (when DXGI lists more than
+    /// The "Video card" choice of the GPU view (when wgpu lists more than
     /// one card it matters which one is tested).
     fn card_choice(&mut self, ui: &mut Ui, enabled: bool) {
         let cards = self.adapters().to_vec();
         let Some(current) = self.gpu_card() else { return };
-        let mut choice = current.luid;
+        let mut choice = current.id;
         ui.add_enabled_ui(enabled, |ui| {
             parts::setting_combo(ui, "benchmarks-card", "Video card", Some("The card the video card test runs on"), current.name.as_str(), |ui| {
                 for card in &cards {
-                    ui.selectable_value(&mut choice, card.luid, card.name.as_str());
+                    ui.selectable_value(&mut choice, card.id, card.name.as_str());
                 }
             });
         });
-        if let Some(card) = cards.iter().find(|c| c.luid == choice && choice != current.luid) {
+        if let Some(card) = cards.iter().find(|c| c.id == choice && choice != current.id) {
             self.choose_card(card);
         }
     }
@@ -874,8 +874,7 @@ impl Benchmarks {
     }
 }
 
-/// The GPU view's hardware line when DXGI lists no hardware card.
-const NO_CARD: &str = "No Direct3D 11 GPU found";
+use gpu::NO_CARD;
 
 impl Benchmarks {
     /// Under the test folder: its free space, "Choose…", and the refusal
@@ -1455,8 +1454,8 @@ mod tests {
 
     pub(super) fn cards() -> Vec<gpu::Adapter> {
         vec![
-            gpu::Adapter { name: "AMD Radeon(TM) Graphics".into(), luid: 7 },
-            gpu::Adapter { name: "NVIDIA GeForce RTX 4080".into(), luid: 9 },
+            gpu::Adapter { name: "AMD Radeon(TM) Graphics".into(), id: 7 },
+            gpu::Adapter { name: "NVIDIA GeForce RTX 4080".into(), id: 9 },
         ]
     }
 
@@ -1495,10 +1494,10 @@ mod tests {
     #[test]
     fn without_a_card_the_gpu_test_fails_with_its_message() {
         let mut b = Benchmarks { adapters: Some(vec![]), ..Default::default() };
-        assert_eq!(b.hardware_line(View::Gpu, 0).as_deref(), Some("No Direct3D 11 GPU found \u{b7} Not run yet"));
+        assert_eq!(b.hardware_line(View::Gpu, 0).as_deref(), Some(format!("{NO_CARD} \u{b7} Not run yet").as_str()));
         assert!(b.run(Test::Gpu));
         let s = wait_idle(&b.engine);
-        assert_eq!(s.status().as_deref(), Some("GPU test failed: A hardware Direct3D 11 GPU is unavailable on this system."));
+        assert_eq!(s.status().as_deref(), Some(format!("GPU test failed: {}", gpu::NO_GPU).as_str()));
     }
 
     #[test]
@@ -1655,7 +1654,7 @@ mod tests {
 
     #[test]
     fn the_gpu_test_and_the_addon_say_they_test_compute_and_graphics() {
-        assert_eq!(Test::Gpu.about(), "Runs a Direct3D 11 compute shader, then draws with a pixel shader, on the chosen video card: about 4 seconds.");
+        assert_eq!(Test::Gpu.about(), "Runs a compute shader, then draws with a pixel shader, on the chosen video card: about 4 seconds.");
         assert_eq!(Benchmarks::default().description(), "Quick CPU, GPU, memory, disk and Internet speed tests.");
     }
 
@@ -1853,9 +1852,9 @@ mod settings_tests {
 
         // The next run of the app: the card is found again by its name (its
         // LUID changes on every boot).
-        let mut next = Benchmarks { adapters: Some(vec![gpu::Adapter { name: "NVIDIA GeForce RTX 4080".into(), luid: 42 }, cards()[0].clone()]), ..Default::default() };
+        let mut next = Benchmarks { adapters: Some(vec![gpu::Adapter { name: "NVIDIA GeForce RTX 4080".into(), id: 42 }, cards()[0].clone()]), ..Default::default() };
         next.load_settings(&json!({ "gpuAdapter": "NVIDIA GeForce RTX 4080", "selectedTest": "memory", "fromANewerVersion": 1 }));
-        assert_eq!(next.gpu_card().map(|c| c.luid), Some(42));
+        assert_eq!(next.gpu_card().map(|c| c.id), Some(42));
         assert_eq!(next.selected, View::Memory);
         assert_eq!(next.settings()["fromANewerVersion"], 1, "fields it does not know are kept");
     }
@@ -1977,7 +1976,7 @@ mod score_tests {
             assert!(texts.iter().any(|t| t == wanted), "{wanted:?} not drawn in {texts:?}");
         }
         let note = "100 is the reference machine: an AMD Ryzen 5 7600X with an NVIDIA GeForce RTX 4080 and a Samsung 980 PRO. \
-            Score comparisons are valid only per version, per platform. Internet and Memory have no score.";
+            Score comparisons are valid only per version. Internet and Memory have no score.";
         assert!(texts.iter().any(|t| t == note), "one paragraph: {texts:?}");
     }
 

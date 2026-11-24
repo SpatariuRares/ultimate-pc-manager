@@ -1,13 +1,10 @@
-//! macOS: no graphics card is listed and none can be tested yet.
+//! macOS: wgpu runs on Metal.
 
-use super::{Adapter, Cancel, Gpu, NO_GPU};
+/// The backend the GPU test uses.
+pub const BACKENDS: wgpu::Backends = wgpu::Backends::METAL;
 
-/// The hardware video cards: none are listed yet.
-pub fn adapters() -> Vec<Adapter> {
-    Vec::new()
-}
+/// The GPU test's error when no card can be tested.
+pub const NO_GPU: &str = "A hardware Metal GPU is unavailable on this system.";
 
-/// No device can be opened yet.
-pub fn open(_adapter: &Adapter, _cancel: Cancel) -> Result<Box<dyn Gpu>, String> {
-    Err(NO_GPU.into())
-}
+/// The GPU view's hardware line when no card is listed.
+pub const NO_CARD: &str = "No Metal GPU found";
