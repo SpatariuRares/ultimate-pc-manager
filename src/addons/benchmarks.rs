@@ -77,7 +77,7 @@ impl Test {
             Test::Cpu => Unit::new(self.name(), |p| cpu(p, CPU_SECONDS)),
             Test::Gpu => gpu::unit(gpu::adapters().into_iter().next()),
             Test::Memory => Unit::new(self.name(), |p| memory(p, MEMORY_BLOCK, MEMORY_ROUNDS)),
-            Test::Disk => disk_unit(disk::test_folder(None, std::env::temp_dir())),
+            Test::Disk => disk_unit(disk::test_folder(None, disk::default_folder())),
             Test::Internet => Unit::new(self.name(), |p| internet::run(p, &mut internet::Cloudflare::new(), &internet::PLAN)),
         }
     }
@@ -181,7 +181,7 @@ impl Benchmarks {
 
     /// The disk test's folder: the chosen one, else the temp folder.
     fn test_folder(&self) -> Result<std::path::PathBuf, &'static str> {
-        disk::test_folder(self.disk_folder.as_deref(), std::env::temp_dir())
+        disk::test_folder(self.disk_folder.as_deref(), disk::default_folder())
     }
 
     /// The video cards, listed on first use.
@@ -1558,7 +1558,7 @@ mod tests {
     fn the_chosen_test_folder_is_remembered_and_survives_turning_off() {
         let mut b = Benchmarks::default();
         assert_eq!(b.settings(), serde_json::Value::Null, "nothing saved while nothing was chosen");
-        assert_eq!(b.test_folder().ok(), Some(std::env::temp_dir()), "the temp folder by default");
+        assert_eq!(b.test_folder().ok(), disk::default_folder(), "this system's default folder");
         b.load_settings(&serde_json::json!({ "diskBenchmarkFolder": "D:\\Bench", "other": 1 }));
         assert_eq!(b.test_folder().ok(), Some(std::path::PathBuf::from("D:\\Bench")));
         b.stop();
@@ -1568,9 +1568,9 @@ mod tests {
     #[test]
     fn without_a_temp_folder_the_disk_test_fails_with_its_message() {
         let mut engine = Engine::default();
-        engine.start(vec![disk_unit(Err(disk::NO_TEMP_FOLDER))]);
+        engine.start(vec![disk_unit(Err(disk::NO_DEFAULT_FOLDER))]);
         let s = wait_idle(&engine);
-        assert_eq!(s.status().as_deref(), Some("Disk test failed: Windows could not locate the temporary folder."));
+        assert_eq!(s.status().as_deref(), Some(format!("Disk test failed: {}", disk::NO_DEFAULT_FOLDER).as_str()));
     }
 
     #[test]

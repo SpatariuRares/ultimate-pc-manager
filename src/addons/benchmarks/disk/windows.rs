@@ -20,3 +20,18 @@ pub fn direct_io(o: &mut std::fs::OpenOptions) {
     use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH};
     o.custom_flags(FILE_FLAG_WRITE_THROUGH | FILE_FLAG_NO_BUFFERING);
 }
+
+/// The default test folder is the temp folder, which exists.
+pub const CREATE_DEFAULT: bool = false;
+
+pub const NO_DEFAULT_FOLDER: &str = "Windows could not locate the temporary folder.";
+
+/// The temp folder.
+pub fn default_folder() -> Option<std::path::PathBuf> {
+    Some(std::env::temp_dir())
+}
+
+/// Windows has no direct I/O refusal of its own: its errors keep their message.
+pub fn refuses_direct_io(_e: &std::io::Error) -> bool {
+    false
+}
