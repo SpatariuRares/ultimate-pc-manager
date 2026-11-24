@@ -344,6 +344,11 @@ pub fn open_resources(pid: u32, each: Duration) -> Result<Vec<Resource>, Missing
     imp::open_resources(pid, each)
 }
 
+/// The working folder of the process, where the system tells it (Linux).
+pub fn working_folder(pid: u32) -> Option<String> {
+    imp::working_folder(pid)
+}
+
 /// A kernel path as the user knows it: "\Device\HarddiskVolume3\x" →
 /// "C:\x" with `drives` from [`drive_devices`]; other names as they are.
 #[allow(dead_code)] // the Windows reader and the tests use it
@@ -375,6 +380,13 @@ pub fn bring_to_front(pid: u32) -> Result<(), String> {
     }
 }
 
+/// The service units that run (Linux: from the processes' cgroups), each
+/// with the PID of the process that hosts it.
+#[cfg(target_os = "linux")]
+pub fn hosted_units() -> Vec<(u32, String)> {
+    imp::hosted_units()
+}
+
 #[cfg(windows)]
 mod windows;
 #[cfg(target_os = "linux")]
@@ -392,6 +404,12 @@ use macos as imp;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_does_not_tell_the_working_folder() {
+        assert_eq!(working_folder(std::process::id()), None);
+    }
 
     #[cfg(windows)]
     #[test]

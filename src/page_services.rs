@@ -5,10 +5,11 @@ use egui::{Align, Layout, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 
 use crate::addons::Core;
+use crate::availability::{is_available, Feature};
 use crate::core_page::{page_title, CorePage, PageCtx};
 use crate::list_pages::{fact_values, panel_title, summary_band, GAP};
 use crate::platform::Action;
-use crate::system_lists::{ServiceRow, SystemLists};
+use crate::system_lists::{ServiceKey, ServiceRow, SystemLists};
 use crate::theme;
 use crate::widgets::parts::{
     self, cell_text, column_heading, design_table, facts, list_with_panel, CellInk, Mark, SidePanel, TABLE_HEADER_HEIGHT, TABLE_ROW_HEIGHT,
@@ -18,12 +19,41 @@ use crate::widgets::refresh_button;
 /// What Services can do to a service: the button's words and the action.
 const SERVICE_ACTIONS: [(&str, &str); 3] = [("Start", "start"), ("Stop", "stop"), ("Restart", "restart")];
 
+/// Turning a service on or off at boot, offered for the services of the
+/// system's service managers (not the Windows ones) by their start type:
+/// the one that changes it.
+fn boot_action(s: &ServiceRow) -> Option<(&'static str, &'static str)> {
+    if s.source.is_empty() {
+        return None;
+    }
+    let offered = match s.start_type.as_str() {
+        "Enabled" => ("Disable at boot", "disable"),
+        "Disabled" => ("Enable at boot", "enable"),
+        _ => return None,
+    };
+    // Hidden, not shown and failing, where the row's manager cannot do it.
+    s.can(offered.1).then_some(offered)
+}
+
+/// The buttons of Start, Stop and Restart the row's manager supports.
+fn offered_actions(s: Option<&ServiceRow>) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
+    SERVICE_ACTIONS.into_iter().filter(move |(_, what)| s.is_none_or(|s| s.can(what)))
+}
+
+/// Is `row` the service `key` names? A key made of a name alone (from Go to
+/// service(s)) names the rows of that name, whatever their manager and scope.
+fn names(key: &ServiceKey, row: &ServiceRow) -> bool {
+    key.name == row.name && (key.source.is_empty() || key.source == row.source) && (key.scope.is_empty() || key.scope == row.scope)
+}
+
 #[derive(Default)]
 pub struct ServicesPage {
     /// The list as last read; `None` until the page is first shown.
     list: Option<Result<Vec<ServiceRow>, String>>,
-    /// The chosen service, by name.
-    selected: Option<String>,
+    /// The sources that could not be read at the last read, and why.
+    notices: Vec<String>,
+    /// The chosen service.
+    selected: Option<ServiceKey>,
     /// The filter text.
     search: String,
 }
@@ -32,7 +62,9 @@ impl ServicesPage {
     /// The one place the services list is read: every reader (first draw,
     /// Refresh, F5, the sidebar, Go to services, a control) comes here.
     pub fn reload(&mut self, system: &dyn SystemLists) {
-        self.list = Some(system.list_services());
+        let read = system.list_services();
+        self.notices = read.as_ref().map(|r| r.notices.clone()).unwrap_or_default();
+        self.list = Some(read.map(|r| r.rows));
     }
 
     /// Whether the list has been read yet.
@@ -43,7 +75,7 @@ impl ServicesPage {
     /// Go to service(s): the page filtered to `search` with `selected`
     /// chosen.
     pub fn show(&mut self, selected: Option<String>, search: String) {
-        self.selected = selected;
+        self.selected = selected.map(|name| ServiceKey::from(name.as_str()));
         self.search = search;
     }
 }
@@ -63,11 +95,24 @@ impl CorePage for ServicesPage {
                 if refresh_button(ui).clicked() {
                     self.reload(ctx.system);
                 }
-                let sel = self.selected.clone();
-                for (label, what) in SERVICE_ACTIONS.into_iter().rev() {
-                    if parts::header_button(ui, label, sel.is_some()).clicked() {
-                        if let Some(n) = &sel {
-                            actions.push(Action::Service(n.clone(), what));
+                // The chosen row's own key, so a system and a user service of
+                // one name are told apart.
+                let sel = self.selected.as_ref().map(|k| match self.list.as_ref() {
+                    Some(Ok(list)) => list.iter().find(|s| names(k, s)).map(ServiceRow::key).unwrap_or_else(|| k.clone()),
+                    _ => k.clone(),
+                });
+                // Control is hidden, not disabled, where the system has none.
+                if is_available(Feature::ServiceControl) {
+                    let chosen = match (&sel, self.list.as_ref()) {
+                        (Some(k), Some(Ok(list))) => list.iter().find(|s| names(k, s)),
+                        _ => None,
+                    };
+                    let shown: Vec<_> = offered_actions(chosen).collect();
+                    for (label, what) in shown.into_iter().rev() {
+                        if parts::header_button(ui, label, sel.is_some()).clicked() {
+                            if let Some(n) = &sel {
+                                actions.push(Action::Service(n.clone(), what));
+                            }
                         }
                     }
                 }
@@ -84,7 +129,19 @@ impl CorePage for ServicesPage {
             }
             None => Vec::new(),
         };
-        summary_band(ui, Mark::None, &services_headline(&list), "From the Service Control Manager, read when the page opens, on Refresh and after each start, stop or restart.");
+        // Rows that carry a scope come from the system's service managers
+        // (not the Service Control Manager).
+        let scoped = list.iter().any(|s| !s.scope.is_empty());
+        let source_note = if scoped {
+            "From the service managers of this system, read when the page opens and on Refresh."
+        } else {
+            "From the Service Control Manager, read when the page opens, on Refresh and after each start, stop or restart."
+        };
+        summary_band(ui, Mark::None, &services_headline(&list), source_note);
+        for notice in &self.notices {
+            let t = theme::of_ui(ui);
+            ui.label(egui::RichText::new(format!("Could not read {notice}")).color(t.red).size(12.5));
+        }
         let q = self.search.trim().to_lowercase();
         // By name or display name, or by the PID of the host (Go to
         // service(s) from Processes filters by it).
@@ -99,7 +156,7 @@ impl CorePage for ServicesPage {
             |ui, _| {
                 let mut new_sel = None;
                 design_table(ui, |ui| {
-                    TableBuilder::new(ui)
+                    let mut table = TableBuilder::new(ui)
                         .resizable(true)
                         .sense(Sense::click())
                         .cell_layout(Layout::left_to_right(Align::Center))
@@ -107,16 +164,23 @@ impl CorePage for ServicesPage {
                         .column(Column::initial(60.0))
                         .column(Column::remainder().at_least(120.0).clip(true))
                         .column(Column::initial(90.0))
-                        .column(Column::initial(100.0).clip(true))
+                        .column(Column::initial(100.0).clip(true));
+                    let mut headings = vec!["Name", "PID", "Description", "Status", "Start type"];
+                    if scoped {
+                        table = table.column(Column::initial(70.0)).column(Column::initial(70.0));
+                        headings.push("Scope");
+                        headings.push("Source");
+                    }
+                    table
                         .header(TABLE_HEADER_HEIGHT, |mut h| {
-                            for t in ["Name", "PID", "Description", "Status", "Start type"] {
+                            for t in headings {
                                 h.col(|ui| column_heading(ui, t));
                             }
                         })
                         .body(|body| {
                             body.rows(TABLE_ROW_HEIGHT, rows.len(), |mut row| {
                                 let s = rows[row.index()];
-                                let on = selected.as_deref() == Some(s.name.as_str());
+                                let on = selected.as_ref().is_some_and(|k| names(k, s));
                                 row.set_selected(on);
                                 row.col(|ui| {
                                     cell_text(ui, &s.name, CellInk::Main, on);
@@ -134,18 +198,36 @@ impl CorePage for ServicesPage {
                                 row.col(|ui| {
                                     cell_text(ui, &s.start_type, CellInk::Soft, on);
                                 });
+                                if scoped {
+                                    row.col(|ui| {
+                                        cell_text(ui, &s.scope, CellInk::Soft, on);
+                                    });
+                                    row.col(|ui| {
+                                        cell_text(ui, &s.source, CellInk::Soft, on);
+                                    });
+                                }
                                 let r = row.response();
                                 if r.clicked() || r.secondary_clicked() {
-                                    new_sel = Some(s.name.clone());
+                                    new_sel = Some(s.key());
                                 }
                                 r.context_menu(|ui| {
-                                    for (label, what) in SERVICE_ACTIONS {
-                                        if ui.button(label).clicked() {
-                                            actions.push(Action::Service(s.name.clone(), what));
-                                            ui.close();
+                                    if is_available(Feature::ServiceControl) {
+                                        let mut any = false;
+                                        for (label, what) in offered_actions(Some(s)).chain(boot_action(s)) {
+                                            any = true;
+                                            if ui.button(label).clicked() {
+                                                actions.push(Action::Service(s.key(), what));
+                                                ui.close();
+                                            }
+                                        }
+                                        if any {
+                                            ui.separator();
                                         }
                                     }
-                                    ui.separator();
+                                    if has_process_jump(s) && ui.button(GO_TO_PROCESS).clicked() {
+                                        actions.push(Action::GoToProcess(s.pid));
+                                        ui.close();
+                                    }
                                     if ui.button("Copy name").clicked() {
                                         actions.push(Action::Copy(s.name.clone()));
                                         ui.close();
@@ -161,10 +243,10 @@ impl CorePage for ServicesPage {
                 new_sel
             },
             |ui, new_sel| {
-                let name = new_sel.as_ref().or(selected.as_ref());
-                let chosen = name.and_then(|n| list.iter().find(|s| &s.name == n));
+                let key = new_sel.as_ref().or(selected.as_ref());
+                let chosen = key.and_then(|k| list.iter().find(|s| names(k, s)));
                 SidePanel::new("svc-detail").show(ui, chosen, |ui, s| {
-                    panel_action = service_detail(ui, s).map(|what| Action::Service(s.name.clone(), what));
+                    panel_action = service_detail(ui, s).map(|what| if what == GO_TO_PROCESS_ACTION { Action::GoToProcess(s.pid) } else { Action::Service(s.key(), what) });
                 });
             },
         );
@@ -180,18 +262,42 @@ impl CorePage for ServicesPage {
 fn service_detail(ui: &mut Ui, s: &ServiceRow) -> Option<&'static str> {
     panel_title(ui, &s.name);
     let pid = if s.pid > 0 { s.pid.to_string() } else { String::new() };
-    let values = [s.display.as_str(), pid.as_str(), s.status.as_str(), s.start_type.as_str()];
-    facts(ui, &["Description", "PID", "Status", "Start type"], |ui, i| fact_values(ui, &values, i));
+    let mut labels = vec!["Description", "PID", "Status", "Start type"];
+    let mut values = vec![s.display.as_str(), pid.as_str(), s.status.as_str(), s.start_type.as_str()];
+    if !s.scope.is_empty() {
+        labels.push("Scope");
+        values.push(s.scope.as_str());
+    }
+    if !s.source.is_empty() {
+        labels.push("Source");
+        values.push(s.source.as_str());
+    }
+    facts(ui, &labels, |ui, i| fact_values(ui, &values, i));
     ui.add_space(8.0);
     let mut clicked = None;
     ui.horizontal(|ui| {
-        for (label, what) in SERVICE_ACTIONS {
-            if parts::outline_button(ui, label, true).clicked() {
-                clicked = Some(what);
+        if is_available(Feature::ServiceControl) {
+            for (label, what) in offered_actions(Some(s)).chain(boot_action(s)) {
+                if parts::outline_button(ui, label, true).clicked() {
+                    clicked = Some(what);
+                }
             }
+        }
+        if has_process_jump(s) && parts::outline_button(ui, GO_TO_PROCESS, true).clicked() {
+            clicked = Some(GO_TO_PROCESS_ACTION);
         }
     });
     clicked
+}
+
+/// The jump to Processes: the words and the panel's answer for it.
+const GO_TO_PROCESS: &str = "Go to process";
+const GO_TO_PROCESS_ACTION: &str = "go-to-process";
+
+/// A service that runs shows the jump to its process when its manager says
+/// which one (rows with a source; the Windows list keeps its look).
+fn has_process_jump(s: &ServiceRow) -> bool {
+    s.pid > 0 && !s.source.is_empty()
 }
 
 /// "339 services (152 running, 187 stopped)".
@@ -209,7 +315,7 @@ mod tests {
     use crate::widgets::parts::EMPTY_DETAIL;
 
     fn service(status: &str) -> ServiceRow {
-        ServiceRow { name: "Svc".into(), display: String::new(), pid: 0, status: status.into(), start_type: "Manual".into() }
+        ServiceRow { name: "Svc".into(), display: String::new(), pid: 0, status: status.into(), start_type: "Manual".into(), ..Default::default() }
     }
 
     fn running(name: &str) -> ServiceRow {
@@ -232,7 +338,7 @@ mod tests {
     #[test]
     fn the_services_side_panel_shows_the_chosen_service_and_its_actions() {
         let env = Env::new();
-        let wsearch = ServiceRow { name: "WSearch".into(), display: "Windows Search".into(), pid: 14192, status: "Running".into(), start_type: "Automatic".into() };
+        let wsearch = ServiceRow { name: "WSearch".into(), display: "Windows Search".into(), pid: 14192, status: "Running".into(), start_type: "Automatic".into(), ..Default::default() };
         env.system.script_services(vec![wsearch, service("Stopped")]);
         let mut page = ServicesPage::default();
         let ui = ui_ctx();
@@ -249,13 +355,120 @@ mod tests {
 
     #[test]
     fn the_services_panel_holds_the_rows_fields() {
-        let s = ServiceRow { name: "WSearch".into(), display: "Windows Search".into(), pid: 14192, status: "Running".into(), start_type: "Automatic".into() };
+        let s = ServiceRow { name: "WSearch".into(), display: "Windows Search".into(), pid: 14192, status: "Running".into(), start_type: "Automatic".into(), ..Default::default() };
         let shown = words(|ui| {
             service_detail(ui, &s);
         });
         for w in ["WSearch", "Description", "Windows Search", "PID", "14192", "Status", "Running", "Start type", "Automatic", "Start", "Stop", "Restart"] {
             assert!(has(&shown, w), "{w} in {shown:?}");
         }
+    }
+
+    fn systemd_row(name: &str, scope: &str, pid: u32) -> ServiceRow {
+        ServiceRow { name: name.into(), display: "A daemon".into(), pid, status: "Running".into(), start_type: "Enabled".into(), source: "systemd".into(), scope: scope.into(), actions: None }
+    }
+
+    #[test]
+    fn rows_with_a_scope_show_it_in_the_list_and_the_panel_with_their_source() {
+        let env = Env::new();
+        env.system.script_services(vec![systemd_row("ssh.service", "System", 812), systemd_row("pipewire.service", "User", 2210)]);
+        let mut page = ServicesPage::default();
+        page.show(Some("pipewire.service".into()), String::new());
+        let shown = texts(&ui_ctx(), &mut page, &env.ctx());
+        for w in ["Scope", "System", "User", "Source", "systemd", "2210"] {
+            assert!(has(&shown, w), "{w} in {shown:?}");
+        }
+        let windows_like = texts(&ui_ctx(), &mut ServicesPage::default(), &Env::new().ctx());
+        assert!(!has(&windows_like, "Scope"), "a list without scopes keeps the Windows columns: {windows_like:?}");
+    }
+
+    #[test]
+    fn the_list_names_the_manager_of_every_row_in_a_source_column() {
+        let env = Env::new();
+        let openrc = ServiceRow { source: "OpenRC".into(), ..systemd_row("sshd", "System", 0) };
+        env.system.script_services(vec![systemd_row("ssh.service", "System", 812), openrc]);
+        let shown = texts(&ui_ctx(), &mut ServicesPage::default(), &env.ctx());
+        for w in ["Source", "systemd", "OpenRC"] {
+            assert!(has(&shown, w), "{w} in {shown:?} (nothing is chosen: not the panel's)");
+        }
+        let windows_like = Env::new();
+        windows_like.system.script_services(vec![service("Running")]);
+        let shown = texts(&ui_ctx(), &mut ServicesPage::default(), &windows_like.ctx());
+        assert!(!has(&shown, "Source"), "the Windows list keeps its columns: {shown:?}");
+    }
+
+    #[test]
+    fn a_source_that_could_not_be_read_is_told_beside_the_rows_of_the_others() {
+        let env = Env::new();
+        env.system.script_services(vec![systemd_row("ssh.service", "System", 812)]);
+        env.system.script_service_notices(vec!["OpenRC: rc-status failed".into()]);
+        let shown = texts(&ui_ctx(), &mut ServicesPage::default(), &env.ctx());
+        assert!(has(&shown, "ssh.service"), "{shown:?}");
+        assert!(has(&shown, "Could not read OpenRC: rc-status failed"), "{shown:?}");
+    }
+
+    #[test]
+    fn a_running_service_of_a_manager_links_to_its_process() {
+        let s = systemd_row("ssh.service", "System", 812);
+        let shown = words(|ui| {
+            service_detail(ui, &s);
+        });
+        assert!(has(&shown, GO_TO_PROCESS), "{shown:?}");
+        let stopped = ServiceRow { pid: 0, status: "Stopped".into(), ..s };
+        assert!(!has(&words(|ui| {
+            service_detail(ui, &stopped);
+        }), GO_TO_PROCESS), "no process, no jump");
+        let windows = ServiceRow { name: "WSearch".into(), pid: 14192, ..service("Running") };
+        assert!(!has(&words(|ui| {
+            service_detail(ui, &windows);
+        }), GO_TO_PROCESS), "the Windows panel is unchanged");
+    }
+
+    #[test]
+    fn an_action_the_rows_manager_cannot_do_is_not_offered() {
+        let limited = ServiceRow { actions: Some(&["start", "stop", "restart"]), ..systemd_row("cron", "System", 0) };
+        let shown = words(|ui| {
+            service_detail(ui, &limited);
+        });
+        for w in ["Start", "Stop", "Restart"] {
+            assert!(has(&shown, w), "{w} in {shown:?}");
+        }
+        assert!(!has(&shown, "Disable at boot") && !has(&shown, "Enable at boot"), "{shown:?}");
+        let none = ServiceRow { actions: Some(&[]), ..systemd_row("cron", "System", 0) };
+        let shown = words(|ui| {
+            service_detail(ui, &none);
+        });
+        for w in ["Start", "Stop", "Restart", "Disable at boot"] {
+            assert!(!has(&shown, w), "{w} hidden: {shown:?}");
+        }
+        // A row that does not say (Windows) keeps every button.
+        let windows = words(|ui| {
+            service_detail(ui, &service("Running"));
+        });
+        assert!(has(&windows, "Start") && has(&windows, "Restart"), "{windows:?}");
+        // The header offers what the chosen row's manager can do.
+        let env = Env::new();
+        env.system.script_services(vec![none]);
+        let mut page = ServicesPage::default();
+        page.show(Some("cron".into()), String::new());
+        let header = texts(&ui_ctx(), &mut page, &env.ctx());
+        for w in ["Start", "Stop", "Restart"] {
+            assert!(!has(&header, w), "{w} hidden in the header: {header:?}");
+        }
+    }
+
+    #[test]
+    fn control_is_hidden_where_the_system_has_none_and_the_jump_stays() {
+        let _guard = crate::availability::unavailable_in_test(&[Feature::ServiceControl]);
+        let env = Env::new();
+        env.system.script_services(vec![systemd_row("ssh.service", "System", 812)]);
+        let mut page = ServicesPage::default();
+        page.show(Some("ssh.service".into()), String::new());
+        let shown = texts(&ui_ctx(), &mut page, &env.ctx());
+        for action in ["Start", "Stop", "Restart"] {
+            assert!(!has(&shown, action), "{action} hidden: {shown:?}");
+        }
+        assert!(has(&shown, GO_TO_PROCESS) && has(&shown, "ssh.service"), "{shown:?}");
     }
 
     #[test]
@@ -383,6 +596,57 @@ mod tests {
         let ui = ui_ctx();
         assert!(click(&ui, &mut page, &env.ctx(), "Stop").is_empty(), "nothing is chosen");
         page.show(Some("WSearch".into()), String::new());
-        assert_eq!(click(&ui, &mut page, &env.ctx(), "Stop"), vec![Action::Service("WSearch".into(), "stop")]);
+        assert_eq!(click(&ui, &mut page, &env.ctx(), "Stop"), vec![Action::Service(ServiceKey::from("WSearch"), "stop")]);
+    }
+    #[test]
+    fn control_names_the_chosen_row_by_name_manager_and_scope() {
+        let env = Env::new();
+        env.system.script_services(vec![systemd_row("sync.service", "System", 0), systemd_row("sync.service", "User", 0)]);
+        let mut page = ServicesPage::default();
+        let ui = ui_ctx();
+        click(&ui, &mut page, &env.ctx(), "User");
+        let user = ServiceKey { name: "sync.service".into(), source: "systemd".into(), scope: "User".into() };
+        assert_eq!(click(&ui, &mut page, &env.ctx(), "Stop"), vec![Action::Service(user, "stop")]);
+    }
+
+    #[test]
+    fn a_service_of_a_manager_offers_the_change_of_its_start_type_at_boot() {
+        let enabled = systemd_row("ssh.service", "System", 812);
+        let shown = words(|ui| {
+            service_detail(ui, &enabled);
+        });
+        assert!(has(&shown, "Disable at boot") && !has(&shown, "Enable at boot"), "{shown:?}");
+        let disabled = ServiceRow { start_type: "Disabled".into(), ..enabled.clone() };
+        let shown = words(|ui| {
+            service_detail(ui, &disabled);
+        });
+        assert!(has(&shown, "Enable at boot") && !has(&shown, "Disable at boot"), "{shown:?}");
+        let fixed = ServiceRow { start_type: "Static".into(), ..enabled };
+        let shown = words(|ui| {
+            service_detail(ui, &fixed);
+        });
+        assert!(!has(&shown, "Enable at boot") && !has(&shown, "Disable at boot"), "a unit that cannot change has neither: {shown:?}");
+    }
+
+    #[test]
+    fn the_windows_panel_has_no_boot_buttons() {
+        let s = ServiceRow { name: "WSearch".into(), start_type: "Automatic".into(), ..service("Running") };
+        let shown = words(|ui| {
+            service_detail(ui, &s);
+        });
+        assert!(!has(&shown, "Enable at boot") && !has(&shown, "Disable at boot"), "{shown:?}");
+        let disabled = ServiceRow { start_type: "Disabled".into(), ..s };
+        assert_eq!(boot_action(&disabled), None);
+    }
+
+    #[test]
+    fn the_boot_button_asks_for_the_service_key() {
+        let env = Env::new();
+        let mut row = systemd_row("cron.service", "System", 0);
+        row.start_type = "Disabled".into();
+        env.system.script_services(vec![row.clone()]);
+        let mut page = ServicesPage::default();
+        page.show(Some("cron.service".into()), String::new());
+        assert_eq!(click(&ui_ctx(), &mut page, &env.ctx(), "Enable at boot"), vec![Action::Service(row.key(), "enable")]);
     }
 }

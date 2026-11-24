@@ -46,7 +46,7 @@ impl Provider for SystemCounters {
 #[cfg(windows)]
 mod windows;
 #[cfg(target_os = "linux")]
-mod linux;
+pub(crate) mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 

@@ -1,0 +1,4 @@
+[Desktop Entry]
+Name=Tool in opt
+Comment=The tool in /opt
+Exec=/opt/tool/tool

@@ -167,6 +167,12 @@ pub struct PerfLive {
     /// [`gpu_by_pid`]); processes without engines are absent.
     pub gpu_by_pid: std::collections::HashMap<u32, f32>,
     pub cpu_power_w: Option<f32>,
+    /// Linux pressure stall information: the share of the last 10 seconds
+    /// some task waited for a processor; `None` when the kernel has none.
+    pub cpu_pressure: Option<f32>,
+    /// The same for memory (some task waited for a page) and for disk I/O.
+    pub memory_pressure: Option<f32>,
+    pub io_pressure: Option<f32>,
     /// Working set of the "Memory Compression" process (it is protected, so
     /// it is read through the performance counters).
     pub compressed: u64,
@@ -206,6 +212,8 @@ pub mod counter {
     pub const COMPR: &str = "compr";
     /// The page file in use, in percent.
     pub const PAGEFILE: &str = "pagefile";
+    /// Linux pressure stall information (in no health list: older kernels have none).
+    pub const PRESSURE: &str = "pressure";
 }
 
 /// The performance counters every Windows PC answers, by key: the provider

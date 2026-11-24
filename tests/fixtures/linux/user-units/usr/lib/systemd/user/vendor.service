@@ -1,0 +1,8 @@
+[Unit]
+Description=Vendor helper
+
+[Service]
+ExecStart=/usr/bin/vendor
+
+[Install]
+WantedBy=graphical-session.target

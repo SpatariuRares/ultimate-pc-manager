@@ -1,0 +1,5 @@
+nr_free_pages 500000
+pgpgin 800000
+pgpgout 300000
+pgfault 9000000
+pgmajfault 12000

@@ -184,6 +184,7 @@ pub fn list_services() -> Result<Vec<ServiceRow>, String> {
                 pid: it.ServiceStatusProcess.dwProcessId,
                 status: state_text(it.ServiceStatusProcess.dwCurrentState).to_string(),
                 start_type,
+                ..Default::default()
             });
         }
         CloseServiceHandle(scm);
@@ -192,7 +193,8 @@ pub fn list_services() -> Result<Vec<ServiceRow>, String> {
     }
 }
 
-pub fn control_service(name: &str, action: &str) -> Result<(), String> {
+pub fn control_service(service: &crate::system_lists::ServiceKey, action: &str) -> Result<(), String> {
+    let name = service.name.as_str();
     unsafe {
         let scm = OpenSCManagerW(null(), null(), SC_MANAGER_CONNECT);
         if scm.is_null() {

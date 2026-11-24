@@ -1,0 +1,8 @@
+[Unit]
+Description=Started by a timer
+
+[Service]
+ExecStart=/usr/bin/on-demand
+
+[Install]
+WantedBy=timers.target

@@ -97,7 +97,12 @@ pub fn publisher(checked: Option<Signature>) -> String {
 }
 
 /// The Publisher column's text for a file without a verified signature.
+#[cfg(not(target_os = "linux"))]
 pub const NOT_VERIFIED: &str = "Not verified";
+/// The Publisher column's text for a file no package owns (Linux shows the
+/// owning package where Windows shows the signer).
+#[cfg(target_os = "linux")]
+pub const NOT_VERIFIED: &str = "Not from a package";
 
 /// The verified signature of the file at `path`, if any: on Windows its own
 /// (embedded) signature, else a catalog's; the other systems have none yet.

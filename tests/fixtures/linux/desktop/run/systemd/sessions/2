@@ -1,0 +1,11 @@
+UID=1000
+USER=spata
+ACTIVE=1
+STATE=active
+TYPE=wayland
+CLASS=user
+SCOPE=session-2.scope
+SEAT=seat0
+TTY=tty2
+REMOTE=0
+SERVICE=gdm-password

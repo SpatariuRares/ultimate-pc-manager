@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Other
+Comment=Main thing
+Exec=main-thing
+
+[Desktop Action x]
+Name=Action
+Comment=An action
+Exec=other

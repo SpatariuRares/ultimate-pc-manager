@@ -1,0 +1,9 @@
+Name:	sshd
+State:	S (sleeping)
+Pid:	1
+Uid:	0	0	0	0
+Threads:	1
+VmHWM:	6000 kB
+VmRSS:	5000 kB
+RssAnon:	2000 kB
+VmData:	9000 kB

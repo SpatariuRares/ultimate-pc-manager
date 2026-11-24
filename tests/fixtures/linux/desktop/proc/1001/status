@@ -1,0 +1,9 @@
+Name:	pipewire
+State:	S (sleeping)
+Pid:	1
+Uid:	1000	1000	1000	1000
+Threads:	3
+VmHWM:	9000 kB
+VmRSS:	8000 kB
+RssAnon:	3000 kB
+VmData:	20000 kB

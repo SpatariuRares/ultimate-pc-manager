@@ -1,0 +1,9 @@
+Name:	firefox
+State:	S (sleeping)
+Pid:	1
+Uid:	1000	1000	1000	1000
+Threads:	5
+VmHWM:	200000 kB
+VmRSS:	160000 kB
+RssAnon:	90000 kB
+VmData:	300000 kB

@@ -1,0 +1,7 @@
+MemTotal:        4096000 kB
+MemAvailable:    2000000 kB
+Cached:           500000 kB
+SwapTotal:             0 kB
+SwapFree:              0 kB
+CommitLimit:     2048000 kB
+Committed_AS:    1000000 kB

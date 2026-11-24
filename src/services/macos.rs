@@ -5,7 +5,7 @@ use crate::availability::{unavailable_error, Feature};
 
 /// No Service Control Manager: an error.
 pub fn list_services() -> Result<Vec<ServiceRow>, String> {
-    Err(unavailable_error(Feature::ServiceControl))
+    Err(unavailable_error(Feature::ServiceListing))
 }
 
 /// No running services.
@@ -19,6 +19,6 @@ pub fn service_description(_: &str) -> String {
 }
 
 /// Services cannot be started or stopped: an error.
-pub fn control_service(_: &str, _: &str) -> Result<(), String> {
+pub fn control_service(_: &crate::system_lists::ServiceKey, _: &str) -> Result<(), String> {
     Err(unavailable_error(Feature::ServiceControl))
 }

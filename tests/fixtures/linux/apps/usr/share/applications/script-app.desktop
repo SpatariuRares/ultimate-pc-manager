@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Script App
+Comment=A Python script
+Exec=python3.12 /opt/script-app/run.py

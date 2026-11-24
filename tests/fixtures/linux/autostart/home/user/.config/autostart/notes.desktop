@@ -1,0 +1,4 @@
+[Desktop Entry]
+Type=Application
+Name=My Notes
+Exec=/home/user/bin/notes --background

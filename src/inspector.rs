@@ -61,6 +61,8 @@ pub struct Details {
     pub environment: Result<Vec<(String, String)>, Missing>,
     pub resources: Result<Vec<Resource>, Missing>,
     pub private_memory: Option<u64>,
+    /// The process's working folder, where the system tells it.
+    pub working_folder: Option<String>,
 }
 
 impl Details {
@@ -73,13 +75,14 @@ impl Details {
             environment,
             resources: proc_info::open_resources(pid, NAME_TIMEOUT),
             private_memory: proc_info::private_memory(pid),
+            working_folder: proc_info::working_folder(pid),
         }
     }
 
     /// What shows when the read could not run (its worker did not start
     /// or died): every part "Unavailable".
     fn unavailable() -> Details {
-        Details { command_line: Err(Missing::Unavailable), environment: Err(Missing::Unavailable), resources: Err(Missing::Unavailable), private_memory: None }
+        Details { command_line: Err(Missing::Unavailable), environment: Err(Missing::Unavailable), resources: Err(Missing::Unavailable), private_memory: None, working_folder: None }
     }
 
     /// Whether a read found the process gone.
@@ -275,13 +278,17 @@ impl Inspector {
                 Some(Err(m)) => missing_text(*m).to_string(),
             };
             ui.add(egui::TextEdit::multiline(&mut command.as_str()).desired_rows(2).desired_width(f32::INFINITY).font(TextStyle::Monospace));
+            if let Some(folder) = self.details.as_ref().and_then(|d| d.working_folder.as_deref()) {
+                heading(ui, &t, "Working folder");
+                ui.add(egui::TextEdit::singleline(&mut &*folder).desired_width(f32::INFINITY).font(TextStyle::Monospace));
+            }
             heading(ui, &t, "Environment");
             let shown = self.shown_environment();
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Filter").desired_width(220.0));
                 if ui.add_enabled(!shown.is_empty(), egui::Button::new("Copy")).clicked() {
                     let text: Vec<String> = shown.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                    ui.ctx().copy_text(text.join("\r\n"));
+                    ui.ctx().copy_text(text.join(if cfg!(windows) { "\r\n" } else { "\n" }));
                     actions.push(Action::Say(format!("Copied {} environment variables", shown.len())));
                 }
             });
@@ -298,8 +305,15 @@ impl Inspector {
                     None => soft(ui, &t, RESOURCES_LOADING),
                     Some(Err(m)) => soft(ui, &t, missing_text(*m)),
                     Some(Ok(list)) => {
+                        // Registry keys exist only where the system has a registry.
+                        let keys = unavailable_text(Feature::ProcessRegistryKeys).is_none();
+                        let list: Vec<&Resource> = list.iter().filter(|r| keys || r.kind != ResourceKind::Key).collect();
                         let count = |k| list.iter().filter(|r| r.kind == k).count();
-                        let sum = format!("{} files, {} keys, {} pipes/sockets", count(ResourceKind::File), count(ResourceKind::Key), count(ResourceKind::Socket));
+                        let sum = if keys {
+                            format!("{} files, {} keys, {} pipes/sockets", count(ResourceKind::File), count(ResourceKind::Key), count(ResourceKind::Socket))
+                        } else {
+                            format!("{} files, {} pipes/sockets", count(ResourceKind::File), count(ResourceKind::Socket))
+                        };
                         soft(ui, &t, &sum);
                         two_columns(ui, &t, "inspector-resources", ("Type", "Name"), list.iter().map(|r| (kind_label(r.kind), r.name.as_str())));
                     }
@@ -379,6 +393,7 @@ mod tests {
                 Resource { kind: ResourceKind::Socket, name: r"\Device\Afd".into() },
             ]),
             private_memory: Some(349_175_808),
+            working_folder: None,
         }
     }
 
@@ -443,7 +458,7 @@ mod tests {
     #[test]
     fn parts_that_cannot_be_read_say_access_denied_or_unavailable() {
         let ctx = crate::test_ui::context(Mode::Dark);
-        let details = Details { command_line: Err(Missing::Denied), environment: Err(Missing::Denied), resources: Err(Missing::Unavailable), private_memory: None };
+        let details = Details { command_line: Err(Missing::Denied), environment: Err(Missing::Denied), resources: Err(Missing::Unavailable), private_memory: None, working_folder: None };
         let mut inspector = Inspector::with_details(26920, &[ProcRow { user: String::new(), ..nordvpn() }], details);
         let texts: Vec<String> = frame(&ctx, &mut inspector, &mut 620.0, vec![]).into_iter().map(|x| x.0).collect();
         let count = |s: &str| texts.iter().filter(|t| *t == s).count();
@@ -457,7 +472,7 @@ mod tests {
         let mut gone = Inspector::open(4_000_000_001, &[nordvpn()]);
         let texts: Vec<String> = frame(&ctx, &mut gone, &mut 620.0, vec![]).into_iter().map(|x| x.0).collect();
         assert!(texts.iter().any(|t| t == EXITED), "{texts:?}");
-        let ended = Details { command_line: Err(Missing::Exited), environment: Err(Missing::Exited), resources: Err(Missing::Exited), private_memory: None };
+        let ended = Details { command_line: Err(Missing::Exited), environment: Err(Missing::Exited), resources: Err(Missing::Exited), private_memory: None, working_folder: None };
         let mut read_too_late = Inspector::with_details(26920, &[nordvpn()], ended);
         let texts: Vec<String> = frame(&ctx, &mut read_too_late, &mut 620.0, vec![]).into_iter().map(|x| x.0).collect();
         assert!(texts.iter().any(|t| t == EXITED), "{texts:?}");
@@ -510,6 +525,55 @@ mod tests {
         let d = inspector.details.as_ref().expect("details, not Loading");
         assert_eq!(d.command_line, Err(Missing::Unavailable));
         assert_eq!(d.resources, Err(Missing::Unavailable));
+    }
+
+    /// A Linux process as the Inspector reads it from /proc.
+    fn read_linux() -> Details {
+        Details {
+            command_line: Ok("/usr/lib/firefox/firefox --new-window https://example.org".into()),
+            environment: Ok(vec![("HOME".into(), "/home/user".into()), ("WAYLAND_DISPLAY".into(), "wayland-0".into())]),
+            resources: Ok(vec![
+                Resource { kind: ResourceKind::File, name: "/home/user/notes.txt".into() },
+                Resource { kind: ResourceKind::Socket, name: "TCP 127.0.0.1:8080 listening".into() },
+            ]),
+            private_memory: None,
+            working_folder: Some("/home/user/project".into()),
+        }
+    }
+
+    #[test]
+    fn the_working_folder_is_shown_when_the_system_tells_it_and_not_when_it_does_not() {
+        let ctx = crate::test_ui::context(Mode::Dark);
+        let mut with = Inspector::with_details(26920, &[nordvpn()], read_linux());
+        let texts: Vec<String> = frame(&ctx, &mut with, &mut 620.0, vec![]).into_iter().map(|x| x.0).collect();
+        assert!(texts.iter().any(|t| t == "Working folder") && texts.iter().any(|t| t == "/home/user/project"), "{texts:?}");
+        let mut without = Inspector::with_details(26920, &[nordvpn()], read_ok());
+        let texts: Vec<String> = frame(&ctx, &mut without, &mut 620.0, vec![]).into_iter().map(|x| x.0).collect();
+        assert!(!texts.iter().any(|t| t == "Working folder"), "Windows shows none: {texts:?}");
+    }
+
+    #[test]
+    fn registry_keys_are_hidden_where_the_system_has_none_and_the_summary_does_not_count_them() {
+        let _no_registry = unavailable_in_test(&[Feature::ProcessRegistryKeys]);
+        let ctx = crate::test_ui::context(Mode::Dark);
+        let mut inspector = Inspector::with_details(26920, &[nordvpn()], read_ok());
+        let texts: Vec<String> = frame(&ctx, &mut inspector, &mut 620.0, vec![]).into_iter().map(|x| x.0).collect();
+        assert!(texts.iter().any(|t| t == "Open file") && texts.iter().any(|t| t == "Socket"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == "Registry key" || t.contains("HKLM") || t.contains("keys")), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "1 files, 1 pipes/sockets"), "{texts:?}");
+    }
+
+    #[test]
+    fn a_linux_process_shows_its_command_line_environment_files_and_sockets() {
+        let ctx = crate::test_ui::context(Mode::Dark);
+        let mut inspector = Inspector::with_details(26920, &[nordvpn()], read_linux());
+        let texts: Vec<String> = frame(&ctx, &mut inspector, &mut 620.0, vec![]).into_iter().map(|x| x.0).collect();
+        for shown in ["/usr/lib/firefox/firefox --new-window https://example.org", "WAYLAND_DISPLAY", "wayland-0", "/home/user/notes.txt", "TCP 127.0.0.1:8080 listening", "Copy"] {
+            assert!(texts.iter().any(|t| t == shown), "{shown} in {texts:?}");
+        }
+        inspector.filter = "wayland".into();
+        let shown = inspector.shown_environment();
+        assert_eq!(shown, [("WAYLAND_DISPLAY".to_string(), "wayland-0".to_string())], "the filter works on a Linux environment");
     }
 
     #[test]
