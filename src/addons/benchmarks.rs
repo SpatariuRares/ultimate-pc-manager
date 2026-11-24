@@ -141,6 +141,8 @@ pub struct Benchmarks {
     history_file: Option<PathBuf>,
     /// Why the history could not be read or saved, shown in the band.
     history_warning: Option<String>,
+    /// The one-time line about GPU results removed at this start.
+    history_notice: Option<String>,
     /// The Clear History confirmation is open (for the selected test).
     clear_asked: bool,
     /// A debug build, whose numbers mean nothing: its runs are shown but
@@ -325,6 +327,7 @@ impl Benchmarks {
     fn read_history(&mut self) {
         let (history, warning) = History::open(self.history_file.clone().or_else(app_history_file));
         self.history = history;
+        self.history_notice = self.history.take_notice();
         self.history_warning = warning;
     }
 
@@ -1179,6 +1182,9 @@ impl Addon for Benchmarks {
         if let Some(warning) = self.history_warning.clone() {
             parts::alert_banner(ui, &warning);
         }
+        if let Some(notice) = &self.history_notice {
+            ui.label(RichText::new(notice).size(12.0).color(t.label));
+        }
         self.band(ui, &st);
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 20.0;
@@ -1785,6 +1791,27 @@ mod tests {
         assert_eq!(history_columns(Test::Disk), ["Run", "Write speed (MB/sec)", "Read speed (MB/sec)", "Score", "Version"]);
         assert_eq!(history_columns(Test::Internet), ["Run", "Download (Mbit/s)", "Upload (Mbit/s)", "Version"], "no score");
         assert_eq!(history::EMPTY, "Benchmark runs will appear here as they complete.");
+    }
+
+    #[test]
+    fn older_gpu_results_are_removed_once_and_the_line_is_kept_for_the_page() {
+        let dir = history::tests::TempDir::new("addon-gpu-purge");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(
+            dir.file(),
+            r#"{"runs": [
+{"test": "GPU", "date": "2026-11-11T10:00:00", "figures": [], "score": 900.0, "version": "0.3.1", "platform": "windows x86_64", "hardware": "Card"},
+{"test": "CPU", "date": "2026-11-10T10:00:00", "figures": [], "score": 100.0, "version": "0.3.1", "platform": "windows x86_64", "hardware": "CPU"}
+]}"#,
+        )
+        .unwrap();
+        let b = with_history(&dir);
+        assert_eq!(b.history_notice.as_deref(), Some("Older GPU results were removed: the GPU test changed"));
+        assert!(b.history.runs("GPU").is_empty());
+        assert_eq!(b.history.runs("CPU").len(), 1);
+        let again = with_history(&dir);
+        assert_eq!(again.history_notice, None, "the next start shows no line");
+        assert_eq!(again.history.runs("CPU").len(), 1);
     }
 
     #[test]
