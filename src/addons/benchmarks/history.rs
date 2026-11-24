@@ -140,8 +140,15 @@ impl History {
         self.notice.take()
     }
 
-    /// Adds a completed run and saves the file.
+    /// Adds a completed run and saves the file. A history whose removal of
+    /// the old GPU results failed at start drops them now, so the file
+    /// never pairs a new GPU run with the old revision (which the next
+    /// start would remove).
     pub fn add(&mut self, run: Run) -> Result<(), String> {
+        if self.gpu_test < GPU_TEST_REVISION {
+            self.runs.retain(|r| r.test != GPU_TEST);
+            self.gpu_test = GPU_TEST_REVISION;
+        }
         self.runs.push(run);
         self.write()
     }
@@ -376,6 +383,28 @@ pub(crate) mod tests {
         assert_eq!(warning, None);
         assert!(next.runs("GPU").is_empty());
         assert!(next.take_notice().is_some());
+    }
+
+    #[test]
+    fn a_new_gpu_run_saved_after_a_failed_removal_is_kept_by_the_next_start() {
+        let dir = TempDir::new("purge-fails-then-add");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(dir.file(), OLD_FILE).unwrap();
+        std::fs::create_dir_all(dir.0.join("benchmark-history.json.tmp")).unwrap();
+        let (mut h, warning) = History::open(Some(dir.file()));
+        assert!(warning.is_some());
+
+        // The obstacle goes, and a run of the new GPU test is saved.
+        std::fs::remove_dir_all(dir.0.join("benchmark-history.json.tmp")).unwrap();
+        h.add(run("GPU", "2026-11-20T10:00:00", 5.0)).unwrap();
+        let other_tests = h.runs.iter().filter(|r| r.test != "GPU").count();
+
+        let (next, warning) = History::open(Some(dir.file()));
+        assert_eq!(warning, None);
+        let gpu = next.runs("GPU");
+        assert_eq!(gpu.len(), 1, "only the new GPU run is left");
+        assert_eq!(gpu[0].date, "2026-11-20T10:00:00");
+        assert_eq!(next.runs.iter().filter(|r| r.test != "GPU").count(), other_tests, "other tests keep their runs");
     }
 
     #[test]
