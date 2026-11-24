@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Firefox
+Comment=Browse the World Wide Web
+Comment[it]=Naviga sul web
+Exec=/usr/lib/firefox/firefox %u

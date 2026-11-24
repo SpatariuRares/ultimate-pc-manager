@@ -375,6 +375,13 @@ pub fn bring_to_front(pid: u32) -> Result<(), String> {
     }
 }
 
+/// The service units that run (Linux: from the processes' cgroups), each
+/// with the PID of the process that hosts it.
+#[cfg(target_os = "linux")]
+pub fn hosted_units() -> Vec<(u32, String)> {
+    imp::hosted_units()
+}
+
 #[cfg(windows)]
 mod windows;
 #[cfg(target_os = "linux")]

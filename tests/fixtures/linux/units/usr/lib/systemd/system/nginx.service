@@ -1,0 +1,6 @@
+[Unit]
+Description=A high performance web server
+After=network.target
+
+[Service]
+ExecStart=/usr/sbin/nginx

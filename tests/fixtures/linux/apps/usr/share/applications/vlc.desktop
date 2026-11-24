@@ -1,0 +1,3 @@
+[Desktop Entry]
+Name=VLC media player
+Exec="vlc" --started-from-file %U
