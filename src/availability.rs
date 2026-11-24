@@ -80,6 +80,8 @@ features! {
     UninstallRegistry,
     /// The handles open files and resources are listed from.
     OpenHandles,
+    /// The registry keys a process holds open.
+    ProcessRegistryKeys,
     /// The machine's fixed facts: processor, memory, disks, graphics.
     MachineInformation,
 }
@@ -103,7 +105,8 @@ pub(crate) fn system_has(feature: Feature) -> bool {
     // Linux: signals, nice values and affinity work through kill, renice and taskset;
     // the startup entries are read from the XDG autostart folders; the service
     // list and its control come from its sources (they say when no service manager is there);
-    // the open-file count and the architecture are read from /proc (the program's ELF header).
+    // the open-file count and the architecture are read from /proc (the program's ELF header);
+    // the open files and sockets are read from /proc/<pid>/fd (there are no registry keys).
     #[cfg(target_os = "linux")]
     return matches!(
         feature,
@@ -113,6 +116,7 @@ pub(crate) fn system_has(feature: Feature) -> bool {
             | Feature::ServiceControl
             | Feature::ProcessHandleCounts
             | Feature::ProcessArchitecture
+            | Feature::OpenHandles
     );
     // No current feature has a macOS implementation yet.
     #[cfg(target_os = "macos")]
@@ -222,6 +226,7 @@ mod tests {
             Feature::ServiceControl,
             Feature::ProcessHandleCounts,
             Feature::ProcessArchitecture,
+            Feature::OpenHandles,
         ];
         for &feature in Feature::ALL {
             assert_eq!(system_has(feature), here.contains(&feature), "{feature:?}");

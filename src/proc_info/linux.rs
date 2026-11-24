@@ -21,7 +21,7 @@
 //! controlling terminal, and its environment names a display
 //! (`DISPLAY` or `WAYLAND_DISPLAY`).
 
-use super::{CommandAndEnvironment, Counts, Missing, Windows};
+use super::{CommandAndEnvironment, Counts, Missing, Resource, ResourceKind, Windows};
 use crate::fs_root::FsRoot;
 use std::collections::HashMap;
 use std::io::Read;
@@ -149,9 +149,27 @@ impl<'a> ProcFiles<'a> {
             .collect())
     }
 
+    /// The files, sockets and pipes the process holds open (`fd`), in
+    /// descriptor order. Sockets are named from the system's socket tables.
+    pub fn open_resources(&self) -> Result<Vec<Resource>, Missing> {
+        let entries = std::fs::read_dir(self.root.path(&self.rel("fd"))).map_err(|e| self.missing(&e))?;
+        let mut links: Vec<(u32, String)> = entries
+            .filter_map(|e| {
+                let entry = e.ok()?;
+                let number = entry.file_name().to_str()?.parse().ok()?;
+                let target = std::fs::read_link(entry.path()).ok()?;
+                Some((number, target.to_string_lossy().into_owned()))
+            })
+            .collect();
+        links.sort();
+        let sockets = SocketNames::read(self.root);
+        let mut list: Vec<Resource> = links.into_iter().filter_map(|(_, target)| resource_of(&target, &sockets)).collect();
+        list.sort();
+        list.dedup();
+        Ok(list)
+    }
+
     /// The process's working folder.
-    // Read by the Inspector (tickets for the Process Inspector build on it).
-    #[allow(dead_code)]
     pub fn cwd(&self) -> Option<PathBuf> {
         std::fs::read_link(self.root.path(&self.rel("cwd"))).ok()
     }
@@ -447,9 +465,113 @@ pub fn command_line_and_environment(pid: u32) -> super::CommandAndEnvironment {
     command_line_and_environment_in(&FsRoot::system(), pid)
 }
 
-/// Not available yet.
-pub fn open_resources(_pid: u32, _each: std::time::Duration) -> Result<Vec<super::Resource>, super::Missing> {
-    Err(super::Missing::Unavailable)
+/// The open files, sockets and pipes of one process.
+pub fn open_resources_in(root: &FsRoot, pid: u32) -> Result<Vec<Resource>, Missing> {
+    ProcFiles::new(root, pid).open_resources()
+}
+
+/// The open files, sockets and pipes of the process, from `/proc`.
+pub fn open_resources(pid: u32, _each: std::time::Duration) -> Result<Vec<Resource>, Missing> {
+    open_resources_in(&FsRoot::system(), pid)
+}
+
+/// The working folder of the process, from `/proc`.
+pub fn working_folder(pid: u32) -> Option<String> {
+    ProcFiles::new(&FsRoot::system(), pid).cwd().map(|p| p.to_string_lossy().into_owned())
+}
+
+/// How one descriptor's link target shows in the Inspector: a path is a
+/// file, a socket or pipe is a socket; anonymous kernel objects (events,
+/// timers) are left out.
+fn resource_of(target: &str, sockets: &SocketNames) -> Option<Resource> {
+    if let Some(inode) = target.strip_prefix("socket:[").and_then(|t| t.strip_suffix(']')) {
+        let name = sockets.0.get(inode).cloned().unwrap_or_else(|| target.to_string());
+        return Some(Resource { kind: ResourceKind::Socket, name });
+    }
+    if target.starts_with("pipe:[") {
+        return Some(Resource { kind: ResourceKind::Socket, name: target.to_string() });
+    }
+    target.starts_with('/').then(|| Resource { kind: ResourceKind::File, name: target.to_string() })
+}
+
+/// The names of the system's sockets by inode, from `/proc/net`.
+struct SocketNames(HashMap<String, String>);
+
+impl SocketNames {
+    fn read(root: &FsRoot) -> Self {
+        let mut names = HashMap::new();
+        for (file, protocol) in [("tcp", "TCP"), ("tcp6", "TCP"), ("udp", "UDP"), ("udp6", "UDP")] {
+            if let Some(text) = root.read(&format!("proc/net/{file}")) {
+                parse_inet_sockets(&text, protocol, &mut names);
+            }
+        }
+        if let Some(text) = root.read("proc/net/unix") {
+            parse_unix_sockets(&text, &mut names);
+        }
+        SocketNames(names)
+    }
+}
+
+/// `address:port` from the kernel's hex form (little-endian words).
+fn inet_address(hex: &str) -> Option<String> {
+    let (addr, port) = hex.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let word = |i: usize| u32::from_str_radix(addr.get(i * 8..i * 8 + 8)?, 16).ok().map(u32::swap_bytes);
+    match addr.len() {
+        8 => Some(format!("{}:{port}", std::net::Ipv4Addr::from(word(0)?))),
+        32 => {
+            let ip = std::net::Ipv6Addr::from(u128::from(word(0)?) << 96 | u128::from(word(1)?) << 64 | u128::from(word(2)?) << 32 | u128::from(word(3)?));
+            Some(format!("[{ip}]:{port}"))
+        }
+        _ => None,
+    }
+}
+
+fn tcp_state(code: &str) -> &'static str {
+    match code {
+        "01" => "established",
+        "02" => "syn sent",
+        "03" => "syn received",
+        "04" => "fin wait 1",
+        "05" => "fin wait 2",
+        "06" => "time wait",
+        "07" => "closed",
+        "08" => "close wait",
+        "09" => "last ack",
+        "0A" => "listening",
+        "0B" => "closing",
+        _ => "",
+    }
+}
+
+/// Reads one of `/proc/net/tcp`, `tcp6`, `udp`, `udp6` into inode -> name.
+pub fn parse_inet_sockets(text: &str, protocol: &str, names: &mut HashMap<String, String>) {
+    for line in text.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let (Some(local), Some(remote), Some(state), Some(inode)) = (f.get(1), f.get(2), f.get(3), f.get(9)) else { continue };
+        let (Some(local), Some(remote)) = (inet_address(local), inet_address(remote)) else { continue };
+        let state = if protocol == "TCP" { tcp_state(state) } else { "" };
+        let name = match (state, protocol) {
+            ("listening", _) => format!("{protocol} {local} listening"),
+            (_, "UDP") => format!("{protocol} {local}"),
+            ("", _) => format!("{protocol} {local} -> {remote}"),
+            (state, _) => format!("{protocol} {local} -> {remote} ({state})"),
+        };
+        names.insert((*inode).to_string(), name);
+    }
+}
+
+/// Reads `/proc/net/unix` into inode -> name.
+pub fn parse_unix_sockets(text: &str, names: &mut HashMap<String, String>) {
+    for line in text.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let Some(inode) = f.get(6) else { continue };
+        let name = match f.get(7) {
+            Some(path) => format!("Unix socket {path}"),
+            None => "Unix socket".to_string(),
+        };
+        names.insert((*inode).to_string(), name);
+    }
 }
 
 /// The NT names of the drives: none, not available yet.
@@ -608,6 +730,75 @@ mod tests {
         assert_eq!(files.exe(), Some(PathBuf::from("/usr/bin/tool")));
         assert_eq!(ProcFiles::new(&root, 43).cwd(), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `/proc` of process 42 with descriptors and the socket tables.
+    fn resources_root(name: &str) -> PathBuf {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("upm-proc-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fd = dir.join("proc/42/fd");
+        std::fs::create_dir_all(&fd).unwrap();
+        std::fs::create_dir_all(dir.join("proc/net")).unwrap();
+        for (n, target) in [
+            ("0", "/dev/null"),
+            ("1", "/home/user/notes.txt"),
+            ("2", "socket:[111]"),
+            ("3", "socket:[222]"),
+            ("4", "pipe:[333]"),
+            ("5", "anon_inode:[eventpoll]"),
+            ("6", "socket:[999]"),
+            ("7", "socket:[444]"),
+            ("10", "/var/log/app.log"),
+        ] {
+            symlink(target, fd.join(n)).unwrap();
+        }
+        let tcp = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 111 1 0000 100 0 0 10 0\n   1: 0100007F:D2A4 0100007F:0050 01 00000000:00000000 00:00000000 00000000  1000        0 222 1 0000 100 0 0 10 0\n";
+        std::fs::write(dir.join("proc/net/tcp"), tcp).unwrap();
+        std::fs::write(dir.join("proc/net/udp"), "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n").unwrap();
+        let tcp6 = "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n   0: 00000000000000000000000001000000:0016 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 555 1 0 100 0 0 10 0\n";
+        std::fs::write(dir.join("proc/net/tcp6"), tcp6).unwrap();
+        let unix = "Num       RefCount Protocol Flags    Type St Inode Path\n0000000000000000: 00000002 00000000 00010000 0001 01 444 /run/user/1000/bus\n";
+        std::fs::write(dir.join("proc/net/unix"), unix).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_open_files_sockets_and_pipes_are_listed_with_sockets_named_from_the_tables() {
+        let dir = resources_root("resources");
+        let list = open_resources_in(&FsRoot::at(&dir), 42).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let shown: Vec<(ResourceKind, &str)> = list.iter().map(|r| (r.kind, r.name.as_str())).collect();
+        assert_eq!(
+            shown,
+            [
+                (ResourceKind::File, "/dev/null"),
+                (ResourceKind::File, "/home/user/notes.txt"),
+                (ResourceKind::File, "/var/log/app.log"),
+                (ResourceKind::Socket, "TCP 127.0.0.1:53924 -> 127.0.0.1:80 (established)"),
+                (ResourceKind::Socket, "TCP 127.0.0.1:8080 listening"),
+                (ResourceKind::Socket, "Unix socket /run/user/1000/bus"),
+                (ResourceKind::Socket, "pipe:[333]"),
+                (ResourceKind::Socket, "socket:[999]"),
+            ],
+            "sorted by kind and name; anonymous kernel objects left out; an unknown socket keeps the kernel's name"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_socket_is_named_with_its_address_and_port() {
+        let mut names = HashMap::new();
+        parse_inet_sockets(
+            "h\n   0: 00000000000000000000000001000000:0016 00000000000000000000000000000000:0000 0A 0:0 0:0 0 0 0 555 1\n",
+            "TCP",
+            &mut names,
+        );
+        assert_eq!(names["555"], "TCP [::1]:22 listening");
+    }
+
+    #[test]
+    fn the_open_resources_of_a_gone_process_say_exited() {
+        assert_eq!(open_resources_in(&fixture("desktop"), 4_000_000), Err(Missing::Exited));
     }
 
     #[test]

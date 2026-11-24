@@ -344,6 +344,17 @@ pub fn open_resources(pid: u32, each: Duration) -> Result<Vec<Resource>, Missing
     imp::open_resources(pid, each)
 }
 
+/// The working folder of the process, where the system tells it (Linux).
+pub fn working_folder(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    return imp::working_folder(pid);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// A kernel path as the user knows it: "\Device\HarddiskVolume3\x" →
 /// "C:\x" with `drives` from [`drive_devices`]; other names as they are.
 #[allow(dead_code)] // the Windows reader and the tests use it
