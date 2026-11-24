@@ -29,6 +29,11 @@ pub fn windows() -> super::Windows {
 }
 
 /// Not available yet.
+pub fn working_folder(_pid: u32) -> Option<String> {
+    None
+}
+
+/// Not available yet.
 pub fn bring_to_front(_pid: u32) -> bool {
     false
 }

@@ -16,6 +16,25 @@ use crate::fs_root::FsRoot;
 /// What a disk's kernel counters count: the bytes of a sector in `/proc/diskstats`.
 const SECTOR_BYTES: u64 = 512;
 
+/// What kind of disk it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskKind {
+    Nvme,
+    Ssd,
+    Hdd,
+}
+
+impl DiskKind {
+    /// The word the pages show: "NVMe", "SSD" or "HDD".
+    pub fn label(self) -> &'static str {
+        match self {
+            DiskKind::Nvme => "NVMe",
+            DiskKind::Ssd => "SSD",
+            DiskKind::Hdd => "HDD",
+        }
+    }
+}
+
 /// One physical disk.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalDisk {
@@ -24,8 +43,7 @@ pub struct PhysicalDisk {
     pub name: String,
     /// The model the device reports; empty when it does not.
     pub model: String,
-    /// "NVMe", "SSD" or "HDD".
-    pub kind: &'static str,
+    pub kind: DiskKind,
     pub capacity: u64,
 }
 
@@ -43,11 +61,11 @@ pub fn physical_disks(root: &FsRoot) -> Vec<PhysicalDisk> {
         }
         let rotational = root.read(&format!("{base}/queue/rotational")).is_some_and(|t| t == "1");
         let kind = if name.starts_with("nvme") {
-            "NVMe"
+            DiskKind::Nvme
         } else if rotational {
-            "HDD"
+            DiskKind::Hdd
         } else {
-            "SSD"
+            DiskKind::Ssd
         };
         let sectors: u64 = root.read(&format!("{base}/size")).and_then(|t| t.parse().ok()).unwrap_or(0);
         disks.push(PhysicalDisk {
@@ -128,9 +146,16 @@ mod tests {
     use crate::fs_root::fixture;
 
     #[test]
+    fn a_disk_kind_is_shown_by_its_label() {
+        assert_eq!([DiskKind::Nvme, DiskKind::Ssd, DiskKind::Hdd].map(DiskKind::label), ["NVMe", "SSD", "HDD"]);
+        let kinds: Vec<DiskKind> = physical_disks(&fixture("disks")).iter().map(|d| d.kind).collect();
+        assert_eq!(kinds, [DiskKind::Nvme, DiskKind::Ssd, DiskKind::Hdd]);
+    }
+
+    #[test]
     fn only_whole_physical_disks_are_listed_with_their_type_model_and_size() {
         let disks = physical_disks(&fixture("disks"));
-        let shown: Vec<(u32, &str, &str, &str, u64)> = disks.iter().map(|d| (d.number, d.name.as_str(), d.kind, d.model.as_str(), d.capacity)).collect();
+        let shown: Vec<(u32, &str, &str, &str, u64)> = disks.iter().map(|d| (d.number, d.name.as_str(), d.kind.label(), d.model.as_str(), d.capacity)).collect();
         assert_eq!(
             shown,
             [
