@@ -399,7 +399,6 @@ fn counts_of(files: &ProcFiles) -> Option<Counts> {
     Some(c)
 }
 
-#[cfg(test)]
 /// The IDs of the processes under the root.
 fn pids(root: &FsRoot) -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir(root.path("proc")) else { return Vec::new() };

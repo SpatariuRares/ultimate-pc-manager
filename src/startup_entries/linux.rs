@@ -37,6 +37,11 @@ fn noticed(sources: &[Box<dyn StartupSource>]) -> (Vec<StartupEntry>, Vec<String
     (entries, failures.into_iter().map(|(id, why)| format!("{}: {why}", label(id))).collect())
 }
 
+/// Turns an entry on or off through the source that read it.
+pub fn set_startup_enabled(entry: &StartupEntry, enable: bool) -> Result<(), String> {
+    set_enabled_in(&sources(), entry, enable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,9 +61,4 @@ mod tests {
         assert!(!entries.is_empty(), "the autostart entries are still listed");
         assert_eq!(notices, ["systemd user services: boom"]);
     }
-}
-
-/// Turns an entry on or off through the source that read it.
-pub fn set_startup_enabled(entry: &StartupEntry, enable: bool) -> Result<(), String> {
-    set_enabled_in(&sources(), entry, enable)
 }
