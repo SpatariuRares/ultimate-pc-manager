@@ -820,7 +820,5 @@ mod tests {
     #[test]
     fn every_system_says_what_a_missing_gpu_means() {
         assert!(NO_GPU.len() > 20 && NO_CARD.len() > 5);
-        #[cfg(target_os = "linux")]
-        assert!(NO_GPU.contains("Vulkan driver") && NO_CARD.contains("Vulkan driver"));
     }
 }

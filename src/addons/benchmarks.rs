@@ -24,6 +24,7 @@ use crate::widgets::{self, parts};
 
 use disk::DiskJob;
 use engine::{Engine, Measure, Probe, Unit, GBS, GOPS, MBITS, MBS, MOPS};
+use gpu::NO_CARD;
 use history::History;
 use page::View;
 
@@ -77,10 +78,15 @@ impl Test {
             Test::Cpu => Unit::new(self.name(), |p| cpu(p, CPU_SECONDS)),
             Test::Gpu => gpu::unit(gpu::adapters().into_iter().next()),
             Test::Memory => Unit::new(self.name(), |p| memory(p, MEMORY_BLOCK, MEMORY_ROUNDS)),
-            Test::Disk => disk_unit(disk::test_folder(None, disk::default_folder())),
+            Test::Disk => disk_unit(test_folder(None)),
             Test::Internet => Unit::new(self.name(), |p| internet::run(p, &mut internet::Cloudflare::new(), &internet::PLAN)),
         }
     }
+}
+
+/// The folder the disk test writes in: the chosen one, else this system's default.
+fn test_folder(chosen: Option<&str>) -> Result<PathBuf, &'static str> {
+    disk::test_folder(chosen, disk::default_folder())
 }
 
 /// The tests "Run All Benchmarks" runs, in order.
@@ -183,7 +189,7 @@ impl Benchmarks {
 
     /// The disk test's folder: the chosen one, else the temp folder.
     fn test_folder(&self) -> Result<std::path::PathBuf, &'static str> {
-        disk::test_folder(self.disk_folder.as_deref(), disk::default_folder())
+        test_folder(self.disk_folder.as_deref())
     }
 
     /// The video cards, listed on first use.
@@ -876,8 +882,6 @@ impl Benchmarks {
         }
     }
 }
-
-use gpu::NO_CARD;
 
 impl Benchmarks {
     /// Under the test folder: its free space, "Choose…", and the refusal

@@ -5,6 +5,12 @@
 
 use super::{proxy_for, HOST};
 
+/// No separate environment proxy: [`system_proxy`] reads the variables
+/// itself (lower case wins, `no_proxy` honoured).
+pub fn env_proxy() -> Option<ureq::Proxy> {
+    None
+}
+
 /// The system proxy for [`HOST`], from the process environment.
 pub fn system_proxy() -> Option<String> {
     proxy_from_env(|name| std::env::var(name).ok())

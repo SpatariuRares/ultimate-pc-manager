@@ -8,3 +8,13 @@ pub const NO_GPU: &str = "A hardware GPU with Direct3D 12 is unavailable on this
 
 /// The GPU view's hardware line when no card is listed.
 pub const NO_CARD: &str = "No Direct3D 12 GPU found";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_missing_gpu_messages_name_this_systems_graphics_api() {
+        assert!(NO_GPU.contains("Direct3D 12") && NO_CARD.contains("Direct3D 12"));
+    }
+}

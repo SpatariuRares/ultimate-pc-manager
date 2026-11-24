@@ -72,17 +72,22 @@ pub struct History {
 }
 
 impl History {
+    /// An empty history at the current GPU test revision.
+    fn current(path: Option<PathBuf>) -> History {
+        History { path, gpu_test: GPU_TEST_REVISION, ..History::default() }
+    }
+
     /// Reads the history at `path` (none: in memory only). A missing file
     /// is an empty history; a file that cannot be read is renamed beside
     /// itself, a new empty one is written, and the warning tells so.
     pub fn open(path: Option<PathBuf>) -> (History, Option<String>) {
-        let Some(path) = path else { return (History { gpu_test: GPU_TEST_REVISION, ..History::default() }, None) };
+        let Some(path) = path else { return (History::current(None), None) };
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (History { path: Some(path), gpu_test: GPU_TEST_REVISION, ..History::default() }, None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (History::current(Some(path)), None),
             Err(e) => {
                 // Not even readable: keep it in place, keep runs in memory.
-                return (History { gpu_test: GPU_TEST_REVISION, ..History::default() }, Some(format!("The benchmark history could not be read ({e}); new runs will not be saved.")));
+                return (History::current(None), Some(format!("The benchmark history could not be read ({e}); new runs will not be saved.")));
             }
         };
         if let Ok(saved) = serde_json::from_str::<Saved>(&text) {
@@ -91,7 +96,7 @@ impl History {
             return (history, warning);
         }
         let aside = set_aside_name(&path, crate::platform::local_secs());
-        let history = History { path: Some(path.clone()), gpu_test: GPU_TEST_REVISION, ..History::default() };
+        let history = History::current(Some(path.clone()));
         let warning = match std::fs::rename(&path, &aside).map_err(|e| e.to_string()).and_then(|_| history.write()) {
             Ok(()) => format!(
                 "The benchmark history could not be read. It was set aside as {} and a new one was started.",
@@ -116,7 +121,7 @@ impl History {
         let before = self.runs.len();
         let kept: Vec<Run> = self.runs.iter().filter(|r| r.test != GPU_TEST).cloned().collect();
         let removed = kept.len() != before;
-        let purged = History { path: self.path.clone(), runs: kept, gpu_test: GPU_TEST_REVISION, notice: None };
+        let purged = History { runs: kept, ..History::current(self.path.clone()) };
         match purged.write() {
             Ok(()) => {
                 self.runs = purged.runs;

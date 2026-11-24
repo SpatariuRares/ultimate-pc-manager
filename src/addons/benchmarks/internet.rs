@@ -288,9 +288,7 @@ const BLOCK_TIMEOUT: Duration = Duration::from_secs(90);
 
 impl Cloudflare {
     pub fn new() -> Cloudflare {
-        // On Linux the environment is read by `system_proxy` (lower case wins, `no_proxy` honoured).
-        let from_env = if cfg!(target_os = "linux") { None } else { ureq::Proxy::try_from_env() };
-        let proxy = from_env.or_else(|| system_proxy().and_then(|url| ureq::Proxy::new(&url).ok()));
+        let proxy = system::env_proxy().or_else(|| system_proxy().and_then(|url| ureq::Proxy::new(&url).ok()));
         let config = ureq::Agent::config_builder()
             .proxy(proxy)
             .http_status_as_error(false)

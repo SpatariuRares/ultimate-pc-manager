@@ -21,12 +21,9 @@ pub fn direct_io(o: &mut std::fs::OpenOptions) {
     o.custom_flags(FILE_FLAG_WRITE_THROUGH | FILE_FLAG_NO_BUFFERING);
 }
 
-/// The default test folder is the temp folder, which exists.
-pub const CREATE_DEFAULT: bool = false;
-
 pub const NO_DEFAULT_FOLDER: &str = "Windows could not locate the temporary folder.";
 
-/// The temp folder.
+/// The temp folder, which exists.
 pub fn default_folder() -> Option<std::path::PathBuf> {
     Some(std::env::temp_dir())
 }
@@ -34,4 +31,29 @@ pub fn default_folder() -> Option<std::path::PathBuf> {
 /// Windows has no direct I/O refusal of its own: its errors keep their message.
 pub fn refuses_direct_io(_e: &std::io::Error) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::scratch;
+    use super::*;
+
+    #[test]
+    fn the_missing_default_folder_names_windows() {
+        assert_eq!(NO_DEFAULT_FOLDER, "Windows could not locate the temporary folder.");
+    }
+
+    #[test]
+    fn no_error_is_a_direct_io_refusal() {
+        assert!(!refuses_direct_io(&std::io::Error::from_raw_os_error(5)));
+        assert!(!refuses_direct_io(&std::io::Error::from_raw_os_error(22)));
+    }
+
+    #[test]
+    fn free_space_of_an_existing_folder_is_read_and_a_missing_one_is_unknown() {
+        let dir = scratch("free");
+        assert!(free_space(&dir).is_some_and(|f| f > 0));
+        assert_eq!(free_space(&dir.join("not-there")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

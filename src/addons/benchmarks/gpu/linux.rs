@@ -8,3 +8,13 @@ pub const NO_GPU: &str = "No hardware Vulkan GPU was found. Install your distrib
 
 /// The GPU view's hardware line when no card is listed.
 pub const NO_CARD: &str = "No Vulkan GPU found: install your distribution's Vulkan driver";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_missing_gpu_messages_name_this_systems_graphics_api() {
+        assert!(NO_GPU.contains("Vulkan driver") && NO_CARD.contains("Vulkan driver"));
+    }
+}

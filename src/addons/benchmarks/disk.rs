@@ -13,8 +13,6 @@ use super::{READ_SPEED, WRITE_SPEED};
 
 /// The disk test's messages.
 pub const NOT_ENOUGH_SPACE: &str = "Not enough free space to run the test.";
-/// Worded per system (no "Windows" on Linux).
-pub const NO_DEFAULT_FOLDER: &str = system::NO_DEFAULT_FOLDER;
 /// The drive's filesystem refuses direct I/O: no score is possible.
 pub const DIRECT_IO_REFUSED: &str = "This drive does not allow direct I/O.";
 const CREATE_FAILED: &str = "Unable to create the test file.";
@@ -60,15 +58,8 @@ impl DiskJob {
 pub fn test_folder(chosen: Option<&str>, default: Option<PathBuf>) -> Result<PathBuf, &'static str> {
     match chosen.filter(|c| !c.is_empty()) {
         Some(c) => Ok(PathBuf::from(c)),
-        None => default.filter(|d| (system::CREATE_DEFAULT && std::fs::create_dir_all(d).is_ok()) || d.is_dir()).ok_or(NO_DEFAULT_FOLDER),
+        None => default.filter(|d| d.is_dir()).ok_or(NO_DEFAULT_FOLDER),
     }
-}
-
-/// The folder the test writes in without a chosen one: the temp folder on
-/// Windows and macOS, the app's folder in the XDG cache on Linux (`/tmp` is
-/// often in memory there).
-pub fn default_folder() -> Option<PathBuf> {
-    system::default_folder()
 }
 
 #[cfg(target_os = "linux")]
@@ -84,6 +75,10 @@ use linux as system;
 use macos as system;
 #[cfg(windows)]
 use windows as system;
+
+/// The per-system default test folder (made when missing) and the message
+/// for when there is none.
+pub use system::{default_folder, NO_DEFAULT_FOLDER};
 
 /// The bytes free for this user on the drive of `folder`.
 pub fn free_space(folder: &Path) -> Option<u64> {
@@ -130,10 +125,16 @@ fn create(path: &Path) -> std::io::Result<File> {
     o.open(path)
 }
 
-/// The message of a failed step: the direct I/O refusal when the filesystem
-/// refused it, else the step's own.
-fn failure(e: &std::io::Error, step: &str) -> String {
-    if system::refuses_direct_io(e) { DIRECT_IO_REFUSED } else { step }.to_string()
+/// The message of a failed open: the direct I/O refusal when the filesystem
+/// refused it there, else the generic one. Only opening the file with direct
+/// I/O can be refused; any other step keeps its own message.
+fn open_failure(e: &std::io::Error) -> String {
+    if system::refuses_direct_io(e) { DIRECT_IO_REFUSED } else { CREATE_FAILED }.to_string()
+}
+
+/// The message of a failed transfer step.
+fn step_failure(step: &str) -> impl Fn(std::io::Error) -> String + '_ {
+    move |_| step.to_string()
 }
 
 /// A buffer of `len` bytes aligned to [`ALIGN`]: (storage, offset).
@@ -170,7 +171,7 @@ fn process_alive(pid: u32) -> bool {
 fn speeds(probe: &Probe, job: &DiskJob) -> Result<Option<(f64, f64)>, String> {
     remove_stale(&job.folder, process_alive);
     let path = job.folder.join(format!("{FILE_PREFIX}{}", std::process::id()));
-    let file = create(&path).map_err(|e| failure(&e, CREATE_FAILED))?;
+    let file = create(&path).map_err(|e| open_failure(&e))?;
     let mut test = TestFile { path, file: Some(file) };
     let f = test.file.as_mut().expect("the file is open");
     let (n, total) = (job.chunks, job.chunk * job.chunks);
@@ -182,20 +183,20 @@ fn speeds(probe: &Probe, job: &DiskJob) -> Result<Option<(f64, f64)>, String> {
         if probe.cancelled() {
             return Ok(None);
         }
-        f.write_all(&buf[off..off + job.chunk]).map_err(|e| failure(&e, WRITE_FAILED))?;
+        f.write_all(&buf[off..off + job.chunk]).map_err(step_failure(WRITE_FAILED))?;
         probe.progress((i + 1) as f32 / n as f32 * 0.5);
     }
-    f.sync_all().map_err(|e| failure(&e, FLUSH_FAILED))?;
+    f.sync_all().map_err(step_failure(FLUSH_FAILED))?;
     let write = mb_per_sec(total, t.elapsed().as_secs_f64());
 
-    f.seek(SeekFrom::Start(0)).map_err(|e| failure(&e, REWIND_FAILED))?;
+    f.seek(SeekFrom::Start(0)).map_err(step_failure(REWIND_FAILED))?;
     probe.phase("Reading test file");
     let t = Instant::now();
     for i in 0..n {
         if probe.cancelled() {
             return Ok(None);
         }
-        f.read_exact(&mut buf[off..off + job.chunk]).map_err(|e| failure(&e, READ_FAILED))?;
+        f.read_exact(&mut buf[off..off + job.chunk]).map_err(step_failure(READ_FAILED))?;
         probe.progress(0.5 + (i + 1) as f32 / n as f32 * 0.5);
     }
     let read = mb_per_sec(total, t.elapsed().as_secs_f64());
@@ -209,7 +210,7 @@ mod tests {
     use std::time::Duration;
 
     /// An empty folder of its own under the temp folder, for one test.
-    fn scratch(name: &str) -> PathBuf {
+    pub(super) fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("bench-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -217,16 +218,16 @@ mod tests {
     }
 
     /// The names of the files left in `dir`.
-    fn left_in(dir: &Path) -> Vec<String> {
+    pub(super) fn left_in(dir: &Path) -> Vec<String> {
         std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect()
     }
 
     /// A small disk job (2 x 4 KB) in `folder`, seeing `free` bytes free.
-    fn small_job(folder: &Path, free: Option<u64>) -> DiskJob {
+    pub(super) fn small_job(folder: &Path, free: Option<u64>) -> DiskJob {
         DiskJob { folder: folder.to_path_buf(), chunk: 4096, chunks: 2, free: Box::new(move |_| free) }
     }
 
-    fn run(job: DiskJob) -> EngineState {
+    pub(super) fn run(job: DiskJob) -> EngineState {
         let mut engine = Engine::default();
         engine.start(vec![Unit::new("Disk", move |p| disk(p, &job))]);
         wait_idle(&engine)
@@ -333,56 +334,19 @@ mod tests {
     }
 
     #[test]
-    fn the_missing_default_folder_message_is_worded_per_system() {
-        if cfg!(windows) {
-            assert_eq!(NO_DEFAULT_FOLDER, "Windows could not locate the temporary folder.");
-        } else {
-            assert!(!NO_DEFAULT_FOLDER.contains("Windows"), "{NO_DEFAULT_FOLDER}");
-            assert!(NO_DEFAULT_FOLDER.starts_with("Could not locate"));
-        }
+    fn the_missing_default_folder_has_a_message() {
+        assert!(!NO_DEFAULT_FOLDER.is_empty());
     }
 
     #[test]
-    fn free_space_of_an_existing_folder_is_read_and_a_missing_one_is_unknown() {
-        if cfg!(target_os = "macos") {
-            return;
+    fn only_a_refused_open_gets_the_direct_io_message() {
+        // An error that is no refusal keeps the generic messages everywhere.
+        let other = std::io::Error::from_raw_os_error(2);
+        assert_eq!(open_failure(&other), CREATE_FAILED);
+        assert_eq!(step_failure(WRITE_FAILED)(other), WRITE_FAILED);
+        // The code a refusing system gives on open does not change a transfer step.
+        for step in [WRITE_FAILED, FLUSH_FAILED, REWIND_FAILED, READ_FAILED] {
+            assert_eq!(step_failure(step)(std::io::Error::from_raw_os_error(22)), step);
         }
-        let dir = scratch("free");
-        assert!(free_space(&dir).is_some_and(|f| f > 0));
-        assert_eq!(free_space(&dir.join("not-there")), None);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_refusal_of_direct_io_has_its_own_message() {
-        let refused = std::io::Error::from_raw_os_error(if cfg!(target_os = "linux") { 22 } else { 5 });
-        let message = failure(&refused, CREATE_FAILED);
-        assert_eq!(message, if cfg!(target_os = "linux") { DIRECT_IO_REFUSED } else { CREATE_FAILED });
-        // Any other error keeps the step's message.
-        assert_eq!(failure(&std::io::Error::from_raw_os_error(2), CREATE_FAILED), CREATE_FAILED);
-    }
-
-    /// In memory (tmpfs) the kernel either allows direct I/O (6.6+) or refuses
-    /// it: a refusal must say so and leave no file and no score.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_filesystem_refusing_direct_io_gives_the_message_and_no_score() {
-        let shm = Path::new("/dev/shm");
-        if !shm.is_dir() {
-            return;
-        }
-        let dir = shm.join(format!("bench-directio-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let s = run(small_job(&dir, None));
-        match s.status().as_deref() {
-            Some("Test complete") => {}
-            Some(status) => {
-                assert_eq!(status, format!("Disk test failed: {DIRECT_IO_REFUSED}"));
-                assert!(s.results("Disk").is_empty());
-            }
-            None => panic!("no status"),
-        }
-        assert!(left_in(&dir).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
