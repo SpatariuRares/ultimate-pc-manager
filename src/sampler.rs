@@ -282,7 +282,10 @@ fn counters_into(perf: &mut PerfLive, frame: Option<&crate::sensors::Frame>) {
     }
     gpus_into(perf, frame);
     power_into(perf, answered(frame, counter::POWER));
-    perf.cpu_pressure = answered(frame, counter::PRESSURE).and_then(|c| c.instance("cpu")).map(|i| i.value as f32);
+    let pressure = |what: &str| answered(frame, counter::PRESSURE).and_then(|c| c.instance(what)).map(|i| i.value as f32);
+    perf.cpu_pressure = pressure("cpu");
+    perf.memory_pressure = pressure("memory");
+    perf.io_pressure = pressure("io");
 }
 
 fn performance_level(perf: &mut PerfLive, counted: &CounterSet) {

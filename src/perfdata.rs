@@ -170,6 +170,9 @@ pub struct PerfLive {
     /// Linux pressure stall information: the share of the last 10 seconds
     /// some task waited for a processor; `None` when the kernel has none.
     pub cpu_pressure: Option<f32>,
+    /// The same for memory (some task waited for a page) and for disk I/O.
+    pub memory_pressure: Option<f32>,
+    pub io_pressure: Option<f32>,
     /// Working set of the "Memory Compression" process (it is protected, so
     /// it is read through the performance counters).
     pub compressed: u64,

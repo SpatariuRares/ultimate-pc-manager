@@ -105,6 +105,14 @@ fn pct1(v: f32) -> String {
     format!("{v:.1}%")
 }
 
+/// A "Pressure:" line, only where the kernel reports it (Linux pressure
+/// stall information: the share of the last 10 seconds some task waited).
+fn pressure_row(st: &mut Stats, pressure: Option<f32>) {
+    if let Some(p) = pressure {
+        st.row("Pressure:", pct1(p));
+    }
+}
+
 fn letters(d: &perfdata::DiskInfo) -> String {
     if d.letters.is_empty() {
         format!("Disk {}", d.number)
@@ -823,6 +831,7 @@ impl<'a> Frame<'a> {
                 st.fact_row("Frequency governor:", if c.plan.is_empty() { dash.to_string() } else { c.plan.clone() });
                 st.fact_row("Power preference:", if c.overlay.is_empty() { dash.to_string() } else { c.overlay.clone() });
                 st.row("Handles:", pf.handles.to_string());
+                pressure_row(&mut st, pf.cpu_pressure);
             }
             PerfItem::Memory => {
                 let m = &info.mem;
@@ -839,6 +848,7 @@ impl<'a> Frame<'a> {
                 st.top("Compressed", fmt_size(s.compressed));
                 st.top("Page ins", pf.page_ins.to_string());
                 st.top("Hard faults", format!("{:.0} pages/s", pf.hard_faults));
+                pressure_row(&mut st, pf.memory_pressure);
             }
             PerfItem::Disk(n) => {
                 let live = pf.disks.iter().find(|d| d.number == n).cloned().unwrap_or_default();
@@ -853,6 +863,7 @@ impl<'a> Frame<'a> {
                 st.fact_top("Formatted", fixed.filter(|d| d.formatted > 0).map(|d| fmt_size(d.formatted)).unwrap_or_else(|| "Unavailable".into()));
                 st.fact_top("System disk", if fixed.map(|d| d.system).unwrap_or(false) { "Yes" } else { "No" });
                 st.fact_top("Type", fixed.map(|d| d.bus).unwrap_or(dash));
+                pressure_row(&mut st, pf.io_pressure);
             }
             PerfItem::Network => {
                 let crate::metrics::Adapters { rx_bps: rx, tx_bps: tx, .. } = crate::metrics::combine_adapters(&s.net);
@@ -1211,6 +1222,27 @@ mod tests {
         }
         assert!(!shows(&drawn.texts, HARD_FAULTS), "the CPU is the device shown, not Memory");
         assert!(drawn.actions.is_empty(), "drawing alone asks for nothing");
+    }
+
+    /// The "Pressure:" value of `item` for a snapshot, if the page shows one.
+    fn pressure_of(item: PerfItem, perf: crate::perfdata::PerfLive) -> Option<String> {
+        let app = TaskApp::headless(crate::settings::Settings::default(), Snapshot { seq: 1, perf, ..Default::default() });
+        app.stats(item).table.into_iter().find(|(k, _)| k == "Pressure:").map(|(_, v)| v)
+    }
+
+    #[test]
+    fn the_cpu_memory_and_disk_panels_show_the_pressure_the_kernel_reports() {
+        let perf = crate::perfdata::PerfLive { cpu_pressure: Some(3.2), memory_pressure: Some(0.5), io_pressure: Some(12.0), ..Default::default() };
+        assert_eq!(pressure_of(PerfItem::Cpu, perf.clone()).as_deref(), Some("3.2%"));
+        assert_eq!(pressure_of(PerfItem::Memory, perf.clone()).as_deref(), Some("0.5%"));
+        assert_eq!(pressure_of(PerfItem::Disk(0), perf).as_deref(), Some("12.0%"));
+    }
+
+    #[test]
+    fn a_kernel_without_pressure_leaves_the_panels_as_they_were() {
+        for item in [PerfItem::Cpu, PerfItem::Memory, PerfItem::Disk(0)] {
+            assert_eq!(pressure_of(item, Default::default()), None, "{item:?}: no row, not a blank one");
+        }
     }
 
     #[test]

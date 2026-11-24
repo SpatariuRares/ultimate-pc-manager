@@ -1,6 +1,6 @@
 //! Linux: the system counters, read through an [`FsRoot`]. Today: kernel
 //! time per processor and in total (`/proc/stat`) and the processor pressure
-//! stall information (`/proc/pressure/cpu`, when the kernel has it).
+//! stall information (`/proc/pressure/{cpu,memory,io}`, when the kernel has it).
 //!
 //! The memory counters keep the shapes the Windows provider gives, so the
 //! sampler fills the same figures from them:
@@ -76,7 +76,7 @@ impl Counters {
         let now = proc_stat::read(&self.root)?;
         let before = self.previous.replace(now.clone());
         let mut sets = vec![kernel_time(before.as_ref(), &now)];
-        sets.extend(cpu_pressure(&self.root));
+        sets.extend(pressure(&self.root));
         sets.extend(disk_counters(&self.root, &mut self.previous_disks, at));
         sets.push(pages_read(&self.root, &mut self.faults, at));
         sets.push(swap_in_use(&self.root));
@@ -128,11 +128,15 @@ fn disk_counters(root: &FsRoot, previous: &mut Option<(Instant, Vec<(String, Tal
     vec![CounterSet::new(counter::IDLE, idle), CounterSet::new(counter::DREAD, read), CounterSet::new(counter::DWRITE, write), CounterSet::new(counter::DRESP, resp)]
 }
 
-/// The share of the last 10 seconds some task waited for a processor, when
-/// the kernel has pressure stall information ("cpu"); nothing otherwise.
-fn cpu_pressure(root: &FsRoot) -> Option<CounterSet> {
-    let avg10 = pressure_avg10(&root.read("proc/pressure/cpu")?)?;
-    Some(CounterSet::new(counter::PRESSURE, vec![Instance::new("cpu", avg10)]))
+/// The share of the last 10 seconds some task waited for a processor, for
+/// memory or for disk I/O, one instance each ("cpu", "memory", "io"), as far
+/// as the kernel has pressure stall information for it; nothing otherwise.
+fn pressure(root: &FsRoot) -> Option<CounterSet> {
+    let instances: Vec<Instance> = ["cpu", "memory", "io"]
+        .into_iter()
+        .filter_map(|what| Some(Instance::new(what, pressure_avg10(&root.read(&format!("proc/pressure/{what}"))?)?)))
+        .collect();
+    (!instances.is_empty()).then(|| CounterSet::new(counter::PRESSURE, instances))
 }
 
 /// The `some` line's 10-second average of a pressure file's text.
@@ -230,6 +234,8 @@ mod tests {
         let sets = Counters::at(fixture("cpu-modern")).read().unwrap();
         let p = sets.iter().find(|s| s.key == counter::PRESSURE).unwrap();
         assert_eq!(p.instance("cpu").map(|i| i.value), Some(1.5));
+        assert_eq!(p.instance("memory").map(|i| i.value), Some(3.25));
+        assert_eq!(p.instance("io").map(|i| i.value), Some(7.5));
     }
 
     #[test]
