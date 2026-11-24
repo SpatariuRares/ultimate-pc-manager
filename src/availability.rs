@@ -80,6 +80,8 @@ features! {
     UninstallRegistry,
     /// The handles open files and resources are listed from.
     OpenHandles,
+    /// The registry keys a process holds open.
+    ProcessRegistryKeys,
     /// The machine's fixed facts: processor, memory, disks, graphics.
     MachineInformation,
 }
@@ -106,6 +108,7 @@ pub(crate) fn system_has(feature: Feature) -> bool {
     // the open-file count and the architecture are read from /proc (the program's ELF header);
     // the owning package (in place of a signer) comes from the package database and the
     // description from the program's desktop entry.
+    // the open files and sockets are read from /proc/<pid>/fd (there are no registry keys).
     #[cfg(target_os = "linux")]
     return matches!(
         feature,
@@ -117,6 +120,7 @@ pub(crate) fn system_has(feature: Feature) -> bool {
             | Feature::ProcessArchitecture
             | Feature::FileSignatures
             | Feature::FileVersionInfo
+            | Feature::OpenHandles
     );
     // No current feature has a macOS implementation yet.
     #[cfg(target_os = "macos")]
@@ -228,6 +232,7 @@ mod tests {
             Feature::ProcessArchitecture,
             Feature::FileSignatures,
             Feature::FileVersionInfo,
+            Feature::OpenHandles,
         ];
         for &feature in Feature::ALL {
             assert_eq!(system_has(feature), here.contains(&feature), "{feature:?}");
