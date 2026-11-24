@@ -1,0 +1,7 @@
+Name:	big
+State:	S (sleeping)
+Pid:	400
+PPid:	1
+Uid:	1000	1000	1000	1000
+Cpus_allowed:	00000001,00000000,00000000,0000000f
+Cpus_allowed_list:	0-3

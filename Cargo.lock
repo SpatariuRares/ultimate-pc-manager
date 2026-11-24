@@ -3232,6 +3232,7 @@ dependencies = [
  "egui",
  "egui_extras",
  "image",
+ "libc",
  "rustls",
  "serde",
  "serde_json",

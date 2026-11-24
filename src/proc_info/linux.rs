@@ -381,21 +381,32 @@ fn counts_of(files: &ProcFiles) -> Option<Counts> {
     Some(c)
 }
 
+#[cfg(test)]
 /// The IDs of the processes under the root.
 fn pids(root: &FsRoot) -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir(root.path("proc")) else { return Vec::new() };
     entries.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok()).collect()
 }
 
+#[cfg(test)]
 /// One read of every process.
 pub fn counts_in(root: &FsRoot) -> HashMap<u32, Counts> {
-    pids(root).into_iter().filter_map(|pid| Some((pid, counts_of(&ProcFiles::new(root, pid))?))).collect()
+    counts_of_pids(root, pids(root))
 }
 
+fn counts_of_pids(root: &FsRoot, pids: impl IntoIterator<Item = u32>) -> HashMap<u32, Counts> {
+    pids.into_iter().filter_map(|pid| Some((pid, counts_of(&ProcFiles::new(root, pid))?))).collect()
+}
+
+#[cfg(test)]
 /// The processes listed as Apps; Linux has no hung-window check and the
 /// view's "Bring to front" has no window walk to ask yet.
 pub fn windows_in(root: &FsRoot) -> Windows {
-    let apps = pids(root).into_iter().filter(|&pid| ProcFiles::new(root, pid).is_app()).collect();
+    windows_of_pids(root, pids(root))
+}
+
+fn windows_of_pids(root: &FsRoot, pids: impl IntoIterator<Item = u32>) -> Windows {
+    let apps = pids.into_iter().filter(|&pid| ProcFiles::new(root, pid).is_app()).collect();
     Windows { apps, ..Windows::default() }
 }
 
@@ -413,7 +424,9 @@ pub fn priority_class_in(root: &FsRoot, pid: u32) -> Option<&'static str> {
 
 /// One read of every process.
 pub fn counts(_buf: &mut Vec<u64>) -> HashMap<u32, Counts> {
-    counts_in(&FsRoot::system())
+    // The list of processes comes from kernel notifications where the
+    // system has them, from a scan of `/proc` otherwise.
+    counts_of_pids(&FsRoot::system(), crate::proc_fast::system_pids())
 }
 
 /// Not available yet.
@@ -434,7 +447,7 @@ pub fn priority_class(pid: u32) -> Option<&'static str> {
 
 /// The Apps among the processes.
 pub fn windows() -> super::Windows {
-    windows_in(&FsRoot::system())
+    windows_of_pids(&FsRoot::system(), crate::proc_fast::system_pids())
 }
 
 /// Not available yet.
