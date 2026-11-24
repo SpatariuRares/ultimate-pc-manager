@@ -1,0 +1,14 @@
+26 1 259:2 / / rw,relatime shared:1 - btrfs /dev/nvme0n1p2 rw,subvolid=256,subvol=/@
+21 26 0:5 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+22 26 0:20 / /proc rw,nosuid,nodev,noexec,relatime shared:3 - proc proc rw
+23 26 0:6 / /dev rw,nosuid shared:4 - devtmpfs udev rw,size=8116492k
+24 21 0:25 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:5 - cgroup2 cgroup2 rw
+25 26 0:24 / /run rw,nosuid,nodev shared:6 - tmpfs tmpfs rw,mode=755
+28 26 0:26 / /tmp rw,nosuid,nodev shared:7 - tmpfs tmpfs rw
+27 26 259:1 / /boot/efi rw,relatime shared:8 - vfat /dev/nvme0n1p1 rw,fmask=0077
+29 26 0:45 /@snapshots /home/user/.snapshots rw,relatime shared:9 - btrfs /dev/nvme0n1p2 rw,subvolid=300,subvol=/@snapshots
+30 26 8:1 / /home rw,relatime shared:10 - ext4 /dev/sda1 rw
+31 26 8:1 /shared /srv rw,relatime shared:10 - ext4 /dev/sda1 rw
+32 26 8:17 / /mnt/data\040space rw,relatime shared:11 - xfs /dev/sdb1 rw
+33 26 7:3 / /snap/core/1 ro,nodev,relatime shared:12 - squashfs /dev/loop3 ro
+34 26 0:50 / /var/lib/docker/overlay2/x/merged rw,relatime - overlay overlay rw,lowerdir=/a,upperdir=/b

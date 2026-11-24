@@ -14,6 +14,8 @@ mod linux_facts;
 mod proc_fast;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod linux_disks;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod linux_mounts;
 mod user_sessions;
 mod availability;
 mod core_page;
