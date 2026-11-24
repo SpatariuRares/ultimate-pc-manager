@@ -29,15 +29,15 @@ pub const SCORED: [Test; 3] = [Test::Cpu, Test::Gpu, Test::Disk];
 /// The reference machine's figures, the only place they are written down:
 /// the median of three release-build runs of this app's tests on the
 /// owner's PC (AMD Ryzen 5 7600X, NVIDIA GeForce RTX 4080, Samsung 980 PRO;
-/// disk test in the temp folder), measured on 2026-11-17 (GPU Compute on
-/// 2026-11-18, with our own compute shader). Changing a test's
+/// disk test in the temp folder), measured on 2026-11-17 (GPU figures on
+/// 2026-11-24, with the wgpu GPU test and GPU timestamps). Changing a test's
 /// work or these values changes what the score means: scores are compared
 /// per version only.
 const BASE: [(Test, &str, f64); 6] = [
     (Test::Cpu, super::SINGLE_CORE, 152.8),  // Mops/sec
     (Test::Cpu, super::MULTI_CORE, 1.868),   // Gop/sec
-    (Test::Gpu, super::gpu::COMPUTE, 40580.0), // GFLOPS
-    (Test::Gpu, super::gpu::GRAPHICS, 61.45),  // Gpixels/sec
+    (Test::Gpu, super::gpu::COMPUTE, 45750.0),  // GFLOPS
+    (Test::Gpu, super::gpu::GRAPHICS, 61.49),   // Gpixels/sec
     (Test::Disk, super::WRITE_SPEED, 3863.0), // MB/sec
     (Test::Disk, super::READ_SPEED, 5161.0),  // MB/sec
 ];
@@ -126,7 +126,7 @@ mod tests {
     fn the_reference_values_are_the_measured_ones() {
         let cpu = [(super::super::SINGLE_CORE, 152.8), (super::super::MULTI_CORE, 1.868)];
         assert!(close(test_score(Test::Cpu, cpu), 100.0));
-        assert!(close(test_score(Test::Gpu, [("Compute", 40580.0), ("Graphics", 61.45)]), 100.0));
+        assert!(close(test_score(Test::Gpu, [("Compute", 45750.0), ("Graphics", 61.49)]), 100.0));
         assert!(close(test_score(Test::Disk, [("Write speed", 3863.0), ("Read speed", 5161.0)]), 100.0));
     }
 
@@ -135,12 +135,12 @@ mod tests {
         // Twice the reference on one figure, half on the other: 100.
         assert!(close(test_score(Test::Disk, [("Write speed", 3863.0 * 2.0), ("Read speed", 5161.0 / 2.0)]), 100.0));
         // Four times on one, the reference on the other: 200.
-        assert!(close(test_score(Test::Gpu, [("Compute", 40580.0 * 4.0), ("Graphics", 61.45)]), 200.0));
+        assert!(close(test_score(Test::Gpu, [("Compute", 45750.0 * 4.0), ("Graphics", 61.49)]), 200.0));
     }
 
     #[test]
     fn a_run_missing_a_figure_or_a_test_without_a_score_has_none() {
-        assert_eq!(test_score(Test::Gpu, [("Compute", 40580.0)]), None);
+        assert_eq!(test_score(Test::Gpu, [("Compute", 45750.0)]), None);
         assert_eq!(test_score(Test::Disk, [("Write speed", 0.0), ("Read speed", 5161.0)]), None);
         assert_eq!(test_score(Test::Internet, [("Download", 500.0), ("Upload", 50.0)]), None);
         assert_eq!(test_score(Test::Memory, [("Copy speed", 20.0)]), None);
