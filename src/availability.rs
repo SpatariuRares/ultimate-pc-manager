@@ -102,9 +102,18 @@ pub(crate) fn system_has(feature: Feature) -> bool {
     };
     // Linux: signals, nice values and affinity work through kill, renice and taskset;
     // the startup entries are read from the XDG autostart folders; the service
-    // list and its control come from its sources (they say when no service manager is there).
+    // list and its control come from its sources (they say when no service manager is there);
+    // the open-file count and the architecture are read from /proc (the program's ELF header).
     #[cfg(target_os = "linux")]
-    return matches!(feature, Feature::ProcessControl | Feature::StartupEntries | Feature::ServiceListing | Feature::ServiceControl);
+    return matches!(
+        feature,
+        Feature::ProcessControl
+            | Feature::StartupEntries
+            | Feature::ServiceListing
+            | Feature::ServiceControl
+            | Feature::ProcessHandleCounts
+            | Feature::ProcessArchitecture
+    );
     // No current feature has a macOS implementation yet.
     #[cfg(target_os = "macos")]
     return {
@@ -205,9 +214,17 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn on_linux_process_control_startup_entries_and_the_service_list_and_control_are_in_the_system_so_far() {
+    fn on_linux_process_control_startup_entries_services_and_the_proc_facts_are_in_the_system_so_far() {
+        let here = [
+            Feature::ProcessControl,
+            Feature::StartupEntries,
+            Feature::ServiceListing,
+            Feature::ServiceControl,
+            Feature::ProcessHandleCounts,
+            Feature::ProcessArchitecture,
+        ];
         for &feature in Feature::ALL {
-            assert_eq!(system_has(feature), matches!(feature, Feature::ProcessControl | Feature::StartupEntries | Feature::ServiceListing | Feature::ServiceControl), "{feature:?}");
+            assert_eq!(system_has(feature), here.contains(&feature), "{feature:?}");
         }
     }
 

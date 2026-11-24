@@ -1,0 +1,9 @@
+Name:	sleeper
+State:	T (stopped)
+Pid:	1
+Uid:	1000	1000	1000	1000
+Threads:	1
+VmHWM:	1000 kB
+VmRSS:	1000 kB
+RssAnon:	500 kB
+VmData:	2000 kB
