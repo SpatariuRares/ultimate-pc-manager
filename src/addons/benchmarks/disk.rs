@@ -13,7 +13,10 @@ use super::{READ_SPEED, WRITE_SPEED};
 
 /// The disk test's messages.
 pub const NOT_ENOUGH_SPACE: &str = "Not enough free space to run the test.";
-pub const NO_TEMP_FOLDER: &str = "Windows could not locate the temporary folder.";
+/// Worded per system (no "Windows" on Linux).
+pub const NO_DEFAULT_FOLDER: &str = system::NO_DEFAULT_FOLDER;
+/// The drive's filesystem refuses direct I/O: no score is possible.
+pub const DIRECT_IO_REFUSED: &str = "This drive does not allow direct I/O.";
 const CREATE_FAILED: &str = "Unable to create the test file.";
 const WRITE_FAILED: &str = "Writing the test file failed.";
 const FLUSH_FAILED: &str = "Flushing the test file failed.";
@@ -52,14 +55,20 @@ impl DiskJob {
     }
 }
 
-/// The folder the test writes in: the chosen one, else the temp folder
-/// `temp` ("Windows could not locate the temporary folder." when missing).
-pub fn test_folder(chosen: Option<&str>, temp: PathBuf) -> Result<PathBuf, &'static str> {
+/// The folder the test writes in: the chosen one, else `default` (this
+/// system's default folder; the NO_DEFAULT_FOLDER message when there is none).
+pub fn test_folder(chosen: Option<&str>, default: Option<PathBuf>) -> Result<PathBuf, &'static str> {
     match chosen.filter(|c| !c.is_empty()) {
         Some(c) => Ok(PathBuf::from(c)),
-        None if temp.is_dir() => Ok(temp),
-        None => Err(NO_TEMP_FOLDER),
+        None => default.filter(|d| (system::CREATE_DEFAULT && std::fs::create_dir_all(d).is_ok()) || d.is_dir()).ok_or(NO_DEFAULT_FOLDER),
     }
+}
+
+/// The folder the test writes in without a chosen one: the temp folder on
+/// Windows and macOS, the app's folder in the XDG cache on Linux (`/tmp` is
+/// often in memory there).
+pub fn default_folder() -> Option<PathBuf> {
+    system::default_folder()
 }
 
 #[cfg(target_os = "linux")]
@@ -121,6 +130,12 @@ fn create(path: &Path) -> std::io::Result<File> {
     o.open(path)
 }
 
+/// The message of a failed step: the direct I/O refusal when the filesystem
+/// refused it, else the step's own.
+fn failure(e: &std::io::Error, step: &str) -> String {
+    if system::refuses_direct_io(e) { DIRECT_IO_REFUSED } else { step }.to_string()
+}
+
 /// A buffer of `len` bytes aligned to [`ALIGN`]: (storage, offset).
 fn aligned(len: usize, fill: u8) -> (Vec<u8>, usize) {
     let v = vec![fill; len + ALIGN];
@@ -155,7 +170,7 @@ fn process_alive(pid: u32) -> bool {
 fn speeds(probe: &Probe, job: &DiskJob) -> Result<Option<(f64, f64)>, String> {
     remove_stale(&job.folder, process_alive);
     let path = job.folder.join(format!("{FILE_PREFIX}{}", std::process::id()));
-    let file = create(&path).map_err(|_| CREATE_FAILED.to_string())?;
+    let file = create(&path).map_err(|e| failure(&e, CREATE_FAILED))?;
     let mut test = TestFile { path, file: Some(file) };
     let f = test.file.as_mut().expect("the file is open");
     let (n, total) = (job.chunks, job.chunk * job.chunks);
@@ -167,20 +182,20 @@ fn speeds(probe: &Probe, job: &DiskJob) -> Result<Option<(f64, f64)>, String> {
         if probe.cancelled() {
             return Ok(None);
         }
-        f.write_all(&buf[off..off + job.chunk]).map_err(|_| WRITE_FAILED.to_string())?;
+        f.write_all(&buf[off..off + job.chunk]).map_err(|e| failure(&e, WRITE_FAILED))?;
         probe.progress((i + 1) as f32 / n as f32 * 0.5);
     }
-    f.sync_all().map_err(|_| FLUSH_FAILED.to_string())?;
+    f.sync_all().map_err(|e| failure(&e, FLUSH_FAILED))?;
     let write = mb_per_sec(total, t.elapsed().as_secs_f64());
 
-    f.seek(SeekFrom::Start(0)).map_err(|_| REWIND_FAILED.to_string())?;
+    f.seek(SeekFrom::Start(0)).map_err(|e| failure(&e, REWIND_FAILED))?;
     probe.phase("Reading test file");
     let t = Instant::now();
     for i in 0..n {
         if probe.cancelled() {
             return Ok(None);
         }
-        f.read_exact(&mut buf[off..off + job.chunk]).map_err(|_| READ_FAILED.to_string())?;
+        f.read_exact(&mut buf[off..off + job.chunk]).map_err(|e| failure(&e, READ_FAILED))?;
         probe.progress(0.5 + (i + 1) as f32 / n as f32 * 0.5);
     }
     let read = mb_per_sec(total, t.elapsed().as_secs_f64());
@@ -298,10 +313,14 @@ mod tests {
     #[test]
     fn the_test_folder_is_the_chosen_one_or_the_temp_folder() {
         let temp = scratch("temp");
-        assert_eq!(test_folder(None, temp.clone()), Ok(temp.clone()));
-        assert_eq!(test_folder(Some(""), temp.clone()), Ok(temp.clone()));
-        assert_eq!(test_folder(Some("D:\\Bench"), temp.clone()), Ok(PathBuf::from("D:\\Bench")));
-        assert_eq!(test_folder(None, temp.join("gone")), Err("Windows could not locate the temporary folder."));
+        assert_eq!(test_folder(None, Some(temp.clone())), Ok(temp.clone()));
+        assert_eq!(test_folder(Some(""), Some(temp.clone())), Ok(temp.clone()));
+        assert_eq!(test_folder(Some("D:\\Bench"), Some(temp.clone())), Ok(PathBuf::from("D:\\Bench")));
+        // A default that cannot be had (under a plain file, so it cannot be made).
+        let file = temp.join("plain-file");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(test_folder(None, Some(file.join("gone"))), Err(NO_DEFAULT_FOLDER));
+        assert_eq!(test_folder(None, None), Err(NO_DEFAULT_FOLDER));
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -311,5 +330,59 @@ mod tests {
         assert_eq!(speed, 512.0);
         let f = super::super::engine::Figure { name: "Read speed", value: speed, unit: super::super::engine::MBS };
         assert_eq!(f.text(), "512 MB/sec");
+    }
+
+    #[test]
+    fn the_missing_default_folder_message_is_worded_per_system() {
+        if cfg!(windows) {
+            assert_eq!(NO_DEFAULT_FOLDER, "Windows could not locate the temporary folder.");
+        } else {
+            assert!(!NO_DEFAULT_FOLDER.contains("Windows"), "{NO_DEFAULT_FOLDER}");
+            assert!(NO_DEFAULT_FOLDER.starts_with("Could not locate"));
+        }
+    }
+
+    #[test]
+    fn free_space_of_an_existing_folder_is_read_and_a_missing_one_is_unknown() {
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        let dir = scratch("free");
+        assert!(free_space(&dir).is_some_and(|f| f > 0));
+        assert_eq!(free_space(&dir.join("not-there")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refusal_of_direct_io_has_its_own_message() {
+        let refused = std::io::Error::from_raw_os_error(if cfg!(target_os = "linux") { 22 } else { 5 });
+        let message = failure(&refused, CREATE_FAILED);
+        assert_eq!(message, if cfg!(target_os = "linux") { DIRECT_IO_REFUSED } else { CREATE_FAILED });
+        // Any other error keeps the step's message.
+        assert_eq!(failure(&std::io::Error::from_raw_os_error(2), CREATE_FAILED), CREATE_FAILED);
+    }
+
+    /// In memory (tmpfs) the kernel either allows direct I/O (6.6+) or refuses
+    /// it: a refusal must say so and leave no file and no score.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_filesystem_refusing_direct_io_gives_the_message_and_no_score() {
+        let shm = Path::new("/dev/shm");
+        if !shm.is_dir() {
+            return;
+        }
+        let dir = shm.join(format!("bench-directio-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = run(small_job(&dir, None));
+        match s.status().as_deref() {
+            Some("Test complete") => {}
+            Some(status) => {
+                assert_eq!(status, format!("Disk test failed: {DIRECT_IO_REFUSED}"));
+                assert!(s.results("Disk").is_empty());
+            }
+            None => panic!("no status"),
+        }
+        assert!(left_in(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
