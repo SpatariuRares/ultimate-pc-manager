@@ -150,6 +150,12 @@ From the user's point of view:
 
 **Decisions already taken.** Canvas layout design A of P14: three drop-down menus instead of segmented controls, "Start" button, Balls canvas colored by type, panel in the order drive card / File Type / Largest Folders / History, status strip with LEDs, "Idle", "Not scanned", paths written as "C:\", category "Code". No file deletion (the page only shows the item in File Explorer). No link to Windows Storage settings and no installed-app sizes on this page (they were inventions of the previous mock; apps remain in Installed Apps). Used/free bar and Copy path are our kept additions.
 
+### Linux (spec #41, decided in #75)
+
+- Drives are the mounted real filesystems (no proc, sysfs or other pseudo filesystems), one entry per device: when the same filesystem is mounted more than once (bind mounts, several btrfs subvolumes of one filesystem), only the mount closest to `/` is listed, so the same space is never shown twice.
+- A scan always stays on the filesystem it started on; there is no option to cross into other mounts. A mount found inside the scanned folder is not entered; it can be scanned by choosing it as its own drive.
+- Sizes are allocated blocks, hard links are counted once (device and inode), and folders the user cannot read are counted as skipped.
+
 ## Testing Decisions
 
 Good tests check external behavior (what a function returns given an input, what the add-on does when it is turned on or off), not internal details.
