@@ -26,7 +26,10 @@ pub fn free_space(folder: &Path) -> Option<u64> {
     // SAFETY: `path` is NUL-terminated and `st` is a valid out-pointer.
     let ok = unsafe { libc::statvfs(path.as_ptr(), st.as_mut_ptr()) } == 0;
     // SAFETY: statvfs filled `st` when it returned 0.
-    ok.then(|| unsafe { st.assume_init() }).map(|st| st.f_bavail as u64 * st.f_frsize as u64)
+    // The fields are u32 on some targets: the casts widen there.
+    #[allow(clippy::unnecessary_cast)]
+    let free = ok.then(|| unsafe { st.assume_init() }).map(|st| st.f_bavail as u64 * st.f_frsize as u64);
+    free
 }
 
 /// Opens the test file with direct I/O: the drive, not the page cache.
